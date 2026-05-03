@@ -1,0 +1,107 @@
+diff --git a/packages/coding-agent/src/modes/interactive/components/model-selector.ts b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
+index 711ac3a9..2d4af2e4 100644
+--- a/packages/coding-agent/src/modes/interactive/components/model-selector.ts
++++ b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
+@@ -61,6 +61,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 	private scopeText?: Text;
+ 	private scopeHintText?: Text;
+ 
++	private modelOrder?: Set<string>;
++
+ 	constructor(
+ 		tui: TUI,
+ 		currentModel: Model<any> | undefined,
+@@ -70,6 +72,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 		onSelect: (model: Model<any>) => void,
+ 		onCancel: () => void,
+ 		initialSearchInput?: string,
++		modelOrder?: Set<string>,
+ 	) {
+ 		super();
+ 
+@@ -79,6 +82,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 		this.modelRegistry = modelRegistry;
+ 		this.scopedModels = scopedModels;
+ 		this.scope = scopedModels.length > 0 ? "scoped" : "all";
++		this.modelOrder = modelOrder;
+ 		this.onSelectCallback = onSelect;
+ 		this.onCancelCallback = onCancel;
+ 
+@@ -182,8 +186,25 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 
+ 	private sortModels(models: ModelItem[]): ModelItem[] {
+ 		const sorted = [...models];
+-		// Sort: current model first, then by provider
++
++		// Build priority map: lower = more recent (higher priority)
++		const priority = new Map<string, number>();
++		if (this.modelOrder && this.modelOrder.size > 0) {
++			let rank = 0;
++			for (const key of this.modelOrder) {
++				if (!priority.has(key)) {
++					priority.set(key, rank++);
++				}
++			}
++		}
++
+ 		sorted.sort((a, b) => {
++			const keyA = `${a.provider}/${a.id}`;
++			const keyB = `${b.provider}/${b.id}`;
++			const pA = priority.get(keyA) ?? Number.MAX_SAFE_INTEGER;
++			const pB = priority.get(keyB) ?? Number.MAX_SAFE_INTEGER;
++			if (pA !== pB) return pA - pB;
++			// Within same recency tier: current model first, then alphabetical
+ 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
+ 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
+ 			if (aIsCurrent && !bIsCurrent) return -1;
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index af20eda6..ab3df3aa 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -4107,6 +4107,38 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private showModelSelector(initialSearchInput?: string): void {
++		// Read model-recency order from session entries for MRU sorting
++		let modelOrder: Set<string> | undefined;
++		try {
++			const entries = (this.session as any).sessionManager?.getEntries() ?? [];
++			for (let i = entries.length - 1; i >= 0; i--) {
++				const entry = entries[i];
++				if ((entry as any).type === "custom" && (entry as any).customType === "model-recency") {
++					const data = (entry as any).data;
++					if (data?.order && Array.isArray(data.order)) {
++						const order: Array<{ provider: string; modelId: string }> = data.order;
++						modelOrder = new Set(order.map((r) => `${r.provider}/${r.modelId}`));
++					}
++					break;
++				}
++			}
++			// Fallback: read from cache file (survives session restarts)
++			if (!modelOrder) {
++				try {
++					const fs = require("fs");
++					const cachePath = require("path").join(
++						process.env.HOME ?? require("os").homedir(),
++						".pi/agent/model-recency.json",
++					);
++					const raw = fs.readFileSync(cachePath, "utf-8");
++					const data = JSON.parse(raw);
++					if (data?.order && Array.isArray(data.order)) {
++						modelOrder = new Set(data.order.map((r: any) => `${r.provider}/${r.modelId}`));
++					}
++				} catch { /* ignore */ }
++			}
++		} catch { /* ignore any errors reading entries */ }
++
+ 		this.showSelector((done) => {
+ 			const selector = new ModelSelectorComponent(
+ 				this.ui,
+@@ -4133,6 +4165,7 @@ export class InteractiveMode {
+ 					this.ui.requestRender();
+ 				},
+ 				initialSearchInput,
++				modelOrder,
+ 			);
+ 			return { component: selector, focus: selector };
+ 		});
