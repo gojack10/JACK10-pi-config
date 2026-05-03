@@ -55,10 +55,10 @@ index 711ac3a9..2d4af2e4 100644
  			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
  			if (aIsCurrent && !bIsCurrent) return -1;
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index af20eda6..ab3df3aa 100644
+index 3b2adb5d..b623e533 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-@@ -4107,6 +4107,38 @@ export class InteractiveMode {
+@@ -3957,6 +3957,38 @@ export class InteractiveMode {
  	}
  
  	private showModelSelector(initialSearchInput?: string): void {
@@ -97,7 +97,7 @@ index af20eda6..ab3df3aa 100644
  		this.showSelector((done) => {
  			const selector = new ModelSelectorComponent(
  				this.ui,
-@@ -4133,6 +4165,7 @@ export class InteractiveMode {
+@@ -3983,6 +4015,7 @@ export class InteractiveMode {
  					this.ui.requestRender();
  				},
  				initialSearchInput,

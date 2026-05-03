@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
-index 61661485..33650df2 100644
+index eb430a3c..b9f0d360 100644
 --- a/packages/coding-agent/src/core/agent-session.ts
 +++ b/packages/coding-agent/src/core/agent-session.ts
 @@ -25,6 +25,10 @@ import type {
@@ -13,7 +13,7 @@ index 61661485..33650df2 100644
  import { theme } from "../modes/interactive/theme/theme.js";
  import { stripFrontmatter } from "../utils/frontmatter.js";
  import { sleep } from "../utils/sleep.js";
-@@ -1405,6 +1409,12 @@ export class AgentSession {
+@@ -1419,6 +1423,12 @@ export class AgentSession {
  		this.sessionManager.appendModelChange(model.provider, model.id);
  		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
  
@@ -26,7 +26,7 @@ index 61661485..33650df2 100644
  		// Re-clamp thinking level for new model's capabilities
  		this.setThinkingLevel(thinkingLevel);
  
-@@ -1765,6 +1775,9 @@ export class AgentSession {
+@@ -1786,6 +1796,9 @@ export class AgentSession {
  		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
  		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return;
  
