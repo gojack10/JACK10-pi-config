@@ -1,7 +1,7 @@
 {
   "lastChangelogVersion": "0.70.2",
   "defaultProvider": "omlx",
-  "defaultModel": "vendor-tunnel-model",
+  "defaultModel": "Qwen3.6-27B-UD-MLX-4bit",
   "defaultThinkingLevel": "high",
   "theme": "dark",
   "compaction": {
