@@ -26,6 +26,17 @@ function getDisplayPath(cwd: string): string {
 	return cwd;
 }
 
+function getTemperature(): number | null {
+	try {
+		const configPath = `${process.env.HOME || process.env.USERPROFILE}/.pi/agent/temperature.json`;
+		const fs = require("node:fs");
+		const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { temp?: number };
+		return data.temp ?? null;
+	} catch {
+		return null;
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
@@ -59,6 +70,7 @@ export default function (pi: ExtensionAPI) {
 					const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
 					const modelName = ctx.model?.id ?? "no-model";
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
+					const isLocal = ctx.model && String((ctx.model as any).baseURL ?? (ctx.model as any).baseUrl ?? "").match(/localhost|127\.0\.0\.1/i);
 					const thinkingSuffix =
 						ctx.model?.reasoning && !isClaudeCodeModel ? ` ${pi.getThinkingLevel()}` : "";
 
@@ -77,7 +89,8 @@ export default function (pi: ExtensionAPI) {
 					const statsLine =
 						`CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)` +
 						` | SESSION: ↑${formatTokens(totalInput)} ↓${formatTokens(totalOutput)} CR:${formatTokens(totalCacheRead)}` +
-						` $${totalCost.toFixed(3)}${usingSubscription ? " (SUB)" : ""}` +
+						`${isLocal ? " (LOCAL)" : ` $${totalCost.toFixed(3)}`}${usingSubscription ? " (SUB)" : ""}` +
+						` | TEMP: ${getTemperature() ?? "(DEFAULT)"}` +
 						` | MODEL: ${modelName}${thinkingSuffix}`;
 
 					const lines = [pwdLine, truncateToWidth(theme.fg("dim", statsLine), width, theme.fg("dim", "..."))];

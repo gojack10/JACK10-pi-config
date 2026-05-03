@@ -10,3 +10,6 @@ tool-cache.json
 # Dependencies (directories and symlinks)
 node_modules
 node_modules/
+
+# User preferences
+temperature.json
