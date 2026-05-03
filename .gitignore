@@ -1,0 +1,12 @@
+# Secrets
+auth.json
+
+# Auto-generated / cache
+sessions/
+model-recency.json
+tool-cache.json
+*.log
+
+# Dependencies (directories and symlinks)
+node_modules
+node_modules/
