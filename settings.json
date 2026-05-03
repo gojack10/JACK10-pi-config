@@ -1,0 +1,13 @@
+{
+  "lastChangelogVersion": "0.70.2",
+  "defaultProvider": "openrouter",
+  "defaultModel": "deepseek/deepseek-v4-pro",
+  "defaultThinkingLevel": "xhigh",
+  "theme": "dark",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  },
+  "hideThinkingBlock": false
+}

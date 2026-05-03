@@ -1,0 +1,6 @@
+{
+	"name": "claude-code-session",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Run Claude Code (claude -p) as a pi provider backed by Pro subscription billing. Pi acts as TUI shell + session recorder; Claude Code owns conversation state, tools, and compaction."
+}
