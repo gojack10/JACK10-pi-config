@@ -1,0 +1,13 @@
+diff --git a/packages/ai/src/providers/openai-completions.ts b/packages/ai/src/providers/openai-completions.ts
+index 0000000..0000000 100644
+--- a/packages/ai/src/providers/openai-completions.ts
++++ b/packages/ai/src/providers/openai-completions.ts
+@@ -1061,7 +1061,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
+ 
+ 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
+ 	const isGroq = provider === "groq" || baseUrl.includes("groq.com");
+-	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
++	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com") || model.id.includes("deepseek");
+ 	const cacheControlFormat = provider === "openrouter" && model.id.startsWith("anthropic/") ? "anthropic" : undefined;
+ 
+ 	const reasoningEffortMap = isDeepSeek
