@@ -1,7 +1,7 @@
 {
-  "lastChangelogVersion": "0.70.2",
+  "lastChangelogVersion": "0.71.0",
   "defaultProvider": "omlx",
-  "defaultModel": "Qwen3.6-27B-UD-MLX-4bit",
+  "defaultModel": "Qwen3.6-35B-A3B-MLX-8bit",
   "defaultThinkingLevel": "high",
   "theme": "dark",
   "compaction": {
