@@ -1,19 +1,19 @@
 diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
-index eb430a3c..b9f0d360 100644
+index db2d6f0d..fd2b11a0 100644
 --- a/packages/coding-agent/src/core/agent-session.ts
 +++ b/packages/coding-agent/src/core/agent-session.ts
-@@ -25,6 +25,10 @@ import type {
- } from "@mariozechner/pi-agent-core";
- import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
- import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
+@@ -33,6 +33,10 @@ import {
+ 	resetApiProviders,
+ } from "@mariozechner/pi-ai";
+ import { theme } from "../modes/interactive/theme/theme.js";
 +
 +function isTalkieModel(model: Model<any> | undefined): boolean {
 +	return (model?.id ?? "").startsWith("talkie");
 +}
- import { theme } from "../modes/interactive/theme/theme.js";
  import { stripFrontmatter } from "../utils/frontmatter.js";
  import { sleep } from "../utils/sleep.js";
-@@ -1419,6 +1423,12 @@ export class AgentSession {
+ import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
+@@ -1424,6 +1428,12 @@ export class AgentSession {
  		this.sessionManager.appendModelChange(model.provider, model.id);
  		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
  
@@ -26,7 +26,7 @@ index eb430a3c..b9f0d360 100644
  		// Re-clamp thinking level for new model's capabilities
  		this.setThinkingLevel(thinkingLevel);
  
-@@ -1786,6 +1796,9 @@ export class AgentSession {
+@@ -1770,6 +1780,9 @@ export class AgentSession {
  		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
  		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return;
  
