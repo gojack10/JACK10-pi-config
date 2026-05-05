@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "0.71.0",
   "defaultProvider": "omlx",
-  "defaultModel": "Qwen3.6-35B-A3B-MLX-8bit",
-  "defaultThinkingLevel": "high",
+  "defaultModel": "vendor-tunnel-model",
+  "defaultThinkingLevel": "xhigh",
   "theme": "dark",
   "compaction": {
     "enabled": true,
