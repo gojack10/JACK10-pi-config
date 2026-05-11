@@ -1,18 +1,18 @@
 diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
-index db2d6f0d..fd2b11a0 100644
+index 4985779f..679c3a4a 100644
 --- a/packages/coding-agent/src/core/agent-session.ts
 +++ b/packages/coding-agent/src/core/agent-session.ts
-@@ -33,6 +33,10 @@ import {
+@@ -32,6 +32,10 @@ import {
+ 	modelsAreEqual,
  	resetApiProviders,
- } from "@mariozechner/pi-ai";
- import { theme } from "../modes/interactive/theme/theme.js";
+ } from "@earendil-works/pi-ai";
 +
 +function isTalkieModel(model: Model<any> | undefined): boolean {
 +	return (model?.id ?? "").startsWith("talkie");
 +}
+ import { theme } from "../modes/interactive/theme/theme.js";
  import { stripFrontmatter } from "../utils/frontmatter.js";
  import { sleep } from "../utils/sleep.js";
- import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
 @@ -1424,6 +1428,12 @@ export class AgentSession {
  		this.sessionManager.appendModelChange(model.provider, model.id);
  		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);

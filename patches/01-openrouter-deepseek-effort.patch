@@ -1,0 +1,78 @@
+diff --git a/packages/ai/src/providers/openai-completions.ts b/packages/ai/src/providers/openai-completions.ts
+index 4f001514..c617b492 100644
+--- a/packages/ai/src/providers/openai-completions.ts
++++ b/packages/ai/src/providers/openai-completions.ts
+@@ -1071,9 +1071,30 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
+ 	const useMaxTokens = baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway;
+ 
+ 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
+-	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
++	const isGroq = provider === "groq" || baseUrl.includes("groq.com");
++	const isDeepSeekProvider = provider === "deepseek" || baseUrl.includes("deepseek.com");
++	const isDeepSeek = isDeepSeekProvider || model.id.includes("deepseek");
+ 	const cacheControlFormat = provider === "openrouter" && model.id.startsWith("anthropic/") ? "anthropic" : undefined;
+ 
++	// Only apply DeepSeek-native effort mapping for direct DeepSeek provider.
++	// OpenRouter handles its own reasoning.effort normalization.
++	const reasoningEffortMap = isDeepSeekProvider
++		? {
++				minimal: "high",
++				low: "high",
++				medium: "high",
++				high: "high",
++				xhigh: "max",
++			}
++		: isGroq && model.id === "qwen/qwen3-32b"
++			? {
++					minimal: "default",
++					low: "default",
++					medium: "default",
++					high: "default",
++					xhigh: "default",
++				}
++			: {} as Record<string, string>;
+ 	return {
+ 		supportsStore: !isNonStandard,
+ 		supportsDeveloperRole: !isNonStandard,
+@@ -1084,7 +1105,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
+ 		requiresAssistantAfterToolResult: false,
+ 		requiresThinkingAsText: false,
+ 		requiresReasoningContentOnAssistantMessages: isDeepSeek,
+-		thinkingFormat: isDeepSeek
++		thinkingFormat: isDeepSeekProvider
+ 			? "deepseek"
+ 			: isZai
+ 				? "zai"
+@@ -1098,6 +1119,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
+ 		cacheControlFormat,
+ 		sendSessionAffinityHeaders: false,
+ 		supportsLongCacheRetention: !(isCloudflareWorkersAI || isCloudflareAiGateway),
++		reasoningEffortMap,
+ 	};
+ }
+ 
+@@ -1113,6 +1135,11 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
+ 		supportsStore: model.compat.supportsStore ?? detected.supportsStore,
+ 		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? detected.supportsDeveloperRole,
+ 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,
++		// OpenRouter handles its own reasoning.effort normalization;
++		// ignore model.compat mapping that may contain provider-native values like "max".
++		reasoningEffortMap: (model.provider === "openrouter" || model.baseUrl?.includes("openrouter.ai"))
++			? detected.reasoningEffortMap
++			: (model.compat.reasoningEffortMap ?? detected.reasoningEffortMap),
+ 		supportsUsageInStreaming: model.compat.supportsUsageInStreaming ?? detected.supportsUsageInStreaming,
+ 		maxTokensField: model.compat.maxTokensField ?? detected.maxTokensField,
+ 		requiresToolResultName: model.compat.requiresToolResultName ?? detected.requiresToolResultName,
+diff --git a/packages/ai/src/types.ts b/packages/ai/src/types.ts
+index e7947756..52371a99 100644
+--- a/packages/ai/src/types.ts
++++ b/packages/ai/src/types.ts
+@@ -315,6 +315,8 @@ export interface OpenAICompletionsCompat {
+ 	supportsStrictMode?: boolean;
+ 	/** Cache control convention for prompt caching. "anthropic" applies Anthropic-style `cache_control` markers to the system prompt, last tool definition, and last user/assistant text content. */
+ 	cacheControlFormat?: "anthropic";
++	/** Override for reasoning effort value mapping. Keys are "minimal" through "xhigh", values are provider-native strings. When unset, defaults to the model's `thinkingLevelMap` in models.generated.ts. */
++	reasoningEffortMap?: Record<string, string>;
+ 	/** Whether to send known session-affinity headers (`session_id`, `x-client-request-id`, `x-session-affinity`) from `options.sessionId` when caching is enabled. Default: false. */
+ 	sendSessionAffinityHeaders?: boolean;
+ 	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */

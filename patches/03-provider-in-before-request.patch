@@ -1,0 +1,65 @@
+diff --git a/packages/coding-agent/src/core/extensions/runner.ts b/packages/coding-agent/src/core/extensions/runner.ts
+index c37a4588..c101caa6 100644
+--- a/packages/coding-agent/src/core/extensions/runner.ts
++++ b/packages/coding-agent/src/core/extensions/runner.ts
+@@ -887,7 +887,7 @@ export class ExtensionRunner {
+ 		return currentMessages;
+ 	}
+ 
+-	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
++	async emitBeforeProviderRequest(payload: unknown, provider: string): Promise<unknown> {
+ 		const ctx = this.createContext();
+ 		let currentPayload = payload;
+ 
+@@ -900,6 +900,7 @@ export class ExtensionRunner {
+ 					const event: BeforeProviderRequestEvent = {
+ 						type: "before_provider_request",
+ 						payload: currentPayload,
++						provider,
+ 					};
+ 					const handlerResult = await handler(event, ctx);
+ 					if (handlerResult !== undefined) {
+diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
+index 4c1b6fca..54c5ee1d 100644
+--- a/packages/coding-agent/src/core/extensions/types.ts
++++ b/packages/coding-agent/src/core/extensions/types.ts
+@@ -611,6 +611,7 @@ export interface ContextEvent {
+ export interface BeforeProviderRequestEvent {
+ 	type: "before_provider_request";
+ 	payload: unknown;
++	provider: string;
+ }
+ 
+ /** Fired after a provider response is received and before the response stream is consumed. */
+diff --git a/packages/coding-agent/src/core/sdk.ts b/packages/coding-agent/src/core/sdk.ts
+index 8bc96072..7492957b 100644
+--- a/packages/coding-agent/src/core/sdk.ts
++++ b/packages/coding-agent/src/core/sdk.ts
+@@ -344,12 +344,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 						: undefined,
+ 			});
+ 		},
+-		onPayload: async (payload, _model) => {
++		onPayload: async (payload, model) => {
+ 			const runner = extensionRunnerRef.current;
+ 			if (!runner?.hasHandlers("before_provider_request")) {
+ 				return payload;
+ 			}
+-			return runner.emitBeforeProviderRequest(payload);
++			return runner.emitBeforeProviderRequest(payload, model.provider);
+ 		},
+ 		onResponse: async (response, _model) => {
+ 			const runner = extensionRunnerRef.current;
+diff --git a/packages/coding-agent/test/suite/harness.ts b/packages/coding-agent/test/suite/harness.ts
+index 16a8182e..aa937bbb 100644
+--- a/packages/coding-agent/test/suite/harness.ts
++++ b/packages/coding-agent/test/suite/harness.ts
+@@ -140,7 +140,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
+ 			if (!runner?.hasHandlers("before_provider_request")) {
+ 				return payload;
+ 			}
+-			return runner.emitBeforeProviderRequest(payload);
++			return runner.emitBeforeProviderRequest(payload, "test");
+ 		},
+ 		onResponse: async (response) => {
+ 			const runner = extensionRunnerRef.current;

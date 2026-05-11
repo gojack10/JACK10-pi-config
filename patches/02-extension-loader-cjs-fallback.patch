@@ -1,0 +1,17 @@
+diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
+index b2d7b275..4d7121bd 100644
+--- a/packages/coding-agent/src/core/extensions/loader.ts
++++ b/packages/coding-agent/src/core/extensions/loader.ts
+@@ -84,7 +84,11 @@ function getAliases(): Record<string, string> {
+ 		if (fs.existsSync(workspacePath)) {
+ 			return workspacePath;
+ 		}
+-		return fileURLToPath(import.meta.resolve(specifier));
++		try {
++			return require.resolve(specifier);
++		} catch {
++			return fileURLToPath(import.meta.resolve(specifier));
++		}
+ 	};
+ 
+ 	const piCodingAgentEntry = packageIndex;
