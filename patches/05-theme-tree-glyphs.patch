@@ -1,0 +1,275 @@
+diff --git a/packages/coding-agent/src/modes/interactive/components/tree-selector.ts b/packages/coding-agent/src/modes/interactive/components/tree-selector.ts
+index 35c59d74..b0f8e46f 100644
+--- a/packages/coding-agent/src/modes/interactive/components/tree-selector.ts
++++ b/packages/coding-agent/src/modes/interactive/components/tree-selector.ts
+@@ -14,16 +14,16 @@ import { theme } from "../theme/theme.js";
+ import { DynamicBorder } from "./dynamic-border.js";
+ import { keyHint, keyText } from "./keybinding-hints.js";
+ 
+-/** Gutter info: position (displayIndent where connector was) and whether to show │ */
++/** Gutter info: position (displayIndent where connector was) and whether to show vertical bar */
+ interface GutterInfo {
+ 	position: number; // displayIndent level where the connector was shown
+-	show: boolean; // true = show │, false = show spaces
++	show: boolean; // true = show branchVert, false = show spaces
+ }
+ 
+ /** Flattened tree node for navigation */
+ interface FlatNode {
+ 	node: SessionTreeNode;
+-	/** Indentation level (each level = 3 chars) */
++	/** Indentation level (each level = cellWidth cols, derived from theme connector length) */
+ 	indent: number;
+ 	/** Whether to show connector (├─ or └─) - true if parent has multiple children */
+ 	showConnector: boolean;
+@@ -617,48 +617,65 @@ class TreeList implements Component {
+ 		);
+ 		const endIndex = Math.min(startIndex + this.maxVisibleLines, this.filteredNodes.length);
+ 
++		// Helper: compute cell width from current theme's connector
++		const treeGlyphs = theme.treeGlyphs;
++		const cellWidth = treeGlyphs.branchTee.length;
++
+ 		for (let i = startIndex; i < endIndex; i++) {
+ 			const flatNode = this.filteredNodes[i];
+ 			const entry = flatNode.node.entry;
+ 			const isSelected = i === this.selectedIndex;
+ 
+ 			// Build line: cursor + prefix + path marker + label + content
+-			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
++			const cursor = isSelected ? theme.fg("accent", `${treeGlyphs.cursorArrow} `) : "  ";
+ 
+ 			// If multiple roots, shift display (roots at 0, not 1)
+ 			const displayIndent = this.multipleRoots ? Math.max(0, flatNode.indent - 1) : flatNode.indent;
+ 
+ 			// Build prefix with gutters at their correct positions
+ 			// Each gutter has a position (displayIndent where its connector was shown)
++			// Connector is a full string (e.g. └─ or +-- ), length = cellWidth
+ 			const connector =
+-				flatNode.showConnector && !flatNode.isVirtualRootChild ? (flatNode.isLast ? "└─ " : "├─ ") : "";
++				flatNode.showConnector && !flatNode.isVirtualRootChild
++					? (flatNode.isLast ? treeGlyphs.branchCorner : treeGlyphs.branchTee)
++					: "";
+ 			const connectorPosition = connector ? displayIndent - 1 : -1;
+ 
+ 			// Build prefix char by char, placing gutters and connector at their positions
+-			const totalChars = displayIndent * 3;
++			const totalChars = displayIndent * cellWidth;
+ 			const prefixChars: string[] = [];
+ 			const isFolded = this.foldedNodes.has(entry.id);
+-			for (let i = 0; i < totalChars; i++) {
+-				const level = Math.floor(i / 3);
+-				const posInLevel = i % 3;
++			for (let ci = 0; ci < totalChars; ci++) {
++				const level = Math.floor(ci / cellWidth);
++				const posInLevel = ci % cellWidth;
+ 
+ 				// Check if there's a gutter at this level
+ 				const gutter = flatNode.gutters.find((g) => g.position === level);
+ 				if (gutter) {
+ 					if (posInLevel === 0) {
+-						prefixChars.push(gutter.show ? "│" : " ");
++						prefixChars.push(gutter.show ? treeGlyphs.branchVert : " ");
+ 					} else {
+ 						prefixChars.push(" ");
+ 					}
+ 				} else if (connector && level === connectorPosition) {
+ 					// Connector at this level, with fold indicator
+ 					if (posInLevel === 0) {
+-						prefixChars.push(flatNode.isLast ? "└" : "├");
++						// First char of connector (e.g. ├ or +)
++						prefixChars.push(connector.charAt(0));
+ 					} else if (posInLevel === 1) {
++						// Second char: fold indicator or connector dash
+ 						const foldable = this.isFoldable(entry.id);
+-						prefixChars.push(isFolded ? "⊞" : foldable ? "⊟" : "─");
++						if (isFolded) {
++							prefixChars.push(treeGlyphs.foldClosed);
++						} else if (foldable) {
++							prefixChars.push(treeGlyphs.foldOpen);
++						} else {
++							// Remaining connector chars (skip pos 0)
++							prefixChars.push(posInLevel < connector.length ? connector.charAt(posInLevel) : " ");
++						}
+ 					} else {
+-						prefixChars.push(" ");
++						// Later positions: connector remainder or space
++						prefixChars.push(posInLevel < connector.length ? connector.charAt(posInLevel) : " ");
+ 					}
+ 				} else {
+ 					prefixChars.push(" ");
+@@ -668,11 +685,11 @@ class TreeList implements Component {
+ 
+ 			// Fold marker for nodes without connectors (roots)
+ 			const showsFoldInConnector = flatNode.showConnector && !flatNode.isVirtualRootChild;
+-			const foldMarker = isFolded && !showsFoldInConnector ? theme.fg("accent", "⊞ ") : "";
++			const foldMarker = isFolded && !showsFoldInConnector ? theme.fg("accent", `${treeGlyphs.foldClosed} `) : "";
+ 
+ 			// Active path marker - shown right before the entry text
+ 			const isOnActivePath = this.activePathIds.has(entry.id);
+-			const pathMarker = isOnActivePath ? theme.fg("accent", "• ") : "";
++			const pathMarker = isOnActivePath ? theme.fg("accent", `${treeGlyphs.activeDot} `) : "";
+ 
+ 			const label = flatNode.node.label ? theme.fg("warning", `[${flatNode.node.label}] `) : "";
+ 			const labelTimestamp =
+diff --git a/packages/coding-agent/src/modes/interactive/theme/theme-schema.json b/packages/coding-agent/src/modes/interactive/theme/theme-schema.json
+index 7bc495da..0d28db00 100644
+--- a/packages/coding-agent/src/modes/interactive/theme/theme-schema.json
++++ b/packages/coding-agent/src/modes/interactive/theme/theme-schema.json
+@@ -313,6 +313,48 @@
+ 				}
+ 			},
+ 			"additionalProperties": false
++		},
++		"tree": {
++			"type": "object",
++			"description": "Optional tree-glyph characters (override defaults for terminals that cannot render box-drawing or Unicode glyphs)",
++			"properties": {
++				"branchVert": {
++					"type": "string",
++					"default": "│",
++					"description": "Vertical gutter character"
++				},
++				"branchCorner": {
++					"type": "string",
++					"default": "��─ ",
++					"description": "Last-child branch connector"
++				},
++				"branchTee": {
++					"type": "string",
++					"default": "��─ ",
++					"description": "Non-last child branch connector"
++				},
++				"foldClosed": {
++					"type": "string",
++					"default": "���",
++					"description": "Fold indicator for collapsed nodes (expandable)"
++				},
++				"foldOpen": {
++					"type": "string",
++					"default": "���",
++					"description": "Fold indicator for expanded nodes (collapsible)"
++				},
++				"activeDot": {
++					"type": "string",
++					"default": "•",
++					"description": "Active-path marker dot"
++				},
++				"cursorArrow": {
++					"type": "string",
++					"default": "›",
++					"description": "Selected-item cursor arrow"
++				}
++			},
++			"additionalProperties": false
+ 		}
+ 	},
+ 	"additionalProperties": false,
+diff --git a/packages/coding-agent/src/modes/interactive/theme/theme.ts b/packages/coding-agent/src/modes/interactive/theme/theme.ts
+index 955fa44a..a4953065 100644
+--- a/packages/coding-agent/src/modes/interactive/theme/theme.ts
++++ b/packages/coding-agent/src/modes/interactive/theme/theme.ts
+@@ -20,6 +20,66 @@ const ColorValueSchema = Type.Union([
+ 
+ type ColorValue = Static<typeof ColorValueSchema>;
+ 
++// Cell width for tree prefix is derived from connector length.
++// Default connectors are 3 chars (��─ , ��─ ). ASCII variants may be wider (+-- , `-- ).
++
++const TreeGlyphsSchema = Type.Object({
++	branchVert: Type.String({
++		default: "│",
++		description: "Vertical gutter character (single char)",
++	}),
++	branchTee: Type.String({
++		default: "��─ ",
++		description: "Full tee connector string (e.g. ��─  or +-- )",
++	}),
++	branchCorner: Type.String({
++		default: "��─ ",
++		description: "Full corner connector string (e.g. ��─  or `-- )",
++	}),
++	foldClosed: Type.String({
++		default: "���",
++		description: "Fold indicator for collapsed (expandable)",
++	}),
++	foldOpen: Type.String({
++		default: "���",
++		description: "Fold indicator for expanded (collapsible)",
++	}),
++	activeDot: Type.String({
++		default: "•",
++		description: "Active-path marker",
++	}),
++	cursorArrow: Type.String({
++		default: "›",
++		description: "Selected-item cursor arrow",
++	}),
++});
++
++export interface TreeGlyphs {
++	branchVert: string;
++	branchTee: string;
++	branchCorner: string;
++	foldClosed: string;
++	foldOpen: string;
++	activeDot: string;
++	cursorArrow: string;
++}
++
++// Default tree glyphs (Unicode box-drawing + special chars)
++const DEFAULT_TREE_GLYPHS: TreeGlyphs = {
++	branchVert:   "│",
++	branchTee:    "��─ ",
++	branchCorner: "��─ ",
++	foldClosed:  "���",
++	foldOpen:     "���",
++	activeDot:    "•",
++	cursorArrow:  "›",
++};
++
++// Derives cell width from the default connector length.
++function treeCellWidth(glyphs: TreeGlyphs): number {
++	return glyphs.branchTee.length;
++}
++
+ const ThemeJsonSchema = Type.Object({
+ 	$schema: Type.Optional(Type.String()),
+ 	name: Type.String(),
+@@ -91,6 +151,7 @@ const ThemeJsonSchema = Type.Object({
+ 			infoBg: Type.Optional(ColorValueSchema),
+ 		}),
+ 	),
++	tree: TreeGlyphsSchema,
+ });
+ 
+ type ThemeJson = Static<typeof ThemeJsonSchema>;
+@@ -347,17 +408,19 @@ export class Theme {
+ 	private fgColors: Map<ThemeColor, string>;
+ 	private bgColors: Map<ThemeBg, string>;
+ 	private mode: ColorMode;
++	readonly treeGlyphs: TreeGlyphs;
+ 
+ 	constructor(
+ 		fgColors: Record<ThemeColor, string | number>,
+ 		bgColors: Record<ThemeBg, string | number>,
+ 		mode: ColorMode,
+-		options: { name?: string; sourcePath?: string; sourceInfo?: SourceInfo } = {},
++		options: { name?: string; sourcePath?: string; sourceInfo?: SourceInfo; treeGlyphs?: Partial<TreeGlyphs> } = {},
+ 	) {
+ 		this.name = options.name;
+ 		this.sourcePath = options.sourcePath;
+ 		this.sourceInfo = options.sourceInfo;
+ 		this.mode = mode;
++		this.treeGlyphs = { ...DEFAULT_TREE_GLYPHS, ...(options.treeGlyphs ?? {}) };
+ 		this.fgColors = new Map();
+ 		for (const [key, value] of Object.entries(fgColors) as [ThemeColor, string | number][]) {
+ 			this.fgColors.set(key, fgAnsi(value, mode));
+@@ -607,6 +670,7 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
+ 	return new Theme(fgColors, bgColors, colorMode, {
+ 		name: themeJson.name,
+ 		sourcePath,
++		treeGlyphs: themeJson.tree,
+ 	});
+ }
+ 

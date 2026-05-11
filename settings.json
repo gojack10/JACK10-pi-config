@@ -1,7 +1,7 @@
 {
-  "lastChangelogVersion": "0.71.0",
-  "defaultProvider": "omlx",
-  "defaultModel": "vendor-tunnel-model",
+  "lastChangelogVersion": "0.74.0",
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-v4-pro",
   "defaultThinkingLevel": "xhigh",
   "theme": "dark",
   "compaction": {
