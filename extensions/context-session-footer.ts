@@ -1,6 +1,26 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth } from "@mariozechner/pi-tui";
+
+const wrapAndDim = (text: string, width: number, separator: string, themeFn: (t: string) => string): string[] => {
+	const sections = text.split(separator);
+	if (sections.length === 1) {
+		return [themeFn(text)];
+	}
+	const lines: string[] = [];
+	let currentLine = "";
+	for (const section of sections) {
+		const candidate = currentLine ? currentLine + separator + section : section;
+		if (candidate.length > width) {
+			if (currentLine) lines.push(themeFn(currentLine));
+			currentLine = section;
+		} else {
+			currentLine = candidate;
+		}
+	}
+	if (currentLine) lines.push(themeFn(currentLine));
+	return lines;
+};
+
 
 function sanitizeStatusText(text: string): string {
 	return text
@@ -85,15 +105,17 @@ export default function (pi: ExtensionAPI) {
 						pwd = `${pwd} • ${sessionName}`;
 					}
 
-					const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
 					const statsLine =
-						`CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)` +
+						`CWD: [${pwd}]` +
+						` | CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)` +
 						` | SESSION: ↑${formatTokens(totalInput)} ↓${formatTokens(totalOutput)} CR:${formatTokens(totalCacheRead)}` +
 						`${isLocal ? " (LOCAL)" : ` $${totalCost.toFixed(3)}`}${usingSubscription ? " (SUB)" : ""}` +
 						` | TEMP: ${getTemperature() ?? "(DEFAULT)"}` +
 						` | MODEL: ${modelName}${thinkingSuffix}`;
 
-					const lines = [pwdLine, truncateToWidth(theme.fg("dim", statsLine), width, theme.fg("dim", "..."))];
+					const statsWrapped = wrapAndDim(statsLine, width, " | ", theme.fg.bind(theme, "dim"));
+					const lines: string[] = [];
+					lines.push(...statsWrapped);
 
 					const extensionStatuses = footerData.getExtensionStatuses();
 					if (extensionStatuses.size > 0) {
@@ -101,7 +123,7 @@ export default function (pi: ExtensionAPI) {
 							.sort(([a], [b]) => a.localeCompare(b))
 							.map(([, text]) => sanitizeStatusText(text))
 							.join(" ");
-						lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+						lines.push(...wrapAndDim(statusLine, width, " | ", theme.fg.bind(theme, "dim")));
 					}
 
 					return lines;
