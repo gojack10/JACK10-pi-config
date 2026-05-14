@@ -1,14 +1,44 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 export default function ctrlSPromptStash(pi: ExtensionAPI) {
   let stash: string | undefined;
   let restoreGeneration = 0;
   let slashRestorePending = false;
+  let stashWidgetTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function clearStash(_ctx: ExtensionContext) {
+  function clearStashNotification(ctx: ExtensionContext): void {
+    if (stashWidgetTimer) {
+      clearTimeout(stashWidgetTimer);
+      stashWidgetTimer = undefined;
+    }
+    ctx.ui.setWidget("prompt-stash", undefined);
+  }
+
+  function showStashNotification(ctx: ExtensionContext, message: string): void {
+    if (stashWidgetTimer) {
+      clearTimeout(stashWidgetTimer);
+      stashWidgetTimer = undefined;
+    }
+    ctx.ui.setWidget("prompt-stash", (tui, thm) => {
+      const container = new Container();
+      container.addChild(new Spacer(1));
+      container.addChild(new Text(thm.fg("text", message), 1, 0));
+      return container;
+    }, { placement: "aboveEditor" });
+    if (message === "Prompt restored") {
+      stashWidgetTimer = setTimeout(() => {
+        stashWidgetTimer = undefined;
+        ctx.ui.setWidget("prompt-stash", undefined);
+      }, 3000);
+    }
+  }
+
+  function clearStash(ctx: ExtensionContext) {
     stash = undefined;
     slashRestorePending = false;
     restoreGeneration += 1;
+    clearStashNotification(ctx);
   }
 
   function restoreImmediatelyIfEditorEmpty(ctx: ExtensionContext): boolean {
@@ -84,7 +114,7 @@ export default function ctrlSPromptStash(pi: ExtensionAPI) {
           const text = stash;
           clearStash(ctx);
           ctx.ui.setEditorText(text);
-          ctx.ui.notify("Prompt restored", "info");
+          showStashNotification(ctx, "Prompt restored");
         }
         return;
       }
@@ -93,7 +123,7 @@ export default function ctrlSPromptStash(pi: ExtensionAPI) {
       slashRestorePending = false;
       restoreGeneration += 1;
       ctx.ui.setEditorText("");
-      ctx.ui.notify("Prompt stashed", "info");
+      showStashNotification(ctx, "Prompt stashed");
     },
   });
 
