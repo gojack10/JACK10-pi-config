@@ -195,8 +195,10 @@ export default function todoLoop(pi: ExtensionAPI) {
   let lastSeenModelKey: string | undefined;
 
   let statePath: string | undefined;
-  let nudgeTimer: NodeJS.Timeout | undefined;
+  let pumpTimer: NodeJS.Timeout | undefined;
+  let lastNudgeAt = 0;
   let nudgeCtx: { isIdle: () => boolean; hasPendingMessages: () => boolean } | undefined;
+  const MIN_NUDGE_INTERVAL_MS = 1000;
   let setWidget: ((key: string, content: string[] | undefined) => void) | undefined;
   let widgetVisible = false; // Hidden by default — use /todo to show
   // Prior sessions (same cwd) with open todos — populated on session_start and
@@ -577,7 +579,7 @@ export default function todoLoop(pi: ExtensionAPI) {
         );
         // Kick off the loop immediately
         nudgeCtx = { isIdle: () => ctx.isIdle(), hasPendingMessages: () => ctx.hasPendingMessages() };
-        scheduleNudge();
+        kickPump();
       } else {
         ctx.ui.notify(
           "Todo loop activated. Agent will be nudged whenever todos are open. Esc pauses.",
@@ -747,24 +749,36 @@ export default function todoLoop(pi: ExtensionAPI) {
     }
   });
 
-  const scheduleNudge = (): void => {
-    if (nudgeTimer) return;
-    const fire = (): void => {
-      nudgeTimer = undefined;
-      if (openTodos().length === 0) return;
-      if (!loopActive) return; // Don't nudge unless /todo-loop activated
-      if (!todoToolsRegistered) return; // Don't nudge if LLM can't act on todos
-      const ctx = nudgeCtx;
-      if (!ctx) return;
-      if (!ctx.isIdle() || ctx.hasPendingMessages()) {
-        nudgeTimer = setTimeout(fire, 150);
-        return;
-      }
-      const open = openTodos().length;
-      const msg = `SYSTEM (todo-loop): continue — ${open} open todo${open === 1 ? "" : "s"}. Call todo_list() for state. Do not stop until every todo is checked.`;
-      pi.sendUserMessage(msg);
-    };
-    nudgeTimer = setTimeout(fire, 50);
+  // Single self-pumping nudge loop. Every event (turn_end, session_compact,
+  // session_start, /todo-loop) just calls kickPump(); the pump itself decides
+  // whether to nudge, wait, or stop. Idempotent — if a timer is already
+  // pending, additional kicks are no-ops.
+  const pump = (): void => {
+    pumpTimer = undefined;
+    if (!loopActive || pausedByAbort) return;
+    if (!todoToolsRegistered) return;
+    if (openTodos().length === 0) return;
+    const ctx = nudgeCtx;
+    if (!ctx) return;
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+      pumpTimer = setTimeout(pump, 150);
+      return;
+    }
+    const elapsed = Date.now() - lastNudgeAt;
+    if (elapsed < MIN_NUDGE_INTERVAL_MS) {
+      pumpTimer = setTimeout(pump, MIN_NUDGE_INTERVAL_MS - elapsed);
+      return;
+    }
+    lastNudgeAt = Date.now();
+    const open = openTodos().length;
+    pi.sendUserMessage(
+      `SYSTEM (todo-loop): continue — ${open} open todo${open === 1 ? "" : "s"}. Call todo_list() for state. Do not stop until every todo is checked.`,
+    );
+  };
+
+  const kickPump = (): void => {
+    if (pumpTimer) return;
+    pumpTimer = setTimeout(pump, 50);
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -776,6 +790,7 @@ export default function todoLoop(pi: ExtensionAPI) {
     priorSessions = scanPriorSessions(sessionDir, sessionId);
     setWidget = (key, content) => ctx.ui.setWidget(key, content);
     refreshWidget();
+    nudgeCtx = { isIdle: () => ctx.isIdle(), hasPendingMessages: () => ctx.hasPendingMessages() };
     if (todos.length > 0) {
       ctx.ui.notify(
         `${todos.length} todo${todos.length === 1 ? "" : "s"} loaded from previous session (${openTodos().length} open). Run /todo to activate todo tools.`,
@@ -788,9 +803,9 @@ export default function todoLoop(pi: ExtensionAPI) {
     // Hard stop on escape: never nudge on an aborted turn, and drop any
     // already-scheduled nudge so we don't fire after the user bailed.
     if (event.message.stopReason === "aborted") {
-      if (nudgeTimer) {
-        clearTimeout(nudgeTimer);
-        nudgeTimer = undefined;
+      if (pumpTimer) {
+        clearTimeout(pumpTimer);
+        pumpTimer = undefined;
       }
       if (!pausedByAbort) {
         pausedByAbort = true;
@@ -839,37 +854,22 @@ export default function todoLoop(pi: ExtensionAPI) {
       });
       return;
     }
-    if (openTodos().length === 0) return;
-    if (!loopActive) return;
     nudgeCtx = { isIdle: () => ctx.isIdle(), hasPendingMessages: () => ctx.hasPendingMessages() };
-    scheduleNudge();
+    kickPump();
   });
 
   pi.on("session_compact", async (_event, ctx) => {
     compacting = false;
     compactArmed = false;
     lastCompactAttemptAt = Date.now();
-    if (openTodos().length === 0) return;
-    if (!loopActive) return;
-    if (!todoToolsRegistered) return;
-    const msg = [
-      "SYSTEM (todo-loop) — POST-COMPACTION RE-HYDRATE",
-      "",
-      "Todos:",
-      renderTodoList(),
-      "",
-      "Continue working on the remaining todos. Call todo_check(id) when a todo is done.",
-    ].join("\n");
-    setTimeout(() => {
-      if (!ctx.isIdle()) return;
-      pi.sendUserMessage(msg);
-    }, 300);
+    nudgeCtx = { isIdle: () => ctx.isIdle(), hasPendingMessages: () => ctx.hasPendingMessages() };
+    kickPump();
   });
 
   pi.on("session_shutdown", async () => {
-    if (nudgeTimer) {
-      clearTimeout(nudgeTimer);
-      nudgeTimer = undefined;
+    if (pumpTimer) {
+      clearTimeout(pumpTimer);
+      pumpTimer = undefined;
     }
   });
 }
