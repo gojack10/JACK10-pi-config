@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "0.74.0",
-  "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-v4-pro",
-  "defaultThinkingLevel": "xhigh",
+  "defaultProvider": "local",
+  "defaultModel": "Qwen3.6-35B-A3B-MLX-8bit",
+  "defaultThinkingLevel": "high",
   "theme": "dark",
   "compaction": {
     "enabled": true,
