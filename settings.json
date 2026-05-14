@@ -2,7 +2,7 @@
   "lastChangelogVersion": "0.74.0",
   "defaultProvider": "local",
   "defaultModel": "Qwen3.6-35B-A3B-MLX-8bit",
-  "defaultThinkingLevel": "high",
+  "defaultThinkingLevel": "medium",
   "theme": "dark",
   "compaction": {
     "enabled": true,
