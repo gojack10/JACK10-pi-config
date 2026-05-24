@@ -1,13 +1,17 @@
 {
   "lastChangelogVersion": "0.74.0",
   "defaultProvider": "local",
-  "defaultModel": "Qwen3.6-35B-A3B-MLX-8bit",
-  "defaultThinkingLevel": "medium",
+  "defaultModel": "tunnel-model",
+  "defaultThinkingLevel": "xhigh",
   "theme": "dark",
   "compaction": {
-    "enabled": true,
+    "enabled": false,
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   },
-  "hideThinkingBlock": false
+  "hideThinkingBlock": false,
+  "packages": [
+    "git:github.com/davebcn87/pi-autoresearch",
+    "extensions/pi-goal"
+  ]
 }
