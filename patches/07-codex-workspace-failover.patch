@@ -1,0 +1,47 @@
+diff --git a/packages/ai/src/providers/openai-codex-responses.ts b/packages/ai/src/providers/openai-codex-responses.ts
+--- a/packages/ai/src/providers/openai-codex-responses.ts
++++ b/packages/ai/src/providers/openai-codex-responses.ts
+@@ -51,7 +51,7 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+ const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
+ const MAX_RETRIES = 3;
+ const BASE_DELAY_MS = 1000;
+-const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
++const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "openai-codex-alt", "opencode"]);
+ const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+ 
+ const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -2419,8 +2419,8 @@ export class AgentSession {
+ 		if (isContextOverflow(message, contextWindow)) return false;
+ 
+ 		const err = message.errorMessage;
+-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, request ended without sending chunks, HTTP/2 closed before response, terminated, retry delay exceeded
+-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
++		// Match: overloaded_error, provider returned error, rate/usage limits, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, request ended without sending chunks, HTTP/2 closed before response, terminated, retry delay exceeded
++		return /overloaded|provider.?returned.?error|rate.?limit|usage.?limit|quota|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i.test(
+ 			err,
+ 		);
+ 	}
+@@ -2459,6 +2459,11 @@ export class AgentSession {
+ 			return false;
+ 		}
+ 
++		const failoverResult =
++			this._scopedModels.length > 1 ? await this._cycleScopedModel("forward") : undefined;
++		const failoverMessage = failoverResult
++			? ` Retrying with ${failoverResult.model.provider}/${failoverResult.model.id}.`
++			: "";
+ 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+ 
+ 		this._emit({
+@@ -2466,7 +2471,7 @@ export class AgentSession {
+ 			attempt: this._retryAttempt,
+ 			maxAttempts: settings.maxRetries,
+ 			delayMs,
+-			errorMessage: message.errorMessage || "Unknown error",
++			errorMessage: `${message.errorMessage || "Unknown error"}${failoverMessage}`,
+ 		});
+ 
+ 		// Remove error message from agent state (keep in session for history)
