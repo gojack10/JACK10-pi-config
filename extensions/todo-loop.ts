@@ -11,7 +11,6 @@ interface Todo {
   id: number;
   text: string;
   status: TodoStatus;
-  related_node_ids: string[];
 }
 
 interface TreeMutation {
@@ -27,7 +26,6 @@ const REARM_AT_PERCENT = 42;
 const MIN_MS_BETWEEN_COMPACTIONS = 30_000;
 
 const UUID_GLOBAL = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
-const UUID_EXACT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MUTATING_IDEATION_TOOLS = new Set<string>([
   "ideation_create_node",
@@ -58,7 +56,7 @@ const MUTATING_IDEATION_TOOLS = new Set<string>([
 ]);
 
 const BASE_COMPACT_RULES = [
-  "Preserve the exact todo list state: every todo id, todo text, todo status, and any related node ids shown in the conversation.",
+  "Preserve the exact todo list state: every todo id, todo text, and todo status shown in the conversation.",
   "Add a 'Tree State Mutations' section listing every ideation_* call that created, modified, or deleted state this session, in chronological order, one per line, with the tool name and key arguments.",
 ].join(" ");
 
@@ -107,7 +105,6 @@ const normalizeTodos = (value: unknown): { todos: Todo[]; migrated: boolean } =>
       id?: unknown;
       text?: unknown;
       status?: unknown;
-      related_node_ids?: unknown;
       blockedReason?: unknown;
     };
     if (typeof todo.id !== "number" || typeof todo.text !== "string") {
@@ -116,17 +113,10 @@ const normalizeTodos = (value: unknown): { todos: Todo[]; migrated: boolean } =>
     }
     const status: TodoStatus = todo.status === "done" ? "done" : "open";
     if (todo.status !== status || todo.blockedReason !== undefined) migrated = true;
-    const related_node_ids = Array.isArray(todo.related_node_ids)
-      ? todo.related_node_ids.filter((id): id is string => typeof id === "string")
-      : [];
-    if (!Array.isArray(todo.related_node_ids) || related_node_ids.length !== todo.related_node_ids.length) {
-      migrated = true;
-    }
     todos.push({
       id: todo.id,
       text: todo.text,
       status,
-      related_node_ids,
     });
   }
   return { todos, migrated };
@@ -300,10 +290,7 @@ export default function todoLoop(pi: ExtensionAPI) {
     return todos
       .map((t) => {
         const box = t.status === "done" ? "[x]" : "[ ]";
-        const main = `  ${box} ${t.id}. ${t.text}`;
-        if (t.related_node_ids.length === 0) return main;
-        const ids = t.related_node_ids.join(", ");
-        return `${main}\n        related nodes: ${ids}\n        (re-read via ideation_get_node before acting)`;
+        return `  ${box} ${t.id}. ${t.text}`;
       })
       .join("\n");
   };
@@ -359,7 +346,6 @@ export default function todoLoop(pi: ExtensionAPI) {
           id: 0,
           text,
           status: "open" as const,
-          related_node_ids: [],
         }));
         todos.push(...added);
         renumberTodos();
@@ -489,51 +475,6 @@ export default function todoLoop(pi: ExtensionAPI) {
       async execute() {
         return {
           content: [{ type: "text", text: renderTodoList() }],
-          details: { todos: todos.map((t) => ({ ...t })) },
-        };
-      },
-    });
-
-    pi.registerTool({
-      name: "todo_related_nodes",
-      label: "todo_related_nodes",
-      description:
-        "Associate one or more SiftText node ids with a todo as 'related nodes'. The harness preserves these ids verbatim across compaction, points the next turn back at them, and instructs you to re-fetch via ideation_get_node before acting. Use whenever a todo's work hinges on the current state of one or more tree nodes (specs, segments, code refs, investigation trails). REPLACES the todo's current related-node list — pass the full set each call. Pass an empty list to clear.",
-      parameters: Type.Object({
-        todo_id: Type.Integer(),
-        node_ids: Type.Array(Type.String(), {
-          description: "SiftText node UUIDs (36-char). Empty list clears the existing relations.",
-        }),
-      }),
-      async execute(_id, { todo_id, node_ids }) {
-        const t = todos.find((x) => x.id === todo_id);
-        if (!t) {
-          return {
-            content: [{ type: "text", text: `ERROR: no todo with id ${todo_id}.` }],
-            isError: true,
-          };
-        }
-        const cleaned: string[] = [];
-        const rejected: string[] = [];
-        for (const raw of node_ids) {
-          const s = raw.trim().toLowerCase();
-          if (UUID_EXACT.test(s)) cleaned.push(s);
-          else rejected.push(raw);
-        }
-        t.related_node_ids = cleaned;
-        for (const id of cleaned) idsObserved.add(id);
-        saveState();
-        const warn =
-          rejected.length > 0
-            ? `\nWARNING: rejected ${rejected.length} non-UUID value(s): ${rejected.join(", ")}`
-            : "";
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Todo #${todo_id} related nodes set to: ${cleaned.length === 0 ? "(none)" : cleaned.join(", ")}.${warn}\nCurrent list:\n${renderTodoList()}`,
-            },
-          ],
           details: { todos: todos.map((t) => ({ ...t })) },
         };
       },
