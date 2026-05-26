@@ -1,11 +1,15 @@
 {
   "lastChangelogVersion": "0.74.0",
-  "defaultProvider": "local",
-  "defaultModel": "tunnel-model",
+  "defaultProvider": "openai-codex-alt",
+  "defaultModel": "gpt-5.5",
   "defaultThinkingLevel": "xhigh",
+  "enabledModels": [
+    "openai-codex*/gpt-5.5:high"
+  ],
+  "transport": "sse",
   "theme": "dark",
   "compaction": {
-    "enabled": false,
+    "enabled": true,
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   },
