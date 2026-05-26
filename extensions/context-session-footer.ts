@@ -1,24 +1,28 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+const fitToWidth = (s: string, width: number): string => {
+	if (width <= 0) return "";
+	if (s.length <= width) return s;
+	if (width <= 1) return s.slice(0, width);
+	return `${s.slice(0, width - 1)}…`;
+};
+
 const wrapAndDim = (text: string, width: number, separator: string, themeFn: (t: string) => string): string[] => {
 	const sections = text.split(separator);
-	if (sections.length === 1) {
-		return [themeFn(text)];
-	}
 	const lines: string[] = [];
 	let currentLine = "";
 	for (const section of sections) {
 		const candidate = currentLine ? currentLine + separator + section : section;
 		if (candidate.length > width) {
-			if (currentLine) lines.push(themeFn(currentLine));
+			if (currentLine) lines.push(themeFn(fitToWidth(currentLine, width)));
 			currentLine = section;
 		} else {
 			currentLine = candidate;
 		}
 	}
-	if (currentLine) lines.push(themeFn(currentLine));
-	return lines;
+	if (currentLine) lines.push(themeFn(fitToWidth(currentLine, width)));
+	return lines.length ? lines : [themeFn(fitToWidth(text, width))];
 };
 
 
