@@ -5,6 +5,7 @@ auth.json
 sessions/
 model-recency.json
 tool-cache.json
+codex-usage-cache.json
 *.log
 
 # Dependencies (directories and symlinks)
