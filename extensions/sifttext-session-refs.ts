@@ -1,6 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
-const EXTENSION_NAME = "sifttext-session-refs";
 const NODE_LIMIT = 200;
 const TREE_LIMIT = 50;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -96,29 +95,11 @@ function buildRefsBlock(treeRefs: Map<string, string>, nodeRefs: Map<string, str
 	return lines.join("\n");
 }
 
-function prefixUserMessageText(message: Record<string, unknown>, prefix: string): Record<string, unknown> {
-	const content = message.content;
-	if (typeof content === "string") {
-		return { ...message, content: `${prefix}\n\n${content}` };
-	}
-	if (Array.isArray(content)) {
-		return {
-			...message,
-			content: [{ type: "text", text: `${prefix}\n\n` }, ...content],
-		};
-	}
-	return message;
-}
+export default async function sifttextSessionRefs(pi: ExtensionAPI) {
+	const { Type } = await import("@sinclair/typebox");
 
-export default function sifttextSessionRefs(pi: ExtensionAPI) {
-	let currentSessionId: string | undefined;
 	let treeRefs = new Map<string, string>();
 	let nodeRefs = new Map<string, string>();
-
-	const resetState = (): void => {
-		treeRefs = new Map<string, string>();
-		nodeRefs = new Map<string, string>();
-	};
 
 	const absorbText = (text: string): void => {
 		const parsed = parseIdeationGetNode(text);
@@ -127,7 +108,8 @@ export default function sifttextSessionRefs(pi: ExtensionAPI) {
 	};
 
 	const rebuildFromBranch = (ctx: ExtensionContext): void => {
-		resetState();
+		treeRefs = new Map<string, string>();
+		nodeRefs = new Map<string, string>();
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "message") continue;
 			const message = entry.message;
@@ -138,7 +120,6 @@ export default function sifttextSessionRefs(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		currentSessionId = ctx.sessionManager.getSessionId();
 		rebuildFromBranch(ctx);
 	});
 
@@ -147,40 +128,44 @@ export default function sifttextSessionRefs(pi: ExtensionAPI) {
 		absorbText(textBlocksToString(event.content));
 	});
 
-	pi.on("context", async (event, ctx) => {
-		if (currentSessionId !== ctx.sessionManager.getSessionId()) {
-			currentSessionId = ctx.sessionManager.getSessionId();
-			rebuildFromBranch(ctx);
-		}
-
-		const refsBlock = buildRefsBlock(treeRefs, nodeRefs);
-		if (!refsBlock) return;
-
-		if (ctx.model?.provider === "claude-code") {
-			for (let i = event.messages.length - 1; i >= 0; i--) {
-				const message = event.messages[i] as Record<string, unknown>;
-				if (message.role !== "user") continue;
-				const nextMessages = [...event.messages];
-				nextMessages[i] = prefixUserMessageText(message, refsBlock) as (typeof event.messages)[number];
-				return { messages: nextMessages };
-			}
-		}
-
-		return {
-			messages: [
-				{
-					role: "custom",
-					customType: EXTENSION_NAME,
-					content: refsBlock,
-					display: false,
-					details: {
-						trees: [...treeRefs].map(([id, name]) => ({ id, name })),
-						nodes: [...nodeRefs].map(([id, name]) => ({ id, name })),
+	pi.registerTool({
+		name: "sifttext_recall_refs",
+		label: "sifttext recall refs",
+		description:
+			"Recall SiftText tree/node UUIDs and names captured from earlier ideation_get_node results in this session. " +
+			"Pass an optional case-insensitive substring (matched against names) or UUID prefix to narrow the list. " +
+			"Use this when you remember seeing a node by name and need its UUID without re-searching. " +
+			"Re-read with ideation_get_node before acting on current SiftText state — these refs are name/id memory only.",
+		parameters: Type.Object({
+			filter: Type.Optional(
+				Type.String({
+					description:
+						"Optional substring to match against names (case-insensitive) or a UUID prefix to match IDs. Omit to return everything.",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal) {
+			const raw = (params as { filter?: unknown })?.filter;
+			const filter = typeof raw === "string" && raw.trim() ? raw.trim().toLowerCase() : undefined;
+			const matches = (id: string, name: string): boolean => {
+				if (!filter) return true;
+				return id.toLowerCase().startsWith(filter) || name.toLowerCase().includes(filter);
+			};
+			const filteredTrees = new Map([...treeRefs].filter(([id, name]) => matches(id, name)));
+			const filteredNodes = new Map([...nodeRefs].filter(([id, name]) => matches(id, name)));
+			const block = buildRefsBlock(filteredTrees, filteredNodes);
+			return {
+				content: [
+					{
+						type: "text",
+						text: block ?? "(no SiftText refs captured in this session yet — call ideation_get_node first)",
 					},
-					timestamp: Date.now(),
+				],
+				details: {
+					trees: [...filteredTrees].map(([id, name]) => ({ id, name })),
+					nodes: [...filteredNodes].map(([id, name]) => ({ id, name })),
 				},
-				...event.messages,
-			],
-		};
+			};
+		},
 	});
 }
