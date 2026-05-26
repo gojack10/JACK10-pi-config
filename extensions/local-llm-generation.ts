@@ -1,24 +1,14 @@
 /**
- * OMLX Progress Bar Extension
+ * Local LLM Progress Bar Extension
  *
- * Reads prefill/decode progress from oMLX's admin API and shows a progress
+ * Reads prefill/decode progress from local model servers and shows a progress
  * bar in the working indicator.
  *
- * During prefill:  ████████░░░░░░░░  6144/12000 tokens (488 tok/s, 2.1s left)
- * During decode:   Generating · 247 tokens  (32 tok/s)
+ * Supported admin stats shape:
+ *   { active_models: { models: [{ id, prefilling: [...], generating: [...] }] } }
  *
- * Strategy:
- *   1. Wait at 0% until first real tok/s arrives from API.
- *   2. On first tok/s: calculate where ground truth will be in 100ms
- *      (currentProcessed + tok_s * 0.1). Animate bar from 0% to that
- *      point over exactly 100ms.
- *   3. When catch-up finishes, bar and ground truth are naturally aligned
- *      (ground truth advanced at the same tok/s for the same 100ms).
- *   4. Resume: bar moves at the API's real tok/s. Polls gently correct
- *      speed. NEVER lie about tok/s — always display the real API value.
- *
- * Usage:
- *   pi --extension ~/.pi/agent/extensions/local-llm-generation.ts
+ * oMLX: logs in through /admin/api/login and polls /admin/api/stats.
+ * ds4-server: polls /admin/api/stats directly.
  */
 
 import { readFileSync } from "node:fs";
@@ -27,9 +17,6 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const OMLX_BASE = "http://localhost:8000";
-const OMLX_LOGIN = `${OMLX_BASE}/admin/api/login`;
-const OMLX_STATS = `${OMLX_BASE}/admin/api/stats`;
 const MODELS_JSON = `${process.env.HOME}/.pi/agent/models.json`;
 const POLL_MS = 100;
 const ANIM_MS = 33;
@@ -45,6 +32,20 @@ interface ProgressData {
   tok_s: number;
   eta?: number;
   count?: number;
+}
+
+interface LoadedModel {
+  id: string;
+  prefilling: any[];
+  generating: any[];
+}
+
+interface MonitorConfig {
+  providerKey: string;
+  statsUrl: string;
+  loginUrl?: string;
+  apiKey?: string;
+  modelIds: string[];
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -79,11 +80,56 @@ function nowMs(): number {
   return (typeof performance !== "undefined" && performance.now?.()) || Date.now();
 }
 
+function adminBaseFromProviderBase(baseUrl: string): string {
+  const trimmed = String(baseUrl || "").replace(/\/+$/, "");
+  return trimmed.replace(/\/v1$/, "");
+}
+
+function numeric(value: any): number {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getItemSpeed(item: any): number {
+  return numeric(item?.speed ?? item?.tok_s ?? item?.tokens_per_second);
+}
+
+function loadMonitorConfig(ctx: ExtensionContext): MonitorConfig | null {
+  const providerKey = ctx.model?.provider;
+  if (!providerKey) return null;
+
+  let provider: any;
+  try {
+    const raw = readFileSync(MODELS_JSON, "utf-8");
+    const cfg = JSON.parse(raw) as Record<string, any>;
+    provider = cfg.providers?.[providerKey];
+  } catch { return null; }
+
+  if (!provider?.baseUrl) return null;
+  const base = adminBaseFromProviderBase(provider.baseUrl);
+  if (!/^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(base)) return null;
+
+  const modelIds = (provider.models as any[])?.map((m: any) => m.id).filter(Boolean) || [];
+  if (ctx.model?.id && modelIds.length && !modelIds.includes(ctx.model.id)) return null;
+
+  return {
+    providerKey,
+    statsUrl: `${base}/admin/api/stats`,
+    // Always try login for any local provider with an API key.
+    // The proxy forwards to the right backend; if login isn't needed
+    // (e.g. ds4-server) it fails silently and we proceed without auth.
+    loginUrl: provider.apiKey ? `${base}/admin/api/login` : undefined,
+    apiKey: provider.apiKey,
+    modelIds: modelIds.length ? modelIds : (ctx.model?.id ? [ctx.model.id] : []),
+  };
+}
+
+function findBestMatch(loaded: LoadedModel[], ids: string[]): LoadedModel | null {
+  for (const m of loaded) { if (ids.includes(m.id)) return m; }
+  return null;
+}
+
 // ── State ───────────────────────────────────────────────────────────────────
-//
-//   Waiting  (apiSpeed === 0):     bar sits at 0, nothing displayed
-//   Catch-up (catchUpEnd > 0):     bar animates from 0 → catchUpTarget over 100ms
-//   Running  (apiSpeed > 0):       bar advances at apiSpeed (corrected by polls)
 
 let barPos     = 0;     // current bar position (tokens)
 let barStart   = 0;     // when current motion segment began
@@ -112,7 +158,6 @@ function inCatchUp(now: number): boolean {
 
 function getInterpolated(now: number): number {
   if (inCatchUp(now)) {
-    // Linear animation from 0 → catchUpTarget over 100ms
     const t = (now - barStart) / 100; // 0..1 over 100ms
     return Math.min(catchUpTarget * t, gtTotal);
   }
@@ -137,20 +182,7 @@ function formatDecode(data: ProgressData): string {
   const speed = formatTokS(data.tok_s);
   const clbl = (data.count != null && data.count > 1) ? ` (${data.count})` : "";
   const sp = speed ? `  (${speed})` : "";
-  return `Generating${clbl} · ${data.tokens} tokens${sp}`;
-}
-
-// ── Model Matching ──────────────────────────────────────────────────────────
-
-interface LoadedModel {
-  id: string;
-  prefilling: any[];
-  generating: any[];
-}
-
-function findBestMatch(loaded: LoadedModel[], ids: string[]): LoadedModel | null {
-  for (const m of loaded) { if (ids.includes(m.id)) return m; }
-  return null;
+  return `Generating${clbl} - ${data.tokens} tokens${sp}`;
 }
 
 // ── Extension ───────────────────────────────────────────────────────────────
@@ -158,7 +190,12 @@ function findBestMatch(loaded: LoadedModel[], ids: string[]): LoadedModel | null
 export default function (pi: ExtensionAPI) {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let animTimer: ReturnType<typeof setInterval> | null = null;
-  let cookieValue: string | null = null;
+
+  function stopTimers() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (animTimer) { clearInterval(animTimer); animTimer = null; }
+    reset();
+  }
 
   async function fetchJSON(url: string, headers: Record<string, string> = {}): Promise<any> {
     const ctl = new AbortController();
@@ -171,44 +208,36 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("agent_start", async (_event, ctx: ExtensionContext) => {
-    reset();
-    cookieValue = null;
+    stopTimers();
+    ctx.ui.setWorkingMessage(undefined);
 
-    // ── Config ──
-    let apiKey: string;
-    let configModelIds: string[] = [];
-    try {
-      const raw = readFileSync(MODELS_JSON, "utf-8");
-      const cfg = JSON.parse(raw) as Record<string, any>;
-      const lp = cfg.providers?.local;
-      if (!lp) return;
-      apiKey = lp.apiKey;
-      if (!apiKey) return;
-      configModelIds = (lp.models as any[])?.map((m: any) => m.id) || [];
-    } catch { return; }
+    const monitor = loadMonitorConfig(ctx);
+    if (!monitor) return;
 
-    // ── Login ──
-    try {
-      const r = await fetch(OMLX_LOGIN, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ api_key: apiKey }),
-      });
-      if (!r.ok) return;
-      cookieValue = r.headers.get("Set-Cookie") || null;
-      if (!cookieValue) return;
-    } catch { return; }
+    let cookieValue: string | null = null;
+    if (monitor.loginUrl) {
+      if (!monitor.apiKey) return;
+      try {
+        const r = await fetch(monitor.loginUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_key: monitor.apiKey }),
+        });
+        if (!r.ok) return;
+        cookieValue = r.headers.get("Set-Cookie") || null;
+        if (!cookieValue) return;
+      } catch { return; }
+    }
 
     const authHeaders = cookieValue ? { Cookie: cookieValue } : {};
 
-    // ── 3. Poll ──
     pollTimer = setInterval(async () => {
       try {
-        const stats = await fetchJSON(OMLX_STATS, authHeaders);
+        const stats = await fetchJSON(monitor.statsUrl, authHeaders);
         const models: LoadedModel[] = stats?.active_models?.models || [];
         if (!models.length) { ctx.ui.setWorkingMessage(undefined); reset(); return; }
 
-        const model = findBestMatch(models, configModelIds);
+        const model = findBestMatch(models, monitor.modelIds);
         if (!model) { ctx.ui.setWorkingMessage(undefined); reset(); return; }
 
         const pf = model.prefilling || [];
@@ -220,13 +249,12 @@ export default function (pi: ExtensionAPI) {
 
         const now = nowMs();
 
-        // ── Prefill ──
         if (pf.length > 0) {
-          const totalProcessed = pf.reduce((s: number, p: any) => s + (p.processed || 0), 0);
-          const maxTotal = Math.max(...pf.map((p: any) => p.total || 0));
+          const totalProcessed = pf.reduce((s: number, p: any) => s + numeric(p.processed), 0);
+          const maxTotal = Math.max(...pf.map((p: any) => numeric(p.total)));
           const first = pf[0];
+          const firstSpeed = getItemSpeed(first);
 
-          // First poll: bar sits at 0, waiting for tok/s
           if (!wasActivity) {
             barPos = 0;
             barStart = now;
@@ -234,43 +262,36 @@ export default function (pi: ExtensionAPI) {
             dispSpeed = 0;
           }
 
-          // First time we see a real tok/s → start catch-up
-          if (apiSpeed === 0 && first.speed > 0) {
-            apiSpeed = first.speed;               // REAL tok/s — never lie
-            // Where ground truth will be in 100ms at the real tok/s
+          if (apiSpeed === 0 && firstSpeed > 0) {
+            apiSpeed = firstSpeed;
             catchUpTarget = totalProcessed + apiSpeed * 0.1;
             catchUpEnd = now + 100;
-            dispSpeed = catchUpTarget / 0.1;      // speed to reach target in 100ms
+            dispSpeed = catchUpTarget / 0.1;
             barPos = 0;
             barStart = now;
           }
 
-          // After catch-up: preserve accumulated position, correct speed
           if (!inCatchUp(now) && apiSpeed > 0) {
-            // Preserve position from whatever dispSpeed was active
             const elapsed = (now - barStart) / 1000;
             barPos = barPos + dispSpeed * elapsed;
             barStart = now;
 
-            // Correct display speed toward real API tok/s (20% per poll)
-            const target = first.speed || apiSpeed;
+            const target = firstSpeed || apiSpeed;
             apiSpeed += (target - apiSpeed) * 0.2;
             dispSpeed = apiSpeed;
           }
 
           gtTotal = maxTotal;
-          gtEta = first.eta;
+          gtEta = numeric(first.eta);
           gtCount = pf.length;
           gtLastPollTime = now;
-        }
-        // ── Decode ──
-        else if (gen.length > 0) {
+        } else if (gen.length > 0) {
           reset();
-          const totalTokens = gen.reduce((s: number, g: any) => s + (g.generated_tokens || 0), 0);
+          const totalTokens = gen.reduce((s: number, g: any) => s + numeric(g.generated_tokens ?? g.tokens), 0);
           let wSpeed = 0, wTime = 0;
           for (const g of gen) {
-            const e = g.elapsed_seconds || 0;
-            wSpeed += (g.tokens_per_second || 0) * e;
+            const e = numeric(g.elapsed_seconds) || 1;
+            wSpeed += getItemSpeed(g) * e;
             wTime += e;
           }
           const avg = wTime > 0 ? wSpeed / wTime : 0;
@@ -282,7 +303,6 @@ export default function (pi: ExtensionAPI) {
       } catch { /* stats fetch failed */ }
     }, POLL_MS);
 
-    // ── 4. Animation ──
     animTimer = setInterval(() => {
       if (gtLastPollTime === 0) return;
       if (!hasActivity || gtTotal <= 0) return;
@@ -295,22 +315,20 @@ export default function (pi: ExtensionAPI) {
         processed: interpolated,
         total: gtTotal,
         tokens: 0,
-        tok_s: apiSpeed,       // <— always the REAL API tok/s
+        tok_s: apiSpeed,
         eta: gtEta,
         count: gtCount,
       }, interpolated));
     }, ANIM_MS);
   });
 
-  pi.on("agent_end", async () => {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (animTimer) { clearInterval(animTimer); animTimer = null; }
-    reset();
+  pi.on("agent_end", async (_event, ctx) => {
+    stopTimers();
+    ctx.ui.setWorkingMessage(undefined);
   });
 
-  pi.on("session_shutdown", async () => {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (animTimer) { clearInterval(animTimer); animTimer = null; }
-    reset();
+  pi.on("session_shutdown", async (_event, ctx) => {
+    stopTimers();
+    ctx.ui.setWorkingMessage(undefined);
   });
 }
