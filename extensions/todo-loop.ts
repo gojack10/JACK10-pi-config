@@ -328,6 +328,20 @@ export default function todoLoop(pi: ExtensionAPI) {
         }),
       }),
       async execute(_id, { items }) {
+        // Models sometimes JSON-serialize the array before passing it, producing a
+        // single-element items array whose only entry is a JSON array string.
+        // Unwrap that case so ["a","b","c"] passed as a string still creates 3 todos.
+        if (items.length === 1) {
+          const only = items[0].trim();
+          if (only.startsWith("[")) {
+            try {
+              const parsed: unknown = JSON.parse(only);
+              if (Array.isArray(parsed) && parsed.every((s) => typeof s === "string")) {
+                items = parsed as string[];
+              }
+            } catch {}
+          }
+        }
         const open = openTodos().length;
         if (open > 0 && !unlockArmed) {
           return {
@@ -591,12 +605,13 @@ export default function todoLoop(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("todo-reset", {
-    description: "Clear all todos.",
+    description: "Clear all todos and deactivate the todo loop.",
     handler: async (_args, ctx) => {
       const cleared = todos.length;
       todos.length = 0;
       nextTodoId = 1;
       unlockArmed = false;
+      loopActive = false;
       syncRenameToolAvailability();
       saveState();
       refreshWidget();
@@ -772,6 +787,7 @@ export default function todoLoop(pi: ExtensionAPI) {
       compactArmed = true;
     }
     if (
+      loopActive &&
       !inClaudeCodeMode &&
       !compacting &&
       compactArmed &&
