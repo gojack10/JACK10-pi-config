@@ -3,6 +3,7 @@ auth.json
 
 # Auto-generated / cache
 sessions/
+git/
 model-recency.json
 tool-cache.json
 codex-usage-cache.json
