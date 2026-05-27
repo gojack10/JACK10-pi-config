@@ -1,0 +1,130 @@
+diff --git a/packages/coding-agent/src/core/compaction/compaction.ts b/packages/coding-agent/src/core/compaction/compaction.ts
+index b8339fba..79d6b3e0 100644
+--- a/packages/coding-agent/src/core/compaction/compaction.ts
++++ b/packages/coding-agent/src/core/compaction/compaction.ts
+@@ -395,16 +395,21 @@ export function findCutPoint(
+ 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+ 	}
+ 
+-	// Walk backwards from newest, accumulating estimated message sizes
++	// Walk backwards from newest, accumulating estimated message-like entry sizes.
++	// Session entries such as custom_message and branch_summary are not stored as
++	// type="message", but buildSessionContext() sends them to the LLM. Count them
++	// here too, otherwise auto-compaction can keep megabytes of extension-injected
++	// messages and make no progress.
+ 	let accumulatedTokens = 0;
+-	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
++	let cutIndex = cutPoints[0]; // Default: keep from first message-like entry (not header)
+ 
+ 	for (let i = endIndex - 1; i >= startIndex; i--) {
+ 		const entry = entries[i];
+-		if (entry.type !== "message") continue;
++		const message = getMessageFromEntryForCompaction(entry);
++		if (!message) continue;
+ 
+-		// Estimate this message's size
+-		const messageTokens = estimateTokens(entry.message);
++		// Estimate this message-like entry's size
++		const messageTokens = estimateTokens(message);
+ 		accumulatedTokens += messageTokens;
+ 
+ 		// Check if we've exceeded the budget
+@@ -420,30 +425,34 @@ export function findCutPoint(
+ 		}
+ 	}
+ 
+-	// Scan backwards from cutIndex to include any non-message entries (bash, settings, etc.)
++	// Scan backwards from cutIndex to include any non-message entries (settings, labels, etc.)
+ 	while (cutIndex > startIndex) {
+ 		const prevEntry = entries[cutIndex - 1];
+-		// Stop at session header or compaction boundaries
++		// Stop at compaction boundaries.
+ 		if (prevEntry.type === "compaction") {
+ 			break;
+ 		}
+-		if (prevEntry.type === "message") {
+-			// Stop if we hit any message
++		if (getMessageFromEntryForCompaction(prevEntry)) {
++			// Stop if we hit any entry that contributes a message to LLM context.
+ 			break;
+ 		}
+-		// Include this non-message entry (bash, settings change, etc.)
++		// Include this non-message entry (settings change, label, etc.)
+ 		cutIndex--;
+ 	}
+ 
+-	// Determine if this is a split turn
++	// Determine if this is a split turn. custom_message and branch_summary entries
++	// behave like user-provided turn starts even though they are not SessionMessageEntry.
+ 	const cutEntry = entries[cutIndex];
+-	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
+-	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
++	const cutEntryStartsTurn =
++		(cutEntry.type === "message" && (cutEntry.message.role === "user" || cutEntry.message.role === "bashExecution")) ||
++		cutEntry.type === "custom_message" ||
++		cutEntry.type === "branch_summary";
++	const turnStartIndex = cutEntryStartsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+ 
+ 	return {
+ 		firstKeptEntryIndex: cutIndex,
+ 		turnStartIndex,
+-		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
++		isSplitTurn: !cutEntryStartsTurn && turnStartIndex !== -1,
+ 	};
+ }
+ 
+diff --git a/packages/coding-agent/test/compaction-cutpoint.test.ts b/packages/coding-agent/test/compaction-cutpoint.test.ts
+new file mode 100644
+index 00000000..79a58fe4
+--- /dev/null
++++ b/packages/coding-agent/test/compaction-cutpoint.test.ts
+@@ -0,0 +1,49 @@
++import { describe, expect, it } from "vitest";
++import { prepareCompaction } from "../src/core/compaction/index.ts";
++import type { CompactionEntry, CustomMessageEntry, SessionEntry } from "../src/core/session-manager.ts";
++
++function customMessage(id: string, parentId: string | null, content: string): CustomMessageEntry {
++	return {
++		type: "custom_message",
++		id,
++		parentId,
++		timestamp: "2026-01-01T00:00:00.000Z",
++		customType: "test-extension",
++		content,
++		display: true,
++	};
++}
++
++function compaction(id: string, parentId: string | null, firstKeptEntryId: string): CompactionEntry {
++	return {
++		type: "compaction",
++		id,
++		parentId,
++		timestamp: "2026-01-01T00:00:00.000Z",
++		summary: "previous summary",
++		firstKeptEntryId,
++		tokensBefore: 1000,
++	};
++}
++
++describe("prepareCompaction cut point", () => {
++	it("counts custom_message entries when choosing the next kept boundary", () => {
++		const huge = "x".repeat(10_000);
++		const entries: SessionEntry[] = [
++			customMessage("k0", null, "previous kept message"),
++			compaction("cmp1", "k0", "k0"),
++			customMessage("c1", "cmp1", huge),
++			customMessage("c2", "c1", huge),
++			customMessage("c3", "c2", huge),
++		];
++
++		const prep = prepareCompaction(entries, {
++			enabled: true,
++			reserveTokens: 4096,
++			keepRecentTokens: 1000,
++		});
++
++		expect(prep?.firstKeptEntryId).toBe("c3");
++		expect(prep?.isSplitTurn).toBe(false);
++	});
++});
