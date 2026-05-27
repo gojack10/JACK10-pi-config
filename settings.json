@@ -1,7 +1,7 @@
 {
-  "lastChangelogVersion": "0.74.0",
-  "defaultProvider": "openai-codex-alt",
-  "defaultModel": "gpt-5.5",
+  "lastChangelogVersion": "0.75.5",
+  "defaultProvider": "local",
+  "defaultModel": "tunnel-model",
   "defaultThinkingLevel": "xhigh",
   "enabledModels": [
     "openai-codex*/gpt-5.5:high"

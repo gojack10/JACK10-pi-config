@@ -204,10 +204,18 @@ export default function (pi: ExtensionAPI) {
 
 	// Inject temperature into every provider request.
 	// Codex rejects `temperature` with 400 "Unsupported parameter", so skip it there.
-	pi.on("before_provider_request", (event) => {
+	pi.on("before_provider_request", (event, ctx) => {
 		if (currentTemp === null) return undefined;
-		if (event.provider.includes("codex")) return undefined;
-		return { ...event.payload, temperature: currentTemp };
+
+		const provider = ctx.model?.provider?.toLowerCase() ?? "";
+		const modelId = ctx.model?.id?.toLowerCase() ?? "";
+		if (provider.includes("codex") || modelId.includes("codex")) return undefined;
+
+		if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) {
+			return undefined;
+		}
+
+		return { ...(event.payload as Record<string, unknown>), temperature: currentTemp };
 	});
 
 	pi.registerCommand("temp", {
