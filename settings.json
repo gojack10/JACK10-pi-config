@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "0.75.5",
   "defaultProvider": "local",
-  "defaultModel": "tunnel-model",
-  "defaultThinkingLevel": "xhigh",
+  "defaultModel": "gemma-4-E4B-it-MLX-8bit",
+  "defaultThinkingLevel": "medium",
   "enabledModels": [
     "openai-codex*/gpt-5.5:high"
   ],
