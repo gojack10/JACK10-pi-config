@@ -6,7 +6,7 @@ diff --git a/packages/ai/src/providers/openai-codex-responses.ts b/packages/ai/s
  const MAX_RETRIES = 3;
  const BASE_DELAY_MS = 1000;
 -const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
-+const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "openai-codex-alt", "opencode"]);
++const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "openai-codex-alt", "openai-codex-team", "opencode"]);
  const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
  
  const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([

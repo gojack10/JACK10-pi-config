@@ -2,13 +2,14 @@
  * Codex workspace aliases.
  *
  * Pi's built-in openai-codex provider stores one OAuth credential under the
- * provider id. This extension registers a second provider id that reuses the
+ * provider id. This extension registers additional provider ids that reuse the
  * same ChatGPT/Codex OAuth flow and the same Codex model catalog, so /login can
- * store a separate Alt/Edu token without overwriting the existing token.
+ * store separate workspace/account tokens without overwriting each other.
  *
  * Usage:
  *   /login openai-codex-alt
- *   pi --model openai-codex-alt/gpt-5.5
+ *   /login openai-codex-team
+ *   pi --model openai-codex-team/gpt-5.5
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -16,10 +17,22 @@ import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
 import { openaiCodexOAuthProvider } from "@earendil-works/pi-ai/oauth";
 
 const SOURCE_PROVIDER = "openai-codex";
-const Alt_PROVIDER = "openai-codex-alt";
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 
-function cloneCodexModels(): Array<{
+const CODEX_ALIASES = [
+	{
+		provider: "openai-codex-alt",
+		name: "ChatGPT Edu / Alt (Codex)",
+		modelSuffix: "Alt",
+	},
+	{
+		provider: "openai-codex-team",
+		name: "ChatGPT Team (Codex)",
+		modelSuffix: "Team",
+	},
+] as const;
+
+function cloneCodexModels(modelSuffix: string): Array<{
 	id: string;
 	name: string;
 	api: Api;
@@ -34,7 +47,7 @@ function cloneCodexModels(): Array<{
 }> {
 	return (getModels(SOURCE_PROVIDER as never) as Model<Api>[]).map((model) => ({
 		id: model.id,
-		name: `${model.name ?? model.id} (Alt)`,
+		name: `${model.name ?? model.id} (${modelSuffix})`,
 		api: model.api,
 		baseUrl: model.baseUrl ?? CODEX_BASE_URL,
 		reasoning: model.reasoning ?? false,
@@ -48,17 +61,19 @@ function cloneCodexModels(): Array<{
 }
 
 export default function codexWorkspaces(pi: ExtensionAPI) {
-	pi.registerProvider(Alt_PROVIDER, {
-		name: "ChatGPT Edu / Alt (Codex)",
-		baseUrl: CODEX_BASE_URL,
-		api: "openai-codex-responses",
-		models: cloneCodexModels(),
-		oauth: {
-			name: "ChatGPT Edu / Alt (Codex)",
-			usesCallbackServer: openaiCodexOAuthProvider.usesCallbackServer,
-			login: (callbacks) => openaiCodexOAuthProvider.login(callbacks),
-			refreshToken: (credentials) => openaiCodexOAuthProvider.refreshToken(credentials),
-			getApiKey: (credentials) => openaiCodexOAuthProvider.getApiKey(credentials),
-		},
-	});
+	for (const alias of CODEX_ALIASES) {
+		pi.registerProvider(alias.provider, {
+			name: alias.name,
+			baseUrl: CODEX_BASE_URL,
+			api: "openai-codex-responses",
+			models: cloneCodexModels(alias.modelSuffix),
+			oauth: {
+				name: alias.name,
+				usesCallbackServer: openaiCodexOAuthProvider.usesCallbackServer,
+				login: (callbacks) => openaiCodexOAuthProvider.login(callbacks),
+				refreshToken: (credentials) => openaiCodexOAuthProvider.refreshToken(credentials),
+				getApiKey: (credentials) => openaiCodexOAuthProvider.getApiKey(credentials),
+			},
+		});
+	}
 }
