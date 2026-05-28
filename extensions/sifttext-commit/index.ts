@@ -11,53 +11,32 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { callMcpTool, mcpTextContent } from "../_shared/mcp-http";
 
 const NODE_ID = "c72d552d-3499-445b-a8d5-05d0ff7824f2";
 const MCP_URL = "https://app.sifttext.com/mcp";
 
-async function importMcpSdk() {
-  const [{ Client }, { StreamableHTTPClientTransport }] = await Promise.all([
-    import("@modelcontextprotocol/sdk/client/index.js"),
-    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
-  ]);
-  return { Client, StreamableHTTPClientTransport };
-}
-
 async function fetchNodeContent(): Promise<string> {
-  const { Client, StreamableHTTPClientTransport } = await importMcpSdk();
-
   const token = process.env.SIFTTEXT_API_KEY;
   if (!token) {
     throw new Error("SIFTTEXT_API_KEY environment variable is not set");
   }
 
-  const client = new Client({ name: "sifttext-commit", version: "1.0.0" });
+  const result = await callMcpTool(
+    MCP_URL,
+    token,
+    "sifttext-commit",
+    "ideation_get_node",
+    { node_id: NODE_ID },
+  );
 
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
-    requestInit: { headers: { Authorization: `Bearer ${token}` } },
-  });
+  const text = mcpTextContent(result);
 
-  await client.connect(transport);
-
-  try {
-    const result = await client.callTool({
-      name: "ideation_get_node",
-      arguments: { node_id: NODE_ID },
-    });
-
-    const text = result.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-
-    if (result.isError) {
-      throw new Error(`MCP tool error: ${text}`);
-    }
-
-    return text;
-  } finally {
-    await client.close();
+  if (result.isError) {
+    throw new Error(`MCP tool error: ${text}`);
   }
+
+  return text;
 }
 
 export default function (pi: ExtensionAPI) {

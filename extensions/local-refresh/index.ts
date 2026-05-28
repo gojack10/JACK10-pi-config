@@ -7,63 +7,31 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { callMcpTool, mcpTextContent } from "../_shared/mcp-http";
 
 const NODE_ID = "d36f646c-f719-4383-843b-e4458e76465a";
 const MCP_URL = "https://app.sifttext.com/mcp";
 
-async function importMcpSdk() {
-  const [{ Client }, { StreamableHTTPClientTransport }] = await Promise.all([
-    import("@modelcontextprotocol/sdk/client/index.js"),
-    import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
-  ]);
-  return { Client, StreamableHTTPClientTransport };
-}
-
 async function fetchNodeContent(): Promise<string> {
-  const { Client, StreamableHTTPClientTransport } = await importMcpSdk();
-
-  // Reuse the same auth approach as sifttext-mcp — SIFT sends a session
-  // header. The MCP endpoint is authenticated via the pi session cookie /
-  // the running process context. Since this runs inside the pi agent
-  // harness, we'll just use a plain request — the MCP endpoint handles
-  // authentication via the session context that flows through the
-  // SiftText platform.
-  //
-  // However, looking at the existing sifttext-mcp extension, it uses
-  // SIFTTEXT_API_KEY. We'll follow that pattern but also support
-  // reading from an environment variable the user sets.
   const token = process.env.SIFTTEXT_API_KEY;
   if (!token) {
     throw new Error("SIFTTEXT_API_KEY environment variable is not set");
   }
 
-  const client = new Client({ name: "local-refresh", version: "1.0.0" });
+  const result = await callMcpTool(
+    MCP_URL,
+    token,
+    "local-refresh",
+    "ideation_get_node",
+    { node_id: NODE_ID },
+  );
 
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
-    requestInit: { headers: { Authorization: `Bearer ${token}` } },
-  });
-
-  await client.connect(transport);
-
-  try {
-    const result = await client.callTool({
-      name: "ideation_get_node",
-      arguments: { node_id: NODE_ID },
-    });
-
-    const text = result.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-
-    if (result.isError) {
-      throw new Error(`MCP tool error: ${text}`);
-    }
-
-    return text;
-  } finally {
-    await client.close();
+  const text = mcpTextContent(result);
+  if (result.isError) {
+    throw new Error(`MCP tool error: ${text}`);
   }
+
+  return text;
 }
 
 export default function (pi: ExtensionAPI) {

@@ -13,6 +13,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { callMcpTool, listMcpTools, mcpTextContent } from "../_shared/mcp-http";
 
 const MCP_URL = "https://app.sifttext.com/mcp";
 const CONNECT_TIMEOUT_MS = 2_000;
@@ -25,56 +26,32 @@ type CachedTool = {
 	inputSchema: Record<string, unknown>;
 };
 
-// ── Lazy SDK imports (bypass jiti — Node native ESM loader is faster) ──────
+// ── Lazy imports ────────────────────────────────────────────────────────────
 
 async function importTypeBox() {
 	const { Type } = await import("@sinclair/typebox");
 	return Type;
 }
 
-async function importMcpSdk() {
-	const [{ Client }, { StreamableHTTPClientTransport }] = await Promise.all([
-		import("@modelcontextprotocol/sdk/client/index.js"),
-		import("@modelcontextprotocol/sdk/client/streamableHttp.js"),
-	]);
-	return { Client, StreamableHTTPClientTransport };
-}
-
 // ── Connect + fetch tool schemas ────────────────────────────────────────────
 
 async function fetchToolSchemas(token: string): Promise<CachedTool[] | null> {
-	const { Client, StreamableHTTPClientTransport } = await importMcpSdk();
-
-	const client = new Client({ name: "pi-sifttext", version: "1.0.0" });
-
-	const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
-		requestInit: { headers: { Authorization: `Bearer ${token}` } },
-	});
-
-	let timedOut = false;
-	const timer = setTimeout(() => {
-		timedOut = true;
-		transport.close();
-	}, CONNECT_TIMEOUT_MS);
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
 
 	try {
-		await client.connect(transport);
-		if (timedOut) return null;
+		const tools = await listMcpTools(MCP_URL, token, "pi-sifttext", { signal: controller.signal });
+		return tools.map((t) => ({
+			name: t.name,
+			description: t.description ?? t.name,
+			inputSchema: (t.inputSchema ?? {}) as Record<string, unknown>,
+		}));
 	} catch (err) {
-		if (!timedOut) console.error("[sifttext-mcp] Failed to connect:", err);
+		if (!controller.signal.aborted) console.error("[sifttext-mcp] Failed to connect:", err);
 		return null;
 	} finally {
 		clearTimeout(timer);
 	}
-
-	const { tools } = await client.listTools();
-	await client.close();
-
-	return tools.map((t) => ({
-		name: t.name,
-		description: t.description,
-		inputSchema: t.inputSchema as Record<string, unknown>,
-	}));
 }
 
 // ── Register tools from schemas ─────────────────────────────────────────────
@@ -121,26 +98,20 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 			label: tool.name.replace(/_/g, " "),
 			description: tool.description ?? tool.name,
 			parameters,
-			async execute(_toolCallId, params, _signal) {
-				// Lazy connect on first tool call
-				const { Client, StreamableHTTPClientTransport } = await importMcpSdk();
-				const client = new Client({ name: "pi-sifttext", version: "1.0.0" });
-				const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
-					requestInit: { headers: { Authorization: `Bearer ${token}` } },
-				});
-				await client.connect(transport);
-				const result = await client.callTool({
-					name: tool.name,
-					arguments: params as Record<string, unknown>,
-				});
-				await client.close();
+			async execute(_toolCallId, params, signal) {
+				// Lazy direct JSON-RPC call on first tool use; no MCP SDK dependency.
+				const result = await callMcpTool(
+					MCP_URL,
+					token,
+					"pi-sifttext",
+					tool.name,
+					params as Record<string, unknown>,
+					{ signal },
+				);
 				if (result.isError) {
 					throw new Error(`Tool error: ${JSON.stringify(result.content)}`);
 				}
-				const text = result.content
-					.filter((c): c is { type: "text"; text: string } => c.type === "text")
-					.map((c) => c.text)
-					.join("\n");
+				const text = mcpTextContent(result);
 				return {
 					content: [{ type: "text", text: text || JSON.stringify(result.content) }],
 					details: {},
@@ -185,7 +156,7 @@ export default async function (pi: ExtensionAPI) {
 		} catch {}
 	}
 
-	// 3. Register tools from cache (instant — TypeBox import only, no MCP SDK)
+	// 3. Register tools from cache (instant — TypeBox import only)
 	await registerTools(pi, tools, token);
 	console.log(`[sifttext-mcp] Registered ${tools.length} SiftText tools`);
 }
