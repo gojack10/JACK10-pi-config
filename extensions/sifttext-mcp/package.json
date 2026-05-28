@@ -1,9 +1,0 @@
-{
-  "name": "pi-sifttext-mcp",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "iconv-lite": "^0.7.2"
-  }
-}
