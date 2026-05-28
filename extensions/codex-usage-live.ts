@@ -130,6 +130,7 @@ function isCodexProvider(provider: string | undefined): boolean {
 
 function providerLabel(provider: string, snapshot: LimitSnapshot): string {
 	if (provider === "openai-codex-alt") return "Codex Alt EDU";
+	if (provider === "openai-codex-team") return "Codex Team";
 	if (provider === "openai-codex") return `Codex ${snapshot.plan.toUpperCase()}`;
 	return `Codex ${snapshot.plan.toUpperCase()}`;
 }
