@@ -8,7 +8,7 @@
  * This machine's ~/.pi/agent/settings.json is set to { "transport": "sse" }.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -16,6 +16,7 @@ import { Text } from "@earendil-works/pi-tui";
 
 const BAR_WIDTH = 10;
 const CACHE_PATH = join(homedir(), ".pi", "agent", "codex-usage-cache.json");
+const OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-usage-observability.jsonl");
 
 const PARTIAL_BLOCKS: Record<number, string> = {
 	1: "▏",
@@ -38,8 +39,13 @@ interface LimitSnapshot {
 	secondaryResetSeconds: number | null;
 	primaryResetAt: number | null;
 	secondaryResetAt: number | null;
+	creditsBalance: string | null;
+	creditsHasCredits: boolean | null;
+	creditsUnlimited: boolean | null;
+	primaryOverSecondaryLimitPercent: number | null;
 	status: number;
 	capturedAtMs: number;
+	rawHeaders?: Record<string, string>;
 }
 
 function lowerHeaders(headers: Record<string, string>): Record<string, string> {
@@ -56,8 +62,31 @@ function num(value: string | undefined): number | null {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
+function bool(value: string | undefined): boolean | null {
+	if (value == null || value === "") return null;
+	if (/^true$/i.test(value)) return true;
+	if (/^false$/i.test(value)) return false;
+	return null;
+}
+
+function usageHeaders(headers: Record<string, string>): Record<string, string> {
+	const h = lowerHeaders(headers);
+	const interesting = new Set([
+		"retry-after",
+		"retry-after-ms",
+		"x-request-id",
+		"openai-processing-ms",
+	]);
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(h)) {
+		if (key.startsWith("x-codex-") || interesting.has(key)) out[key] = value;
+	}
+	return out;
+}
+
 function getSnapshot(status: number, headers: Record<string, string>): LimitSnapshot | null {
 	const h = lowerHeaders(headers);
+	const rawHeaders = usageHeaders(headers);
 	if (!h["x-codex-plan-type"] && !h["x-codex-primary-used-percent"] && !h["x-codex-secondary-used-percent"]) {
 		return null;
 	}
@@ -73,7 +102,12 @@ function getSnapshot(status: number, headers: Record<string, string>): LimitSnap
 		secondaryResetSeconds: num(h["x-codex-secondary-reset-after-seconds"]),
 		primaryResetAt: num(h["x-codex-primary-reset-at"]),
 		secondaryResetAt: num(h["x-codex-secondary-reset-at"]),
+		creditsBalance: h["x-codex-credits-balance"] ?? null,
+		creditsHasCredits: bool(h["x-codex-credits-has-credits"]),
+		creditsUnlimited: bool(h["x-codex-credits-unlimited"]),
+		primaryOverSecondaryLimitPercent: num(h["x-codex-primary-over-secondary-limit-percent"]),
 		capturedAtMs: Date.now(),
+		rawHeaders,
 	};
 }
 
@@ -137,6 +171,15 @@ function providerLabel(provider: string, snapshot: LimitSnapshot): string {
 
 function formatSnapshot(provider: string, snapshot: LimitSnapshot): string {
 	const limited = snapshot.status === 429 ? " LIMIT" : "";
+	const hasCreditHeaders =
+		snapshot.creditsBalance != null || snapshot.creditsHasCredits != null || snapshot.creditsUnlimited != null;
+	const hasWindowLimits = snapshot.primaryWindow !== "0" || snapshot.secondaryWindow !== "0";
+	if (hasCreditHeaders && !hasWindowLimits) {
+		const balance = snapshot.creditsBalance ?? "?";
+		const hasCredits = snapshot.creditsHasCredits == null ? "?" : snapshot.creditsHasCredits ? "yes" : "no";
+		const unlimited = snapshot.creditsUnlimited == null ? "?" : snapshot.creditsUnlimited ? "yes" : "no";
+		return `${providerLabel(provider, snapshot)}${limited} | ${snapshot.plan.toUpperCase()} ${snapshot.activeLimit} | CREDITS ${balance} / HAS ${hasCredits} / UNLIMITED ${unlimited}`;
+	}
 	return `${providerLabel(provider, snapshot)}${limited} | ${formatLimit(
 		"DAILY",
 		snapshot.primaryUsed,
@@ -160,6 +203,28 @@ function writeCache(snapshots: Map<string, LimitSnapshot>): void {
 		writeFileSync(CACHE_PATH, JSON.stringify(Object.fromEntries(snapshots), null, 2), "utf-8");
 	} catch {
 		// Best-effort cache only.
+	}
+}
+
+function appendObservability(provider: string, status: number, headers: Record<string, string>, snapshot: LimitSnapshot | null): void {
+	appendObservabilityRecord({
+		kind: "http_response",
+		provider,
+		status,
+		headers: usageHeaders(headers),
+		snapshot,
+	});
+}
+
+function appendObservabilityRecord(record: Record<string, unknown>): void {
+	try {
+		appendFileSync(
+			OBSERVABILITY_PATH,
+			`${JSON.stringify({ capturedAt: new Date().toISOString(), ...record })}\n`,
+			"utf-8",
+		);
+	} catch {
+		// Best-effort observability only.
 	}
 }
 
@@ -220,10 +285,38 @@ export default function codexUsageLive(pi: ExtensionAPI) {
 		const provider = ctx.model?.provider || "";
 		if (!isCodexProvider(provider)) return;
 		const snapshot = getSnapshot(event.status, event.headers);
+		appendObservability(provider, event.status, event.headers, snapshot);
 		if (!snapshot) return;
 		snapshots.set(provider, snapshot);
 		writeCache(snapshots);
 		showIfCached(ctx, provider);
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		const provider = (event.message as { provider?: string }).provider || ctx.model?.provider || "";
+		if (!isCodexProvider(provider) || event.message.role !== "assistant") return;
+		const message = event.message as {
+			model?: string;
+			stopReason?: string;
+			errorMessage?: string;
+			usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number };
+		};
+		appendObservabilityRecord({
+			kind: "assistant_end",
+			provider,
+			model: message.model,
+			stopReason: message.stopReason,
+			errorMessage: message.errorMessage,
+			usage: message.usage
+				? {
+						input: message.usage.input,
+						output: message.usage.output,
+						cacheRead: message.usage.cacheRead,
+						cacheWrite: message.usage.cacheWrite,
+						totalTokens: message.usage.totalTokens,
+					}
+				: undefined,
+		});
 	});
 
 	pi.on("model_select", async (event, ctx) => {
