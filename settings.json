@@ -1,8 +1,8 @@
 {
   "lastChangelogVersion": "0.75.5",
-  "defaultProvider": "local",
-  "defaultModel": "gemma-4-E4B-it-MLX-8bit",
-  "defaultThinkingLevel": "medium",
+  "defaultProvider": "openai-codex-team",
+  "defaultModel": "gpt-5.5",
+  "defaultThinkingLevel": "xhigh",
   "enabledModels": [
     "openai-codex*/gpt-5.5:high"
   ],
