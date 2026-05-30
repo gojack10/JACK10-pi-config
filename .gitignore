@@ -16,6 +16,7 @@ node_modules/
 
 # User preferences
 temperature.json
+settings.local.json
 
 # Machine-local model registry (per-host endpoints, API keys)
 models.json
