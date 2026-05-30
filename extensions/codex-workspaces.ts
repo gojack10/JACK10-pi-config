@@ -12,12 +12,16 @@
  *   pi --model openai-codex-team/gpt-5.5
  */
 
+import { appendFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
 import { openaiCodexOAuthProvider } from "@earendil-works/pi-ai/oauth";
 
 const SOURCE_PROVIDER = "openai-codex";
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+const AUTH_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-workspace-auth-observability.jsonl");
 
 const CODEX_ALIASES = [
 	{
@@ -31,6 +35,50 @@ const CODEX_ALIASES = [
 		modelSuffix: "Team",
 	},
 ] as const;
+
+function decodeJwtPayload(token: string | undefined): Record<string, unknown> | undefined {
+	try {
+		if (!token) return undefined;
+		const parts = token.split(".");
+		if (parts.length !== 3 || !parts[1]) return undefined;
+		return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8")) as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+}
+
+function redactId(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length < 8) return undefined;
+	return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+function summarizeCredentials(credentials: { access?: string; expires?: number; accountId?: string }): Record<string, unknown> {
+	const payload = decodeJwtPayload(credentials.access);
+	const auth = payload?.["https://api.openai.com/auth"] as Record<string, unknown> | undefined;
+	return {
+		accountId: redactId(credentials.accountId ?? auth?.chatgpt_account_id),
+		expiresAt: credentials.expires ? new Date(credentials.expires).toISOString() : undefined,
+		planType: auth?.chatgpt_plan_type,
+		hasSsoConnection: typeof auth?.sso_connection_id === "string" && auth.sso_connection_id.length > 0,
+	};
+}
+
+function appendAuthObservation(
+	provider: string,
+	phase: "login" | "refresh",
+	outcome: "success" | "error",
+	details: Record<string, unknown>,
+): void {
+	try {
+		appendFileSync(
+			AUTH_OBSERVABILITY_PATH,
+			`${JSON.stringify({ capturedAt: new Date().toISOString(), provider, phase, outcome, ...details })}\n`,
+			"utf-8",
+		);
+	} catch {
+		// Best-effort observability only.
+	}
+}
 
 function cloneCodexModels(modelSuffix: string): Array<{
 	id: string;
@@ -70,8 +118,31 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			oauth: {
 				name: alias.name,
 				usesCallbackServer: openaiCodexOAuthProvider.usesCallbackServer,
-				login: (callbacks) => openaiCodexOAuthProvider.login(callbacks),
-				refreshToken: (credentials) => openaiCodexOAuthProvider.refreshToken(credentials),
+				login: async (callbacks) => {
+					try {
+						const credentials = await openaiCodexOAuthProvider.login(callbacks);
+						appendAuthObservation(alias.provider, "login", "success", summarizeCredentials(credentials));
+						return credentials;
+					} catch (error) {
+						appendAuthObservation(alias.provider, "login", "error", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+						throw error;
+					}
+				},
+				refreshToken: async (credentials) => {
+					try {
+						const refreshed = await openaiCodexOAuthProvider.refreshToken(credentials);
+						appendAuthObservation(alias.provider, "refresh", "success", summarizeCredentials(refreshed));
+						return refreshed;
+					} catch (error) {
+						appendAuthObservation(alias.provider, "refresh", "error", {
+							accountId: redactId(credentials.accountId),
+							error: error instanceof Error ? error.message : String(error),
+						});
+						throw error;
+					}
+				},
 				getApiKey: (credentials) => openaiCodexOAuthProvider.getApiKey(credentials),
 			},
 		});
