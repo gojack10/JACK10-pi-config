@@ -215,18 +215,15 @@ export default function (pi: ExtensionAPI) {
     if (!monitor) return;
 
     let cookieValue: string | null = null;
-    if (monitor.loginUrl) {
-      if (!monitor.apiKey) return;
+    if (monitor.loginUrl && monitor.apiKey) {
       try {
         const r = await fetch(monitor.loginUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ api_key: monitor.apiKey }),
         });
-        if (!r.ok) return;
-        cookieValue = r.headers.get("Set-Cookie") || null;
-        if (!cookieValue) return;
-      } catch { return; }
+        if (r.ok) cookieValue = r.headers.get("Set-Cookie") || null;
+      } catch { /* login is optional for proxy/llama.cpp-backed local servers */ }
     }
 
     const authHeaders = cookieValue ? { Cookie: cookieValue } : {};
