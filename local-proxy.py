@@ -31,6 +31,7 @@ FLASH_MOE_PORT = 8004
 LISTEN_PORT = 8002
 
 QWEN_FLASH_MODEL_ID = "qwen36-35b-a3b-flash-moe"
+DS4_FLASH_MODEL_ID = "tunnel-model"
 
 AUTH_HEADERS = {"Authorization": "Bearer REDACTED-LOCAL-KEY"}
 
@@ -61,9 +62,10 @@ BACKENDS = {
     },
 }
 
-# Static route lets Qwen route correctly immediately after the proxy starts,
-# even before the first successful /v1/models discovery from llama-server.
+# Static routes let hot local models route correctly immediately after the proxy
+# starts, even before the first successful /v1/models discovery.
 STATIC_MODEL_BACKENDS = {
+    DS4_FLASH_MODEL_ID: "ds4",
     QWEN_FLASH_MODEL_ID: "flash_moe",
 }
 MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
@@ -139,6 +141,61 @@ def parse_json_body(body):
         return None, e
 
 
+def normalize_ds4_chat_body(backend_name, body):
+    """Normalize proxy clients onto DS4's DeepSeek-compatible thinking API.
+
+    DS4 exposes three modes: none, high, max. Its chat-completions parser accepts
+    reasoning_effort, but intentionally collapses xhigh/minimal/low/medium/high
+    to HIGH; only the literal DeepSeek API value "max" enters Think Max. Normalize
+    OpenRouter/pi/qwen-template shapes here so proxy clients cannot accidentally
+    turn xhigh into high before the request reaches ds4-server.
+    """
+    if backend_name != "ds4":
+        return body
+    payload, err = parse_json_body(body)
+    if err or not isinstance(payload, dict):
+        return body
+    if payload.get("model") != DS4_FLASH_MODEL_ID:
+        return body
+
+    changed = False
+    effort = None
+
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
+        effort = reasoning.get("effort", "").lower()
+        payload.pop("reasoning", None)
+        changed = True
+    elif isinstance(payload.get("reasoning_effort"), str):
+        effort = payload["reasoning_effort"].lower()
+
+    if effort in ("none", "off"):
+        payload["thinking"] = {"type": "disabled"}
+        payload.pop("reasoning_effort", None)
+        changed = True
+    elif effort in ("max", "xhigh"):
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = "max"
+        changed = True
+    elif effort in ("minimal", "low", "medium", "high"):
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = "high"
+        changed = True
+
+    chat_template_kwargs = payload.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict) and "enable_thinking" in chat_template_kwargs:
+        enabled = bool(chat_template_kwargs.get("enable_thinking"))
+        payload["thinking"] = {"type": "enabled" if enabled else "disabled"}
+        if not enabled:
+            payload.pop("reasoning_effort", None)
+        payload.pop("chat_template_kwargs", None)
+        changed = True
+
+    if changed:
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return body
+
+
 def maybe_prepare_flash_body(backend_name, body):
     """Enable llama.cpp prompt progress events for proxied Qwen streams."""
     if backend_name != "flash_moe":
@@ -149,6 +206,12 @@ def maybe_prepare_flash_body(backend_name, body):
     if payload.get("stream", False):
         payload["return_progress"] = True
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def maybe_prepare_chat_body(backend_name, body):
+    body = normalize_ds4_chat_body(backend_name, body)
+    body = maybe_prepare_flash_body(backend_name, body)
+    return body
 
 
 # ── Flash-MoE progress tracking ─────────────────────────────────────────────
@@ -352,7 +415,7 @@ async def handle_chat(request):
 
     backend_name = get_backend_name(model_id)
     backend = BACKENDS[backend_name]["v1"]
-    body = maybe_prepare_flash_body(backend_name, body)
+    body = maybe_prepare_chat_body(backend_name, body)
     log.info(f"routing {model_id} -> {backend}")
 
     headers = {
