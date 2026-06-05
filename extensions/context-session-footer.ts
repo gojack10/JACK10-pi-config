@@ -75,6 +75,7 @@ export default function (pi: ExtensionAPI) {
 					let totalInput = 0;
 					let totalOutput = 0;
 					let totalCacheRead = 0;
+					let totalCacheWrite = 0;
 					let totalCost = 0;
 
 					for (const entry of ctx.sessionManager.getEntries()) {
@@ -83,6 +84,7 @@ export default function (pi: ExtensionAPI) {
 							totalInput += message.usage.input;
 							totalOutput += message.usage.output;
 							totalCacheRead += message.usage.cacheRead;
+							totalCacheWrite += message.usage.cacheWrite;
 							totalCost += message.usage.cost.total;
 						}
 					}
@@ -94,7 +96,7 @@ export default function (pi: ExtensionAPI) {
 					const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
 					const modelName = ctx.model?.id ?? "no-model";
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
-					const isLocal = ctx.model && String((ctx.model as any).baseURL ?? (ctx.model as any).baseUrl ?? "").match(/localhost|127\.0\.0\.1/i);
+					const isLocal = Boolean(ctx.model && String((ctx.model as any).baseURL ?? (ctx.model as any).baseUrl ?? "").match(/localhost|127\.0\.0\.1/i));
 					const thinkingSuffix =
 						ctx.model?.reasoning && !isClaudeCodeModel ? ` ${pi.getThinkingLevel()}` : "";
 
@@ -109,10 +111,11 @@ export default function (pi: ExtensionAPI) {
 						pwd = `${pwd} • ${sessionName}`;
 					}
 
+					const showCacheWrite = !isLocal && totalCacheWrite > 0;
 					const statsLine =
 						`CWD: [${pwd}]` +
 						` | CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)` +
-						` | SESSION: ↑${formatTokens(totalInput)} ↓${formatTokens(totalOutput)} CR:${formatTokens(totalCacheRead)}` +
+						` | SESSION: ↑${formatTokens(totalInput)} ↓${formatTokens(totalOutput)} CR:${formatTokens(totalCacheRead)}${showCacheWrite ? ` CW:${formatTokens(totalCacheWrite)}` : ""}` +
 						`${isLocal ? " (LOCAL)" : ` $${totalCost.toFixed(3)}`}${usingSubscription ? " (SUB)" : ""}` +
 						` | TEMP: ${getTemperature() ?? "(DEFAULT)"}` +
 						` | MODEL: ${modelName}${thinkingSuffix}`;
