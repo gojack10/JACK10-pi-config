@@ -1,0 +1,53 @@
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index 608a6153..7c3a4e2f 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -134,6 +134,7 @@ export type AgentSessionEvent =
+ 	  }
+ 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+ 	| { type: "session_info_changed"; name: string | undefined }
++	| { type: "model_changed"; model: Model<any>; previousModel: Model<any> | undefined }
+ 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+ 	| {
+ 			type: "compaction_end";
+@@ -1449,6 +1450,7 @@ export class AgentSession {
+ 
+ 		// Re-clamp thinking level for new model's capabilities
+ 		this.setThinkingLevel(thinkingLevel);
++		this._emit({ type: "model_changed", model, previousModel });
+ 
+ 		await this._emitModelSelect(model, previousModel, "set");
+ 	}
+@@ -1489,6 +1491,7 @@ export class AgentSession {
+ 		// - Undefined scoped model thinking level inherits the current session preference
+ 		// setThinkingLevel clamps to model capabilities.
+ 		this.setThinkingLevel(thinkingLevel);
++		this._emit({ type: "model_changed", model: next.model, previousModel: currentModel });
+ 
+ 		await this._emitModelSelect(next.model, currentModel, "cycle");
+ 
+@@ -1514,6 +1517,7 @@ export class AgentSession {
+ 
+ 		// Re-clamp thinking level for new model's capabilities
+ 		this.setThinkingLevel(thinkingLevel);
++		this._emit({ type: "model_changed", model: nextModel, previousModel: currentModel });
+ 
+ 		await this._emitModelSelect(nextModel, currentModel, "cycle");
+ 
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 987a62cb..204dd2ea 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -2720,6 +2720,12 @@ export class InteractiveMode {
+ 				this.ui.requestRender();
+ 				break;
+ 
++			case "model_changed":
++				this.footer.invalidate();
++				this.updateEditorBorderColor();
++				this.ui.requestRender();
++				break;
++
+ 			case "thinking_level_changed":
+ 				this.footer.invalidate();
+ 				this.updateEditorBorderColor();
