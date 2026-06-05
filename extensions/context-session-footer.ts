@@ -25,6 +25,45 @@ const wrapAndDim = (text: string, width: number, separator: string, themeFn: (t:
 	return lines.length ? lines : [themeFn(fitToWidth(text, width))];
 };
 
+type FooterLineState = {
+	lines: string[];
+	currentLine: string;
+};
+
+const flushFooterLine = (state: FooterLineState, width: number): void => {
+	if (!state.currentLine) return;
+	state.lines.push(fitToWidth(state.currentLine, width));
+	state.currentLine = "";
+};
+
+const appendPipeSegment = (state: FooterLineState, segment: string, width: number): void => {
+	const candidate = state.currentLine ? `${state.currentLine} | ${segment}` : segment;
+	if (candidate.length > width) {
+		if (state.currentLine) {
+			state.lines.push(fitToWidth(state.currentLine, width));
+		}
+		state.currentLine = segment;
+	} else {
+		state.currentLine = candidate;
+	}
+};
+
+const appendSessionTokens = (state: FooterLineState, tokens: string[], width: number): void => {
+	let sessionStarted = false;
+	for (const token of tokens) {
+		const separator = state.currentLine ? (sessionStarted ? " " : " | ") : "";
+		const candidate = state.currentLine ? `${state.currentLine}${separator}${token}` : token;
+		if (candidate.length > width) {
+			if (state.currentLine) {
+				state.lines.push(fitToWidth(state.currentLine, width));
+			}
+			state.currentLine = token;
+		} else {
+			state.currentLine = candidate;
+		}
+		sessionStarted = true;
+	}
+};
 
 function sanitizeStatusText(text: string): string {
 	return text
@@ -112,17 +151,33 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					const showCacheWrite = !isLocal && totalCacheWrite > 0;
-					const statsLine =
-						`CWD: [${pwd}]` +
-						` | CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)` +
-						` | SESSION: ↑${formatTokens(totalInput)} ↓${formatTokens(totalOutput)} CR:${formatTokens(totalCacheRead)}${showCacheWrite ? ` CW:${formatTokens(totalCacheWrite)}` : ""}` +
-						`${isLocal ? " (LOCAL)" : ` $${totalCost.toFixed(3)}`}${usingSubscription ? " (SUB)" : ""}` +
-						` | TEMP: ${getTemperature() ?? "(DEFAULT)"}` +
-						` | MODEL: ${modelName}${thinkingSuffix}`;
+					const dim = theme.fg.bind(theme, "dim");
+					const lineState: FooterLineState = { lines: [], currentLine: "" };
 
-					const statsWrapped = wrapAndDim(statsLine, width, " | ", theme.fg.bind(theme, "dim"));
-					const lines: string[] = [];
-					lines.push(...statsWrapped);
+					appendPipeSegment(lineState, `CWD: [${pwd}]`, width);
+					appendPipeSegment(
+						lineState,
+						`CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)`,
+						width,
+					);
+					appendSessionTokens(
+						lineState,
+						[
+							`SESSION:`,
+							`↑${formatTokens(totalInput)}`,
+							`↓${formatTokens(totalOutput)}`,
+							`CR:${formatTokens(totalCacheRead)}`,
+							...(showCacheWrite ? [`CW:${formatTokens(totalCacheWrite)}`] : []),
+							isLocal ? "(LOCAL)" : `$${totalCost.toFixed(3)}`,
+							...(usingSubscription ? ["(SUB)"] : []),
+						],
+						width,
+					);
+					appendPipeSegment(lineState, `TEMP: ${getTemperature() ?? "(DEFAULT)"}`, width);
+					appendPipeSegment(lineState, `MODEL: ${modelName}${thinkingSuffix}`, width);
+					flushFooterLine(lineState, width);
+
+					const lines: string[] = lineState.lines.map(dim);
 
 					const extensionStatuses = footerData.getExtensionStatuses();
 					if (extensionStatuses.size > 0) {
@@ -130,7 +185,7 @@ export default function (pi: ExtensionAPI) {
 							.sort(([a], [b]) => a.localeCompare(b))
 							.map(([, text]) => sanitizeStatusText(text))
 							.join(" ");
-						lines.push(...wrapAndDim(statusLine, width, " | ", theme.fg.bind(theme, "dim")));
+						lines.push(...wrapAndDim(statusLine, width, " | ", dim));
 					}
 
 					return lines;
