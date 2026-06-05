@@ -1,9 +1,9 @@
 /**
  * Budget Saver Extension
  *
- * Shows a combined cache-bust warning, passive context/cost status, and a
- * session budget interrupt. In print mode there is no UI, so it does nothing.
- * RPC hosts receive these through Pi's extension UI protocol.
+ * Shows cache-bust warnings and session budget interrupts. In print mode there
+ * is no UI, so it does nothing. Pi TUI already has native context and session
+ * cost indicators, so this extension does not add a status entry.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -25,8 +25,6 @@ const CFG = {
 	budgetStart: 20,
 	budgetStep: 10,
 	rebillFloor: 0.15,
-	ctxWarn: 150_000,
-	ctxDanger: 200_000,
 	freshSessionEstimate: 0.05,
 	failOpen: true,
 };
@@ -173,19 +171,11 @@ export default function (pi: ExtensionAPI) {
 		return `Session ${fmt(total)}. At ${fmtK(tokens)} context, turns run ~${fmt(perTurn)} each. A fresh session with a handoff runs the same questions at ~${fmt(CFG.freshSessionEstimate)}.`;
 	}
 
-	function refreshStatus(ctx: any): void {
-		if (!ctx.hasUI) return;
+	function syncContextUsage(ctx: any): void {
 		const usage = ctx.getContextUsage?.();
 		if (usage?.tokens != null) lastCtxTokens = usage.tokens;
-		const tokens = usage?.tokens ?? lastCtxTokens;
-		if (tokens == null) return;
-		let suffix = "";
-		if (tokens >= CFG.ctxDanger) suffix = " ⛔";
-		else if (tokens >= CFG.ctxWarn) suffix = " ⚠";
-		const parts = [`ctx ${fmtK(tokens)}${suffix}`];
-		if (lastTurnCost > 0) parts.push(`${fmt(lastTurnCost)}/turn`);
-		parts.push(`session ${fmt(sessionCost)}`);
-		ctx.ui.setStatus("budget", parts.join(" · "));
+		// Clear any old budget status left by previous extension versions.
+		if (ctx.hasUI) ctx.ui.setStatus("budget", undefined);
 	}
 
 	async function restoreAcceptedSettings(ctx: any): Promise<void> {
@@ -205,30 +195,34 @@ export default function (pi: ExtensionAPI) {
 			pi.setThinkingLevel(target.thinking as any);
 			currentThinking = target.thinking;
 		}
-		refreshStatus(ctx);
+		syncContextUsage(ctx);
 	}
+
+	pi.on("session_start", (_event: any, ctx: any) => {
+		syncContextUsage(ctx);
+	});
 
 	pi.on("model_select", (event: any, ctx: any) => {
 		currentProvider = String(event.model?.provider ?? currentProvider ?? "");
 		currentModel = String(event.model?.id ?? currentModel ?? "");
-		refreshStatus(ctx);
+		syncContextUsage(ctx);
 	});
 
 	pi.on("thinking_level_select", (event: any, ctx: any) => {
 		currentThinking = String(event.level ?? currentThinking ?? "");
-		refreshStatus(ctx);
+		syncContextUsage(ctx);
 	});
 
 	pi.on("before_agent_start", (event: any, ctx: any) => {
 		lastTools = [...(event.systemPromptOptions?.selectedTools ?? [])].map(String).sort().join(",");
 		lastSystemHash = hash(String(event.systemPrompt ?? ctx.getSystemPrompt?.() ?? ""));
 		if (!acceptedFingerprint) acceptedFingerprint = currentFingerprint();
-		refreshStatus(ctx);
+		syncContextUsage(ctx);
 	});
 
 	pi.on("context", (event: any, ctx: any) => {
 		syncCostFromMessages(event.messages ?? []);
-		refreshStatus(ctx);
+		syncContextUsage(ctx);
 		return undefined;
 	});
 
@@ -241,7 +235,7 @@ export default function (pi: ExtensionAPI) {
 		lastTurnCost = cost;
 		sessionCost += cost;
 		acceptedFingerprint = currentFingerprint();
-		refreshStatus(ctx);
+		syncContextUsage(ctx);
 	});
 
 	pi.on("input", async (event: any, ctx: any) => {
