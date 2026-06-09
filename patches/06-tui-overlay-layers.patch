@@ -1,17 +1,20 @@
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 824ac82f..ce85e32f 100644
+index 9f6dda4b..932f20f4 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
-@@ -94,6 +94,8 @@ export { visibleWidth };
+@@ -91,6 +91,11 @@ export const CURSOR_MARKER = "\x1b_pi:c\x07";
+ 
+ export { visibleWidth };
+ 
++/**
++ * Overlay render layer. Lower layers render earlier.
++ */
++export type OverlayLayer = "background" | "backdrop" | "normal" | "foreground";
++
  /**
   * Anchor position for overlays
   */
-+export type OverlayLayer = "background" | "backdrop" | "normal" | "foreground";
-+
- export type OverlayAnchor =
- 	| "center"
- 	| "top-left"
-@@ -139,6 +141,9 @@ function isTermuxSession(): boolean {
+@@ -139,6 +144,9 @@ function isTermuxSession(): boolean {
   * Values can be absolute numbers or percentage strings (e.g., "50%").
   */
  export interface OverlayOptions {
@@ -21,15 +24,15 @@ index 824ac82f..ce85e32f 100644
  	// === Sizing ===
  	/** Width in columns, or percentage of terminal width (e.g., "50%") */
  	width?: SizeValue;
-@@ -269,6 +274,7 @@ export class TUI extends Container {
- 		hidden: boolean;
- 		focusOrder: number;
- 	}[] = [];
+@@ -290,6 +298,7 @@ export class TUI extends Container {
+ 	private focusOrderCounter = 0;
+ 	private overlayStack: OverlayStackEntry[] = [];
+ 	private overlayFocusRestore: OverlayFocusRestoreState = { status: "inactive" };
 +	private overlayProtectedBottomRowsProvider?: (width: number, height: number) => number;
  
  	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
  		super();
-@@ -308,6 +314,21 @@ export class TUI extends Container {
+@@ -329,6 +338,21 @@ export class TUI extends Container {
  		this.clearOnShrink = enabled;
  	}
  
@@ -49,9 +52,9 @@ index 824ac82f..ce85e32f 100644
 +	}
 +
  	setFocus(component: Component | null): void {
- 		// Clear focused flag on old component
- 		if (isFocusable(this.focusedComponent)) {
-@@ -754,16 +775,25 @@ export class TUI extends Container {
+ 		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
+ 	}
+@@ -928,16 +952,25 @@ export class TUI extends Container {
  		}
  	}
  
@@ -82,7 +85,7 @@ index 824ac82f..ce85e32f 100644
  		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
  		for (const entry of visibleEntries) {
  			const { component, options } = entry;
-@@ -790,7 +820,7 @@ export class TUI extends Container {
+@@ -964,7 +997,7 @@ export class TUI extends Container {
  		// Pad to at least terminal height so overlays have screen-relative positions.
  		// Excludes maxLinesRendered: the historical high-water mark caused self-reinforcing
  		// inflation that pushed content into scrollback on terminal widen.
@@ -91,7 +94,7 @@ index 824ac82f..ce85e32f 100644
  
  		// Extend result with empty lines if content is too short for overlay placement or working area
  		while (result.length < workingHeight) {
-@@ -813,6 +843,12 @@ export class TUI extends Container {
+@@ -987,9 +1020,63 @@ export class TUI extends Container {
  			}
  		}
  
@@ -104,21 +107,13 @@ index 824ac82f..ce85e32f 100644
  		return result;
  	}
  
-@@ -922,6 +958,57 @@ export class TUI extends Container {
- 		return sliceByColumn(result, 0, totalWidth, true);
- 	}
- 
 +	/** Insert blank rows above protected bottom UI so it stays anchored to the terminal bottom when content is short. */
 +	private anchorProtectedBottomRows(lines: string[], width: number, height: number): string[] {
 +		const protectedRows = this.getOverlayProtectedBottomRows(width, height);
 +		if (protectedRows <= 0 || lines.length >= height) return lines;
 +		const blankRows = height - lines.length;
 +		const insertAt = Math.max(0, lines.length - protectedRows);
-+		return [
-+			...lines.slice(0, insertAt),
-+			...Array.from({ length: blankRows }, () => ""),
-+			...lines.slice(insertAt),
-+		];
++		return [...lines.slice(0, insertAt), ...Array.from({ length: blankRows }, () => ""), ...lines.slice(insertAt)];
 +	}
 +
 +	/** Restore the bottom rows of the base render over backdrop overlays. */
@@ -150,7 +145,8 @@ index 824ac82f..ce85e32f 100644
 +		const afterTarget = Math.max(0, totalWidth - actualBeforeWidth - foreground.width);
 +		const afterPad = Math.max(0, afterTarget - background.afterWidth);
 +		const r = TUI.SEGMENT_RESET;
-+		const result = background.before + " ".repeat(beforePad) + r + foreground.text + r + background.after + " ".repeat(afterPad);
++		const result =
++			background.before + " ".repeat(beforePad) + r + foreground.text + r + background.after + " ".repeat(afterPad);
 +
 +		const resultWidth = visibleWidth(result);
 +		if (resultWidth <= totalWidth) {
@@ -159,10 +155,10 @@ index 824ac82f..ce85e32f 100644
 +		return sliceByColumn(result, 0, totalWidth, true);
 +	}
 +
- 	/**
- 	 * Find and extract cursor position from rendered lines.
- 	 * Searches for CURSOR_MARKER, calculates its position, and strips it from the output.
-@@ -968,10 +1055,20 @@ export class TUI extends Container {
+ 	private static readonly SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
+ 
+ 	private applyLineResets(lines: string[]): string[] {
+@@ -1142,10 +1229,20 @@ export class TUI extends Container {
  
  		// Render all components to get new lines
  		let newLines = this.render(width);

@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/core/extensions/runner.ts b/packages/coding-agent/src/core/extensions/runner.ts
-index c37a4588..c101caa6 100644
+index 3030b65d..0cfd7873 100644
 --- a/packages/coding-agent/src/core/extensions/runner.ts
 +++ b/packages/coding-agent/src/core/extensions/runner.ts
-@@ -887,7 +887,7 @@ export class ExtensionRunner {
+@@ -937,7 +937,7 @@ export class ExtensionRunner {
  		return currentMessages;
  	}
  
@@ -11,7 +11,7 @@ index c37a4588..c101caa6 100644
  		const ctx = this.createContext();
  		let currentPayload = payload;
  
-@@ -900,6 +900,7 @@ export class ExtensionRunner {
+@@ -950,6 +950,7 @@ export class ExtensionRunner {
  					const event: BeforeProviderRequestEvent = {
  						type: "before_provider_request",
  						payload: currentPayload,
@@ -20,10 +20,10 @@ index c37a4588..c101caa6 100644
  					const handlerResult = await handler(event, ctx);
  					if (handlerResult !== undefined) {
 diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
-index 4c1b6fca..54c5ee1d 100644
+index 7575d8af..70327c38 100644
 --- a/packages/coding-agent/src/core/extensions/types.ts
 +++ b/packages/coding-agent/src/core/extensions/types.ts
-@@ -611,6 +611,7 @@ export interface ContextEvent {
+@@ -642,6 +642,7 @@ export interface ContextEvent {
  export interface BeforeProviderRequestEvent {
  	type: "before_provider_request";
  	payload: unknown;
@@ -32,11 +32,11 @@ index 4c1b6fca..54c5ee1d 100644
  
  /** Fired after a provider response is received and before the response stream is consumed. */
 diff --git a/packages/coding-agent/src/core/sdk.ts b/packages/coding-agent/src/core/sdk.ts
-index 8bc96072..7492957b 100644
+index e6db747b..59ba211a 100644
 --- a/packages/coding-agent/src/core/sdk.ts
 +++ b/packages/coding-agent/src/core/sdk.ts
-@@ -344,12 +344,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
- 						: undefined,
+@@ -327,12 +327,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 				),
  			});
  		},
 -		onPayload: async (payload, _model) => {
@@ -51,10 +51,10 @@ index 8bc96072..7492957b 100644
  		onResponse: async (response, _model) => {
  			const runner = extensionRunnerRef.current;
 diff --git a/packages/coding-agent/test/suite/harness.ts b/packages/coding-agent/test/suite/harness.ts
-index 16a8182e..aa937bbb 100644
+index cec82013..85680224 100644
 --- a/packages/coding-agent/test/suite/harness.ts
 +++ b/packages/coding-agent/test/suite/harness.ts
-@@ -140,7 +140,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
+@@ -143,7 +143,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
  			if (!runner?.hasHandlers("before_provider_request")) {
  				return payload;
  			}

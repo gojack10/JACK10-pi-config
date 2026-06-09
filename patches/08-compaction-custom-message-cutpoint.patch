@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/core/compaction/compaction.ts b/packages/coding-agent/src/core/compaction/compaction.ts
-index b8339fba..79d6b3e0 100644
+index eae19794..4aa479dc 100644
 --- a/packages/coding-agent/src/core/compaction/compaction.ts
 +++ b/packages/coding-agent/src/core/compaction/compaction.ts
 @@ -395,16 +395,21 @@ export function findCutPoint(
@@ -29,7 +29,7 @@ index b8339fba..79d6b3e0 100644
  		accumulatedTokens += messageTokens;
  
  		// Check if we've exceeded the budget
-@@ -420,30 +425,34 @@ export function findCutPoint(
+@@ -420,30 +425,35 @@ export function findCutPoint(
  		}
  	}
  
@@ -60,7 +60,8 @@ index b8339fba..79d6b3e0 100644
 -	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
 -	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 +	const cutEntryStartsTurn =
-+		(cutEntry.type === "message" && (cutEntry.message.role === "user" || cutEntry.message.role === "bashExecution")) ||
++		(cutEntry.type === "message" &&
++			(cutEntry.message.role === "user" || cutEntry.message.role === "bashExecution")) ||
 +		cutEntry.type === "custom_message" ||
 +		cutEntry.type === "branch_summary";
 +	const turnStartIndex = cutEntryStartsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
@@ -73,58 +74,3 @@ index b8339fba..79d6b3e0 100644
  	};
  }
  
-diff --git a/packages/coding-agent/test/compaction-cutpoint.test.ts b/packages/coding-agent/test/compaction-cutpoint.test.ts
-new file mode 100644
-index 00000000..79a58fe4
---- /dev/null
-+++ b/packages/coding-agent/test/compaction-cutpoint.test.ts
-@@ -0,0 +1,49 @@
-+import { describe, expect, it } from "vitest";
-+import { prepareCompaction } from "../src/core/compaction/index.ts";
-+import type { CompactionEntry, CustomMessageEntry, SessionEntry } from "../src/core/session-manager.ts";
-+
-+function customMessage(id: string, parentId: string | null, content: string): CustomMessageEntry {
-+	return {
-+		type: "custom_message",
-+		id,
-+		parentId,
-+		timestamp: "2026-01-01T00:00:00.000Z",
-+		customType: "test-extension",
-+		content,
-+		display: true,
-+	};
-+}
-+
-+function compaction(id: string, parentId: string | null, firstKeptEntryId: string): CompactionEntry {
-+	return {
-+		type: "compaction",
-+		id,
-+		parentId,
-+		timestamp: "2026-01-01T00:00:00.000Z",
-+		summary: "previous summary",
-+		firstKeptEntryId,
-+		tokensBefore: 1000,
-+	};
-+}
-+
-+describe("prepareCompaction cut point", () => {
-+	it("counts custom_message entries when choosing the next kept boundary", () => {
-+		const huge = "x".repeat(10_000);
-+		const entries: SessionEntry[] = [
-+			customMessage("k0", null, "previous kept message"),
-+			compaction("cmp1", "k0", "k0"),
-+			customMessage("c1", "cmp1", huge),
-+			customMessage("c2", "c1", huge),
-+			customMessage("c3", "c2", huge),
-+		];
-+
-+		const prep = prepareCompaction(entries, {
-+			enabled: true,
-+			reserveTokens: 4096,
-+			keepRecentTokens: 1000,
-+		});
-+
-+		expect(prep?.firstKeptEntryId).toBe("c3");
-+		expect(prep?.isSplitTurn).toBe(false);
-+	});
-+});

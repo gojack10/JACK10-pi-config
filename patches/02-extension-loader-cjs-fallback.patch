@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
-index b2d7b275..4d7121bd 100644
+index 081d2d11..a092698b 100644
 --- a/packages/coding-agent/src/core/extensions/loader.ts
 +++ b/packages/coding-agent/src/core/extensions/loader.ts
 @@ -84,7 +84,11 @@ function getAliases(): Record<string, string> {

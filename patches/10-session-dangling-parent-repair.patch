@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
-index 914da08d..7417b4a1 100644
+index c2bae164..2147c740 100644
 --- a/packages/coding-agent/src/core/session-manager.ts
 +++ b/packages/coding-agent/src/core/session-manager.ts
-@@ -283,6 +283,32 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
+@@ -285,6 +285,32 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
  	return true;
  }
  
@@ -35,7 +35,7 @@ index 914da08d..7417b4a1 100644
  /** Exported for testing */
  export function migrateSessionEntries(entries: FileEntry[]): void {
  	migrateToCurrentVersion(entries);
-@@ -792,7 +818,9 @@ export class SessionManager {
+@@ -808,7 +834,9 @@ export class SessionManager {
  			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
  			this.sessionId = header?.id ?? createSessionId();
  
