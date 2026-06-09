@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/modes/interactive/components/model-selector.ts b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
-index 613ca9e1..79267858 100644
+index b9f5ec77..33b3f640 100644
 --- a/packages/coding-agent/src/modes/interactive/components/model-selector.ts
 +++ b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
 @@ -61,6 +61,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
@@ -55,10 +55,10 @@ index 613ca9e1..79267858 100644
  			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
  			if (aIsCurrent && !bIsCurrent) return -1;
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index 00183be8..206ecd12 100644
+index f90cffab..a1c017d8 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-@@ -379,6 +379,15 @@ export class InteractiveMode {
+@@ -419,6 +419,15 @@ export class InteractiveMode {
  		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
  		this.footer = new FooterComponent(this.session, this.footerDataProvider);
  		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
@@ -74,7 +74,7 @@ index 00183be8..206ecd12 100644
  
  		// Load hide thinking block setting
  		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
-@@ -3995,6 +4004,38 @@ export class InteractiveMode {
+@@ -4235,6 +4250,42 @@ export class InteractiveMode {
  	}
  
  	private showModelSelector(initialSearchInput?: string): void {
@@ -106,14 +106,18 @@ index 00183be8..206ecd12 100644
 +					if (data?.order && Array.isArray(data.order)) {
 +						modelOrder = new Set(data.order.map((r: any) => `${r.provider}/${r.modelId}`));
 +					}
-+				} catch { /* ignore */ }
++				} catch {
++					/* ignore */
++				}
 +			}
-+		} catch { /* ignore any errors reading entries */ }
++		} catch {
++			/* ignore any errors reading entries */
++		}
 +
  		this.showSelector((done) => {
  			const selector = new ModelSelectorComponent(
  				this.ui,
-@@ -4021,6 +4062,7 @@ export class InteractiveMode {
+@@ -4261,6 +4312,7 @@ export class InteractiveMode {
  					this.ui.requestRender();
  				},
  				initialSearchInput,
