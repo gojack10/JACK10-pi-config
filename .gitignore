@@ -22,4 +22,5 @@ settings.local.json
 
 # Machine-local model registry (per-host endpoints, API keys)
 models.json
-models.json.bak
+models.json.bak*
+trust.json
