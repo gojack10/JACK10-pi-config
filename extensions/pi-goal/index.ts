@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, Spacer, Text } from "@mariozechner/pi-tui";
-import { tokenDeltaFromUsage } from "./usage";
+import { tokenDeltaFromUsage, type UsageSnapshot } from "./usage";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
@@ -96,9 +96,15 @@ function goalEventStatus(kind: GoalEventKind): string {
 function goalContentForLLM(kind: GoalEventKind, state: GoalState): string {
 	switch (kind) {
 		case "active":
-		case "continuation":
 		case "resumed":
 			return continuationPrompt(state);
+		case "continuation":
+			// Deliberately slim: continuation events accumulate in history every
+			// iteration of the goal loop. Keeping them tiny lets us leave them in
+			// context untouched, which preserves the provider prompt cache.
+			// Pruning or rewriting them after the fact busts the cache for the
+			// entire previous turn on every request.
+			return slimContinuationPrompt(state);
 		case "budget_limited":
 			return budgetLimitPrompt(state);
 		case "paused":
@@ -185,6 +191,13 @@ function objectivePreview(objective: string): string {
 	return `${text.slice(0, OBJECTIVE_PREVIEW_CHARS).trimEnd()}\n\n[Objective truncated for context hygiene. Call get_goal for the full objective before relying on exact requirements.]`;
 }
 
+function slimContinuationPrompt(state: GoalState): string {
+	const budget = state.tokenBudget == null
+		? `time spent ${state.timeUsedSeconds}s`
+		: `${state.tokensUsed} / ${state.tokenBudget} tokens used`;
+	return `Continue working toward the active thread goal (${budget}). Pick the next concrete action; avoid repeating completed work. Call get_goal if you need the full objective. Only call update_goal complete after a strict audit verifying every requirement against concrete evidence.`;
+}
+
 function continuationPrompt(state: GoalState): string {
 	const tokenBudget = state.tokenBudget == null ? "none" : String(state.tokenBudget);
 	const remainingTokens = state.tokenBudget == null ? "n/a" : String(Math.max(0, state.tokenBudget - state.tokensUsed));
@@ -236,14 +249,6 @@ function isGoalEventMessage(message: any): boolean {
 	return message?.role === "custom" && message.customType === EVENT_TYPE;
 }
 
-function compactGoalEventMessage(message: any): any {
-	const details = message.details as { kind?: GoalEventKind; goal?: GoalState | null } | undefined;
-	const state = details?.goal;
-	if (!state) return message;
-	const kind = details?.kind ?? "continuation";
-	return { ...message, content: goalContentForLLM(kind, state) };
-}
-
 function isInfrastructureError(message: any): boolean {
 	if (message?.role !== "assistant" || message.stopReason !== "error") return false;
 	return /context_length_exceeded|usage limit|Operation aborted/i.test(message.errorMessage ?? "");
@@ -273,21 +278,18 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.on("context", (event) => {
-		let latestGoalEventIndex = -1;
-		for (let i = 0; i < event.messages.length; i++) {
-			if (isGoalEventMessage(event.messages[i])) latestGoalEventIndex = i;
-		}
-		if (latestGoalEventIndex === -1) return;
+		// CACHE SAFETY: never remove or rewrite goal events here. They are part of
+		// the cached prompt prefix; pruning "superseded" events used to invalidate
+		// the provider prompt cache back to the previous turn on every request.
+		// Continuation events are slim by construction instead (slimContinuationPrompt).
+		if (!event.messages.some((m) => isGoalEventMessage(m) || isInfrastructureError(m))) return;
 
-		const messages = event.messages.flatMap((message, index) => {
-			if (isGoalEventMessage(message)) {
-				return index === latestGoalEventIndex ? [compactGoalEventMessage(message)] : [];
-			}
+		const messages = event.messages.filter((message) => {
 			// Repeated provider/rate/context errors from an autonomous goal loop are
 			// infrastructure noise. Keeping them in prompt context can cause the loop
-			// to spiral after recovery.
-			if (isInfrastructureError(message)) return [];
-			return [message];
+			// to spiral after recovery. Filtering is deterministic per message, so it
+			// only busts the cache once when the error first leaves context.
+			return !isInfrastructureError(message);
 		});
 		return { messages };
 	});
