@@ -10,11 +10,22 @@
  * Auth: set SIFTTEXT_API_KEY env var (sk-... key from SiftText API key management)
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { callMcpTool, initializeMcp, listMcpTools, mcpTextContent } from "../_shared/mcp-http";
+import {
+	hasSiftTextPullDone,
+	inputIncludesSiftTextIdeationWrite,
+	isKnownToolWrapper,
+	isSiftTextIdeationWriteTool,
+	normNodeId,
+	rememberSiftTextPullRead,
+	requiredSiftTextPullNode,
+	siftTextPullBlockReason,
+	siftTextToolTargetNodeId,
+} from "../_shared/sifttext-pull-gate";
 
 const MCP_URL = "https://app.sifttext.com/mcp";
 const CONNECT_TIMEOUT_MS = 2_000;
@@ -105,6 +116,71 @@ type CachedTool = {
 	description: string;
 	inputSchema: Record<string, unknown>;
 };
+
+type SiftTextPullGateState = {
+	pullNodeIds: Set<string>;
+};
+
+const PULL_STATE_STATE_ENTRY = "sifttext-pull-gate-state";
+
+function freshPullGateState(): SiftTextPullGateState {
+	return { pullNodeIds: new Set() };
+}
+
+function restorePullGateState(ctx: ExtensionContext, state: SiftTextPullGateState) {
+	state.pullNodeIds = new Set();
+	const entries = ctx.sessionManager.getEntries();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as { type?: string; customType?: string; data?: Record<string, unknown> };
+		if (entry.type !== "custom" || entry.customType !== PULL_STATE_STATE_ENTRY || !entry.data) continue;
+		const ids = Array.isArray(entry.data.pullNodeIds)
+			? (entry.data.pullNodeIds as unknown[])
+			: [];
+		state.pullNodeIds = new Set(
+			ids
+				.filter((id): id is string => typeof id === "string")
+				.map(normNodeId)
+				.filter((id) => Boolean(requiredSiftTextPullNode(id))),
+		);
+		return;
+	}
+}
+
+function persistPullGateState(pi: ExtensionAPI, state: SiftTextPullGateState) {
+	pi.appendEntry(PULL_STATE_STATE_ENTRY, {
+		pullDone: hasSiftTextPullDone(state),
+		pullNodeIds: [...state.pullNodeIds],
+	});
+}
+
+function registerSiftTextPullGate(pi: ExtensionAPI) {
+	const state = freshPullGateState();
+
+	pi.on("session_start", async (_event, ctx) => {
+		restorePullGateState(ctx, state);
+	});
+
+	pi.on("tool_call", async (event) => {
+		const input = (event.input ?? {}) as Record<string, unknown>;
+
+		// Only real ideation_get_node tool calls witness the pre-write pull.
+		if (event.toolName === "ideation_get_node") {
+			const beforeSize = state.pullNodeIds.size;
+			const beforeDone = hasSiftTextPullDone(state);
+			const read = rememberSiftTextPullRead(state, siftTextToolTargetNodeId(input));
+			if (read && (state.pullNodeIds.size !== beforeSize || read.done !== beforeDone)) {
+				persistPullGateState(pi, state);
+			}
+			return;
+		}
+
+		const directWrite = isSiftTextIdeationWriteTool(event.toolName);
+		const wrappedWrite = isKnownToolWrapper(event.toolName) && inputIncludesSiftTextIdeationWrite(input);
+		if ((directWrite || wrappedWrite) && !hasSiftTextPullDone(state)) {
+			return { block: true, reason: siftTextPullBlockReason(state, "sifttext") };
+		}
+	});
+}
 
 // ── Lazy imports ────────────────────────────────────────────────────────────
 
@@ -256,7 +332,8 @@ export default async function (pi: ExtensionAPI) {
 		} catch {}
 	}
 
-	// 3. Register tools from cache (instant — TypeBox import only)
+	// 3. Register the global write gate, then tools from cache (instant — TypeBox import only)
+	registerSiftTextPullGate(pi);
 	await registerTools(pi, tools, token);
 	console.log(`[sifttext-mcp] Registered ${tools.length} SiftText tools`);
 }
