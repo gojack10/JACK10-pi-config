@@ -31,8 +31,8 @@ type ProxyModel = {
 
 const FALLBACK_MODELS: ProxyModel[] = [
 	{ id: GEMMA_ID, name: "Gemma 4 12B (tunnel)", reasoning: false, input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
-	{ id: QWEN_27_ID, name: "Qwen3.6 27B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 262144, maxTokens: 262144, compat: { maxTokensField: "max_tokens" } },
-	{ id: QWEN_35_ID, name: "Qwen3.6 35B-A3B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 262144, maxTokens: 262144, compat: { maxTokensField: "max_tokens" } },
+	{ id: QWEN_27_ID, name: "Qwen3.6 27B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 130000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
+	{ id: QWEN_35_ID, name: "Qwen3.6 35B-A3B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 85000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
 	{ id: DEEPSEEK_ID, name: "DeepSeek V4 Flash (tunnel)", reasoning: true, input: ["text"], contextWindow: 524288, maxTokens: 393216, compat: { maxTokensField: "max_tokens" } },
 ];
 
@@ -46,8 +46,8 @@ function displayName(id: string, name?: string): string {
 
 function metaFor(id: string): Omit<ProxyModel, "id" | "name"> {
 	if (id === GEMMA_ID) return { reasoning: false, input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
-	if (id === QWEN_27_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 262144, maxTokens: 262144, compat: { maxTokensField: "max_tokens" } };
-	if (id === QWEN_35_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 262144, maxTokens: 262144, compat: { maxTokensField: "max_tokens" } };
+	if (id === QWEN_27_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 130000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
+	if (id === QWEN_35_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 85000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
 	if (id === DEEPSEEK_ID) return { reasoning: true, input: ["text"], contextWindow: 524288, maxTokens: 393216, compat: { maxTokensField: "max_tokens" } };
 	return { reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
 }
