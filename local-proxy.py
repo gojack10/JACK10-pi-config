@@ -523,30 +523,51 @@ async def stop_dsv4():
 async def start_dsv4():
     uid = os.getuid()
     plist = str(Path.home() / "Library" / "LaunchAgents" / "com.dsv4.server.plist")
+    label = f"gui/{uid}/{DS4_SERVICE_LABEL}"
     log.info("starting dsv4")
-    try:
-        # Bootstrap the service definition (idempotent if already loaded).
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/launchctl", "bootstrap", f"gui/{uid}", plist,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode != 0:
-            err = (stderr or stdout).decode()[:300]
-            log.debug(f"launchctl bootstrap note: {err}")
-        # Kickstart to actually run the service.
-        proc2 = await asyncio.create_subprocess_exec(
-            "/bin/launchctl", "kickstart", f"gui/{uid}/{DS4_SERVICE_LABEL}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=15)
-        if proc2.returncode != 0:
-            err2 = (stderr2 or stdout2).decode()[:300]
-            log.warning(f"launchctl kickstart: {err2}")
-    except Exception as e:
-        log.warning(f"start_dsv4 error: {e}")
+
+    for attempt in range(2):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/launchctl", "bootstrap", f"gui/{uid}", plist,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode != 0:
+                err = (stderr or stdout).decode()[:300]
+                log.debug(f"launchctl bootstrap note: {err}")
+            proc2 = await asyncio.create_subprocess_exec(
+                "/bin/launchctl", "kickstart", label,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=15)
+            if proc2.returncode != 0:
+                err2 = (stderr2 or stdout2).decode()[:300]
+                log.warning(f"launchctl kickstart: {err2}")
+        except Exception as e:
+            log.warning(f"start_dsv4 error: {e}")
+
+        # Verify the service actually exists in launchd (race: bootout between
+        # idle stop and this start can leave no service loaded).
+        try:
+            proc3 = await asyncio.create_subprocess_exec(
+                "/bin/launchctl", "print", label,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout3, stderr3 = await asyncio.wait_for(proc3.communicate(), timeout=10)
+            if proc3.returncode == 0:
+                return  # service is loaded
+            log.warning(f"dsv4 not loaded after attempt {attempt+1}, retrying")
+        except Exception as e:
+            log.warning(f"dsv4 verify error: {e}")
+
+        if attempt == 0:
+            await asyncio.sleep(1)
+
+    log.warning("dsv4 failed to load after 2 attempts; will timeout in caller")
 
 
 async def ds4_idle_check_loop():
