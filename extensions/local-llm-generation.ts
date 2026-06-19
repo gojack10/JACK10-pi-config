@@ -190,6 +190,7 @@ function formatDecode(data: ProgressData): string {
 export default function (pi: ExtensionAPI) {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let animTimer: ReturnType<typeof setInterval> | null = null;
+  let sessionToken: {} | null = null;
 
   function stopTimers() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -209,6 +210,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", async (_event, ctx: ExtensionContext) => {
     stopTimers();
+    const myToken = {};
+    sessionToken = myToken;
     ctx.ui.setWorkingMessage(undefined);
 
     const monitor = loadMonitorConfig(ctx);
@@ -229,6 +232,7 @@ export default function (pi: ExtensionAPI) {
     const authHeaders = cookieValue ? { Cookie: cookieValue } : {};
 
     pollTimer = setInterval(async () => {
+      if (sessionToken !== myToken) return;
       try {
         const stats = await fetchJSON(monitor.statsUrl, authHeaders);
         const models: LoadedModel[] = stats?.active_models?.models || [];
@@ -301,6 +305,7 @@ export default function (pi: ExtensionAPI) {
     }, POLL_MS);
 
     animTimer = setInterval(() => {
+      if (sessionToken !== myToken) return;
       if (gtLastPollTime === 0) return;
       if (!hasActivity || gtTotal <= 0) return;
 
