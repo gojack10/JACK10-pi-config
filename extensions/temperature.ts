@@ -34,6 +34,36 @@ function saveTemp(v: number | null) {
 	writeFileSync(CONFIG_FILE, JSON.stringify({ temp: v }), "utf-8");
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stripTemperature(payload: Record<string, unknown>): Record<string, unknown> {
+	const { temperature: _temperature, ...rest } = payload;
+	return rest;
+}
+
+function modelRejectsTemperature(model: unknown): boolean {
+	if (!isPlainObject(model)) return false;
+
+	const provider = String(model.provider ?? "").toLowerCase();
+	const api = String(model.api ?? "").toLowerCase();
+	const id = String(model.id ?? "").toLowerCase();
+	const isOpenAI =
+		provider === "openai" ||
+		provider.startsWith("openai-") ||
+		provider === "azure-openai-responses" ||
+		api === "azure-openai-responses";
+
+	// ponytail: OpenAI reasoning/Codex models reject sampling knobs; keep temp for local/HF/OpenRouter models.
+	return (
+		provider.includes("codex") ||
+		api.includes("codex") ||
+		id.includes("codex") ||
+		(isOpenAI && (/^(gpt-5(?:\.|-|$)|o\d(?:\.|-|$))/.test(id) || model.reasoning === true))
+	);
+}
+
 /* ── Slider component ────────────────────────────────────────────────── */
 
 class TempSlider {
@@ -202,20 +232,16 @@ export default function (pi: ExtensionAPI) {
 		currentTemp = loadTemp();
 	});
 
-	// Inject temperature into every provider request.
-	// Codex rejects `temperature` with 400 "Unsupported parameter", so skip it there.
+	// Inject temperature only where the model accepts it.
 	pi.on("before_provider_request", (event, ctx) => {
-		if (currentTemp === null) return undefined;
+		if (!isPlainObject(event.payload)) return undefined;
 
-		const provider = ctx.model?.provider?.toLowerCase() ?? "";
-		const modelId = ctx.model?.id?.toLowerCase() ?? "";
-		if (provider.includes("codex") || modelId.includes("codex")) return undefined;
-
-		if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) {
-			return undefined;
+		if (modelRejectsTemperature(ctx.model)) {
+			return "temperature" in event.payload ? stripTemperature(event.payload) : undefined;
 		}
 
-		return { ...(event.payload as Record<string, unknown>), temperature: currentTemp };
+		if (currentTemp === null) return undefined;
+		return { ...event.payload, temperature: currentTemp };
 	});
 
 	pi.registerCommand("temp", {
