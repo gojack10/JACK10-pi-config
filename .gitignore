@@ -24,3 +24,9 @@ settings.local.json
 models.json
 models.json.bak*
 trust.json
+
+# Python caches and local backups
+__pycache__/
+*.pyc
+*.py.bak*
+*.bak
