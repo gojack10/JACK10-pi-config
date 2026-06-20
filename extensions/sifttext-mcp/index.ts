@@ -25,6 +25,8 @@ import {
 	requiredSiftTextPullNode,
 	siftTextPullBlockReason,
 	siftTextToolTargetNodeId,
+	SIFTTEXT_COMMIT_PULL_NODES,
+	SIFTTEXT_IDEATION_READ_TOOLS,
 } from "../_shared/sifttext-pull-gate";
 
 const MCP_URL = "https://app.sifttext.com/mcp";
@@ -163,14 +165,27 @@ function registerSiftTextPullGate(pi: ExtensionAPI) {
 	pi.on("tool_call", async (event) => {
 		const input = (event.input ?? {}) as Record<string, unknown>;
 
-		// Only real ideation_get_node tool calls witness the pre-write pull.
-		if (event.toolName === "ideation_get_node") {
+		// Witness the PULL: any read tool that names a required node ID counts.
+		if (SIFTTEXT_IDEATION_READ_TOOLS.has(event.toolName) && event.toolName !== "ideation_sql") {
 			const beforeSize = state.pullNodeIds.size;
 			const beforeDone = hasSiftTextPullDone(state);
 			const read = rememberSiftTextPullRead(state, siftTextToolTargetNodeId(input));
 			if (read && (state.pullNodeIds.size !== beforeSize || read.done !== beforeDone)) {
 				persistPullGateState(pi, state);
 			}
+			return;
+		}
+		if (event.toolName === "ideation_sql") {
+			const query = String((input as { query?: unknown }).query ?? "").toLowerCase();
+			let changed = false;
+			for (const node of SIFTTEXT_COMMIT_PULL_NODES) {
+				const id = normNodeId(node.id);
+				if (!state.pullNodeIds.has(id) && query.includes(id)) {
+					state.pullNodeIds.add(id);
+					changed = true;
+				}
+			}
+			if (changed) persistPullGateState(pi, state);
 			return;
 		}
 
@@ -216,6 +231,8 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 	const Type = await importTypeBox();
 
 	for (const tool of tools) {
+		// ponytail: SQL-mode — skip old read tools, only ideation_sql for reads
+		if (SIFTTEXT_IDEATION_READ_TOOLS.has(tool.name) && tool.name !== "ideation_sql") continue;
 		const rawSchema = tool.inputSchema;
 		const properties = (rawSchema?.properties ?? {}) as Record<string, unknown>;
 		const required = (rawSchema?.required ?? []) as string[];
