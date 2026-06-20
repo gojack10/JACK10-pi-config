@@ -42,6 +42,14 @@ export default function (pi: ExtensionAPI) {
 	let lastCtxTokens: number | null = null;
 	let syncedFromHistory = false;
 
+	function syncActiveSettings(ctx: any): void {
+		const active = ctx.model as CostModel | undefined;
+		if (active?.provider) currentProvider = String(active.provider);
+		if (active?.id) currentModel = String(active.id);
+		const thinking = pi.getThinkingLevel?.();
+		if (thinking) currentThinking = String(thinking);
+	}
+
 	function currentFingerprint(): Fingerprint {
 		return {
 			provider: currentProvider,
@@ -59,6 +67,7 @@ export default function (pi: ExtensionAPI) {
 
 	function syncCostFromBranch(ctx: any): void {
 		try {
+			syncActiveSettings(ctx);
 			const entries = ctx.sessionManager?.getBranch?.() ?? [];
 			let total = 0;
 			let branchProvider = "";
@@ -79,10 +88,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (total > sessionCost) sessionCost = total;
 			if (!acceptedFingerprint) {
+				const live = currentFingerprint();
 				acceptedFingerprint = {
-					provider: branchProvider || currentProvider,
-					model: branchModel || currentModel,
-					thinking: branchThinking || currentThinking,
+					provider: live.provider || branchProvider,
+					model: live.model || branchModel,
+					thinking: live.thinking || branchThinking,
 					tools: lastTools,
 					systemHash: lastSystemHash,
 				};
@@ -172,6 +182,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function syncContextUsage(ctx: any): void {
+		syncActiveSettings(ctx);
 		const usage = ctx.getContextUsage?.();
 		if (usage?.tokens != null) lastCtxTokens = usage.tokens;
 		// Clear any old budget status left by previous extension versions.
@@ -226,6 +237,11 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	});
 
+	pi.on("session_compact", () => {
+		lastCtxTokens = null;
+		acceptedFingerprint = null;
+	});
+
 	pi.on("message_end", (event: any, ctx: any) => {
 		const msg = event.message;
 		if (msg?.role !== "assistant") return;
@@ -241,11 +257,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event: any, ctx: any) => {
 		if (!ctx.hasUI) return { action: "continue" };
 		if (event.source === "extension") return { action: "continue" };
+		syncActiveSettings(ctx);
 		if (!syncedFromHistory) syncCostFromBranch(ctx);
 
 		const usage = ctx.getContextUsage?.();
 		if (usage?.tokens != null) lastCtxTokens = usage.tokens;
-		const tokens: number | null = usage?.tokens ?? lastCtxTokens;
+		const tokens: number | null = usage ? usage.tokens : lastCtxTokens;
 
 		if (sessionCost >= nextBudgetThreshold) {
 			const perTurn = lastTurnCost || estimatePerTurn(ctx, tokens);
