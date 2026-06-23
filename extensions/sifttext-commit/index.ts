@@ -59,7 +59,7 @@ export default function (pi: ExtensionAPI) {
           : "Focus: (model decides based on full context)";
 
         pi.sendUserMessage(
-          `please read and perform this skill\n\n${focusBlock}\n\n${content}`
+          `please follow this skill\n\n${focusBlock}\n\n${content}`
         );
         ctx.ui.notify("Node content sent to agent", "success");
       } catch (err: unknown) {
