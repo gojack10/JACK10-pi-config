@@ -1,7 +1,7 @@
 /**
  * SiftText MCP Extension for pi
  *
- * Connects to app.sifttext.com/mcp and registers all ideation tools.
+ * Connects to app.sifttext.com/mcp and registers selected ideation tools.
  *
  * Strategy: tool schemas are cached to tool-cache.json. Cache is valid for 24h.
  * On cache hit: tools load instantly (<50ms). On cache miss/expiry: ~2s connect.
@@ -227,12 +227,13 @@ async function fetchToolSchemas(token: string): Promise<CachedTool[] | null> {
 
 // ── Register tools from schemas ─────────────────────────────────────────────
 
-async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: string) {
+async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: string): Promise<number> {
 	const Type = await importTypeBox();
+	let registered = 0;
 
 	for (const tool of tools) {
-		// ponytail: SQL-mode — skip old read tools, only ideation_sql for reads
-		if (SIFTTEXT_IDEATION_READ_TOOLS.has(tool.name) && tool.name !== "ideation_sql") continue;
+		// ponytail: only expose node/outline/sql reads plus ideation writes.
+		if (!SIFTTEXT_IDEATION_READ_TOOLS.has(tool.name) && !isSiftTextIdeationWriteTool(tool.name)) continue;
 		const rawSchema = tool.inputSchema;
 		const properties = (rawSchema?.properties ?? {}) as Record<string, unknown>;
 		const required = (rawSchema?.required ?? []) as string[];
@@ -266,6 +267,7 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 		const parameters =
 			Object.keys(optionalProps).length > 0 ? Type.Object(optionalProps) : Type.Object({});
 
+		registered++;
 		pi.registerTool({
 			name: tool.name,
 			label: tool.name.replace(/_/g, " "),
@@ -308,6 +310,8 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 			},
 		});
 	}
+
+	return registered;
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -351,6 +355,6 @@ export default async function (pi: ExtensionAPI) {
 
 	// 3. Register the global write gate, then tools from cache (instant — TypeBox import only)
 	registerSiftTextPullGate(pi);
-	await registerTools(pi, tools, token);
-	console.log(`[sifttext-mcp] Registered ${tools.length} SiftText tools`);
+	const registered = await registerTools(pi, tools, token);
+	console.log(`[sifttext-mcp] Registered ${registered} SiftText tools`);
 }
