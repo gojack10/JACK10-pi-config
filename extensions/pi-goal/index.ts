@@ -159,23 +159,14 @@ function updateStatusBar(ctx: ExtensionContext) {
 	ctx.ui.setStatus(CUSTOM_TYPE, statusBarEnabled ? statusLine(goal) ?? "" : "");
 }
 
-const GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
-
-// Expose goal tools to the LLM only while a goal is actively being pursued.
-// When no goal exists (or it is paused / complete / budget-limited), keep them
-// hidden so unrelated sessions are not tempted to call them every turn.
-function syncGoalTools(pi: ExtensionAPI) {
-	const want = goal?.status === "active";
-	const active = new Set(pi.getActiveTools());
-	for (const name of GOAL_TOOL_NAMES) (want ? active.add(name) : active.delete(name));
-	pi.setActiveTools(Array.from(active));
-}
-
+// Keep goal tools registered/active instead of toggling them on activation.
+// pi.setActiveTools() rebuilds the system prompt and provider tool payload; doing
+// that inside /goal activate invalidates the prompt cache before the first goal turn.
+// The tools are harmless when no goal exists: get_goal returns null, update_goal errors.
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	goal = next;
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled });
 	updateStatusBar(ctx);
-	syncGoalTools(pi);
 }
 
 function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
@@ -298,9 +289,9 @@ export default function piGoal(pi: ExtensionAPI) {
 		name: "get_goal",
 		label: "Get Goal",
 		description: "Read the current active thread goal, if one exists.",
-		promptSnippet: "Read the current pi-goal objective and remaining budget while pursuing it",
+		promptSnippet: "Read the active /goal objective and remaining budget; returns null when no goal is active",
 		promptGuidelines: [
-			"Only call get_goal when you actually need the current objective or remaining budget; the continuation prompt already injects them.",
+			"Call get_goal only during an active /goal run when the injected objective preview is insufficient.",
 		],
 		parameters: {
 			type: "object",
@@ -316,9 +307,9 @@ export default function piGoal(pi: ExtensionAPI) {
 		name: "update_goal",
 		label: "Update Goal",
 		description: "Mark the current thread goal complete. This tool only accepts status=complete.",
-		promptSnippet: "Mark the current goal complete after a strict completion audit",
+		promptSnippet: "Mark an active /goal complete after a strict completion audit",
 		promptGuidelines: [
-			"Use update_goal only when the current pi-goal objective is fully achieved and verified against concrete evidence.",
+			"Call update_goal only during an active /goal run when the objective is fully achieved and verified against concrete evidence.",
 			"Do not use update_goal to pause, resume, abandon, or budget-limit a goal.",
 		],
 		parameters: {
@@ -435,8 +426,6 @@ export default function piGoal(pi: ExtensionAPI) {
 		statusBarEnabled = restored.statusBarEnabled;
 		continuationQueued = false;
 		activeTurnStartedAt = null;
-		// Hide goal tools from the LLM unless we have an active goal to pursue.
-		syncGoalTools(pi);
 		if (goal?.status === "active" && event.reason === "reload") {
 			// Reload pauses an active goal so it does not silently resume.
 			// We do not emit a goal event — the LLM has nothing to do here —
