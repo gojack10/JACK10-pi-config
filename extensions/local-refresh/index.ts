@@ -42,7 +42,7 @@ export default function (pi: ExtensionAPI) {
         const content = await fetchNodeContent();
 
         pi.sendUserMessage(
-          `please read and perform this skill\n\n--- Node f0000000-0000-4000-8000-5af91e69ec79 ---\n\n${content}`
+          `please follow this skill\n\n--- Node f0000000-0000-4000-8000-5af91e69ec79 ---\n\n${content}`
         );
         ctx.ui.notify("Node content sent to agent", "success");
       } catch (err: unknown) {

@@ -46,7 +46,7 @@ export default function (pi: ExtensionAPI) {
           : "Instruction: (full SKILL.md — agent decides how to use)";
 
         pi.sendUserMessage(
-          `please read and perform this skill\n\n${focusBlock}\n\n${content}`,
+          `please follow this skill\n\n${focusBlock}\n\n${content}`,
         );
         ctx.ui.notify("browser-harness skill sent to agent", "success");
       } catch (err: unknown) {
