@@ -1,8 +1,8 @@
 diff --git a/packages/tui/src/tui.ts b/packages/tui/src/tui.ts
-index 9f6dda4b..932f20f4 100644
+index a7054888..41a90b34 100644
 --- a/packages/tui/src/tui.ts
 +++ b/packages/tui/src/tui.ts
-@@ -91,6 +91,11 @@ export const CURSOR_MARKER = "\x1b_pi:c\x07";
+@@ -121,6 +121,11 @@ export const CURSOR_MARKER = "\x1b_pi:c\x07";
  
  export { visibleWidth };
  
@@ -14,7 +14,7 @@ index 9f6dda4b..932f20f4 100644
  /**
   * Anchor position for overlays
   */
-@@ -139,6 +144,9 @@ function isTermuxSession(): boolean {
+@@ -169,6 +174,9 @@ function isTermuxSession(): boolean {
   * Values can be absolute numbers or percentage strings (e.g., "50%").
   */
  export interface OverlayOptions {
@@ -24,7 +24,7 @@ index 9f6dda4b..932f20f4 100644
  	// === Sizing ===
  	/** Width in columns, or percentage of terminal width (e.g., "50%") */
  	width?: SizeValue;
-@@ -290,6 +298,7 @@ export class TUI extends Container {
+@@ -324,6 +332,7 @@ export class TUI extends Container {
  	private focusOrderCounter = 0;
  	private overlayStack: OverlayStackEntry[] = [];
  	private overlayFocusRestore: OverlayFocusRestoreState = { status: "inactive" };
@@ -32,7 +32,7 @@ index 9f6dda4b..932f20f4 100644
  
  	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
  		super();
-@@ -329,6 +338,21 @@ export class TUI extends Container {
+@@ -363,6 +372,21 @@ export class TUI extends Container {
  		this.clearOnShrink = enabled;
  	}
  
@@ -54,7 +54,7 @@ index 9f6dda4b..932f20f4 100644
  	setFocus(component: Component | null): void {
  		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
  	}
-@@ -928,16 +952,25 @@ export class TUI extends Container {
+@@ -1028,16 +1052,25 @@ export class TUI extends Container {
  		}
  	}
  
@@ -85,7 +85,7 @@ index 9f6dda4b..932f20f4 100644
  		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
  		for (const entry of visibleEntries) {
  			const { component, options } = entry;
-@@ -964,7 +997,7 @@ export class TUI extends Container {
+@@ -1064,7 +1097,7 @@ export class TUI extends Container {
  		// Pad to at least terminal height so overlays have screen-relative positions.
  		// Excludes maxLinesRendered: the historical high-water mark caused self-reinforcing
  		// inflation that pushed content into scrollback on terminal widen.
@@ -94,7 +94,7 @@ index 9f6dda4b..932f20f4 100644
  
  		// Extend result with empty lines if content is too short for overlay placement or working area
  		while (result.length < workingHeight) {
-@@ -987,9 +1020,63 @@ export class TUI extends Container {
+@@ -1087,9 +1120,63 @@ export class TUI extends Container {
  			}
  		}
  
@@ -158,7 +158,7 @@ index 9f6dda4b..932f20f4 100644
  	private static readonly SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
  
  	private applyLineResets(lines: string[]): string[] {
-@@ -1142,10 +1229,20 @@ export class TUI extends Container {
+@@ -1269,10 +1356,20 @@ export class TUI extends Container {
  
  		// Render all components to get new lines
  		let newLines = this.render(width);
