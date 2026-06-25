@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
-index de76a619..8d2c2b8e 100644
+index fafa1031..5cf4fb2c 100644
 --- a/packages/coding-agent/src/core/agent-session.ts
 +++ b/packages/coding-agent/src/core/agent-session.ts
-@@ -135,6 +135,7 @@ export type AgentSessionEvent =
+@@ -137,6 +137,7 @@ export type AgentSessionEvent =
  	  }
  	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
  	| { type: "session_info_changed"; name: string | undefined }
@@ -10,7 +10,7 @@ index de76a619..8d2c2b8e 100644
  	| { type: "thinking_level_changed"; level: ThinkingLevel }
  	| {
  			type: "compaction_end";
-@@ -1452,6 +1453,7 @@ export class AgentSession {
+@@ -1464,6 +1465,7 @@ export class AgentSession {
  
  		// Re-clamp thinking level for new model's capabilities
  		this.setThinkingLevel(thinkingLevel);
@@ -18,7 +18,7 @@ index de76a619..8d2c2b8e 100644
  
  		await this._emitModelSelect(model, previousModel, "set");
  	}
-@@ -1492,6 +1494,7 @@ export class AgentSession {
+@@ -1504,6 +1506,7 @@ export class AgentSession {
  		// - Undefined scoped model thinking level inherits the current session preference
  		// setThinkingLevel clamps to model capabilities.
  		this.setThinkingLevel(thinkingLevel);
@@ -26,7 +26,7 @@ index de76a619..8d2c2b8e 100644
  
  		await this._emitModelSelect(next.model, currentModel, "cycle");
  
-@@ -1517,6 +1520,7 @@ export class AgentSession {
+@@ -1529,6 +1532,7 @@ export class AgentSession {
  
  		// Re-clamp thinking level for new model's capabilities
  		this.setThinkingLevel(thinkingLevel);
@@ -35,10 +35,10 @@ index de76a619..8d2c2b8e 100644
  		await this._emitModelSelect(nextModel, currentModel, "cycle");
  
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index f90cffab..a1c017d8 100644
+index 7b6dbbe8..a1224953 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-@@ -2749,6 +2758,12 @@ export class InteractiveMode {
+@@ -2774,6 +2774,12 @@ export class InteractiveMode {
  				this.ui.requestRender();
  				break;
  

@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/docs/settings.md b/packages/coding-agent/docs/settings.md
-index df2d0bd6..adff9747 100644
+index 18c9ad97..aa7e99e9 100644
 --- a/packages/coding-agent/docs/settings.md
 +++ b/packages/coding-agent/docs/settings.md
 @@ -7,6 +7,19 @@ Pi uses JSON settings files with project settings overriding global settings.
@@ -22,7 +22,7 @@ index df2d0bd6..adff9747 100644
  Edit directly or use `/settings` for common options.
  
  ## Project Trust
-@@ -203,7 +216,7 @@ When multiple sources specify a session directory, precedence is `--session-dir`
+@@ -220,7 +233,7 @@ When multiple sources specify a session directory, precedence is `--session-dir`
  
  These settings define where to load extensions, skills, prompts, and themes from.
  
@@ -32,10 +32,10 @@ index df2d0bd6..adff9747 100644
  | Setting | Type | Default | Description |
  |---------|------|---------|-------------|
 diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
-index 2ef32d6d..783006f0 100644
+index 99ae71a4..ee302929 100644
 --- a/packages/coding-agent/src/core/settings-manager.ts
 +++ b/packages/coding-agent/src/core/settings-manager.ts
-@@ -158,13 +158,34 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
+@@ -165,13 +165,34 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
  }
  
  export type SettingsScope = "global" | "project";
@@ -71,7 +71,7 @@ index 2ef32d6d..783006f0 100644
  }
  
  export interface SettingsError {
-@@ -172,15 +193,57 @@ export interface SettingsError {
+@@ -179,15 +200,57 @@ export interface SettingsError {
  	error: Error;
  }
  
@@ -133,7 +133,7 @@ index 2ef32d6d..783006f0 100644
  	}
  
  	private acquireLockSyncWithRetry(path: string): () => void {
-@@ -210,8 +273,16 @@ export class FileSettingsStorage implements SettingsStorage {
+@@ -217,8 +280,16 @@ export class FileSettingsStorage implements SettingsStorage {
  		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
  	}
  
@@ -152,7 +152,7 @@ index 2ef32d6d..783006f0 100644
  		const dir = dirname(path);
  
  		let release: (() => void) | undefined;
-@@ -242,18 +313,37 @@ export class FileSettingsStorage implements SettingsStorage {
+@@ -249,18 +320,37 @@ export class FileSettingsStorage implements SettingsStorage {
  }
  
  export class InMemorySettingsStorage implements SettingsStorage {
@@ -200,16 +200,16 @@ index 2ef32d6d..783006f0 100644
  		}
  	}
  }
-@@ -330,7 +420,7 @@ export class SettingsManager {
- 	static inMemory(settings: Partial<Settings> = {}): SettingsManager {
+@@ -337,7 +427,7 @@ export class SettingsManager {
+ 	static inMemory(settings: Partial<Settings> = {}, options: SettingsManagerCreateOptions = {}): SettingsManager {
  		const storage = new InMemorySettingsStorage();
  		const initialSettings = SettingsManager.migrateSettings(structuredClone(settings) as Record<string, unknown>);
 -		storage.withLock("global", () => JSON.stringify(initialSettings, null, 2));
 +		storage.withLock("global", "legacy", () => JSON.stringify(initialSettings, null, 2));
- 		return SettingsManager.fromStorage(storage);
+ 		return SettingsManager.fromStorage(storage, options);
  	}
  
-@@ -340,7 +430,7 @@ export class SettingsManager {
+@@ -347,7 +437,7 @@ export class SettingsManager {
  		}
  
  		let content: string | undefined;
@@ -218,7 +218,7 @@ index 2ef32d6d..783006f0 100644
  			content = current;
  			return undefined;
  		});
-@@ -562,13 +652,27 @@ export class SettingsManager {
+@@ -569,13 +659,27 @@ export class SettingsManager {
  		return snapshot;
  	}
  
@@ -247,7 +247,7 @@ index 2ef32d6d..783006f0 100644
  			const currentFileSettings = current
  				? SettingsManager.migrateSettings(JSON.parse(current) as Record<string, unknown>)
  				: {};
-@@ -601,11 +705,13 @@ export class SettingsManager {
+@@ -608,11 +712,13 @@ export class SettingsManager {
  		}
  
  		const snapshotGlobalSettings = structuredClone(this.globalSettings);
@@ -263,7 +263,7 @@ index 2ef32d6d..783006f0 100644
  		});
  	}
  
-@@ -619,10 +725,12 @@ export class SettingsManager {
+@@ -626,10 +732,12 @@ export class SettingsManager {
  		}
  
  		const snapshotProjectSettings = structuredClone(this.projectSettings);
@@ -279,7 +279,7 @@ index 2ef32d6d..783006f0 100644
  	}
  
 diff --git a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
-index b28d086a..81a538b6 100644
+index d86c3f91..7810f9d7 100644
 --- a/packages/coding-agent/test/settings-manager.test.ts
 +++ b/packages/coding-agent/test/settings-manager.test.ts
 @@ -111,6 +111,90 @@ describe("SettingsManager", () => {
