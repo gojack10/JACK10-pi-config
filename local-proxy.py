@@ -1093,7 +1093,7 @@ async def main():
     asyncio.create_task(periodic_discover())
     asyncio.create_task(ds4_idle_check_loop())
 
-    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post("/admin/api/login", handle_admin_login)
