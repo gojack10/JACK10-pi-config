@@ -11,7 +11,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 
 const PROVIDER = "tunnel";
 const API = "tunnel-openai-completions" as Api;
-const BASE_URL = (process.env.TUNNEL_PROXY_URL || "http://127.0.0.1:8003/v1").replace(/\/+$/, "");
+const BASE_URL = (process.env.TUNNEL_PROXY_URL || "http://127.0.0.1:8002/v1").replace(/\/+$/, "");
 const API_KEY = process.env.TUNNEL_PROXY_API_KEY || process.env.LOCAL_LLM_PROXY_API_KEY || "REDACTED-LOCAL-KEY";
 
 const GEMMA_ID = "tunnel-model";
