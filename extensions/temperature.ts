@@ -2,9 +2,9 @@
  * Temperature Control Extension
  *
  * /temp command opens a horizontal slider (0 – 2, step 0.5) with a free-text
- * fallback for arbitrary one-decimal values.  Persists to settings.json so
- * the value survives restarts.  Injects the chosen temperature into every
- * provider request via before_provider_request.
+ * fallback for arbitrary one-decimal values.  Persists to temperature.json so
+ * the value survives restarts.  Injects the chosen temperature only into
+ * provider payload shapes that support it.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -43,25 +43,84 @@ function stripTemperature(payload: Record<string, unknown>): Record<string, unkn
 	return rest;
 }
 
-function modelRejectsTemperature(model: unknown): boolean {
-	if (!isPlainObject(model)) return false;
+function hasTemperature(payload: Record<string, unknown>): boolean {
+	return (
+		"temperature" in payload ||
+		(isPlainObject(payload.config) && "temperature" in payload.config) ||
+		(isPlainObject(payload.inferenceConfig) && "temperature" in payload.inferenceConfig)
+	);
+}
 
-	const provider = String(model.provider ?? "").toLowerCase();
-	const api = String(model.api ?? "").toLowerCase();
-	const id = String(model.id ?? "").toLowerCase();
+function stripPayloadTemperature(payload: Record<string, unknown>): Record<string, unknown> {
+	const next = stripTemperature(payload);
+	if (isPlainObject(payload.config)) next.config = stripTemperature(payload.config);
+	if (isPlainObject(payload.inferenceConfig)) next.inferenceConfig = stripTemperature(payload.inferenceConfig);
+	return next;
+}
+
+function modelFields(model: unknown) {
+	const m: Record<string, unknown> = isPlainObject(model) ? model : {};
+	return {
+		api: String(m.api ?? "").toLowerCase(),
+		provider: String(m.provider ?? "").toLowerCase(),
+		id: String(m.id ?? "").toLowerCase(),
+		reasoning: m.reasoning === true,
+		compat: isPlainObject(m.compat) ? m.compat : {},
+	};
+}
+
+function modelRejectsTemperature(model: unknown, payload: Record<string, unknown>): boolean {
+	const { api, provider, id, reasoning, compat } = modelFields(model);
+	const thinking = payload.thinking;
 	const isOpenAI =
 		provider === "openai" ||
 		provider.startsWith("openai-") ||
 		provider === "azure-openai-responses" ||
 		api === "azure-openai-responses";
 
-	// ponytail: OpenAI reasoning/Codex models reject sampling knobs; keep temp for local/HF/OpenRouter models.
+	// ponytail: Provider serializers omit temp for these cases; do not re-add it here.
 	return (
+		compat.supportsTemperature === false ||
+		/(^|[/:])claude-opus-4[.-][78](?:\b|[-.:/])/.test(id) ||
+		(isPlainObject(thinking) && thinking.type !== "disabled") ||
 		provider.includes("codex") ||
 		api.includes("codex") ||
 		id.includes("codex") ||
-		(isOpenAI && (/^(gpt-5(?:\.|-|$)|o\d(?:\.|-|$))/.test(id) || model.reasoning === true))
+		(isOpenAI && (/(^|[/:])(?:gpt-5(?:\.|-|$)|o\d(?:\.|-|$))/.test(id) || reasoning))
 	);
+}
+
+function apiSupportsTemperature(model: unknown, payload: Record<string, unknown>): boolean {
+	const { api } = modelFields(model);
+	if (api === "google-generative-ai" || api === "google-gemini-cli" || api === "google-vertex") {
+		return isPlainObject(payload.config);
+	}
+	if (api === "bedrock-converse-stream") return isPlainObject(payload.inferenceConfig);
+	return (
+		api === "openai-completions" ||
+		api === "openai-responses" ||
+		api === "azure-openai-responses" ||
+		api === "anthropic-messages" ||
+		api === "mistral-conversations" ||
+		"temperature" in payload
+	);
+}
+
+function maxTemperature(model: unknown): number {
+	const { api, provider, id } = modelFields(model);
+	return api === "anthropic-messages" || api === "bedrock-converse-stream" || provider === "mistral" || id.startsWith("anthropic/claude-") ? 1 : 2;
+}
+
+function withTemperature(payload: Record<string, unknown>, model: unknown, temp: number): Record<string, unknown> {
+	const temperature = Math.min(temp, maxTemperature(model));
+	const { api } = modelFields(model);
+	if (api === "google-generative-ai" || api === "google-gemini-cli" || api === "google-vertex") {
+		return { ...payload, config: { ...(payload.config as Record<string, unknown>), temperature } };
+	}
+	if (api === "bedrock-converse-stream") {
+		return { ...payload, inferenceConfig: { ...(payload.inferenceConfig as Record<string, unknown>), temperature } };
+	}
+	return { ...payload, temperature };
 }
 
 /* ── Slider component ────────────────────────────────────────────────── */
@@ -76,7 +135,7 @@ class TempSlider {
 
 	constructor(currentTemp: number | null) {
 		if (currentTemp !== null) {
-			const idx = VALUES.indexOf(currentTemp);
+			const idx = (VALUES as readonly number[]).indexOf(currentTemp);
 			if (idx !== -1) this.selected = idx;
 		}
 	}
@@ -236,12 +295,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!isPlainObject(event.payload)) return undefined;
 
-		if (modelRejectsTemperature(ctx.model)) {
-			return "temperature" in event.payload ? stripTemperature(event.payload) : undefined;
+		if (modelRejectsTemperature(ctx.model, event.payload) || !apiSupportsTemperature(ctx.model, event.payload)) {
+			return hasTemperature(event.payload) ? stripPayloadTemperature(event.payload) : undefined;
 		}
-
 		if (currentTemp === null) return undefined;
-		return { ...event.payload, temperature: currentTemp };
+
+		return withTemperature(event.payload, ctx.model, currentTemp);
 	});
 
 	pi.registerCommand("temp", {
