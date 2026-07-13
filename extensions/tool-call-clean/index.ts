@@ -1,0 +1,196 @@
+import assert from "node:assert/strict";
+import {
+	closeSync,
+	copyFileSync,
+	fsyncSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+	buildSessionContext,
+	estimateTokens,
+	type ExtensionAPI,
+	type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
+
+const KEEP = new Set(["ideation_get_node", "ideation_get_outline"]);
+type Row = Record<string, any>;
+
+type CleanResult = {
+	rows: Row[];
+	removedCalls: number;
+	removedResults: number;
+};
+
+function nearestKeptParent(id: string | null | undefined, removed: Set<string>, byId: Map<string, Row>) {
+	while (id && removed.has(id)) id = byId.get(id)?.parentId;
+	return id ?? null;
+}
+
+export function cleanRows(input: Row[]): CleanResult {
+	const rows = structuredClone(input);
+	const byId = new Map(rows.filter((row) => row.id).map((row) => [row.id, row]));
+	const removed = new Set(
+		rows
+			.filter(
+				(row) =>
+					row.message?.role === "toolResult" && !KEEP.has(row.message.toolName),
+			)
+			.map((row) => row.id),
+	);
+	let removedCalls = 0;
+
+	for (const row of rows) {
+		if (row.message?.role !== "assistant") continue;
+		row.message.content = (row.message.content ?? []).filter((block: Row) => {
+			const drop = block.type === "toolCall" && !KEEP.has(block.name);
+			if (drop) removedCalls++;
+			return !drop;
+		});
+	}
+
+	const kept = rows.filter((row) => !removed.has(row.id));
+	for (const row of kept) {
+		if ("parentId" in row) row.parentId = nearestKeptParent(row.parentId, removed, byId);
+		if (row.type === "label" && removed.has(row.targetId)) {
+			row.targetId = nearestKeptParent(row.targetId, removed, byId);
+		}
+		if (row.type === "compaction" && removed.has(row.firstKeptEntryId)) {
+			row.firstKeptEntryId = nearestKeptParent(row.firstKeptEntryId, removed, byId);
+		}
+		if (row.type === "branch_summary" && removed.has(row.fromId)) {
+			row.fromId = nearestKeptParent(row.fromId, removed, byId) ?? "root";
+		}
+	}
+
+	return { rows: kept, removedCalls, removedResults: removed.size };
+}
+
+function freshContextEstimate(rows: Row[]): number {
+	const entries = rows.filter((row) => row.type !== "session") as SessionEntry[];
+	const leafId = entries.at(-1)?.id ?? null;
+	return buildSessionContext(entries, leafId).messages.reduce(
+		(total: number, message: AgentMessage) => total + estimateTokens(message),
+		0,
+	);
+}
+
+function formatTokens(tokens: number) {
+	return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
+}
+
+function backupName(sessionFile: string) {
+	return `${sessionFile}.tool-call-clean.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+}
+
+function rewriteAtomically(sessionFile: string, content: string) {
+	const temp = `${sessionFile}.${process.pid}.tool-call-clean.tmp`;
+	const fd = openSync(temp, "w", statSync(sessionFile).mode);
+	try {
+		writeFileSync(fd, content);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	try {
+		renameSync(temp, sessionFile);
+	} catch (error) {
+		unlinkSync(temp);
+		throw error;
+	}
+}
+
+function runSelfTest() {
+	const rows: Row[] = [
+		{ type: "session", id: "session" },
+		{ type: "message", id: "user", parentId: null, message: { role: "user", content: [] } },
+		{
+			type: "message",
+			id: "assistant",
+			parentId: "user",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "preserve" },
+					{ type: "toolCall", id: "drop-call", name: "bash", arguments: {} },
+					{ type: "toolCall", id: "keep-call", name: "ideation_get_node", arguments: {} },
+				],
+			},
+		},
+		{
+			type: "message",
+			id: "drop-result",
+			parentId: "assistant",
+			message: { role: "toolResult", toolCallId: "drop-call", toolName: "bash", content: [] },
+		},
+		{
+			type: "message",
+			id: "keep-result",
+			parentId: "drop-result",
+			message: { role: "toolResult", toolCallId: "keep-call", toolName: "ideation_get_node", content: [] },
+		},
+	];
+	const result = cleanRows(rows);
+	assert.equal(result.removedCalls, 1);
+	assert.equal(result.removedResults, 1);
+	assert.deepEqual(
+		result.rows[2].message.content.map((block: Row) => block.type === "toolCall" ? block.name : block.type),
+		["thinking", "ideation_get_node"],
+	);
+	assert.equal(result.rows[3].parentId, "assistant");
+}
+
+export default function (pi: ExtensionAPI) {
+	pi.on("agent_end", (_event, ctx) => ctx.ui.setStatus("tool-call-clean", undefined));
+
+	pi.registerCommand("tool-call-clean", {
+		description: "Remove all tool history except ideation get_node/get_outline, then reload the session",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (!sessionFile) {
+				ctx.ui.notify("tool-call-clean requires a saved session", "error");
+				return;
+			}
+
+			try {
+				const original = readFileSync(sessionFile, "utf8");
+				const rows = original.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+				const beforeTokens = freshContextEstimate(rows);
+				const result = cleanRows(rows);
+				const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+				const afterTokens = freshContextEstimate(result.rows);
+				const changed = result.removedCalls > 0 || result.removedResults > 0;
+
+				if (changed) {
+					if (readFileSync(sessionFile, "utf8") !== original) {
+						throw new Error("Session changed during cleanup; run the command again while idle");
+					}
+					copyFileSync(sessionFile, backupName(sessionFile));
+					rewriteAtomically(sessionFile, cleaned);
+				}
+
+				const summary = changed
+					? `Removed ${result.removedCalls} calls + ${result.removedResults} results; fresh message estimate ${formatTokens(beforeTokens)} → ${formatTokens(afterTokens)}`
+					: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
+
+				const switched = await ctx.switchSession(sessionFile, {
+					withSession: async (replacementCtx) => {
+						replacementCtx.ui.setStatus("tool-call-clean", summary);
+						replacementCtx.ui.notify(`${summary}. Footer CURRENT refreshes after the next successful response.`, "info");
+					},
+				});
+				if (switched.cancelled) ctx.ui.notify(`${summary}, but session reload was cancelled`, "warning");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
+	if (process.env.TOOL_CALL_CLEAN_SELF_TEST === "1") runSelfTest();
+}
