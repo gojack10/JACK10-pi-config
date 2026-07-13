@@ -15,6 +15,8 @@ const BASE_URL = (process.env.TUNNEL_PROXY_URL || "http://127.0.0.1:8002/v1").re
 const API_KEY = process.env.TUNNEL_PROXY_API_KEY || process.env.LOCAL_LLM_PROXY_API_KEY || "REDACTED-LOCAL-KEY";
 
 const GEMMA_ID = "tunnel-model";
+const GEMMA_26_ID = "tunnel-model";
+const GEMMA_31_ID = "tunnel-model";
 const QWEN_27_ID = "tunnel-model";
 const QWEN_35_ID = "tunnel-model";
 const DEEPSEEK_ID = "tunnel-model";
@@ -31,6 +33,8 @@ type ProxyModel = {
 
 const FALLBACK_MODELS: ProxyModel[] = [
 	{ id: GEMMA_ID, name: "Gemma 4 12B (tunnel)", reasoning: false, input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
+	{ id: GEMMA_26_ID, name: "Gemma 4 26B A4B (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } },
+	{ id: GEMMA_31_ID, name: "Gemma 4 31B (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } },
 	{ id: QWEN_27_ID, name: "Qwen3.6 27B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 130000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
 	{ id: QWEN_35_ID, name: "Qwen3.6 35B-A3B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 85000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
 	{ id: DEEPSEEK_ID, name: "DeepSeek V4 Flash (tunnel)", reasoning: true, input: ["text"], contextWindow: 524288, maxTokens: 393216, compat: { maxTokensField: "max_tokens" } },
@@ -38,6 +42,8 @@ const FALLBACK_MODELS: ProxyModel[] = [
 
 function displayName(id: string, name?: string): string {
 	if (id === GEMMA_ID) return "Gemma 4 12B (tunnel)";
+	if (id === GEMMA_26_ID) return name && name !== id ? name : "Gemma 4 26B A4B (tunnel)";
+	if (id === GEMMA_31_ID) return name && name !== id ? name : "Gemma 4 31B (tunnel)";
 	if (id === QWEN_27_ID) return name && name !== id ? name : "Qwen3.6 27B UD Q4_K_XL MLX (tunnel)";
 	if (id === QWEN_35_ID) return name && name !== id ? name : "Qwen3.6 35B-A3B UD Q4_K_XL MLX (tunnel)";
 	if (id === DEEPSEEK_ID) return name && name !== id ? name : "DeepSeek V4 Flash (tunnel)";
@@ -46,6 +52,8 @@ function displayName(id: string, name?: string): string {
 
 function metaFor(id: string): Omit<ProxyModel, "id" | "name"> {
 	if (id === GEMMA_ID) return { reasoning: false, input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
+	if (id === GEMMA_26_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } };
+	if (id === GEMMA_31_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } };
 	if (id === QWEN_27_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 130000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
 	if (id === QWEN_35_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 85000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
 	if (id === DEEPSEEK_ID) return { reasoning: true, input: ["text"], contextWindow: 524288, maxTokens: 393216, compat: { maxTokensField: "max_tokens" } };
@@ -95,7 +103,7 @@ async function proxyModels(): Promise<Model<Api>[]> {
 				};
 			})
 			.sort((a, b) => {
-				const order = (id: string) => (id === GEMMA_ID ? 0 : id === QWEN_27_ID ? 1 : id === QWEN_35_ID ? 2 : id === DEEPSEEK_ID ? 3 : 4);
+				const order = (id: string) => (id === GEMMA_ID ? 0 : id === GEMMA_26_ID ? 1 : id === GEMMA_31_ID ? 2 : id === QWEN_27_ID ? 3 : id === QWEN_35_ID ? 4 : id === DEEPSEEK_ID ? 5 : 6);
 				return order(a.id) - order(b.id) || a.id.localeCompare(b.id);
 			});
 		if (models.length > 0) return models;
