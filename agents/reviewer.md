@@ -1,1 +1,1 @@
-/Users/jack/.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/agents/reviewer.md
+../../../.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/agents/reviewer.md

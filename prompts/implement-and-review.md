@@ -1,1 +1,1 @@
-/Users/jack/.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/prompts/implement-and-review.md
+../../../.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/prompts/implement-and-review.md
