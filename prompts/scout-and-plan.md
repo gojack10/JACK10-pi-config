@@ -1,1 +1,1 @@
-/Users/USER/.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/prompts/scout-and-plan.md
+../../../.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/prompts/scout-and-plan.md

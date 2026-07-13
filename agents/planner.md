@@ -1,1 +1,1 @@
-/Users/USER/.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/agents/planner.md
+../../../.local/share/pi-mono/packages/coding-agent/examples/extensions/subagent/agents/planner.md
