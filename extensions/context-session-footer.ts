@@ -9,23 +9,6 @@ const fitToWidth = (s: string, width: number): string => {
 	return truncateToWidth(s, width, "…");
 };
 
-const wrapAndDim = (text: string, width: number, separator: string, themeFn: (t: string) => string): string[] => {
-	const sections = text.split(separator);
-	const lines: string[] = [];
-	let currentLine = "";
-	for (const section of sections) {
-		const candidate = currentLine ? currentLine + separator + section : section;
-		if (visibleWidth(candidate) > width) {
-			if (currentLine) lines.push(themeFn(fitToWidth(currentLine, width)));
-			currentLine = section;
-		} else {
-			currentLine = candidate;
-		}
-	}
-	if (currentLine) lines.push(themeFn(fitToWidth(currentLine, width)));
-	return lines.length ? lines : [themeFn(fitToWidth(text, width))];
-};
-
 type FooterLineState = {
 	lines: string[];
 	currentLine: string;
@@ -37,41 +20,48 @@ const flushFooterLine = (state: FooterLineState, width: number): void => {
 	state.currentLine = "";
 };
 
-const appendPipeSegment = (state: FooterLineState, segment: string, width: number): void => {
-	const candidate = state.currentLine ? `${state.currentLine} | ${segment}` : segment;
+const appendPipeSegment = (
+	state: FooterLineState,
+	segment: string,
+	width: number,
+	themeFn: (text: string) => string,
+): void => {
+	const styledSegment = themeFn(segment);
+	const separator = themeFn(" | ");
+	const candidate = state.currentLine ? `${state.currentLine}${separator}${styledSegment}` : styledSegment;
 	if (visibleWidth(candidate) > width) {
 		if (state.currentLine) {
 			state.lines.push(fitToWidth(state.currentLine, width));
 		}
-		state.currentLine = segment;
+		state.currentLine = styledSegment;
 	} else {
 		state.currentLine = candidate;
 	}
 };
 
-const appendSessionTokens = (state: FooterLineState, tokens: string[], width: number): void => {
+const appendSessionTokens = (
+	state: FooterLineState,
+	tokens: string[],
+	width: number,
+	themeFn: (text: string) => string,
+): void => {
 	let sessionStarted = false;
 	for (const token of tokens) {
-		const separator = state.currentLine ? (sessionStarted ? " " : " | ") : "";
-		const candidate = state.currentLine ? `${state.currentLine}${separator}${token}` : token;
+		const separatorText = state.currentLine ? (sessionStarted ? " " : " | ") : "";
+		const separator = separatorText ? themeFn(separatorText) : "";
+		const styledToken = themeFn(token);
+		const candidate = state.currentLine ? `${state.currentLine}${separator}${styledToken}` : styledToken;
 		if (visibleWidth(candidate) > width) {
 			if (state.currentLine) {
 				state.lines.push(fitToWidth(state.currentLine, width));
 			}
-			state.currentLine = token;
+			state.currentLine = styledToken;
 		} else {
 			state.currentLine = candidate;
 		}
 		sessionStarted = true;
 	}
 };
-
-function sanitizeStatusText(text: string): string {
-	return text
-		.replace(/[\r\n\t]/g, " ")
-		.replace(/ +/g, " ")
-		.trim();
-}
 
 function formatTokens(count: number): string {
 	if (!Number.isFinite(count) || count <= 0) return "0";
@@ -163,11 +153,12 @@ export default function (pi: ExtensionAPI) {
 					const dim = theme.fg.bind(theme, "dim");
 					const lineState: FooterLineState = { lines: [], currentLine: "" };
 
-					appendPipeSegment(lineState, `CWD: ${cwdPrompt}`, width);
+					appendPipeSegment(lineState, `CWD: ${cwdPrompt}`, width, dim);
 					appendPipeSegment(
 						lineState,
 						`CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)`,
 						width,
+						dim,
 					);
 					appendSessionTokens(
 						lineState,
@@ -181,23 +172,13 @@ export default function (pi: ExtensionAPI) {
 							...(usingSubscription ? ["(SUB)"] : []),
 						],
 						width,
+						dim,
 					);
-					appendPipeSegment(lineState, `TEMP: ${getTemperature() ?? "(DEFAULT)"}`, width);
-					appendPipeSegment(lineState, `MODEL: ${modelName}${thinkingSuffix}`, width);
+					appendPipeSegment(lineState, `TEMP: ${getTemperature() ?? "(DEFAULT)"}`, width, dim);
+					appendPipeSegment(lineState, `MODEL: ${modelName}${thinkingSuffix}`, width, dim);
 					flushFooterLine(lineState, width);
 
-					const lines: string[] = lineState.lines.map(dim);
-
-					const extensionStatuses = footerData.getExtensionStatuses();
-					if (extensionStatuses.size > 0) {
-						const statusLine = Array.from(extensionStatuses.entries())
-							.sort(([a], [b]) => a.localeCompare(b))
-							.map(([, text]) => sanitizeStatusText(text))
-							.join(" ");
-						lines.push(...wrapAndDim(statusLine, width, " | ", dim));
-					}
-
-					return lines;
+					return lineState.lines;
 				},
 			};
 		});
