@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { getCurrentRunUsage, getSessionUsage, type UsageTotals } from "./context-session-footer/session-usage.ts";
 
 const fitToWidth = (s: string, width: number): string => {
 	if (width <= 0) return "";
@@ -72,6 +72,18 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+function usageTokens(label: string, usage: UsageTotals, isLocal: boolean = false): string[] {
+	return [
+		`${label}:`,
+		`↑${formatTokens(usage.input)}`,
+		`↓${formatTokens(usage.output)}`,
+		`CR:${formatTokens(usage.cacheRead)}`,
+		...(usage.cacheWrite > 0 ? [`CW:${formatTokens(usage.cacheWrite)}`] : []),
+		...(isLocal ? ["(LOCAL)"] : []),
+		`$${usage.cost.toFixed(3)}`,
+	];
+}
+
 function getDisplayPath(cwd: string): string {
 	const home = process.env.HOME || process.env.USERPROFILE;
 	if (home && cwd.startsWith(home)) {
@@ -114,28 +126,14 @@ export default function (pi: ExtensionAPI) {
 				dispose: unsubscribe,
 				invalidate() {},
 				render(width: number): string[] {
-					let totalInput = 0;
-					let totalOutput = 0;
-					let totalCacheRead = 0;
-					let totalCacheWrite = 0;
-					let totalCost = 0;
-
-					for (const entry of ctx.sessionManager.getEntries()) {
-						if (entry.type === "message" && entry.message.role === "assistant") {
-							const message = entry.message as AssistantMessage;
-							totalInput += message.usage.input;
-							totalOutput += message.usage.output;
-							totalCacheRead += message.usage.cacheRead;
-							totalCacheWrite += message.usage.cacheWrite;
-							totalCost += message.usage.cost.total;
-						}
-					}
+					const sessionStartedAt = ctx.sessionManager.getHeader()?.timestamp ?? "";
+					const totalUsage = getSessionUsage(ctx.sessionManager.getEntries(), sessionStartedAt);
+					const runUsage = getCurrentRunUsage(ctx.sessionManager.getBranch(), sessionStartedAt);
 
 					const contextUsage = ctx.getContextUsage();
 					const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 					const currentTokens = contextUsage?.tokens ?? 0;
 					const currentPercent = contextUsage?.percent ?? 0;
-					const usingSubscription = ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
 					const modelName = ctx.model?.id ?? "no-model";
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
 					const isLocal = Boolean(ctx.model && String((ctx.model as any).baseURL ?? (ctx.model as any).baseUrl ?? "").match(/localhost|127\.0\.0\.1/i));
@@ -149,31 +147,18 @@ export default function (pi: ExtensionAPI) {
 						: "";
 					const cwdPrompt = `${gitPrompt}${theme.fg("accent", `[${getDisplayPath(cwd)}]`)}`;
 
-					const showCacheWrite = !isLocal && totalCacheWrite > 0;
 					const dim = theme.fg.bind(theme, "dim");
 					const lineState: FooterLineState = { lines: [], currentLine: "" };
 
 					appendPipeSegment(lineState, `CWD: ${cwdPrompt}`, width, dim);
 					appendPipeSegment(
 						lineState,
-						`CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)`,
+						`CTX: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)`,
 						width,
 						dim,
 					);
-					appendSessionTokens(
-						lineState,
-						[
-							`SESSION:`,
-							`↑${formatTokens(totalInput)}`,
-							`↓${formatTokens(totalOutput)}`,
-							`CR:${formatTokens(totalCacheRead)}`,
-							...(showCacheWrite ? [`CW:${formatTokens(totalCacheWrite)}`] : []),
-							isLocal ? "(LOCAL)" : `$${totalCost.toFixed(3)}`,
-							...(usingSubscription ? ["(SUB)"] : []),
-						],
-						width,
-						dim,
-					);
+					appendSessionTokens(lineState, usageTokens("RUN", runUsage, isLocal), width, dim);
+					appendSessionTokens(lineState, usageTokens("TOTAL", totalUsage), width, dim);
 					appendPipeSegment(lineState, `TEMP: ${getTemperature() ?? "(DEFAULT)"}`, width, dim);
 					appendPipeSegment(lineState, `MODEL: ${modelName}${thinkingSuffix}`, width, dim);
 					flushFooterLine(lineState, width);
