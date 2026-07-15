@@ -71,13 +71,31 @@ export function cleanRows(input: Row[]): CleanResult {
 	return { rows: kept, removedCalls, removedResults: removed.size };
 }
 
-function freshContextEstimate(rows: Row[]): number {
+function contextMessages(rows: Row[]): AgentMessage[] {
 	const entries = rows.filter((row) => row.type !== "session") as SessionEntry[];
-	const leafId = entries.at(-1)?.id ?? null;
-	return buildSessionContext(entries, leafId).messages.reduce(
-		(total: number, message: AgentMessage) => total + estimateTokens(message),
-		0,
+	return buildSessionContext(entries, entries.at(-1)?.id ?? null).messages;
+}
+
+function freshContextEstimate(rows: Row[]): number {
+	return contextMessages(rows).reduce((total, message) => total + estimateTokens(message), 0);
+}
+
+function refreshLastUsageEstimate(rows: Row[]): boolean {
+	const messages = contextMessages(rows);
+	const index = messages.findLastIndex(
+		(message) =>
+			message.role === "assistant" &&
+			message.stopReason !== "aborted" &&
+			message.stopReason !== "error" &&
+			message.usage,
 	);
+	if (index < 0) return false;
+
+	const assistant = messages[index] as Extract<AgentMessage, { role: "assistant" }>;
+	const estimate = messages.slice(0, index + 1).reduce((total, message) => total + estimateTokens(message), 0);
+	if (assistant.usage.totalTokens === estimate) return false;
+	assistant.usage.totalTokens = estimate;
+	return true;
 }
 
 function formatTokens(tokens: number) {
@@ -120,6 +138,8 @@ function runSelfTest() {
 					{ type: "toolCall", id: "drop-call", name: "bash", arguments: {} },
 					{ type: "toolCall", id: "keep-call", name: "ideation_get_node", arguments: {} },
 				],
+				stopReason: "toolUse",
+				usage: { totalTokens: 999 },
 			},
 		},
 		{
@@ -143,6 +163,8 @@ function runSelfTest() {
 		["thinking", "ideation_get_node"],
 	);
 	assert.equal(result.rows[3].parentId, "assistant");
+	assert.equal(refreshLastUsageEstimate(result.rows), true);
+	assert.notEqual(result.rows[2].message.usage.totalTokens, 999);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -163,9 +185,10 @@ export default function (pi: ExtensionAPI) {
 				const rows = original.split("\n").filter(Boolean).map((line) => JSON.parse(line));
 				const beforeTokens = freshContextEstimate(rows);
 				const result = cleanRows(rows);
-				const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
 				const afterTokens = freshContextEstimate(result.rows);
-				const changed = result.removedCalls > 0 || result.removedResults > 0;
+				const usageRefreshed = refreshLastUsageEstimate(result.rows);
+				const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+				const changed = result.removedCalls > 0 || result.removedResults > 0 || usageRefreshed;
 
 				if (changed) {
 					if (readFileSync(sessionFile, "utf8") !== original) {
@@ -175,14 +198,16 @@ export default function (pi: ExtensionAPI) {
 					rewriteAtomically(sessionFile, cleaned);
 				}
 
-				const summary = changed
+				const summary = result.removedCalls > 0 || result.removedResults > 0
 					? `Removed ${result.removedCalls} calls + ${result.removedResults} results; fresh message estimate ${formatTokens(beforeTokens)} → ${formatTokens(afterTokens)}`
-					: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
+					: usageRefreshed
+						? `Refreshed footer context estimate to ${formatTokens(afterTokens)}`
+						: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
 
 				const switched = await ctx.switchSession(sessionFile, {
 					withSession: async (replacementCtx) => {
 						replacementCtx.ui.setStatus("tool-call-clean", summary);
-						replacementCtx.ui.notify(`${summary}. Footer CURRENT refreshes after the next successful response.`, "info");
+						replacementCtx.ui.notify(`${summary}. The estimate becomes exact after the next successful response.`, "info");
 					},
 				});
 				if (switched.cancelled) ctx.ui.notify(`${summary}, but session reload was cancelled`, "warning");
