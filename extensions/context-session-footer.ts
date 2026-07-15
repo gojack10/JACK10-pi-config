@@ -1,11 +1,12 @@
+import { execFileSync } from "node:child_process";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
 const fitToWidth = (s: string, width: number): string => {
 	if (width <= 0) return "";
-	if (s.length <= width) return s;
-	if (width <= 1) return s.slice(0, width);
-	return `${s.slice(0, width - 1)}…`;
+	if (visibleWidth(s) <= width) return s;
+	return truncateToWidth(s, width, "…");
 };
 
 const wrapAndDim = (text: string, width: number, separator: string, themeFn: (t: string) => string): string[] => {
@@ -14,7 +15,7 @@ const wrapAndDim = (text: string, width: number, separator: string, themeFn: (t:
 	let currentLine = "";
 	for (const section of sections) {
 		const candidate = currentLine ? currentLine + separator + section : section;
-		if (candidate.length > width) {
+		if (visibleWidth(candidate) > width) {
 			if (currentLine) lines.push(themeFn(fitToWidth(currentLine, width)));
 			currentLine = section;
 		} else {
@@ -38,7 +39,7 @@ const flushFooterLine = (state: FooterLineState, width: number): void => {
 
 const appendPipeSegment = (state: FooterLineState, segment: string, width: number): void => {
 	const candidate = state.currentLine ? `${state.currentLine} | ${segment}` : segment;
-	if (candidate.length > width) {
+	if (visibleWidth(candidate) > width) {
 		if (state.currentLine) {
 			state.lines.push(fitToWidth(state.currentLine, width));
 		}
@@ -53,7 +54,7 @@ const appendSessionTokens = (state: FooterLineState, tokens: string[], width: nu
 	for (const token of tokens) {
 		const separator = state.currentLine ? (sessionStarted ? " " : " | ") : "";
 		const candidate = state.currentLine ? `${state.currentLine}${separator}${token}` : token;
-		if (candidate.length > width) {
+		if (visibleWidth(candidate) > width) {
 			if (state.currentLine) {
 				state.lines.push(fitToWidth(state.currentLine, width));
 			}
@@ -87,6 +88,18 @@ function getDisplayPath(cwd: string): string {
 		return `~${cwd.slice(home.length)}`;
 	}
 	return cwd;
+}
+
+function isGitDirty(cwd: string): boolean {
+	try {
+		return execFileSync("git", ["status", "--porcelain", "--ignore-submodules=dirty"], {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim().length > 0;
+	} catch {
+		return false;
+	}
 }
 
 function getTemperature(): number | null {
@@ -139,22 +152,18 @@ export default function (pi: ExtensionAPI) {
 					const thinkingSuffix =
 						ctx.model?.reasoning && !isClaudeCodeModel ? ` ${pi.getThinkingLevel()}` : "";
 
-					let pwd = getDisplayPath(ctx.sessionManager.getCwd());
+					const cwd = ctx.sessionManager.getCwd();
 					const branch = footerData.getGitBranch();
-					if (branch) {
-						pwd = `${pwd} (${branch})`;
-					}
-
-					const sessionName = ctx.sessionManager.getSessionName();
-					if (sessionName) {
-						pwd = `${pwd} • ${sessionName}`;
-					}
+					const gitPrompt = branch
+						? `${isGitDirty(cwd) ? theme.fg("error", "*") : ""}${theme.fg("success", `[${branch}]`)}`
+						: "";
+					const cwdPrompt = `${gitPrompt}${theme.fg("accent", `[${getDisplayPath(cwd)}]`)}`;
 
 					const showCacheWrite = !isLocal && totalCacheWrite > 0;
 					const dim = theme.fg.bind(theme, "dim");
 					const lineState: FooterLineState = { lines: [], currentLine: "" };
 
-					appendPipeSegment(lineState, `CWD: [${pwd}]`, width);
+					appendPipeSegment(lineState, `CWD: ${cwdPrompt}`, width);
 					appendPipeSegment(
 						lineState,
 						`CURRENT: ${formatTokens(currentTokens)}/${formatTokens(contextWindow)} (${currentPercent.toFixed(1)}%)`,
