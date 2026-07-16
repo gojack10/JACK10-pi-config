@@ -19,56 +19,27 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const KEEP = new Set(["ideation_get_node", "ideation_get_outline"]);
+const CLEARED_RESULT = "[tool result cleared by /tool-call-clean]";
 type Row = Record<string, any>;
 
 type CleanResult = {
 	rows: Row[];
-	removedCalls: number;
-	removedResults: number;
+	clearedResults: number;
 };
-
-function nearestKeptParent(id: string | null | undefined, removed: Set<string>, byId: Map<string, Row>) {
-	while (id && removed.has(id)) id = byId.get(id)?.parentId;
-	return id ?? null;
-}
 
 export function cleanRows(input: Row[]): CleanResult {
 	const rows = structuredClone(input);
-	const byId = new Map(rows.filter((row) => row.id).map((row) => [row.id, row]));
-	const removed = new Set(
-		rows
-			.filter(
-				(row) =>
-					row.message?.role === "toolResult" && !KEEP.has(row.message.toolName),
-			)
-			.map((row) => row.id),
-	);
-	let removedCalls = 0;
+	let clearedResults = 0;
 
 	for (const row of rows) {
-		if (row.message?.role !== "assistant") continue;
-		row.message.content = (row.message.content ?? []).filter((block: Row) => {
-			const drop = block.type === "toolCall" && !KEEP.has(block.name);
-			if (drop) removedCalls++;
-			return !drop;
-		});
+		if (row.message?.role !== "toolResult" || KEEP.has(row.message.toolName)) continue;
+		const content = row.message.content ?? [];
+		if (content.length === 1 && content[0]?.type === "text" && content[0].text === CLEARED_RESULT) continue;
+		row.message.content = [{ type: "text", text: CLEARED_RESULT }];
+		clearedResults++;
 	}
 
-	const kept = rows.filter((row) => !removed.has(row.id));
-	for (const row of kept) {
-		if ("parentId" in row) row.parentId = nearestKeptParent(row.parentId, removed, byId);
-		if (row.type === "label" && removed.has(row.targetId)) {
-			row.targetId = nearestKeptParent(row.targetId, removed, byId);
-		}
-		if (row.type === "compaction" && removed.has(row.firstKeptEntryId)) {
-			row.firstKeptEntryId = nearestKeptParent(row.firstKeptEntryId, removed, byId);
-		}
-		if (row.type === "branch_summary" && removed.has(row.fromId)) {
-			row.fromId = nearestKeptParent(row.fromId, removed, byId) ?? "root";
-		}
-	}
-
-	return { rows: kept, removedCalls, removedResults: removed.size };
+	return { rows, clearedResults };
 }
 
 function contextMessages(rows: Row[]): AgentMessage[] {
@@ -134,8 +105,8 @@ function runSelfTest() {
 			message: {
 				role: "assistant",
 				content: [
-					{ type: "thinking", thinking: "preserve" },
-					{ type: "toolCall", id: "drop-call", name: "bash", arguments: {} },
+					{ type: "thinking", thinking: "valuable", thinkingSignature: "signed" },
+					{ type: "toolCall", id: "clear-call", name: "bash", arguments: {} },
 					{ type: "toolCall", id: "keep-call", name: "ideation_get_node", arguments: {} },
 				],
 				stopReason: "toolUse",
@@ -144,25 +115,35 @@ function runSelfTest() {
 		},
 		{
 			type: "message",
-			id: "drop-result",
+			id: "clear-result",
 			parentId: "assistant",
-			message: { role: "toolResult", toolCallId: "drop-call", toolName: "bash", content: [] },
+			message: {
+				role: "toolResult",
+				toolCallId: "clear-call",
+				toolName: "bash",
+				content: [{ type: "text", text: "large output" }],
+				details: { state: "preserved" },
+			},
 		},
 		{
 			type: "message",
 			id: "keep-result",
-			parentId: "drop-result",
-			message: { role: "toolResult", toolCallId: "keep-call", toolName: "ideation_get_node", content: [] },
+			parentId: "clear-result",
+			message: {
+				role: "toolResult",
+				toolCallId: "keep-call",
+				toolName: "ideation_get_node",
+				content: [{ type: "text", text: "keep output" }],
+			},
 		},
 	];
 	const result = cleanRows(rows);
-	assert.equal(result.removedCalls, 1);
-	assert.equal(result.removedResults, 1);
-	assert.deepEqual(
-		result.rows[2].message.content.map((block: Row) => block.type === "toolCall" ? block.name : block.type),
-		["thinking", "ideation_get_node"],
-	);
-	assert.equal(result.rows[3].parentId, "assistant");
+	assert.equal(result.clearedResults, 1);
+	assert.deepEqual(result.rows[2].message, rows[2].message);
+	assert.deepEqual(result.rows[3].message.content, [{ type: "text", text: CLEARED_RESULT }]);
+	assert.deepEqual(result.rows[3].message.details, { state: "preserved" });
+	assert.deepEqual(result.rows[4], rows[4]);
+	assert.equal(cleanRows(result.rows).clearedResults, 0);
 	assert.equal(refreshLastUsageEstimate(result.rows), true);
 	assert.notEqual(result.rows[2].message.usage.totalTokens, 999);
 }
@@ -171,7 +152,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", (_event, ctx) => ctx.ui.setStatus("tool-call-clean", undefined));
 
 	pi.registerCommand("tool-call-clean", {
-		description: "Remove all tool history except ideation get_node/get_outline, then reload the session",
+		description: "Clear non-ideation tool outputs while preserving every assistant and thinking block",
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();
 			const sessionFile = ctx.sessionManager.getSessionFile();
@@ -188,7 +169,7 @@ export default function (pi: ExtensionAPI) {
 				const afterTokens = freshContextEstimate(result.rows);
 				const usageRefreshed = refreshLastUsageEstimate(result.rows);
 				const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
-				const changed = result.removedCalls > 0 || result.removedResults > 0 || usageRefreshed;
+				const changed = result.clearedResults > 0 || usageRefreshed;
 
 				if (changed) {
 					if (readFileSync(sessionFile, "utf8") !== original) {
@@ -198,8 +179,8 @@ export default function (pi: ExtensionAPI) {
 					rewriteAtomically(sessionFile, cleaned);
 				}
 
-				const summary = result.removedCalls > 0 || result.removedResults > 0
-					? `Removed ${result.removedCalls} calls + ${result.removedResults} results; fresh message estimate ${formatTokens(beforeTokens)} → ${formatTokens(afterTokens)}`
+				const summary = result.clearedResults > 0
+					? `Cleared ${result.clearedResults} tool outputs; preserved all thinking and assistant blocks; fresh message estimate ${formatTokens(beforeTokens)} → ${formatTokens(afterTokens)}`
 					: usageRefreshed
 						? `Refreshed footer context estimate to ${formatTokens(afterTokens)}`
 						: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
