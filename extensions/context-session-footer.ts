@@ -1,7 +1,17 @@
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { getCurrentRunUsage, getSessionUsage, type UsageTotals } from "./context-session-footer/session-usage.ts";
+import {
+	type CacheLifetime,
+	getCacheFooterStatus,
+	getCurrentRunUsage,
+	getLastModelRequestAt,
+	getLatestReportedCacheLifetime,
+	getModelCacheLifetime,
+	getRequestCacheLifetime,
+	getSessionUsage,
+	type UsageTotals,
+} from "./context-session-footer/session-usage.ts";
 
 const fitToWidth = (s: string, width: number): string => {
 	if (width <= 0) return "";
@@ -28,7 +38,9 @@ const appendPipeSegment = (
 ): void => {
 	const styledSegment = themeFn(segment);
 	const separator = themeFn(" | ");
-	const candidate = state.currentLine ? `${state.currentLine}${separator}${styledSegment}` : styledSegment;
+	const candidate = state.currentLine
+		? `${state.currentLine}${separator}${styledSegment}`
+		: styledSegment;
 	if (visibleWidth(candidate) > width) {
 		if (state.currentLine) {
 			state.lines.push(fitToWidth(state.currentLine, width));
@@ -47,10 +59,16 @@ const appendSessionTokens = (
 ): void => {
 	let sessionStarted = false;
 	for (const token of tokens) {
-		const separatorText = state.currentLine ? (sessionStarted ? " " : " | ") : "";
+		const separatorText = state.currentLine
+			? sessionStarted
+				? " "
+				: " | "
+			: "";
 		const separator = separatorText ? themeFn(separatorText) : "";
 		const styledToken = themeFn(token);
-		const candidate = state.currentLine ? `${state.currentLine}${separator}${styledToken}` : styledToken;
+		const candidate = state.currentLine
+			? `${state.currentLine}${separator}${styledToken}`
+			: styledToken;
 		if (visibleWidth(candidate) > width) {
 			if (state.currentLine) {
 				state.lines.push(fitToWidth(state.currentLine, width));
@@ -72,7 +90,11 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-function usageTokens(label: string, usage: UsageTotals, isLocal: boolean = false): string[] {
+function usageTokens(
+	label: string,
+	usage: UsageTotals,
+	isLocal: boolean = false,
+): string[] {
 	return [
 		`${label}:`,
 		`↑${formatTokens(usage.input)}`,
@@ -94,11 +116,17 @@ function getDisplayPath(cwd: string): string {
 
 function isGitDirty(cwd: string): boolean {
 	try {
-		return execFileSync("git", ["status", "--porcelain", "--ignore-submodules=dirty"], {
-			cwd,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim().length > 0;
+		return (
+			execFileSync(
+				"git",
+				["status", "--porcelain", "--ignore-submodules=dirty"],
+				{
+					cwd,
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "ignore"],
+				},
+			).trim().length > 0
+		);
 	} catch {
 		return false;
 	}
@@ -108,7 +136,9 @@ function getTemperature(): number | null {
 	try {
 		const configPath = `${process.env.HOME || process.env.USERPROFILE}/.pi/agent/temperature.json`;
 		const fs = require("node:fs");
-		const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as { temp?: number };
+		const data = JSON.parse(fs.readFileSync(configPath, "utf-8")) as {
+			temp?: number;
+		};
 		return data.temp ?? null;
 	} catch {
 		return null;
@@ -116,29 +146,95 @@ function getTemperature(): number | null {
 }
 
 export default function (pi: ExtensionAPI) {
+	const observedLifetimes = new Map<string, CacheLifetime>();
+	let requestRender: (() => void) | undefined;
+	const modelKey = (
+		provider: string | undefined,
+		model: string | undefined,
+	): string => `${provider}/${model}`;
+
+	pi.on("before_provider_request", (event, ctx) => {
+		if (!ctx.model) return;
+		const fallback = getModelCacheLifetime(
+			ctx.model,
+			process.env.PI_CACHE_RETENTION === "long",
+		);
+		observedLifetimes.set(
+			modelKey(ctx.model.provider, ctx.model.id),
+			getRequestCacheLifetime(event.payload, fallback),
+		);
+		requestRender?.();
+	});
+
+	pi.on("model_select", () => requestRender?.());
+
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
-			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+			const rerender = () => tui.requestRender();
+			requestRender = rerender;
+			const unsubscribe = footerData.onBranchChange(rerender);
+			const timer = setInterval(rerender, 15_000);
 
 			return {
-				dispose: unsubscribe,
+				dispose() {
+					clearInterval(timer);
+					unsubscribe();
+					if (requestRender === rerender) requestRender = undefined;
+				},
 				invalidate() {},
 				render(width: number): string[] {
-					const sessionStartedAt = ctx.sessionManager.getHeader()?.timestamp ?? "";
-					const totalUsage = getSessionUsage(ctx.sessionManager.getEntries(), sessionStartedAt);
-					const runUsage = getCurrentRunUsage(ctx.sessionManager.getBranch(), sessionStartedAt);
+					const sessionStartedAt =
+						ctx.sessionManager.getHeader()?.timestamp ?? "";
+					const branchEntries = ctx.sessionManager.getBranch();
+					const totalUsage = getSessionUsage(
+						ctx.sessionManager.getEntries(),
+						sessionStartedAt,
+					);
+					const runUsage = getCurrentRunUsage(branchEntries, sessionStartedAt);
 
 					const contextUsage = ctx.getContextUsage();
-					const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+					const contextWindow =
+						contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 					const currentTokens = contextUsage?.tokens ?? 0;
 					const currentPercent = contextUsage?.percent ?? 0;
 					const modelName = ctx.model?.id ?? "no-model";
+					const providerName = ctx.model?.provider ?? "no-provider";
+					const fallbackLifetime =
+						observedLifetimes.get(modelKey(providerName, modelName)) ??
+						getModelCacheLifetime(
+							ctx.model,
+							process.env.PI_CACHE_RETENTION === "long",
+						);
+					const lifetime = getLatestReportedCacheLifetime(
+						branchEntries,
+						providerName,
+						modelName,
+						fallbackLifetime,
+					);
+					const cacheStatus = getCacheFooterStatus(
+						lifetime,
+						getLastModelRequestAt(
+							branchEntries,
+							providerName,
+							modelName,
+							sessionStartedAt,
+						),
+					);
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
-					const isLocal = Boolean(ctx.model && String((ctx.model as any).baseURL ?? (ctx.model as any).baseUrl ?? "").match(/localhost|127\.0\.0\.1/i));
+					const modelUrl = ctx.model as
+						| { baseURL?: unknown; baseUrl?: unknown }
+						| undefined;
+					const isLocal = Boolean(
+						String(modelUrl?.baseURL ?? modelUrl?.baseUrl ?? "").match(
+							/localhost|127\.0\.0\.1/i,
+						),
+					);
 					const thinkingSuffix =
-						ctx.model?.reasoning && !isClaudeCodeModel ? ` ${pi.getThinkingLevel()}` : "";
+						ctx.model?.reasoning && !isClaudeCodeModel
+							? ` ${pi.getThinkingLevel()}`
+							: "";
 
 					const cwd = ctx.sessionManager.getCwd();
 					const branch = footerData.getGitBranch();
@@ -157,10 +253,31 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					appendSessionTokens(lineState, usageTokens("RUN", runUsage, isLocal), width, dim);
-					appendSessionTokens(lineState, usageTokens("TOTAL", totalUsage), width, dim);
-					appendPipeSegment(lineState, `TEMP: ${getTemperature() ?? "(DEFAULT)"}`, width, dim);
-					appendPipeSegment(lineState, `MODEL: ${modelName}${thinkingSuffix}`, width, dim);
+					appendSessionTokens(
+						lineState,
+						usageTokens("RUN", runUsage, isLocal),
+						width,
+						dim,
+					);
+					appendSessionTokens(
+						lineState,
+						usageTokens("TOTAL", totalUsage),
+						width,
+						dim,
+					);
+					appendPipeSegment(lineState, cacheStatus, width, dim);
+					appendPipeSegment(
+						lineState,
+						`TEMP: ${getTemperature() ?? "(DEFAULT)"}`,
+						width,
+						dim,
+					);
+					appendPipeSegment(
+						lineState,
+						`MODEL: ${modelName}${thinkingSuffix}`,
+						width,
+						dim,
+					);
 					flushFooterLine(lineState, width);
 
 					return lineState.lines;
