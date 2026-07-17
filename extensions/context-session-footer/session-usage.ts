@@ -67,6 +67,22 @@ export type CacheObservation = {
 	usesOneHourTtl: boolean;
 };
 
+export type CacheTimerColor = "dim" | "warning" | "error" | "text";
+
+export const getCacheTimerColor = (
+	remainingMs: number,
+	durationMs: number | undefined,
+): CacheTimerColor => {
+	if (remainingMs <= 0) return "text";
+	if (durationMs !== undefined && remainingMs <= durationMs * 0.15) {
+		return "error";
+	}
+	if (durationMs !== undefined && remainingMs <= durationMs * 0.3) {
+		return "warning";
+	}
+	return "dim";
+};
+
 type CacheModel = {
 	api?: string;
 	provider?: string;
@@ -336,15 +352,21 @@ const getCacheTimerStartedAt = (
 	return observation.latestCacheAt;
 };
 
+export const getCacheTimerDurationMs = (
+	lifetime: CacheLifetime,
+	observation: CacheObservation,
+): number | undefined =>
+	observation.usesOneHourTtl ? ONE_HOUR : lifetime.minTtlMs ?? undefined;
+
 /** Guaranteed time remaining; zero means treat the cache as expired. */
 export const getCacheTimerRemainingMs = (
 	lifetime: CacheLifetime,
 	observation: CacheObservation,
 	now: number = Date.now(),
 ): number => {
-	const ttlMs = observation.usesOneHourTtl ? ONE_HOUR : lifetime.minTtlMs;
+	const ttlMs = getCacheTimerDurationMs(lifetime, observation);
 	const startedAt = getCacheTimerStartedAt(observation);
-	return ttlMs === null || startedAt === undefined
+	return ttlMs === undefined || startedAt === undefined
 		? 0
 		: Math.max(0, startedAt + ttlMs - now);
 };
