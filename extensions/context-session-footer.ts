@@ -1,16 +1,17 @@
 import { execFileSync } from "node:child_process";
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	Theme,
+	ThemeColor,
+} from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import {
-	type CacheLifetime,
-	getCacheObservations,
+	cacheStatus,
+	type CacheStatusRow,
+} from "./cache-status/store.ts";
+import {
 	getCacheTimerColor,
-	getCacheTimerDurationMs,
-	getCacheTimerRemainingMs,
 	getCurrentRunUsage,
-	getLatestReportedCacheLifetime,
-	getModelCacheLifetime,
-	getRequestCacheLifetime,
 	getSessionUsage,
 	type UsageTotals,
 } from "./context-session-footer/session-usage.ts";
@@ -97,55 +98,104 @@ const cacheCell = (value: string, width: number): string => {
 	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
 };
 
-type CacheTableRow = {
-	provider: string;
-	model: string;
-	remainingMs: number;
-	durationMs: number | undefined;
-	lastSeenAt: number;
+const formatCacheCount = (count: number): string => {
+	if (count < 1000) return String(Math.max(0, Math.round(count)));
+	if (count < 1_000_000) return `${(count / 1000).toFixed(2)} K`;
+	return `${(count / 1_000_000).toFixed(2)} M`;
+};
+
+const CACHE_FLASH_MS = 3000;
+const CACHE_FLASH_HOLD_MS = 1000;
+const CACHE_FLASH_PALETTE = [46, 82, 83, 119, 120, 156, 157, 193, 194, 252];
+
+const cacheFlashText = (
+	theme: Theme,
+	text: string,
+	flashUntil: number,
+): string => {
+	const elapsed = CACHE_FLASH_MS - Math.max(0, flashUntil - Date.now());
+	const progress = Math.max(
+		0,
+		Math.min(1, (elapsed - CACHE_FLASH_HOLD_MS) / (CACHE_FLASH_MS - CACHE_FLASH_HOLD_MS)),
+	);
+	if (theme.getColorMode() === "truecolor") {
+		const redBlue = Math.round(204 * progress);
+		const green = Math.round(255 - 51 * progress);
+		return `\x1b[38;2;${redBlue};${green};${redBlue}m${text}\x1b[39m`;
+	}
+	const color = CACHE_FLASH_PALETTE[
+		Math.min(
+			CACHE_FLASH_PALETTE.length - 1,
+			Math.floor(progress * CACHE_FLASH_PALETTE.length),
+		)
+	];
+	return `\x1b[38;5;${color}m${text}\x1b[39m`;
 };
 
 const appendCacheTable = (
 	state: FooterLineState,
-	rows: CacheTableRow[],
+	rows: CacheStatusRow[],
 	width: number,
 	theme: Theme,
 ): void => {
 	if (rows.length === 0) return;
 	flushFooterLine(state, width);
 
-	const statuses = rows.map((row) =>
-		row.remainingMs > 0
-			? `WARM ${formatCacheTimerValue(row.remainingMs)}`
-			: "EXPIRED",
+	const headers = ["PROVIDER", "MODEL", "STATUS", "TIME", "READ", "ADDED"];
+	const values = rows.map((row) => {
+		const expired =
+			row.result !== "CHECKING" &&
+			row.result !== "NO CACHE" &&
+			row.durationMs !== undefined &&
+			row.remainingMs <= 0;
+		return [
+			row.provider,
+			row.model,
+			expired ? "EXPIRED" : (row.result ?? "NO CACHE"),
+			row.durationMs !== undefined && row.remainingMs > 0
+				? formatCacheTimerValue(row.remainingMs)
+				: "-",
+			row.cacheRead === undefined ? "-" : formatCacheCount(row.cacheRead),
+			row.cacheWrite === undefined
+				? "-"
+				: `+${formatCacheCount(row.cacheWrite)}`,
+		];
+	});
+	const desired = headers.map((header, index) =>
+		Math.max(
+			visibleWidth(header),
+			...values.map((row) => visibleWidth(row[index])),
+		),
 	);
-	const desired = [
-		Math.max(6, ...rows.map((row) => visibleWidth(row.provider))),
-		Math.max(1, ...rows.map((row) => visibleWidth(row.model))),
-		Math.max(7, ...statuses.map((status) => visibleWidth(status))),
-	];
-	const available = Math.max(3, width - 10);
-	const minimum = [1, 1, 1];
+	const available = Math.max(headers.length, width - (headers.length * 3 + 1));
 	const columns = [...desired];
 	while (columns.reduce((sum, value) => sum + value, 0) > available) {
 		const index = columns.indexOf(Math.max(...columns));
-		if (columns[index] <= minimum[index]) break;
+		if (columns[index] <= 1) break;
 		columns[index]--;
 	}
-	if (columns.reduce((sum, value) => sum + value, 0) > available) {
-		columns.splice(0, 3, 1, 1, 1);
-	}
 
-	const [providerWidth, modelWidth, statusWidth] = columns;
 	const border = (left: string, middle: string, right: string) =>
-		`${left}${"─".repeat(providerWidth + 2)}${middle}${"─".repeat(modelWidth + 2)}${middle}${"─".repeat(statusWidth + 2)}${right}`;
-	const top = `CACHE${"─".repeat(Math.max(0, providerWidth + 3 - "CACHE".length))}┬${"─".repeat(modelWidth + 2)}┬${"─".repeat(statusWidth + 2)}┐`;
+		`${left}${columns.map((column) => "─".repeat(column + 2)).join(middle)}${right}`;
+	const top = `CACHE${"─".repeat(Math.max(0, columns[0] + 3 - "CACHE".length))}${columns
+		.slice(1)
+		.map((column) => `┬${"─".repeat(column + 2)}`)
+		.join("")}┐`;
 	state.lines.push(theme.fg("dim", top));
 
 	for (const [index, row] of rows.entries()) {
-		const status = statuses[index];
+		const [provider, model, status, time, read, added] = values[index];
+		const flashing = (row.flashUntil ?? 0) > Date.now();
+		const statusColor: ThemeColor =
+			status === "EXPIRED" || status === "NO CACHE" ? "text" : "dim";
+		const timeColor: ThemeColor =
+			time === "-" ? "text" : getCacheTimerColor(row.remainingMs, row.durationMs);
+		const paint = (text: string, color: ThemeColor) =>
+			flashing
+				? cacheFlashText(theme, text, row.flashUntil ?? 0)
+				: theme.fg(color, text);
 		state.lines.push(
-			`${theme.fg("dim", "│ ")}${theme.fg("dim", cacheCell(row.provider, providerWidth))}${theme.fg("dim", " │ ")}${theme.fg("dim", cacheCell(row.model, modelWidth))}${theme.fg("dim", " │ ")}${theme.fg(getCacheTimerColor(row.remainingMs, row.durationMs), cacheCell(status, statusWidth))}${theme.fg("dim", " │")}`,
+			`${theme.fg("dim", "│ ")}${paint(cacheCell(provider, columns[0]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(model, columns[1]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(status, columns[2]), statusColor)}${theme.fg("dim", " │ ")}${paint(cacheCell(time, columns[3]), timeColor)}${theme.fg("dim", " │ ")}${paint(cacheCell(read, columns[4]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(added, columns[5]), "dim")}${theme.fg("dim", " │")}`,
 		);
 	}
 
@@ -228,27 +278,8 @@ function getTemperature(): number | null {
 }
 
 export default function (pi: ExtensionAPI) {
-	const observedLifetimes = new Map<string, CacheLifetime>();
 	let requestRender: (() => void) | undefined;
-	const modelKey = (
-		provider: string | undefined,
-		model: string | undefined,
-	): string => `${provider}/${model}`;
-
-	pi.on("before_provider_request", (event, ctx) => {
-		if (!ctx.model) return;
-		const fallback = getModelCacheLifetime(
-			ctx.model,
-			process.env.PI_CACHE_RETENTION === "long",
-		);
-		observedLifetimes.set(
-			modelKey(ctx.model.provider, ctx.model.id),
-			getRequestCacheLifetime(event.payload, fallback),
-		);
-		requestRender?.();
-	});
-
-	pi.on("model_select", () => requestRender?.());
+	pi.events.on("cache-status:update", () => requestRender?.());
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
@@ -282,49 +313,7 @@ export default function (pi: ExtensionAPI) {
 					const currentTokens = contextUsage?.tokens ?? 0;
 					const currentPercent = contextUsage?.percent ?? 0;
 					const modelName = ctx.model?.id ?? "no-model";
-					const cacheObservations = getCacheObservations(
-						branchEntries,
-						sessionStartedAt,
-					);
-					const now = Date.now();
-					const cacheTimers = cacheObservations
-						.map((observation) => {
-							const fallbackLifetime =
-								observedLifetimes.get(
-									modelKey(observation.provider, observation.model),
-								) ??
-								getModelCacheLifetime(
-									ctx.modelRegistry.find(
-										observation.provider,
-										observation.model,
-									),
-									process.env.PI_CACHE_RETENTION === "long",
-								);
-							const lifetime = getLatestReportedCacheLifetime(
-								branchEntries,
-								observation.provider,
-								observation.model,
-								fallbackLifetime,
-							);
-							return {
-								provider: observation.provider,
-								model: observation.model,
-								remainingMs: getCacheTimerRemainingMs(
-									lifetime,
-									observation,
-									now,
-								),
-								durationMs: getCacheTimerDurationMs(lifetime, observation),
-								lastSeenAt: observation.latestCacheAt,
-							};
-						})
-						.sort((a, b) => {
-							if (a.remainingMs > 0 !== b.remainingMs > 0)
-								return a.remainingMs > 0 ? -1 : 1;
-							return a.remainingMs > 0
-								? a.remainingMs - b.remainingMs
-								: b.lastSeenAt - a.lastSeenAt;
-						});
+					const cacheTimers = cacheStatus.getRows();
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
 					const modelUrl = ctx.model as
 						| { baseURL?: unknown; baseUrl?: unknown }
