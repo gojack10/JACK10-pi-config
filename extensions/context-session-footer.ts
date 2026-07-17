@@ -1,9 +1,8 @@
 import { execFileSync } from "node:child_process";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import {
 	type CacheLifetime,
-	formatCacheTimer,
 	getCacheObservations,
 	getCacheTimerRemainingMs,
 	getCurrentRunUsage,
@@ -93,6 +92,85 @@ function formatTokens(count: number): string {
 
 const CACHE_WARNING_MS = 10 * 60 * 1000;
 const CACHE_URGENT_MS = 2 * 60 * 1000;
+
+const cacheCell = (value: string, width: number): string => {
+	const fitted = truncateToWidth(value, width, "…");
+	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
+};
+
+type CacheTableRow = {
+	provider: string;
+	model: string;
+	remainingMs: number;
+	lastSeenAt: number;
+};
+
+const appendCacheTable = (
+	state: FooterLineState,
+	rows: CacheTableRow[],
+	width: number,
+	theme: Theme,
+): void => {
+	if (rows.length === 0) return;
+	flushFooterLine(state, width);
+
+	const statuses = rows.map((row) =>
+		row.remainingMs > 0
+			? `WARM ${formatCacheTimerValue(row.remainingMs)}`
+			: "EXPIRED",
+	);
+	const desired = [
+		Math.max(6, ...rows.map((row) => visibleWidth(row.provider))),
+		Math.max(1, ...rows.map((row) => visibleWidth(row.model))),
+		Math.max(7, ...statuses.map((status) => visibleWidth(status))),
+	];
+	const available = Math.max(3, width - 10);
+	const minimum = [1, 1, 1];
+	const columns = [...desired];
+	while (columns.reduce((sum, value) => sum + value, 0) > available) {
+		const index = columns.indexOf(Math.max(...columns));
+		if (columns[index] <= minimum[index]) break;
+		columns[index]--;
+	}
+	if (columns.reduce((sum, value) => sum + value, 0) > available) {
+		columns.splice(0, 3, 1, 1, 1);
+	}
+
+	const [providerWidth, modelWidth, statusWidth] = columns;
+	const border = (left: string, middle: string, right: string) =>
+		`${left}${"─".repeat(providerWidth + 2)}${middle}${"─".repeat(modelWidth + 2)}${middle}${"─".repeat(statusWidth + 2)}${right}`;
+	const titleWidth = providerWidth + 2;
+	const title = "─ CACHE ";
+	const top = `┌${title}${"─".repeat(Math.max(0, titleWidth - title.length))}┬${"─".repeat(modelWidth + 2)}┬${"─".repeat(statusWidth + 2)}┐`;
+	state.lines.push(theme.fg("dim", top));
+
+	for (const [index, row] of rows.entries()) {
+		const status = statuses[index];
+		const statusColor =
+			row.remainingMs <= 0
+				? "dim"
+				: row.remainingMs <= CACHE_URGENT_MS
+					? "error"
+					: row.remainingMs <= CACHE_WARNING_MS
+						? "warning"
+						: "dim";
+		state.lines.push(
+			`${theme.fg("dim", "│ ")}${cacheCell(row.provider, providerWidth)}${theme.fg("dim", " │ ")}${cacheCell(row.model, modelWidth)}${theme.fg("dim", " │ ")}${theme.fg(statusColor, cacheCell(status, statusWidth))}${theme.fg("dim", " │")}`,
+		);
+	}
+
+	state.lines.push(theme.fg("dim", border("└", "┴", "┘")));
+};
+
+const formatCacheTimerValue = (milliseconds: number): string => {
+	const total = Math.max(0, Math.ceil(milliseconds / 1000));
+	const hours = Math.floor(total / 3600);
+	const minutes = Math.floor((total % 3600) / 60);
+	const seconds = total % 60;
+	return [hours, minutes, seconds]
+		.map((part) => String(part).padStart(2, "0"))
+		.join(":");
+};
 
 function usageTokens(
 	label: string,
@@ -218,13 +296,6 @@ export default function (pi: ExtensionAPI) {
 						branchEntries,
 						sessionStartedAt,
 					);
-					const duplicateModelIds = new Set(
-						cacheObservations
-							.map((observation) => observation.model)
-							.filter(
-								(model, index, models) => models.indexOf(model) !== index,
-							),
-					);
 					const now = Date.now();
 					const cacheTimers = cacheObservations
 						.map((observation) => {
@@ -246,9 +317,8 @@ export default function (pi: ExtensionAPI) {
 								fallbackLifetime,
 							);
 							return {
-								label: duplicateModelIds.has(observation.model)
-									? `${observation.provider}/${observation.model}`
-									: observation.model,
+								provider: observation.provider,
+								model: observation.model,
 								remainingMs: getCacheTimerRemainingMs(
 									lifetime,
 									observation,
@@ -307,21 +377,7 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					for (const cache of cacheTimers) {
-						const warm = cache.remainingMs > 0;
-						const style =
-							warm && cache.remainingMs <= CACHE_URGENT_MS
-								? theme.fg.bind(theme, "error")
-								: warm && cache.remainingMs <= CACHE_WARNING_MS
-									? theme.fg.bind(theme, "warning")
-									: dim;
-						appendPipeSegment(
-							lineState,
-							formatCacheTimer(cache.label, cache.remainingMs),
-							width,
-							style,
-						);
-					}
+					appendCacheTable(lineState, cacheTimers, width, theme);
 					appendPipeSegment(
 						lineState,
 						`TEMP: ${getTemperature() ?? "(DEFAULT)"}`,
