@@ -64,6 +64,9 @@ export type CacheObservation = {
 	latestRequestAt: number;
 	latestCacheAt: number;
 	latestWriteAt?: number;
+	latestCacheRead: number;
+	latestCacheWrite: number;
+	hadPriorCache: boolean;
 	usesOneHourTtl: boolean;
 };
 
@@ -74,10 +77,10 @@ export const getCacheTimerColor = (
 	durationMs: number | undefined,
 ): CacheTimerColor => {
 	if (remainingMs <= 0) return "text";
-	if (durationMs !== undefined && remainingMs <= durationMs * 0.15) {
+	if (durationMs !== undefined && remainingMs <= durationMs * 0.25) {
 		return "error";
 	}
-	if (durationMs !== undefined && remainingMs <= durationMs * 0.3) {
+	if (durationMs !== undefined && remainingMs <= durationMs * 0.5) {
 		return "warning";
 	}
 	return "dim";
@@ -329,6 +332,9 @@ export const getCacheObservations = (
 				: previous?.latestWriteAt !== undefined
 					? { latestWriteAt: previous.latestWriteAt }
 					: {}),
+			latestCacheRead: cacheRead,
+			latestCacheWrite: cacheWrite,
+			hadPriorCache: previous !== undefined,
 			usesOneHourTtl:
 				cacheWrite > 0 ? cacheWrite1h > 0 : (previous?.usesOneHourTtl ?? false),
 		});
