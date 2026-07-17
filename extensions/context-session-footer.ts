@@ -136,9 +136,7 @@ const appendCacheTable = (
 	const [providerWidth, modelWidth, statusWidth] = columns;
 	const border = (left: string, middle: string, right: string) =>
 		`${left}${"─".repeat(providerWidth + 2)}${middle}${"─".repeat(modelWidth + 2)}${middle}${"─".repeat(statusWidth + 2)}${right}`;
-	const titleWidth = providerWidth + 2;
-	const title = "─ CACHE ";
-	const top = `┌${title}${"─".repeat(Math.max(0, titleWidth - title.length))}┬${"─".repeat(modelWidth + 2)}┬${"─".repeat(statusWidth + 2)}┐`;
+	const top = `CACHE${"─".repeat(Math.max(0, providerWidth + 3 - "CACHE".length))}┬${"─".repeat(modelWidth + 2)}┬${"─".repeat(statusWidth + 2)}┐`;
 	state.lines.push(theme.fg("dim", top));
 
 	for (const [index, row] of rows.entries()) {
