@@ -294,30 +294,31 @@ const getPaneRecords = async (
 	exec: TmuxExec,
 	sessionId: string,
 ): Promise<PaneRecord[]> => {
-	const result = await exec([
-		"list-panes",
-		"-a",
-		"-t",
-		sessionId,
-		"-F",
-		"#{window_id}|#{pane_id}|#{@pi_cache_data}",
-	]);
-	if (result.code !== 0) return [];
-	return result.stdout
-		.trimEnd()
-		.split("\n")
-		.flatMap((line) => {
-			const [windowId, paneId, encoded] = line.split("|", 3);
+	const windows = await exec(["list-windows", "-t", sessionId, "-F", "#{window_id}"]);
+	if (windows.code !== 0) return [];
+	const records: PaneRecord[] = [];
+	for (const windowId of windows.stdout.trimEnd().split("\n")) {
+		if (!windowId) continue;
+		const panes = await exec([
+			"list-panes",
+			"-t",
+			windowId,
+			"-F",
+			"#{pane_id}|#{@pi_cache_data}",
+		]);
+		if (panes.code !== 0) continue;
+		for (const line of panes.stdout.trimEnd().split("\n")) {
+			const [paneId, encoded] = line.split("|", 2);
 			const snapshot = encoded ? decodeSnapshot(encoded) : undefined;
-			return snapshot && windowId && paneId
-				? [{ ...snapshot, paneId, windowId }]
-				: [];
-		});
+			if (snapshot && paneId) records.push({ ...snapshot, paneId, windowId });
+		}
+	}
+	return records;
 };
 
 const clearSessionOptions = async (exec: TmuxExec, sessionId: string) => {
 	for (const name of [
-		"@pi_cache",
+		"@pi_cache_session",
 		"@pi_cache_expiry",
 		"@pi_cache_duration",
 		"@pi_cache_model",
@@ -344,12 +345,25 @@ const publishAggregates = async (
 		byWindow.set(record.windowId, snapshots);
 	}
 	for (const [windowId, snapshots] of byWindow) {
-		await option(exec, ["-w", "-t", windowId, "@pi_cache", formatGroupCacheStatus(snapshots, now)]);
+		await option(exec, [
+			"-w",
+			"-t",
+			windowId,
+			"@pi_cache_window",
+			snapshots.length === 1
+				? formatPaneCacheStatus(snapshots[0], now)
+				: formatGroupCacheStatus(snapshots, now),
+		]);
 	}
 
 	const snapshots = records.map(({ paneId: _paneId, windowId: _windowId, ...snapshot }) => snapshot);
 	const summary = summarize(snapshots, now);
-	await option(exec, ["-t", sessionId, "@pi_cache", formatGroupCacheStatus(snapshots, now)]);
+	await option(exec, [
+		"-t",
+		sessionId,
+		"@pi_cache_session",
+		formatGroupCacheStatus(snapshots, now),
+	]);
 	await option(exec, [
 		"-t",
 		sessionId,
@@ -578,14 +592,28 @@ export class CacheStatus {
 		const snapshot = this.getSnapshot();
 		if (!snapshot) return;
 		await option(exec, ["-p", "-t", paneId, "@pi_cache_data", encodeSnapshot(snapshot)]);
-		await option(exec, ["-p", "-t", paneId, "@pi_cache", formatPaneCacheStatus(snapshot)]);
+		await option(exec, [
+			"-p",
+			"-t",
+			paneId,
+			"@pi_cache_pane",
+			formatPaneCacheStatus(snapshot),
+		]);
 		const sessionId = await getSessionId(exec, paneId);
 		if (sessionId) await publishAggregates(exec, sessionId, Date.now());
 	}
 
 	async clear(exec: TmuxExec, paneId: string): Promise<void> {
 		await exec(["set-option", "-q", "-u", "-p", "-t", paneId, "@pi_cache_data"]);
-		await exec(["set-option", "-q", "-u", "-p", "-t", paneId, "@pi_cache"]);
+		await exec([
+			"set-option",
+			"-q",
+			"-u",
+			"-p",
+			"-t",
+			paneId,
+			"@pi_cache_pane",
+		]);
 		const sessionId = await getSessionId(exec, paneId);
 		if (sessionId) await publishAggregates(exec, sessionId, Date.now());
 	}
