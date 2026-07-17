@@ -11,6 +11,7 @@ test("publishes pane and session cache options through tmux", async (t) => {
 	const listeners = new Map<string, ((data: unknown) => void)[]>();
 	const options = new Map<string, string>();
 	const messages: string[] = [];
+	const cacheUpdates: unknown[] = [];
 	const paneId = "%cache-test";
 	const originalPane = process.env.TMUX_PANE;
 	process.env.TMUX_PANE = paneId;
@@ -58,6 +59,7 @@ test("publishes pane and session cache options through tmux", async (t) => {
 			throw new Error(`unexpected tmux call: ${args.join(" ")}`);
 		},
 	};
+	listeners.set("cache-status:update", [(data) => cacheUpdates.push(data)]);
 	const ctx = {
 		model: { provider: "anthropic", id: "claude-fable-5", contextWindow: 200_000 },
 		modelRegistry: { find: () => undefined },
@@ -76,6 +78,7 @@ test("publishes pane and session cache options through tmux", async (t) => {
 	});
 	handlers.get("session_start")?.({}, ctx);
 	await wait();
+	assert.ok(Array.isArray(cacheUpdates.at(-1)));
 	assert.ok(options.get(optionKey("pane", paneId, "@pi_cache_data")));
 	assert.match(
 		options.get(optionKey("session", "$1", "@pi_cache_session")) ?? "",
