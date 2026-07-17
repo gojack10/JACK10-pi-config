@@ -90,9 +90,6 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-const CACHE_WARNING_MS = 10 * 60 * 1000;
-const CACHE_URGENT_MS = 2 * 60 * 1000;
-
 const cacheCell = (value: string, width: number): string => {
 	const fitted = truncateToWidth(value, width, "…");
 	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
@@ -146,16 +143,8 @@ const appendCacheTable = (
 
 	for (const [index, row] of rows.entries()) {
 		const status = statuses[index];
-		const statusColor =
-			row.remainingMs <= 0
-				? "dim"
-				: row.remainingMs <= CACHE_URGENT_MS
-					? "error"
-					: row.remainingMs <= CACHE_WARNING_MS
-						? "warning"
-						: "dim";
 		state.lines.push(
-			`${theme.fg("dim", "│ ")}${cacheCell(row.provider, providerWidth)}${theme.fg("dim", " │ ")}${cacheCell(row.model, modelWidth)}${theme.fg("dim", " │ ")}${theme.fg(statusColor, cacheCell(status, statusWidth))}${theme.fg("dim", " │")}`,
+			`${theme.fg("dim", "│ ")}${theme.fg("dim", cacheCell(row.provider, providerWidth))}${theme.fg("dim", " │ ")}${theme.fg("dim", cacheCell(row.model, modelWidth))}${theme.fg("dim", " │ ")}${theme.fg("dim", cacheCell(status, statusWidth))}${theme.fg("dim", " │")}`,
 		);
 	}
 
@@ -377,7 +366,6 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					appendCacheTable(lineState, cacheTimers, width, theme);
 					appendPipeSegment(
 						lineState,
 						`TEMP: ${getTemperature() ?? "(DEFAULT)"}`,
@@ -390,6 +378,7 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
+					appendCacheTable(lineState, cacheTimers, width, theme);
 					flushFooterLine(lineState, width);
 
 					return lineState.lines;
