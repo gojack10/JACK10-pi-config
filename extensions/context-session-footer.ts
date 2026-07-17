@@ -4,6 +4,8 @@ import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import {
 	type CacheLifetime,
 	getCacheObservations,
+	getCacheTimerColor,
+	getCacheTimerDurationMs,
 	getCacheTimerRemainingMs,
 	getCurrentRunUsage,
 	getLatestReportedCacheLifetime,
@@ -99,6 +101,7 @@ type CacheTableRow = {
 	provider: string;
 	model: string;
 	remainingMs: number;
+	durationMs: number | undefined;
 	lastSeenAt: number;
 };
 
@@ -142,7 +145,7 @@ const appendCacheTable = (
 	for (const [index, row] of rows.entries()) {
 		const status = statuses[index];
 		state.lines.push(
-			`${theme.fg("dim", "│ ")}${theme.fg("dim", cacheCell(row.provider, providerWidth))}${theme.fg("dim", " │ ")}${theme.fg("dim", cacheCell(row.model, modelWidth))}${theme.fg("dim", " │ ")}${theme.fg("dim", cacheCell(status, statusWidth))}${theme.fg("dim", " │")}`,
+			`${theme.fg("dim", "│ ")}${theme.fg("dim", cacheCell(row.provider, providerWidth))}${theme.fg("dim", " │ ")}${theme.fg("dim", cacheCell(row.model, modelWidth))}${theme.fg("dim", " │ ")}${theme.fg(getCacheTimerColor(row.remainingMs, row.durationMs), cacheCell(status, statusWidth))}${theme.fg("dim", " │")}`,
 		);
 	}
 
@@ -311,6 +314,7 @@ export default function (pi: ExtensionAPI) {
 									observation,
 									now,
 								),
+								durationMs: getCacheTimerDurationMs(lifetime, observation),
 								lastSeenAt: observation.latestCacheAt,
 							};
 						})
