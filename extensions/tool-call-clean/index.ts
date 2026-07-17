@@ -185,6 +185,12 @@ export default function (pi: ExtensionAPI) {
 						? `Refreshed footer context estimate to ${formatTokens(afterTokens)}`
 						: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
 
+				if (!changed) {
+					ctx.ui.setStatus("tool-call-clean", summary);
+					ctx.ui.notify(summary, "info");
+					return;
+				}
+
 				const switched = await ctx.switchSession(sessionFile, {
 					withSession: async (replacementCtx) => {
 						replacementCtx.ui.setStatus("tool-call-clean", summary);
