@@ -15,7 +15,7 @@ export default function (pi: ExtensionAPI) {
 		| ((args: string[]) => Promise<{ stdout: string; code: number }>)
 		| undefined;
 
-	const render = () => pi.events.emit("cache-status:update", undefined);
+	const render = () => pi.events.emit("cache-status:update", cacheStatus.getRows());
 	const stopFlashTimer = () => {
 		if (flashTimer) clearInterval(flashTimer);
 		flashTimer = undefined;

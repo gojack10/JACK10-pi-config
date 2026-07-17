@@ -5,10 +5,7 @@ import type {
 	ThemeColor,
 } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import {
-	cacheStatus,
-	type CacheStatusRow,
-} from "./cache-status/store.ts";
+import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
 	getCacheTimerColor,
 	getCurrentRunUsage,
@@ -279,7 +276,11 @@ function getTemperature(): number | null {
 
 export default function (pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
-	pi.events.on("cache-status:update", () => requestRender?.());
+	let cacheTimers: CacheStatusRow[] = [];
+	pi.events.on("cache-status:update", (data) => {
+		if (Array.isArray(data)) cacheTimers = data as CacheStatusRow[];
+		requestRender?.();
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
@@ -313,7 +314,6 @@ export default function (pi: ExtensionAPI) {
 					const currentTokens = contextUsage?.tokens ?? 0;
 					const currentPercent = contextUsage?.percent ?? 0;
 					const modelName = ctx.model?.id ?? "no-model";
-					const cacheTimers = cacheStatus.getRows();
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
 					const modelUrl = ctx.model as
 						| { baseURL?: unknown; baseUrl?: unknown }
