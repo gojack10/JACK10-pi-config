@@ -164,7 +164,9 @@ export const getReportedCacheLifetime = (
 	if (!promptCache) return fallback;
 	if (promptCache.ttl === "30m") return openAI56Lifetime();
 	if (promptCache.retention === "24h") {
-		return { minTtlMs: null, maxTtlMs: ONE_DAY, label: "max 24h" };
+		return fallback.minTtlMs === THIRTY_MINUTES && fallback.maxTtlMs === ONE_DAY
+			? fallback
+			: { minTtlMs: null, maxTtlMs: ONE_DAY, label: "max 24h" };
 	}
 	if (
 		promptCache.retention === "in_memory" ||

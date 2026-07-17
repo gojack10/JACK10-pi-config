@@ -166,6 +166,10 @@ test("reports documented cache bounds without inventing an exact OpenAI expiry",
 		shortOpenAI,
 	);
 	assert.deepEqual(
+		getReportedCacheLifetime({ retention: "24h" }, shortOpenAI),
+		shortOpenAI,
+	);
+	assert.deepEqual(
 		getReportedCacheLifetime({ retention: "in_memory" }, shortOpenAI),
 		{
 			minTtlMs: null,
