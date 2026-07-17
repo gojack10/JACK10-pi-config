@@ -6,7 +6,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 
 const wait = () => new Promise((resolve) => setTimeout(resolve, 10));
 
-test("publishes pane and session cache options through tmux", async () => {
+test("publishes pane and session cache options through tmux", async (t) => {
 	const handlers = new Map<string, Handler>();
 	const listeners = new Map<string, ((data: unknown) => void)[]>();
 	const options = new Map<string, string>();
@@ -42,9 +42,10 @@ test("publishes pane and session cache options through tmux", async () => {
 			}
 			if (args[0] === "display-message" && args.includes("-p"))
 				return { stdout: "$1\n", code: 0 };
+			if (args[0] === "list-windows") return { stdout: "@1\n", code: 0 };
 			if (args[0] === "list-panes") {
 				return {
-					stdout: `$1|${paneId}|${options.get(optionKey("pane", paneId, "@pi_cache_data")) ?? ""}\n`,
+					stdout: `${paneId}|${options.get(optionKey("pane", paneId, "@pi_cache_data")) ?? ""}\n`,
 					code: 0,
 				};
 			}
@@ -69,10 +70,21 @@ test("publishes pane and session cache options through tmux", async () => {
 	};
 
 	activate(pi as never);
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		process.env.TMUX_PANE = originalPane;
+	});
 	handlers.get("session_start")?.({}, ctx);
 	await wait();
 	assert.ok(options.get(optionKey("pane", paneId, "@pi_cache_data")));
-	assert.match(options.get(optionKey("session", "$1", "@pi_cache")) ?? "", /NO CACHE/);
+	assert.match(
+		options.get(optionKey("session", "$1", "@pi_cache_session")) ?? "",
+		/NO CACHE/,
+	);
+	assert.match(
+		options.get(optionKey("window", "@1", "@pi_cache_window")) ?? "",
+		/RUN \$0\.00 TOTAL \$0\.00/,
+	);
 
 	handlers.get("agent_start")?.({}, ctx);
 	handlers.get("agent_settled")?.({}, ctx);
@@ -81,5 +93,4 @@ test("publishes pane and session cache options through tmux", async () => {
 
 	await handlers.get("session_shutdown")?.({}, ctx);
 	assert.equal(options.get(optionKey("pane", paneId, "@pi_cache_data")), undefined);
-	process.env.TMUX_PANE = originalPane;
 });
