@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-	getCacheFooterStatus,
+	formatCacheTimer,
+	getCacheObservations,
+	getCacheTimerRemainingMs,
 	getCurrentRunUsage,
-	getLastModelRequestAt,
 	getLatestReportedCacheLifetime,
 	getModelCacheLifetime,
 	getReportedCacheLifetime,
@@ -48,7 +49,7 @@ test("separates the current session and post-boundary run", () => {
 	assert.equal(getCurrentRunUsage(activeBranch, startedAt).cost, 6);
 });
 
-test("reports documented cache bounds without inventing an exact OpenAI expiry", () => {
+test("reports provider policy and conservative per-model cache timers", () => {
 	const shortClaude = getModelCacheLifetime(
 		{ provider: "anthropic", id: "claude-sonnet-5", api: "anthropic-messages" },
 		false,
@@ -201,121 +202,130 @@ test("reports documented cache bounds without inventing an exact OpenAI expiry",
 	const entries = [
 		{
 			type: "message",
-			timestamp: "2026-01-01T00:00:00.000Z",
+			timestamp: "2025-12-31T23:59:00.000Z",
+			message: {
+				role: "assistant",
+				provider: "openai",
+				model: "ignored-before-session",
+				timestamp: -1,
+				usage: { input: 1, cacheWrite: 1 },
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: "openai",
+				model: "gpt-5.6-sol",
+				timestamp: 1_000,
+				usage: { input: 1, cacheWrite: 2_000 },
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: "openai",
+				model: "gpt-5.6-sol",
+				timestamp: 2_000,
+				usage: { input: 1, cacheRead: 2_000, cacheWrite: 0 },
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: "openai-codex-team",
+				model: "gpt-5.6-sol",
+				timestamp: 10_000,
+				usage: { input: 2_000, cacheRead: 0, cacheWrite: 0 },
+				promptCache: { retention: "24h" },
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: "openai-codex-team",
+				model: "gpt-5.6-sol",
+				timestamp: 20_000,
+				usage: { input: 2_000, cacheRead: 0, cacheWrite: 0 },
+			},
+		},
+		{
+			type: "message",
 			message: {
 				role: "assistant",
 				provider: "anthropic",
-				model: "claude-sonnet-5",
-				timestamp: 1_000,
+				model: "claude-fable-5",
+				timestamp: 30_000,
+				usage: { input: 1, cacheWrite: 2_000, cacheWrite1h: 2_000 },
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: "anthropic",
+				model: "claude-fable-5",
+				timestamp: 40_000,
+				usage: { input: 1, cacheRead: 2_000, cacheWrite: 0 },
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				provider: "deepseek",
+				model: "tunnel-model",
+				timestamp: 50_000,
+				usage: { input: 1, cacheRead: 2_000, cacheWrite: 0 },
 			},
 		},
 	];
-	assert.equal(
-		getLastModelRequestAt(entries, "anthropic", "claude-sonnet-5"),
-		1_000,
+	const observations = getCacheObservations(
+		entries,
+		"1970-01-01T00:00:00.000Z",
+	);
+	assert.deepEqual(
+		observations.map(({ provider, model }) => `${provider}/${model}`),
+		[
+			"openai/gpt-5.6-sol",
+			"openai-codex-team/gpt-5.6-sol",
+			"anthropic/claude-fable-5",
+			"deepseek/tunnel-model",
+		],
 	);
 	assert.equal(
-		getLastModelRequestAt(
-			entries,
-			"anthropic",
-			"claude-sonnet-5",
-			"2026-01-02T00:00:00.000Z",
+		getCacheTimerRemainingMs(shortOpenAI, observations[0], 61_000),
+		1_740_000,
+	);
+	assert.equal(
+		getCacheTimerRemainingMs(longCodex, observations[1], 80_000),
+		1_740_000,
+	);
+	assert.equal(
+		getCacheTimerRemainingMs(shortClaude, observations[2], 100_000),
+		3_540_000,
+	);
+	assert.equal(
+		getCacheTimerRemainingMs(
+			{ minTtlMs: null, maxTtlMs: null, label: "TTL ?" },
+			observations[3],
+			50_001,
 		),
-		undefined,
+		0,
 	);
 	assert.equal(
-		getLastModelRequestAt(
-			[
-				{
-					type: "message",
-					message: {
-						role: "assistant",
-						provider: "openai",
-						model: "gpt-5.6-sol",
-						timestamp: 1_000,
-						usage: { cacheWrite: 2_000 },
-					},
-				},
-				{
-					type: "message",
-					message: {
-						role: "assistant",
-						provider: "openai",
-						model: "gpt-5.6-sol",
-						timestamp: 2_000,
-						usage: { cacheRead: 2_000, cacheWrite: 0 },
-					},
-				},
-			],
-			"openai",
-			"gpt-5.6-sol",
-		),
-		1_000,
+		getCacheTimerRemainingMs(shortOpenAI, observations[0], 1_801_001),
+		0,
 	);
 	assert.equal(
-		getLastModelRequestAt(
-			[
-				{
-					type: "message",
-					message: {
-						role: "assistant",
-						provider: "openai",
-						model: "gpt-5.6-sol",
-						timestamp: 2_000,
-						usage: { cacheWrite: 0 },
-					},
-				},
-			],
-			"openai",
-			"gpt-5.6-sol",
-		),
-		undefined,
+		formatCacheTimer("gpt-5.6-sol", 60_000),
+		"CACHE: gpt-5.6-sol WARM 00:01:00",
 	);
 	assert.equal(
-		getLastModelRequestAt(
-			[
-				{
-					type: "message",
-					message: {
-						role: "assistant",
-						provider: "openai-codex-alt",
-						model: "gpt-5.6-sol",
-						timestamp: 2_000,
-						usage: { cacheWrite: 0 },
-					},
-				},
-			],
-			"openai-codex-alt",
-			"gpt-5.6-sol",
-		),
-		2_000,
-	);
-	assert.equal(
-		getCacheFooterStatus(shortClaude, 1_000, 61_000),
-		"CACHE: ≤4m/5m",
-	);
-	assert.equal(
-		getCacheFooterStatus(shortClaude, 1_000, 301_000),
-		"CACHE: expired +0s (5m)",
-	);
-	assert.equal(
-		getCacheFooterStatus(shortClaude, 1_000, 361_000),
-		"CACHE: expired +1m (5m)",
-	);
-	assert.equal(
-		getCacheFooterStatus(shortOpenAI, 1_000, 61_000),
-		"CACHE: eligible 29m+ / max 24h",
-	);
-	assert.equal(
-		getCacheFooterStatus(longCodex, 1_000, 61_000),
-		"CACHE*: eligible 29m+ / max 24h",
-	);
-	assert.equal(
-		getCacheFooterStatus(shortOpenAI, 1_000, 1_861_000),
-		"CACHE: uncertain · age 31m / max 24h",
-	);
-	assert.equal(
-		getCacheFooterStatus(shortOpenAI, 1_000, 86_401_000),
-		"CACHE: expired +0s (max 24h)",
+		formatCacheTimer("gpt-5.6-sol", 0),
+		"CACHE: gpt-5.6-sol EXPIRED",
 	);
 });

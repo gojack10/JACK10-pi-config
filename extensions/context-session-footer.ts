@@ -3,9 +3,10 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import {
 	type CacheLifetime,
-	getCacheFooterStatus,
+	formatCacheTimer,
+	getCacheObservations,
+	getCacheTimerRemainingMs,
 	getCurrentRunUsage,
-	getLastModelRequestAt,
 	getLatestReportedCacheLifetime,
 	getModelCacheLifetime,
 	getRequestCacheLifetime,
@@ -90,6 +91,9 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+const CACHE_WARNING_MS = 10 * 60 * 1000;
+const CACHE_URGENT_MS = 2 * 60 * 1000;
+
 function usageTokens(
 	label: string,
 	usage: UsageTotals,
@@ -114,9 +118,17 @@ function getDisplayPath(cwd: string): string {
 	return cwd;
 }
 
+let gitDirtyCache:
+	| { cwd: string; dirty: boolean; checkedAt: number }
+	| undefined;
+
 function isGitDirty(cwd: string): boolean {
+	const now = Date.now();
+	if (gitDirtyCache?.cwd === cwd && now - gitDirtyCache.checkedAt < 5000) {
+		return gitDirtyCache.dirty;
+	}
 	try {
-		return (
+		const dirty =
 			execFileSync(
 				"git",
 				["status", "--porcelain", "--ignore-submodules=dirty"],
@@ -125,9 +137,11 @@ function isGitDirty(cwd: string): boolean {
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "ignore"],
 				},
-			).trim().length > 0
-		);
+			).trim().length > 0;
+		gitDirtyCache = { cwd, dirty, checkedAt: now };
+		return dirty;
 	} catch {
+		gitDirtyCache = { cwd, dirty: false, checkedAt: now };
 		return false;
 	}
 }
@@ -175,7 +189,7 @@ export default function (pi: ExtensionAPI) {
 			const rerender = () => tui.requestRender();
 			requestRender = rerender;
 			const unsubscribe = footerData.onBranchChange(rerender);
-			const timer = setInterval(rerender, 15_000);
+			const timer = setInterval(rerender, 1000);
 
 			return {
 				dispose() {
@@ -200,28 +214,56 @@ export default function (pi: ExtensionAPI) {
 					const currentTokens = contextUsage?.tokens ?? 0;
 					const currentPercent = contextUsage?.percent ?? 0;
 					const modelName = ctx.model?.id ?? "no-model";
-					const providerName = ctx.model?.provider ?? "no-provider";
-					const fallbackLifetime =
-						observedLifetimes.get(modelKey(providerName, modelName)) ??
-						getModelCacheLifetime(
-							ctx.model,
-							process.env.PI_CACHE_RETENTION === "long",
-						);
-					const lifetime = getLatestReportedCacheLifetime(
+					const cacheObservations = getCacheObservations(
 						branchEntries,
-						providerName,
-						modelName,
-						fallbackLifetime,
+						sessionStartedAt,
 					);
-					const cacheStatus = getCacheFooterStatus(
-						lifetime,
-						getLastModelRequestAt(
-							branchEntries,
-							providerName,
-							modelName,
-							sessionStartedAt,
-						),
+					const duplicateModelIds = new Set(
+						cacheObservations
+							.map((observation) => observation.model)
+							.filter(
+								(model, index, models) => models.indexOf(model) !== index,
+							),
 					);
+					const now = Date.now();
+					const cacheTimers = cacheObservations
+						.map((observation) => {
+							const fallbackLifetime =
+								observedLifetimes.get(
+									modelKey(observation.provider, observation.model),
+								) ??
+								getModelCacheLifetime(
+									ctx.modelRegistry.find(
+										observation.provider,
+										observation.model,
+									),
+									process.env.PI_CACHE_RETENTION === "long",
+								);
+							const lifetime = getLatestReportedCacheLifetime(
+								branchEntries,
+								observation.provider,
+								observation.model,
+								fallbackLifetime,
+							);
+							return {
+								label: duplicateModelIds.has(observation.model)
+									? `${observation.provider}/${observation.model}`
+									: observation.model,
+								remainingMs: getCacheTimerRemainingMs(
+									lifetime,
+									observation,
+									now,
+								),
+								lastSeenAt: observation.latestCacheAt,
+							};
+						})
+						.sort((a, b) => {
+							if (a.remainingMs > 0 !== b.remainingMs > 0)
+								return a.remainingMs > 0 ? -1 : 1;
+							return a.remainingMs > 0
+								? a.remainingMs - b.remainingMs
+								: b.lastSeenAt - a.lastSeenAt;
+						});
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
 					const modelUrl = ctx.model as
 						| { baseURL?: unknown; baseUrl?: unknown }
@@ -265,7 +307,21 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					appendPipeSegment(lineState, cacheStatus, width, dim);
+					for (const cache of cacheTimers) {
+						const warm = cache.remainingMs > 0;
+						const style =
+							warm && cache.remainingMs <= CACHE_URGENT_MS
+								? theme.fg.bind(theme, "error")
+								: warm && cache.remainingMs <= CACHE_WARNING_MS
+									? theme.fg.bind(theme, "warning")
+									: dim;
+						appendPipeSegment(
+							lineState,
+							formatCacheTimer(cache.label, cache.remainingMs),
+							width,
+							style,
+						);
+					}
 					appendPipeSegment(
 						lineState,
 						`TEMP: ${getTemperature() ?? "(DEFAULT)"}`,

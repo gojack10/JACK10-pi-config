@@ -19,6 +19,7 @@ type UsageEntry = {
 			output?: number;
 			cacheRead?: number;
 			cacheWrite?: number;
+			cacheWrite1h?: number;
 			cost?: { total?: number };
 		};
 		promptCache?: { retention?: string; ttl?: string };
@@ -55,6 +56,15 @@ export type CacheLifetime = {
 	maxTtlMs: number | null;
 	typicalTtlMs?: [number, number];
 	label: string;
+};
+
+export type CacheObservation = {
+	provider: string;
+	model: string;
+	latestRequestAt: number;
+	latestCacheAt: number;
+	latestWriteAt?: number;
+	usesOneHourTtl: boolean;
 };
 
 type CacheModel = {
@@ -229,7 +239,7 @@ export const getModelCacheLifetime = (
 		return openAI56Lifetime();
 	}
 	if (isOpenAI56 && model.api === "openai-codex-responses") {
-		// The ChatGPT Codex backend sends the same cache key but has no public TTL contract.
+		// Codex omits ttl; infer GPT-5.6's only supported/default 30m value.
 		return openAI56Lifetime(true);
 	}
 
@@ -259,88 +269,98 @@ export const getModelCacheLifetime = (
 	return unknownLifetime();
 };
 
-export const getLastModelRequestAt = (
+export const getCacheObservations = (
 	entries: UsageEntry[],
-	provider: string,
-	model: string,
 	sessionStartedAt?: string,
-): number | undefined => {
-	let latestRequestAt: number | undefined;
+): CacheObservation[] => {
 	const startedAt = Date.parse(sessionStartedAt ?? "");
-	const requiresReportedWrite =
-		/^gpt-5\.6(?:-|$)/.test(model) && !provider.startsWith("openai-codex");
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index];
+	const latestRequests = new Map<string, number>();
+	const observations = new Map<string, CacheObservation>();
+
+	for (const entry of entries) {
+		const message = entry.message;
+		if (entry.type !== "message" || message?.role !== "assistant") continue;
+		const timestamp = message.timestamp ?? Date.parse(entry.timestamp ?? "");
 		if (
-			entry.type !== "message" ||
-			entry.message?.role !== "assistant" ||
-			entry.message.provider !== provider ||
-			entry.message.model !== model
-		) {
-			continue;
-		}
-		const timestamp =
-			entry.message.timestamp ?? Date.parse(entry.timestamp ?? "");
-		if (
+			!message.provider ||
+			!message.model ||
 			!Number.isFinite(timestamp) ||
 			(Number.isFinite(startedAt) && timestamp < startedAt)
 		)
 			continue;
-		latestRequestAt ??= timestamp;
-		// Direct GPT-5.6 reports writes, whose timestamp starts the minimum TTL. Codex currently omits that count.
-		if (
-			!requiresReportedWrite ||
-			numberOrZero(entry.message.usage?.cacheWrite) > 0
-		)
-			return timestamp;
+
+		const usage = message.usage;
+		const cacheRead = numberOrZero(usage?.cacheRead);
+		const cacheWrite = numberOrZero(usage?.cacheWrite);
+		const cacheWrite1h = numberOrZero(usage?.cacheWrite1h);
+		const key = `${message.provider}/${message.model}`;
+		const promptTokens = numberOrZero(usage?.input) + cacheRead + cacheWrite;
+		if (promptTokens >= 1024) latestRequests.set(key, timestamp);
+		const reportedPolicy = Boolean(
+			message.promptCache?.retention || message.promptCache?.ttl,
+		);
+		if (cacheRead + cacheWrite + cacheWrite1h === 0 && !reportedPolicy)
+			continue;
+
+		const previous = observations.get(key);
+		observations.set(key, {
+			provider: message.provider,
+			model: message.model,
+			latestRequestAt: timestamp,
+			latestCacheAt: timestamp,
+			...(cacheWrite > 0
+				? { latestWriteAt: timestamp }
+				: previous?.latestWriteAt !== undefined
+					? { latestWriteAt: previous.latestWriteAt }
+					: {}),
+			usesOneHourTtl:
+				cacheWrite > 0 ? cacheWrite1h > 0 : (previous?.usesOneHourTtl ?? false),
+		});
 	}
-	return requiresReportedWrite ? undefined : latestRequestAt;
+
+	for (const [key, observation] of observations) {
+		observation.latestRequestAt =
+			latestRequests.get(key) ?? observation.latestCacheAt;
+	}
+	return [...observations.values()];
 };
 
-const formatDuration = (milliseconds: number, roundUp: boolean): string => {
-	const seconds = milliseconds / 1000;
-	if (seconds < 60)
-		return `${Math.max(roundUp ? 1 : 0, roundUp ? Math.ceil(seconds) : Math.floor(seconds))}s`;
-	const minutes = seconds / 60;
-	if (minutes < 60)
-		return `${Math.max(1, roundUp ? Math.ceil(minutes) : Math.floor(minutes))}m`;
-	const hours = minutes / 60;
-	return `${Math.max(1, roundUp ? Math.ceil(hours) : Math.floor(hours))}h`;
+const getCacheTimerStartedAt = (
+	observation: CacheObservation,
+): number | undefined => {
+	if (/^gpt-5\.6(?:-|$)/.test(observation.model)) {
+		return observation.provider.startsWith("openai-codex")
+			? observation.latestRequestAt
+			: observation.latestWriteAt;
+	}
+	return observation.latestCacheAt;
 };
 
-export const getCacheFooterStatus = (
+/** Guaranteed time remaining; zero means treat the cache as expired. */
+export const getCacheTimerRemainingMs = (
 	lifetime: CacheLifetime,
-	lastRequestAt: number | undefined,
+	observation: CacheObservation,
 	now: number = Date.now(),
-): string => {
-	const prefix = lifetime.label.endsWith("*") ? "CACHE*:" : "CACHE:";
-	if (lastRequestAt === undefined)
-		return `${prefix} unseeded / ${lifetime.label}`;
-	const age = Math.max(0, now - lastRequestAt);
-	const { minTtlMs, maxTtlMs } = lifetime;
-	if (minTtlMs === null && maxTtlMs === null)
-		return `${prefix} age ${formatDuration(age, false)} / TTL ?`;
+): number => {
+	const ttlMs = observation.usesOneHourTtl ? ONE_HOUR : lifetime.minTtlMs;
+	const startedAt = getCacheTimerStartedAt(observation);
+	return ttlMs === null || startedAt === undefined
+		? 0
+		: Math.max(0, startedAt + ttlMs - now);
+};
 
-	if (minTtlMs !== null && minTtlMs === maxTtlMs) {
-		const remaining = minTtlMs - age;
-		return remaining > 0
-			? `${prefix} ≤${formatDuration(remaining, true)}/${lifetime.label}`
-			: `${prefix} expired +${formatDuration(-remaining, false)} (${lifetime.label})`;
-	}
-	if (minTtlMs !== null && age < minTtlMs) {
-		const maxLabel =
-			maxTtlMs === null ? lifetime.label : formatDuration(maxTtlMs, true);
-		return `${prefix} eligible ${formatDuration(minTtlMs - age, true)}+ / max ${maxLabel}`;
-	}
-	if (maxTtlMs !== null && age >= maxTtlMs) {
-		return `${prefix} expired +${formatDuration(age - maxTtlMs, false)} (max ${formatDuration(maxTtlMs, true)})`;
-	}
-	if (lifetime.typicalTtlMs && age < lifetime.typicalTtlMs[0]) {
-		return `${prefix} age ${formatDuration(age, false)} / typ 5–10m`;
-	}
-	return maxTtlMs === null
-		? `${prefix} age ${formatDuration(age, false)} / TTL ?`
-		: `${prefix} uncertain · age ${formatDuration(age, false)} / max ${formatDuration(maxTtlMs, true)}`;
+export const formatCacheTimer = (
+	model: string,
+	remainingMs: number,
+): string => {
+	if (remainingMs <= 0) return `CACHE: ${model} EXPIRED`;
+	const total = Math.ceil(remainingMs / 1000);
+	const parts = [
+		Math.floor(total / 3600),
+		Math.floor((total % 3600) / 60),
+		total % 60,
+	];
+	return `CACHE: ${model} WARM ${parts.map((part) => String(part).padStart(2, "0")).join(":")}`;
 };
 
 const emptyUsage = (): UsageTotals => ({
