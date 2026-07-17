@@ -53,6 +53,26 @@ test("pane detail puts timer, model, cache state, context, then cost", () => {
 	assert.doesNotMatch(detail, /R:|\+/);
 });
 
+test("labels a policy-derived timer as cache warm without token counters", () => {
+	const detail = formatPaneCacheStatus(
+		snapshot({
+			entries: [
+				{
+					provider: "openai",
+					model: "gpt-5.6",
+					result: "NO CACHE",
+					expiresAt: 1_300_000,
+					durationMs: 1_800_000,
+					lastSeenAt: 1_000_000,
+				},
+			],
+		}),
+		1_000_000,
+	);
+	assert.match(detail, /CACHE WARM/);
+	assert.doesNotMatch(detail, /NO CACHE/);
+});
+
 test("group summary favors the warm cache and worst live context", () => {
 	const summary = formatGroupCacheStatus(
 		[
