@@ -131,6 +131,8 @@ const statusLabel = (entry: PaneCacheEntry | undefined, now: number): string => 
 	if (!entry) return "NO CACHE";
 	if (entry.expiresAt !== undefined && entry.expiresAt <= now)
 		return "CACHE EXPIRED";
+	if (entry.result === "NO CACHE" && entry.expiresAt !== undefined)
+		return "CACHE WARM";
 	return entry.result === "NO CACHE" ? "NO CACHE" : `CACHE ${entry.result}`;
 };
 
