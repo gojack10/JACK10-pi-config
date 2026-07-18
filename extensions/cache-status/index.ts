@@ -62,7 +62,10 @@ export default function (pi: ExtensionAPI) {
 		paneId = process.env.TMUX_PANE;
 		exec = (args) => pi.exec("tmux", args, { timeout: TICK_MS });
 		if (timer) clearInterval(timer);
-		timer = setInterval(() => void publish(), TICK_MS);
+		timer = setInterval(() => {
+			render();
+			void publish();
+		}, TICK_MS);
 		void publish();
 		render();
 	});
