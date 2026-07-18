@@ -53,6 +53,25 @@ test("pane detail puts timer, model, cache state, context, then cost", () => {
 	assert.doesNotMatch(detail, /R:|\+/);
 });
 
+test("labels a reused cache without remaining time as expired", () => {
+	const detail = formatPaneCacheStatus(
+		snapshot({
+			entries: [
+				{
+					provider: "openai-codex",
+					model: "gpt-5.6-luna",
+					result: "REUSED",
+					durationMs: 1_800_000,
+					lastSeenAt: 1_000_000,
+				},
+			],
+		}),
+		1_000_000,
+	);
+	assert.match(detail, /CACHE EXPIRED/);
+	assert.doesNotMatch(detail, /CACHE REUSED/);
+});
+
 test("labels a policy-derived timer as cache warm without token counters", () => {
 	const detail = formatPaneCacheStatus(
 		snapshot({

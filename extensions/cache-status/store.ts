@@ -129,7 +129,12 @@ const color = (name: "green" | "yellow" | "red" | "white", value: string) =>
 
 const statusLabel = (entry: PaneCacheEntry | undefined, now: number): string => {
 	if (!entry) return "NO CACHE";
-	if (entry.expiresAt !== undefined && entry.expiresAt <= now)
+	if (
+		entry.result !== "CHECKING" &&
+		entry.result !== "NO CACHE" &&
+		entry.durationMs !== undefined &&
+		(entry.expiresAt === undefined || entry.expiresAt <= now)
+	)
 		return "CACHE EXPIRED";
 	if (entry.result === "NO CACHE" && entry.expiresAt !== undefined)
 		return "CACHE WARM";
