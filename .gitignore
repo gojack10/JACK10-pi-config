@@ -1,6 +1,7 @@
 # Secrets
 auth.json
 auth.json.bak*
+auth.json.backup.*
 
 # Auto-generated / cache
 sessions/
@@ -19,6 +20,7 @@ node_modules/
 temperature.json
 settings.json
 settings.local.json
+oneplace-settings.json
 
 # Machine-local model registry (per-host endpoints, API keys)
 models.json
