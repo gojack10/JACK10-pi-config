@@ -1,8 +1,8 @@
 diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
-index 5de78527..7f632a68 100644
+index 89f59c03..33bb5838 100644
 --- a/packages/coding-agent/src/core/extensions/loader.ts
 +++ b/packages/coding-agent/src/core/extensions/loader.ts
-@@ -90,7 +90,11 @@ function getAliases(): Record<string, string> {
+@@ -95,7 +95,11 @@ function getAliases(): Record<string, string> {
  		if (fs.existsSync(workspacePath)) {
  			return workspacePath;
  		}
