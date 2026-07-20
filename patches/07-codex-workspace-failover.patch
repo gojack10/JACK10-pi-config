@@ -1,11 +1,11 @@
 diff --git a/packages/ai/src/api/openai-codex-responses.ts b/packages/ai/src/api/openai-codex-responses.ts
-index 267fa90b..df3766ae 100644
+index 955964fe..24f4aef3 100644
 --- a/packages/ai/src/api/openai-codex-responses.ts
 +++ b/packages/ai/src/api/openai-codex-responses.ts
-@@ -60,7 +60,13 @@ const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
- // leaving callers stuck on "Working..." indefinitely. See #4945.
- const DEFAULT_SSE_HEADER_TIMEOUT_MS = 20_000;
- const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
+@@ -64,7 +64,13 @@ const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
+ // The Codex backend accepts zstd-compressed request bodies on the SSE responses
+ // endpoint (the same endpoint the official Codex client compresses against).
+ const REQUEST_COMPRESSION_ZSTD_LEVEL = 3;
 -const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 +const CODEX_TOOL_CALL_PROVIDERS = new Set([
 +	"openai",
