@@ -15,12 +15,9 @@
 import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { OAuthCredential } from "@earendil-works/pi-ai";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
-import { openaiCodexOAuth as openaiCodexOAuthProvider } from "@earendil-works/pi-ai/auth/oauth/openai-codex";
-
-const SOURCE_PROVIDER = "openai-codex";
-const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const AUTH_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-workspace-auth-observability.jsonl");
 
 const CODEX_ALIASES = [
@@ -52,7 +49,7 @@ function redactId(value: unknown): string | undefined {
 	return `${value.slice(0, 4)}…${value.slice(-4)}`;
 }
 
-function summarizeCredentials(credentials: { access?: string; expires?: number; accountId?: string }): Record<string, unknown> {
+function summarizeCredentials(credentials: OAuthCredential): Record<string, unknown> {
 	const payload = decodeJwtPayload(credentials.access);
 	const auth = payload?.["https://api.openai.com/auth"] as Record<string, unknown> | undefined;
 	return {
@@ -80,70 +77,53 @@ function appendAuthObservation(
 	}
 }
 
-function cloneCodexModels(modelSuffix: string): Array<{
-	id: string;
-	name: string;
-	api: Api;
-	baseUrl: string;
-	reasoning: boolean;
-	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
-	input: ("text" | "image")[];
-	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
-	contextWindow: number;
-	maxTokens: number;
-	compat?: Model<Api>["compat"];
-}> {
-	return (getModels(SOURCE_PROVIDER as never) as Model<Api>[]).map((model) => ({
-		id: model.id,
-		name: `${model.name ?? model.id} (${modelSuffix})`,
-		api: model.api,
-		baseUrl: model.baseUrl ?? CODEX_BASE_URL,
-		reasoning: model.reasoning ?? false,
-		thinkingLevelMap: model.thinkingLevelMap,
-		input: (model.input ?? ["text"]) as ("text" | "image")[],
-		cost: model.cost,
-		contextWindow: model.contextWindow,
-		maxTokens: model.maxTokens,
-		compat: model.compat,
-	}));
-}
-
 export default function codexWorkspaces(pi: ExtensionAPI) {
+	const source = builtinProviders().find((provider) => provider.id === "openai-codex");
+	const oauth = source?.auth.oauth;
+	if (!source || !oauth) throw new Error("Built-in Codex provider has no OAuth flow");
+
 	for (const alias of CODEX_ALIASES) {
-		pi.registerProvider(alias.provider, {
+		pi.registerProvider({
+			...source,
+			id: alias.provider,
 			name: alias.name,
-			baseUrl: CODEX_BASE_URL,
-			api: "openai-codex-responses",
-			models: cloneCodexModels(alias.modelSuffix),
-			oauth: {
-				name: alias.name,
-				login: async (callbacks) => {
-					try {
-						const credentials = await openaiCodexOAuthProvider.login(callbacks);
-						appendAuthObservation(alias.provider, "login", "success", summarizeCredentials(credentials));
-						return credentials;
-					} catch (error) {
-						appendAuthObservation(alias.provider, "login", "error", {
-							error: error instanceof Error ? error.message : String(error),
-						});
-						throw error;
-					}
+			auth: {
+				oauth: {
+					...oauth,
+					name: alias.name,
+					login: async (interaction) => {
+						try {
+							const credentials = await oauth.login(interaction);
+							appendAuthObservation(alias.provider, "login", "success", summarizeCredentials(credentials));
+							return credentials;
+						} catch (error) {
+							appendAuthObservation(alias.provider, "login", "error", {
+								error: error instanceof Error ? error.message : String(error),
+							});
+							throw error;
+						}
+					},
+					refresh: async (credentials, signal) => {
+						try {
+							const refreshed = await oauth.refresh(credentials, signal);
+							appendAuthObservation(alias.provider, "refresh", "success", summarizeCredentials(refreshed));
+							return refreshed;
+						} catch (error) {
+							appendAuthObservation(alias.provider, "refresh", "error", {
+								accountId: redactId(credentials.accountId),
+								error: error instanceof Error ? error.message : String(error),
+							});
+							throw error;
+						}
+					},
 				},
-				refreshToken: async (credentials) => {
-					try {
-						const refreshed = await openaiCodexOAuthProvider.refreshToken(credentials);
-						appendAuthObservation(alias.provider, "refresh", "success", summarizeCredentials(refreshed));
-						return refreshed;
-					} catch (error) {
-						appendAuthObservation(alias.provider, "refresh", "error", {
-							accountId: redactId(credentials.accountId),
-							error: error instanceof Error ? error.message : String(error),
-						});
-						throw error;
-					}
-				},
-				getApiKey: (credentials) => openaiCodexOAuthProvider.getApiKey(credentials),
 			},
+			getModels: () =>
+				source.getModels().map((model) => ({
+					...model,
+					provider: alias.provider,
+					name: `${model.name ?? model.id} (${alias.modelSuffix})`,
+				})),
 		});
 	}
 }
