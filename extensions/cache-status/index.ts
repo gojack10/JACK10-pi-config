@@ -10,6 +10,8 @@ export default function (pi: ExtensionAPI) {
 	let publishing = false;
 	let publishAgain = false;
 	let announceAgain = false;
+	let stopping = false;
+	let resolvePublishing: (() => void) | undefined;
 	let paneId: string | undefined;
 	let exec:
 		| ((args: string[]) => Promise<{ stdout: string; code: number }>)
@@ -28,7 +30,7 @@ export default function (pi: ExtensionAPI) {
 		}, FLASH_TICK_MS);
 	};
 	const publish = async (announceDone = false) => {
-		if (!paneId || !exec) return;
+		if (stopping || !paneId || !exec) return;
 		if (publishing) {
 			publishAgain = true;
 			announceAgain = announceAgain || announceDone;
@@ -48,7 +50,9 @@ export default function (pi: ExtensionAPI) {
 			if (announceDone) await tmuxNotice(exec, paneId, "AGENT DONE");
 		} finally {
 			publishing = false;
-			if (publishAgain) {
+			resolvePublishing?.();
+			resolvePublishing = undefined;
+			if (publishAgain && !stopping) {
 				const nextAnnounceDone = announceAgain;
 				publishAgain = false;
 				announceAgain = false;
@@ -58,6 +62,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		stopping = false;
 		cacheStatus.start(ctx);
 		paneId = process.env.TMUX_PANE;
 		exec = (args) => pi.exec("tmux", args, { timeout: TICK_MS });
@@ -102,8 +107,12 @@ export default function (pi: ExtensionAPI) {
 		render();
 	});
 	pi.on("session_shutdown", async () => {
+		stopping = true;
 		if (timer) clearInterval(timer);
 		stopFlashTimer();
+		publishAgain = false;
+		announceAgain = false;
+		if (publishing) await new Promise<void>((resolve) => (resolvePublishing = resolve));
 		if (paneId && exec) await cacheStatus.clear(exec, paneId);
 		cacheStatus.stop();
 		paneId = undefined;
