@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
-import { openaiCodexOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { openaiCodexOAuth as openaiCodexOAuthProvider } from "@earendil-works/pi-ai/auth/oauth/openai-codex";
 
 const SOURCE_PROVIDER = "openai-codex";
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
@@ -117,7 +117,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			models: cloneCodexModels(alias.modelSuffix),
 			oauth: {
 				name: alias.name,
-				usesCallbackServer: openaiCodexOAuthProvider.usesCallbackServer,
 				login: async (callbacks) => {
 					try {
 						const credentials = await openaiCodexOAuthProvider.login(callbacks);
