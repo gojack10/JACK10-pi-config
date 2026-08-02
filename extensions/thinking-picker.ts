@@ -10,9 +10,9 @@ class InlineBorder {
 	}
 }
 
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
-const LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 async function openThinkingPicker(pi: ExtensionAPI, ctx: ExtensionContext) {
   const current = pi.getThinkingLevel() as ThinkingLevel;
