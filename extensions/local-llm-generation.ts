@@ -13,12 +13,12 @@
 
 import { readFileSync } from "node:fs";
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const MODELS_JSON = `${process.env.HOME}/.pi/agent/models.json`;
-const POLL_MS = 100;
+const POLL_MS = 250;
 const ANIM_MS = 33;
 const BAR_WIDTH = 20;
 

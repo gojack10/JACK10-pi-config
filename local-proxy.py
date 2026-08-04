@@ -27,6 +27,14 @@ DISCOVERY_TIMEOUT = ClientTimeout(total=5, sock_connect=2, sock_read=5)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("local-proxy")
 
+
+class _AccessNoiseFilter(logging.Filter):
+    def filter(self, record):
+        return '"GET /admin/api/stats ' not in record.getMessage()
+
+
+logging.getLogger("aiohttp.access").addFilter(_AccessNoiseFilter())
+
 DS4_PORT = 8001
 OMLX_PORT = 8000
 TUNNEL_PORT = 8003
@@ -57,7 +65,7 @@ DS4_SUPPORTED_PARAMETERS = [
 DS4_MODEL_METADATA = {
     DS4_FLASH_MODEL_ID: {
         "name": "DeepSeek V4 Flash",
-        "context_length": 524288,
+        "context_length": 393216,
         "max_completion_tokens": 393216,
     },
     DS4_PRO_MODEL_ID: {
@@ -657,7 +665,7 @@ def _detect_ds4_loaded_model_sync():
 
     ds4_lines = []
     for line in out.splitlines():
-        if "/Users/jack/dsv4/ds4-server" not in line:
+        if "/ds4-server" not in line:
             continue
         if "--port 8001" not in line and "--port" not in line:
             continue
@@ -667,9 +675,11 @@ def _detect_ds4_loaded_model_sync():
         return None
 
     cmd = ds4_lines[-1]
-    if "DeepSeek-V4-Pro" in cmd or "--ssd-streaming" in cmd:
+    if "DeepSeek-V4-Pro" in cmd:
         return DS4_PRO_MODEL_ID
-    return DS4_FLASH_MODEL_ID
+    if "DeepSeek-V4-Flash" in cmd or "ds4flash.gguf" in cmd:
+        return DS4_FLASH_MODEL_ID
+    return None
 
 
 async def detect_ds4_loaded_model(refresh=False):
