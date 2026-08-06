@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/docs/settings.md b/packages/coding-agent/docs/settings.md
-index 72337631..63edf8d8 100644
+index 761a1941e..62a1ed9eb 100644
 --- a/packages/coding-agent/docs/settings.md
 +++ b/packages/coding-agent/docs/settings.md
 @@ -7,6 +7,19 @@ Pi uses JSON settings files with project settings overriding global settings.
@@ -22,7 +22,7 @@ index 72337631..63edf8d8 100644
  Edit directly or use `/settings` for common options.
  
  ## Project Trust
-@@ -231,7 +244,7 @@ When multiple sources specify a session directory, precedence is `--session-dir`
+@@ -234,7 +247,7 @@ When multiple sources specify a session directory, precedence is `--session-dir`
  
  These settings define where to load extensions, skills, prompts, and themes from.
  
@@ -32,10 +32,10 @@ index 72337631..63edf8d8 100644
  | Setting | Type | Default | Description |
  |---------|------|---------|-------------|
 diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
-index e6cae1af..33a69bb8 100644
+index 4a8c8bc47..778081f07 100644
 --- a/packages/coding-agent/src/core/settings-manager.ts
 +++ b/packages/coding-agent/src/core/settings-manager.ts
-@@ -171,13 +171,34 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
+@@ -176,13 +176,34 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
  }
  
  export type SettingsScope = "global" | "project";
@@ -71,7 +71,7 @@ index e6cae1af..33a69bb8 100644
  }
  
  export interface SettingsError {
-@@ -185,15 +206,57 @@ export interface SettingsError {
+@@ -190,15 +211,57 @@ export interface SettingsError {
  	error: Error;
  }
  
@@ -133,7 +133,7 @@ index e6cae1af..33a69bb8 100644
  	}
  
  	private acquireLockSyncWithRetry(path: string): () => void {
-@@ -223,8 +286,16 @@ export class FileSettingsStorage implements SettingsStorage {
+@@ -228,8 +291,16 @@ export class FileSettingsStorage implements SettingsStorage {
  		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
  	}
  
@@ -152,7 +152,7 @@ index e6cae1af..33a69bb8 100644
  		const dir = dirname(path);
  
  		let release: (() => void) | undefined;
-@@ -255,18 +326,37 @@ export class FileSettingsStorage implements SettingsStorage {
+@@ -260,18 +331,37 @@ export class FileSettingsStorage implements SettingsStorage {
  }
  
  export class InMemorySettingsStorage implements SettingsStorage {
@@ -200,7 +200,7 @@ index e6cae1af..33a69bb8 100644
  		}
  	}
  }
-@@ -343,7 +433,7 @@ export class SettingsManager {
+@@ -348,7 +438,7 @@ export class SettingsManager {
  	static inMemory(settings: Partial<Settings> = {}, options: SettingsManagerCreateOptions = {}): SettingsManager {
  		const storage = new InMemorySettingsStorage();
  		const initialSettings = SettingsManager.migrateSettings(structuredClone(settings) as Record<string, unknown>);
@@ -209,7 +209,7 @@ index e6cae1af..33a69bb8 100644
  		return SettingsManager.fromStorage(storage, options);
  	}
  
-@@ -353,7 +443,7 @@ export class SettingsManager {
+@@ -358,7 +448,7 @@ export class SettingsManager {
  		}
  
  		let content: string | undefined;
@@ -218,7 +218,7 @@ index e6cae1af..33a69bb8 100644
  			content = current;
  			return undefined;
  		});
-@@ -575,13 +665,27 @@ export class SettingsManager {
+@@ -580,13 +670,27 @@ export class SettingsManager {
  		return snapshot;
  	}
  
@@ -247,7 +247,7 @@ index e6cae1af..33a69bb8 100644
  			const currentFileSettings = current
  				? SettingsManager.migrateSettings(JSON.parse(current) as Record<string, unknown>)
  				: {};
-@@ -614,11 +718,13 @@ export class SettingsManager {
+@@ -619,11 +723,13 @@ export class SettingsManager {
  		}
  
  		const snapshotGlobalSettings = structuredClone(this.globalSettings);
@@ -263,7 +263,7 @@ index e6cae1af..33a69bb8 100644
  		});
  	}
  
-@@ -632,10 +738,12 @@ export class SettingsManager {
+@@ -637,10 +743,12 @@ export class SettingsManager {
  		}
  
  		const snapshotProjectSettings = structuredClone(this.projectSettings);
@@ -278,8 +278,21 @@ index e6cae1af..33a69bb8 100644
  		});
  	}
  
+diff --git a/packages/coding-agent/test/package-command-paths.test.ts b/packages/coding-agent/test/package-command-paths.test.ts
+index a804b40e4..31e6d10a3 100644
+--- a/packages/coding-agent/test/package-command-paths.test.ts
++++ b/packages/coding-agent/test/package-command-paths.test.ts
+@@ -413,7 +413,7 @@ describe("package commands", () => {
+ 
+ 	it("cycles project package overrides in config local mode", async () => {
+ 		const storage = new InMemorySettingsStorage();
+-		storage.withLock("global", () => JSON.stringify({ packages: ["npm:pi-tools"] }));
++		storage.withLock("global", "legacy", () => JSON.stringify({ packages: ["npm:pi-tools"] }));
+ 		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
+ 		const resolvedPaths = extensionPaths(join(tempDir, "pkg"), "npm:pi-tools", "user", ["bar.ts"]);
+ 		const selector = new ConfigSelectorComponent(
 diff --git a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
-index 46387997..be20c7a8 100644
+index 799da2028..a1bedb24a 100644
 --- a/packages/coding-agent/test/settings-manager.test.ts
 +++ b/packages/coding-agent/test/settings-manager.test.ts
 @@ -111,6 +111,90 @@ describe("SettingsManager", () => {
@@ -373,16 +386,25 @@ index 46387997..be20c7a8 100644
  	describe("packages migration", () => {
  		it("should keep local-only extensions in extensions array", () => {
  			const settingsPath = join(agentDir, "settings.json");
-diff --git a/packages/coding-agent/test/package-command-paths.test.ts b/packages/coding-agent/test/package-command-paths.test.ts
-index 4158f3f0..b2ce023e 100644
---- a/packages/coding-agent/test/package-command-paths.test.ts
-+++ b/packages/coding-agent/test/package-command-paths.test.ts
-@@ -410,7 +410,7 @@ describe("package commands", () => {
- 
- 	it("cycles project package overrides in config local mode", async () => {
+diff --git a/packages/coding-agent/test/suite/regressions/7572-provider-retry-settings-merge.test.ts b/packages/coding-agent/test/suite/regressions/7572-provider-retry-settings-merge.test.ts
+index de6cd686a..62c21d6f7 100644
+--- a/packages/coding-agent/test/suite/regressions/7572-provider-retry-settings-merge.test.ts
++++ b/packages/coding-agent/test/suite/regressions/7572-provider-retry-settings-merge.test.ts
+@@ -4,7 +4,7 @@ import { InMemorySettingsStorage, SettingsManager } from "../../../src/core/sett
+ describe("regression #7572: nested provider retry settings merge", () => {
+ 	it("preserves global provider settings not overridden by the project", () => {
  		const storage = new InMemorySettingsStorage();
--		storage.withLock("global", () => JSON.stringify({ packages: ["npm:pi-tools"] }));
-+		storage.withLock("global", "legacy", () => JSON.stringify({ packages: ["npm:pi-tools"] }));
- 		const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: true });
- 		const resolvedPaths = extensionPaths(join(tempDir, "pkg"), "npm:pi-tools", "user", ["bar.ts"]);
- 		const selector = new ConfigSelectorComponent(
+-		storage.withLock("global", () =>
++		storage.withLock("global", "legacy", () =>
+ 			JSON.stringify({
+ 				retry: {
+ 					provider: {
+@@ -14,7 +14,7 @@ describe("regression #7572: nested provider retry settings merge", () => {
+ 				},
+ 			}),
+ 		);
+-		storage.withLock("project", () =>
++		storage.withLock("project", "legacy", () =>
+ 			JSON.stringify({
+ 				retry: {
+ 					provider: {
