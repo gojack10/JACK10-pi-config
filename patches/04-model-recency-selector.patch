@@ -1,5 +1,5 @@
 diff --git a/packages/coding-agent/src/modes/interactive/components/model-selector.ts b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
-index 567784a5..53aa0083 100644
+index 6f2668a49..ccd58e31d 100644
 --- a/packages/coding-agent/src/modes/interactive/components/model-selector.ts
 +++ b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
 @@ -66,6 +66,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
@@ -45,7 +45,7 @@ index 567784a5..53aa0083 100644
  		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
  		this.filteredModels = this.activeModels;
  		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
-@@ -199,8 +204,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
+@@ -208,8 +213,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
  
  	private sortModels(models: ModelItem[]): ModelItem[] {
  		const sorted = [...models];
@@ -65,10 +65,10 @@ index 567784a5..53aa0083 100644
  			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
  			if (aIsCurrent && !bIsCurrent) return -1;
 diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-index 54415407..775d4b46 100644
+index a306d900b..a3b8bc69a 100644
 --- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
 +++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
-@@ -4415,6 +4415,23 @@ export class InteractiveMode {
+@@ -4701,6 +4701,23 @@ export class InteractiveMode {
  	}
  
  	private showModelSelector(initialSearchInput?: string): void {
@@ -92,11 +92,11 @@ index 54415407..775d4b46 100644
  		this.showSelector((done) => {
  			const selector = new ModelSelectorComponent(
  				this.ui,
-@@ -4441,6 +4458,7 @@ export class InteractiveMode {
+@@ -4727,6 +4744,7 @@ export class InteractiveMode {
  					this.ui.requestRender();
  				},
  				initialSearchInput,
 +				modelOrder,
  			);
- 			return { component: selector, focus: selector };
+ 			return { component: selector, focus: selector, dispose: () => selector.dispose() };
  		});
