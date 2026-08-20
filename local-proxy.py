@@ -518,7 +518,7 @@ async def stop_dsv4():
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
         if proc.returncode != 0 and b"Could not find service" not in stderr:
             log.warning(f"launchctl bootout: {stderr.decode()[:200]}")
     except Exception as e:
