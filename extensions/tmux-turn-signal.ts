@@ -6,6 +6,9 @@ const SESSION_FILE_OPTION = "@pi_session_file";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
 const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
 
+// ponytail: Pi exposes no post-command event; extension commands bypass `input`
+// (docs/extensions.md, “Lifecycle Overview” and “Input Events”). Keep local
+// command ACKs command-specific until a real completion hook exists.
 export default function (pi: ExtensionAPI) {
 	const readOption = async (pane: string, optionName: string) =>
 		(await pi.exec("tmux", ["show-options", "-qv", "-t", pane, optionName])).stdout.trim();
