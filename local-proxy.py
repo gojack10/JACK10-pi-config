@@ -65,20 +65,20 @@ DS4_SUPPORTED_PARAMETERS = [
 DS4_MODEL_METADATA = {
     DS4_FLASH_MODEL_ID: {
         "name": "DeepSeek V4 Flash",
-        "context_length": 393216,
-        "max_completion_tokens": 393216,
+        "context_length": 1048576,
+        "max_completion_tokens": 1048576,
     },
     DS4_PRO_MODEL_ID: {
         "name": "DeepSeek V4 Pro",
-        "context_length": 393216,
-        "max_completion_tokens": 393216,
+        "context_length": 1048576,
+        "max_completion_tokens": 1048576,
     },
 }
 DS4_LOADED_MODEL_ID = None
 DS4_LOADED_CHECK_AT = 0.0
 DS4_SWITCH_LOCK = asyncio.Lock()
 
-DS4_IDLE_TIMEOUT = 60
+DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
 DS4_LAST_REQUEST_AT = 0.0
 DS4_IDLE_TASK = None
