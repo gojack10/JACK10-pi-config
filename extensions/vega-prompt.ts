@@ -1,18 +1,9 @@
-/**
- * VEGA voice prompt poller.
- *
- * /vega toggles polling of the TTS daemon's prompt inbox
- * (https://vega.redacted.invalid/prompt/next). Text dictated on the /player page
- * is delivered into THIS session as a user message.
- *
- * OFF by default so multiple pi sessions don't steal each other's prompts —
- * run /vega in the one session you want to drive from your phone.
- */
+/** /vega exclusively connects this Pi session to VEGA voice. */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const PROMPT_URL = "https://vega.redacted.invalid/prompt/next";
+const BASE_URL = "https://vega.redacted.invalid";
 const POLL_MS = 2000;
 
 function authHeader(): string {
@@ -20,43 +11,89 @@ function authHeader(): string {
   catch { return ""; }
 }
 
+function textOf(message: any): string {
+  const content = message?.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("").trim();
+}
+
 export default function (pi: ExtensionAPI) {
+  let token = "";
   let timer: ReturnType<typeof setInterval> | null = null;
 
+  function headers(extra: Record<string, string> = {}) {
+    return {
+      "User-Agent": "curl/8.7.1",
+      Authorization: authHeader(),
+      ...(token ? { "X-Vega-Session": token } : {}),
+      ...extra,
+    };
+  }
+
   async function poll() {
+    if (!token) return;
     try {
-      const r = await fetch(PROMPT_URL, {
-        headers: {
-          "User-Agent": "curl/8.7.1",
-          Authorization: authHeader(),
-        },
+      const r = await fetch(`${BASE_URL}/prompt/next`, {
+        headers: headers(),
         signal: AbortSignal.timeout(2000),
       });
       if (!r.ok) return;
       const text = ((await r.json())?.text ?? "").trim();
       if (!text) return;
-      try {
-        pi.sendUserMessage(text);
-      } catch {
-        // Agent is streaming - queue it instead of dropping it.
-        pi.sendUserMessage(text, { deliverAs: "steer" });
-      }
-    } catch {
-      // Daemon down / network blip: silently retry on next tick.
-    }
+      try { pi.sendUserMessage(text); }
+      catch { pi.sendUserMessage(text, { deliverAs: "steer" }); }
+    } catch { /* retry next tick */ }
   }
 
+  pi.on("message_end", (event) => {
+    if (!token || event.message.role !== "assistant") return;
+    const text = textOf(event.message);
+    if (!text) return;
+    void fetch(`${BASE_URL}/inject`, {
+      method: "POST",
+      headers: headers({ "Content-Type": "text/plain; charset=utf-8" }),
+      body: text,
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => {});
+  });
+
   pi.registerCommand("vega", {
-    description: "Toggle VEGA voice prompt polling (drive this session from /player)",
+    description: "Toggle exclusive VEGA voice control for this session",
     handler: async (_args, ctx) => {
-      if (timer) {
-        clearInterval(timer);
+      if (token) {
+        clearInterval(timer!);
         timer = null;
-        ctx.ui.notify("VEGA voice polling OFF", "info");
-      } else {
+        const oldToken = token;
+        token = "";
+        void fetch(`${BASE_URL}/session/release`, {
+          method: "POST",
+          headers: { ...headers(), "X-Vega-Session": oldToken },
+          signal: AbortSignal.timeout(2000),
+        }).catch(() => {});
+        ctx.ui.notify("VEGA voice OFF", "info");
+        return;
+      }
+      try {
+        const r = await fetch(`${BASE_URL}/session/claim`, {
+          method: "POST",
+          headers: headers(),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!r.ok) throw new Error(`server returned ${r.status}`);
+        token = String((await r.json()).token ?? "");
+        if (!token) throw new Error("server returned no token");
         timer = setInterval(poll, POLL_MS);
-        ctx.ui.notify("VEGA voice polling ON - dictate at vega.redacted.invalid/player", "info");
+        ctx.ui.notify("VEGA voice ON — this is the only active session", "info");
+      } catch (error) {
+        token = "";
+        ctx.ui.notify(`VEGA unavailable: ${error}`, "error");
       }
     },
+  });
+
+  pi.on("session_shutdown", () => {
+    if (timer) clearInterval(timer);
+    timer = null;
   });
 }
