@@ -10,5 +10,12 @@
   "packages": [
     "git:github.com/davebcn87/pi-autoresearch",
     "git:github.com/DietrichGebert/ponytail"
-  ]
+  ],
+  "terminal": {
+    "showTerminalProgress": true
+  },
+  "enableInstallTelemetry": false,
+  "defaultProjectTrust": "always",
+  "treeFilterMode": "default",
+  "httpIdleTimeoutMs": 0
 }
