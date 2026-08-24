@@ -1,0 +1,126 @@
+diff --git a/packages/ai/src/api/simple-options.ts b/packages/ai/src/api/simple-options.ts
+index 067d01e59..b36299952 100644
+--- a/packages/ai/src/api/simple-options.ts
++++ b/packages/ai/src/api/simple-options.ts
+@@ -14,7 +14,7 @@ const MIN_MAX_TOKENS = 1;
+ 
+ export function clampMaxTokensToContext(model: Model<Api>, context: Context, maxTokens: number): number {
+ 	if (model.contextWindow <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
+-	const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;
++	const available = model.contextWindow - estimateContextTokens(context, model).tokens - CONTEXT_SAFETY_TOKENS;
+ 	return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));
+ }
+ 
+diff --git a/packages/ai/src/utils/estimate.ts b/packages/ai/src/utils/estimate.ts
+index b434969ec..f2d015f29 100644
+--- a/packages/ai/src/utils/estimate.ts
++++ b/packages/ai/src/utils/estimate.ts
+@@ -1,4 +1,14 @@
+-import type { AssistantMessage, Context, ImageContent, Message, TextContent, Tool, Usage } from "../types.ts";
++import type {
++	Api,
++	AssistantMessage,
++	Context,
++	ImageContent,
++	Message,
++	Model,
++	TextContent,
++	Tool,
++	Usage,
++} from "../types.ts";
+ 
+ export interface ContextUsageEstimate {
+ 	/** Estimated total context tokens. */
+@@ -60,7 +70,10 @@ export function estimateMessageTokens(message: Message): number {
+ 	return Math.ceil(chars / CHARS_PER_TOKEN);
+ }
+ 
+-function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage; index: number } | undefined {
++function getLastAssistantUsageInfo(
++	messages: readonly Message[],
++	model?: Model<Api>,
++): { usage: Usage; index: number } | undefined {
+ 	let latestPrefixTimestamp = Number.NEGATIVE_INFINITY;
+ 	let usageInfo: { usage: Usage; index: number } | undefined;
+ 
+@@ -71,8 +84,12 @@ function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage
+ 			// A newer prefix message was inserted after this response (for example, a
+ 			// compaction summary), so its usage cannot describe the current prefix.
+ 			const usageAppliesToPrefix = assistant.timestamp >= latestPrefixTimestamp;
++			const usageMatchesModel =
++				!model ||
++				(assistant.provider === model.provider && assistant.model === model.id && assistant.api === model.api);
+ 			if (
+ 				usageAppliesToPrefix &&
++				usageMatchesModel &&
+ 				assistant.stopReason !== "aborted" &&
+ 				assistant.stopReason !== "error" &&
+ 				calculateContextTokens(assistant.usage) > 0
+@@ -86,8 +103,8 @@ function getLastAssistantUsageInfo(messages: readonly Message[]): { usage: Usage
+ 	return usageInfo;
+ }
+ 
+-function estimateMessages(messages: readonly Message[]): ContextUsageEstimate {
+-	const usageInfo = getLastAssistantUsageInfo(messages);
++function estimateMessages(messages: readonly Message[], model?: Model<Api>): ContextUsageEstimate {
++	const usageInfo = getLastAssistantUsageInfo(messages, model);
+ 	if (usageInfo) {
+ 		const usageTokens = calculateContextTokens(usageInfo.usage);
+ 		let trailingTokens = 0;
+@@ -111,10 +128,10 @@ function isMessageArray(value: Context | readonly Message[]): value is readonly
+ 	return Array.isArray(value);
+ }
+ 
+-export function estimateContextTokens(context: Context | readonly Message[]): ContextUsageEstimate {
+-	if (isMessageArray(context)) return estimateMessages(context);
++export function estimateContextTokens(context: Context | readonly Message[], model?: Model<Api>): ContextUsageEstimate {
++	if (isMessageArray(context)) return estimateMessages(context, model);
+ 
+-	const estimate = estimateMessages(context.messages);
++	const estimate = estimateMessages(context.messages, model);
+ 	if (estimate.lastUsageIndex !== null) {
+ 		const addedNames = new Set(
+ 			context.messages
+diff --git a/packages/ai/test/context-estimate.test.ts b/packages/ai/test/context-estimate.test.ts
+index 85047309e..0963526fc 100644
+--- a/packages/ai/test/context-estimate.test.ts
++++ b/packages/ai/test/context-estimate.test.ts
+@@ -14,7 +14,11 @@ function createUsage(totalTokens: number): Usage {
+ 	};
+ }
+ 
+-function createAssistant(timestamp: number, totalTokens: number): AssistantMessage {
++function createAssistant(
++	timestamp: number,
++	totalTokens: number,
++	overrides?: Partial<AssistantMessage>,
++): AssistantMessage {
+ 	return {
+ 		role: "assistant",
+ 		content: [{ type: "text", text: "kept" }],
+@@ -24,6 +28,7 @@ function createAssistant(timestamp: number, totalTokens: number): AssistantMessa
+ 		usage: createUsage(totalTokens),
+ 		stopReason: "stop",
+ 		timestamp,
++		...overrides,
+ 	};
+ }
+ 
+@@ -78,4 +83,17 @@ describe("context token estimation", () => {
+ 			lastUsageIndex: 3,
+ 		});
+ 	});
++
++	it("does not clamp output from another model's token usage", () => {
++		const context: Context = {
++			systemPrompt: "system",
++			messages: [
++				{ role: "user", content: "x".repeat(4_000), timestamp: 100 },
++				createAssistant(200, 12_000, { provider: "anthropic", model: "claude", api: "anthropic-messages" }),
++				{ role: "user", content: "tail", timestamp: 300 },
++			],
++		};
++
++		expect(buildBaseOptions(model, context).maxTokens).toBe(4_900);
++	});
+ });
