@@ -33,3 +33,18 @@ __pycache__/
 *.pyc
 *.py.bak*
 *.bak
+
+# Session/RLM working artifacts
+commit-buffers/
+commit-rlm/
+rlm-buffers/
+rlm-commit/
+session-snapshots/
+handoffs/
+
+# OS and archived logs
+.DS_Store
+*.log.gz
+
+# Machine-local linked skills
+skills/browser-harness/
