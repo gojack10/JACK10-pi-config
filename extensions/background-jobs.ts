@@ -36,22 +36,12 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   const jobs = new Map<number, BgJob>();
   let nextJobId = 1;
 
-  const liveJobs = () => [...jobs.values()].filter((j) => j.exitCode === undefined);
-
-  const renderCompletionSummary = (): string => {
-    const lines = [...jobs.values()].map((j) => {
-      const elapsed = Math.round(((j.exitedAt ?? Date.now()) - j.startedAt) / 1000);
-      let status: string;
-      if (j.exitCode === -1) {
-        status = `failed${j.errorMessage ? ` (${j.errorMessage})` : ""}`;
-      } else if (j.exitCode !== undefined) {
-        status = `exit ${j.exitCode}${j.killed ? " (killed)" : ""}`;
-      } else {
-        status = "running (unexpected)";
-      }
-      return `  job_${j.id}: [${status}] ${j.command.slice(0, 100)} (${elapsed}s)`;
-    });
-    return `SYSTEM (background-jobs): All background jobs finished:\n${lines.join("\n")}`;
+  const renderCompletionSummary = (job: BgJob): string => {
+    const elapsed = Math.round(((job.exitedAt ?? Date.now()) - job.startedAt) / 1000);
+    const status = job.exitCode === -1
+      ? `failed${job.errorMessage ? ` (${job.errorMessage})` : ""}`
+      : `exit ${job.exitCode}${job.killed ? " (killed)" : ""}`;
+    return `SYSTEM (background-jobs): job_${job.id} finished: [${status}] ${job.command.slice(0, 100)} (${elapsed}s)`;
   };
 
   const renderJobsList = (): string => {
@@ -74,7 +64,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
     name: "bash_bg",
     label: "bash_bg",
     description:
-      "Spawn a long-running command in the background. Returns {job_id, log_path}. Do not poll/wait after starting a job; the agent will receive a follow-up message when all background jobs finish. Use bash_tail(job_id) only for occasional progress checks while doing other work, and bash_kill(job_id) to stop it.",
+      "Spawn a long-running command in the background. Returns {job_id, log_path}. Do not poll/wait after starting a job; the agent will receive a follow-up message when this job finishes. Use bash_tail(job_id) only for occasional progress checks while doing other work, and bash_kill(job_id) to stop it.",
     parameters: Type.Object({
       command: Type.String({ description: "Bash command (runs through `sh -c`)." }),
       cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to session cwd." })),
@@ -105,29 +95,27 @@ export default function backgroundJobs(pi: ExtensionAPI) {
         killed: false,
       };
       child.on("exit", (code) => {
+        if (job.exitedAt !== undefined) return;
         job.exitCode = code;
         job.exitedAt = Date.now();
         logStream.end();
-        if (liveJobs().length === 0) {
-          pi.sendUserMessage(renderCompletionSummary(), { deliverAs: "followUp" });
-        }
+        pi.sendUserMessage(renderCompletionSummary(job), { deliverAs: "followUp" });
       });
       child.on("error", (err) => {
+        if (job.exitedAt !== undefined) return;
         logStream.write(`\n[spawn error: ${err.message}]\n`);
         job.exitCode = -1;
         job.errorMessage = err.message;
         job.exitedAt = Date.now();
         logStream.end();
-        if (liveJobs().length === 0) {
-          pi.sendUserMessage(renderCompletionSummary(), { deliverAs: "followUp" });
-        }
+        pi.sendUserMessage(renderCompletionSummary(job), { deliverAs: "followUp" });
       });
       jobs.set(id, job);
       return {
         content: [
           {
             type: "text",
-            text: `Started job_${id} (pid ${child.pid ?? "?"}).\nLog: ${logPath}\nCommand: ${command}\n\nIMPORTANT NEXT STEP: If you are only waiting for this command, stop now and send the user a brief response. Do NOT call bash_tail(), bash_jobs(), sleep, or any polling/wait command. This extension will send you a follow-up message when all background jobs finish. Only use bash_tail() for occasional progress checks while doing other independent work.`, 
+            text: `Started job_${id} (pid ${child.pid ?? "?"}).\nLog: ${logPath}\nCommand: ${command}\n\nIMPORTANT NEXT STEP: If you are only waiting for this command, stop now and send the user a brief response. Do NOT call bash_tail(), bash_jobs(), sleep, or any polling/wait command. This extension will send you a follow-up message when this job finishes. Only use bash_tail() for occasional progress checks while doing other independent work.`,
           },
         ],
         details: { job_id: id, log_path: logPath, pid: child.pid },
