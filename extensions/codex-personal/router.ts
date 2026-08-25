@@ -9,6 +9,7 @@ import {
 	normalizeObservation,
 	parseRegistry,
 	parseUsageState,
+	quotaStatus,
 	type RegistryAccount,
 } from "../codex-quota-extension/store.ts";
 
@@ -244,10 +245,8 @@ export const evaluateCodexRoute = (options: {
 			);
 		}
 		if (telemetry.windows.length === 0) reasons.push("CAPACITY UNKNOWN");
-		if (account.policyClass === "stable-weekly" && !telemetry.windows.some((window) => window.minutes === 10080))
-			reasons.push("WEEKLY WINDOW MISSING");
-		if (account.policyClass === "perishable" && !telemetry.windows.some((window) => window.minutes < 10080))
-			reasons.push("SHORT WINDOW MISSING");
+		if (!telemetry.windows.some((window) => window.minutes === 300)) reasons.push("5H WINDOW MISSING");
+		if (!telemetry.windows.some((window) => window.minutes === 10080)) reasons.push("WEEKLY WINDOW MISSING");
 		const effectiveWindows: CodexWindow[] = [];
 		for (const window of telemetry.windows) {
 			if (window.resetAt * 1000 <= now) {
@@ -286,8 +285,9 @@ export const evaluateCodexRoute = (options: {
 			effectiveWindows,
 		};
 	});
+	const status = quotaStatus(feed, now);
 	const candidates = rank(accounts, work, model, feed.generation, now);
-	if (candidates.length > 0)
+	if (status?.routable && candidates.length > 0)
 		return { allBlocked: false, candidates, accounts, feedSource, ...(options.feedNotice ? { feedNotice: options.feedNotice } : {}) };
 	const healthy = feed.accounts.filter((account) => account.captureHealth === "healthy").length;
 	const ages = feed.accounts.filter((account) => account.fetchedAt > 0).map((account) => now - account.fetchedAt);

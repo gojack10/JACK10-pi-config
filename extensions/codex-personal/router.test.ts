@@ -77,7 +77,10 @@ const stable = (weeklyPct = 20, shortPct = 30) =>
 		{ minutes: 10080, pctUsed: weeklyPct, resetIn: 5 * 24 * 3600 },
 	]);
 const perishable = (shortPct = 20) =>
-	telemetry(alt, [{ minutes: 300, pctUsed: shortPct, resetIn: 2 * 3600 }]);
+	telemetry(alt, [
+		{ minutes: 300, pctUsed: shortPct, resetIn: 2 * 3600 },
+		{ minutes: 10080, pctUsed: 30, resetIn: 4 * 24 * 3600 },
+	]);
 
 test("parses explicit work horizons and rejects guesses", () => {
 	assert.deepEqual(parseWorkInput(undefined), { workClass: "unpredictable" });
@@ -94,7 +97,10 @@ test("short work burns perishable capacity while long work preserves it", () => 
 });
 
 test("known safe projection may route above the conservative 90 percent fallback", () => {
-	const projected = telemetry(alt, [{ minutes: 300, pctUsed: 95, resetIn: 7200, projectedIn: 8000 }]);
+	const projected = telemetry(alt, [
+		{ minutes: 300, pctUsed: 95, resetIn: 7200, projectedIn: 8000 },
+		{ minutes: 10080, pctUsed: 30, resetIn: 4 * 24 * 3600 },
+	]);
 	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(projected), model, now });
 	assert.equal(result.allBlocked, false);
 	projected.windows[0]!.projectedExhaustAt = nowSeconds + 100;
@@ -126,45 +132,53 @@ test("mixed short and weekly exhaustion still blocks the whole fleet", () => {
 	assert.match(result.error!, /WINDOW EXHAUSTED 300m/);
 });
 
-test("429 blocks only until notBefore and reports the recovery", () => {
-	const blocked = telemetry(alt, [{ minutes: 300, pctUsed: 20, resetIn: 7200 }], {
-		status429: true,
-		notBefore: nowSeconds + 60,
-	});
+test("selector blocks when quota pools are split across accounts", () => {
+	const shortOnly = stable();
+	shortOnly.windows = shortOnly.windows.filter((window) => window.minutes === 300);
+	const weekOnly = perishable();
+	weekOnly.windows = weekOnly.windows.filter((window) => window.minutes === 10080);
+	const result = evaluateCodexRoute({ registry, feed: feed(shortOnly, weekOnly), model, now });
+	assert.equal(result.allBlocked, true);
+	assert.equal(result.candidates.length, 0);
+});
+
+test("429 remains blocked until a valid sample and reports recovery", () => {
+	const blocked = perishable(20);
+	blocked.status429 = true;
+	blocked.notBefore = nowSeconds + 60;
 	const blockedResult = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(blocked), model, now });
 	assert.equal(blockedResult.allBlocked, true);
 	assert.match(blockedResult.error!, new RegExp(`Earliest recovery: ${new Date((nowSeconds + 60) * 1000).toISOString()}`));
 	assert.match(blockedResult.error!, /RATE LIMITED/);
 
 	blocked.notBefore = nowSeconds - 60;
-	const recovered = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(blocked), model, now });
-	assert.equal(recovered.allBlocked, false);
-	assert.match(recovered.candidates[0]!.warnings.join(" "), /COOLDOWN ELAPSED/);
+	const stillBlocked = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(blocked), model, now });
+	assert.equal(stillBlocked.allBlocked, true);
 });
 
-test("aged telemetry remains routable with visible conservative degradation", () => {
+test("stale telemetry refuses routing with visible conservative degradation", () => {
 	const aged = stable(20, 30);
 	aged.fetchedAt = now - 16 * 60_000;
 	aged.captureHealth = "degraded";
 	aged.parseErrors = ["meter offline"];
 	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [personal] }, feed: feed(aged), model, now });
-	assert.equal(result.allBlocked, false);
+	assert.equal(result.allBlocked, true);
 	const account = result.accounts[0]!;
 	assert.equal(account.freshness, "aged");
 	assert.equal(account.ageMs, 16 * 60_000);
 	assert.deepEqual(account.effectiveWindows.map((window) => window.pctUsed), [90, 90]);
 	assert.match(account.degradations.join(" "), /STALE TELEMETRY/);
 	assert.match(account.degradations.join(" "), /meter offline/);
-	assert.match(result.candidates[0]!.warnings.join(" "), /degraded 30%→90.0%/);
+	assert.equal(result.candidates.length, 0);
 });
 
-test("aged telemetry projects known slope instead of applying the floor", () => {
+test("stale telemetry remains blocked even when a slope can be projected", () => {
 	const aged = perishable(20);
 	aged.fetchedAt = now - 30 * 60_000;
 	aged.windows[0]!.slopePctPerHour = 20;
 	aged.windows[0]!.projectedExhaustAt = nowSeconds + 4 * 3600;
 	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(aged), model, now });
-	assert.equal(result.allBlocked, false);
+	assert.equal(result.allBlocked, true);
 	assert.equal(result.accounts[0]!.effectiveWindows[0]!.pctUsed, 30);
 });
 
@@ -220,19 +234,21 @@ test("uses last-known observability quota when the state feed is corrupt", async
 				"x-codex-primary-window-minutes": "300",
 				"x-codex-primary-used-percent": "20",
 				"x-codex-primary-reset-at": String(nowSeconds + 7200),
-				"x-codex-secondary-window-minutes": "0",
+				"x-codex-secondary-window-minutes": "10080",
+				"x-codex-secondary-used-percent": "30",
+				"x-codex-secondary-reset-at": String(nowSeconds + 4 * 24 * 3600),
 			},
 		})}\n`,
 	);
 	const result = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
-	assert.equal(result.allBlocked, false);
+	assert.equal(result.allBlocked, true);
 	assert.equal(result.feedSource, "observability");
 	assert.equal(result.accounts[0]!.freshness, "aged");
 	assert.match(result.feedNotice!, /using .*observability\.jsonl/);
-	assert.match(result.candidates[0]!.warnings.join(" "), /STATE FEED UNREADABLE OR MALFORMED/);
+	assert.equal(result.candidates.length, 0);
 
 	await rm(feedPath);
 	const missing = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
-	assert.equal(missing.allBlocked, false);
+	assert.equal(missing.allBlocked, true);
 	assert.equal(missing.feedSource, "observability");
 });
