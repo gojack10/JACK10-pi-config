@@ -7,6 +7,11 @@ import type {
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
+	buildQuotaView,
+	type CodexUsageState,
+	type QuotaView,
+} from "./codex-quota-extension/store.ts";
+import {
 	getCacheTimerColor,
 	getCurrentRunUsage,
 	getSessionUsage,
@@ -209,6 +214,85 @@ const formatCacheTimerValue = (milliseconds: number): string => {
 		.join(":");
 };
 
+const formatQuotaAge = (milliseconds: number): string => {
+	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+	if (seconds < 60) return `${seconds}S`;
+	if (seconds < 3600) return `${Math.floor(seconds / 60)}M`;
+	if (seconds < 86400) return `${Math.floor(seconds / 3600)}H`;
+	return `${Math.floor(seconds / 86400)}D`;
+};
+
+const quotaBar = (pctUsed: number): string => {
+	const used = Math.round(Math.max(0, Math.min(100, pctUsed)) / 10);
+	return `${"█".repeat(used)}${"░".repeat(10 - used)}`;
+};
+
+const appendQuotaLine = (
+	state: FooterLineState,
+	view: QuotaView | undefined,
+	degraded: boolean,
+	width: number,
+	theme: Theme,
+): void => {
+	if (!view && !degraded) return;
+	flushFooterLine(state, width);
+	if (!view) {
+		state.lines.push(
+			fitToWidth(theme.fg("error", "CODEX-QUOTA: CAPTURE DEGRADED"), width),
+		);
+		return;
+	}
+
+	const now = Date.now();
+	const ageMs = Math.max(0, now - view.oldestFetchedAt);
+	const expired =
+		view.expired ||
+		ageMs > 60 * 60_000 ||
+		[view.win300, view.win10080].some(
+			(window) => window !== undefined && window.resetAt * 1000 < now,
+		);
+	const stale = expired || ageMs > 15 * 60_000;
+	const pctColor = (pct: number): ThemeColor =>
+		view.anyLimited || pct >= 90
+			? "error"
+			: pct >= 70
+				? "warning"
+				: "success";
+	const paintPct = (text: string, pct: number) =>
+		theme.fg(stale ? "dim" : pctColor(pct), text);
+	const dim = (text: string) => theme.fg("dim", text);
+	const separator = dim(" | ");
+	const slash = dim(" / ");
+	const windowText = (
+		label: string,
+		window: { pctUsed: number; resetAt: number } | undefined,
+		wide: boolean,
+	): string => {
+		if (!window) return dim(`${label} -`);
+		const pct = `${Math.round(window.pctUsed)}%`;
+		const timer = formatCacheTimerValue(window.resetAt * 1000 - now);
+		return wide
+			? `${dim(`${label} `)}${paintPct(`${quotaBar(window.pctUsed)} ${pct}`, window.pctUsed)}${slash}${dim(`RESET ${timer}`)}`
+			: `${dim(`${label} `)}${paintPct(pct, window.pctUsed)}${slash}${dim(timer)}`;
+	};
+	const totalPct = view.totalCount > 0
+		? Math.round(view.totalUsedEq / view.totalCount)
+		: undefined;
+	const totalText = (wide: boolean) =>
+		totalPct === undefined
+			? dim("TOTAL -")
+			: `${dim("TOTAL ")}${paintPct(`${wide ? `${quotaBar(totalPct)} ` : ""}${totalPct}%`, totalPct)}`;
+	const suffix = `${view.anyLimited ? theme.fg("error", " LIMIT") : ""}${separator}${
+		expired
+			? theme.fg("error", `AGE ${formatQuotaAge(ageMs)} EXPIRED`)
+			: dim(`AGE ${formatQuotaAge(ageMs)}`)
+	}${degraded ? `${separator}${theme.fg("error", "CAPTURE DEGRADED")}` : ""}`;
+	const build = (wide: boolean) =>
+		`${dim("CODEX-QUOTA: ")}${windowText("5H", view.win300, wide)}${separator}${windowText("WEEK", view.win10080, wide)}${separator}${totalText(wide)}${suffix}`;
+	const wideLine = build(true);
+	state.lines.push(fitToWidth(visibleWidth(wideLine) <= width ? wideLine : build(false), width));
+};
+
 function usageTokens(
 	label: string,
 	usage: UsageTotals,
@@ -277,8 +361,20 @@ function getTemperature(): number | null {
 export default function (pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
 	let cacheTimers: CacheStatusRow[] = [];
+	let quotaView: QuotaView | undefined;
+	let quotaDegraded = false;
 	pi.events.on("cache-status:update", (data) => {
 		if (Array.isArray(data)) cacheTimers = data as CacheStatusRow[];
+		requestRender?.();
+	});
+	pi.events.on("codex-usage:update", (data) => {
+		if (!data || typeof data !== "object") return;
+		const update = data as
+			| CodexUsageState
+			| { state?: CodexUsageState; degraded?: string };
+		const state = "accounts" in update ? update : update.state;
+		if (state) quotaView = buildQuotaView(state);
+		quotaDegraded = "degraded" in update && Boolean(update.degraded);
 		requestRender?.();
 	});
 
@@ -369,6 +465,7 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
+					appendQuotaLine(lineState, quotaView, quotaDegraded, width, theme);
 					appendCacheTable(lineState, cacheTimers, width, theme);
 					flushFooterLine(lineState, width);
 
