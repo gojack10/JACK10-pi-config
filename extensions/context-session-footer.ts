@@ -242,38 +242,19 @@ const renderQuotaLine = (
 	segments: readonly QuotaSegment[],
 ): string | undefined => {
 	if (!view && !degraded) return undefined;
-	if (!view)
-		return fitToWidth(
-			theme.fg("error", "CODEX-QUOTA: CAPTURE DEGRADED"),
-			width,
-		);
+	if (!view) return fitToWidth("CODEX-QUOTA: CAPTURE DEGRADED", width);
 
 	const now = Date.now();
 	const ageMs = Math.max(0, now - view.oldestFetchedAt);
-	const expired =
-		view.expired ||
-		ageMs > 60 * 60_000 ||
-		[view.win300, view.win10080].some(
-			(window) => window !== undefined && window.resetAt * 1000 < now,
-		);
-	const stale = expired || ageMs > 15 * 60_000;
-	const dim = (text: string) => theme.fg("dim", text);
-	const separator = dim(" | ");
+	const separator = " | ";
 	const paintSegment = (text: string, pctUsed: number) =>
-		theme.fg(
-			stale
-				? "dim"
-				: view.anyLimited
-					? "error"
-					: quotaColorForUsedPercent(pctUsed),
-			text,
-		);
+		theme.fg(quotaColorForUsedPercent(pctUsed), text);
 	const windowText = (
 		label: string,
 		window: { pctUsed: number; resetAt: number } | undefined,
 		wide: boolean,
 	): string => {
-		if (!window) return dim(`${label} -`);
+		if (!window) return `${label} -`;
 		const pct = `${Math.round(window.pctUsed)}%`;
 		const timer = formatCacheTimerValue(window.resetAt * 1000 - now);
 		return paintSegment(
@@ -288,16 +269,14 @@ const renderQuotaLine = (
 		: undefined;
 	const totalText = (wide: boolean) =>
 		totalPct === undefined
-			? dim("TOTAL -")
+			? "TOTAL -"
 			: paintSegment(
 				`TOTAL ${wide ? `${quotaBar(totalPct)} ` : ""}${totalPct}%`,
 				totalPct,
 			);
-	const suffix = `${view.anyLimited ? theme.fg("error", " LIMIT") : ""}${separator}${
-		expired
-			? theme.fg("error", `AGE ${formatQuotaAge(ageMs)} EXPIRED`)
-			: dim(`AGE ${formatQuotaAge(ageMs)}`)
-	}${degraded ? `${separator}${theme.fg("error", "CAPTURE DEGRADED")}` : ""}`;
+	const suffix = `${separator}AGE ${formatQuotaAge(ageMs)}${
+		degraded ? `${separator}CAPTURE DEGRADED` : ""
+	}`;
 	const build = (wide: boolean) => {
 		const content: string[] = [];
 		if (segments.includes("5H"))
@@ -305,7 +284,7 @@ const renderQuotaLine = (
 		if (segments.includes("WEEK"))
 			content.push(windowText("WEEK", view.win10080, wide));
 		if (segments.includes("TOTAL")) content.push(totalText(wide));
-		return `${dim("CODEX-QUOTA: ")}${content.join(separator)}${suffix}`;
+		return `CODEX-QUOTA: ${content.join(separator)}${suffix}`;
 	};
 	const wideLine = build(true);
 	return fitToWidth(
