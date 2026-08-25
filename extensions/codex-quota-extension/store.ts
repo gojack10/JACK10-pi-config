@@ -12,8 +12,10 @@ export type CodexAccount = {
 	id: string;
 	plan: string;
 	windows: CodexWindow[];
+	windowsFetchedAt?: number;
 	status429: boolean;
 	retryAfter?: number;
+	lastModel?: string;
 	fetchedAt: number;
 };
 
@@ -23,15 +25,21 @@ export type CodexUsageState = {
 	resetObserved?: string;
 };
 
+export type QuotaWindowView = {
+	pctUsed: number;
+	resetAt: number;
+	expired: boolean;
+};
+
 export type QuotaView = {
 	currentLabel: string;
-	win300?: { pctUsed: number; resetAt: number };
-	win10080?: { pctUsed: number; resetAt: number };
+	win300?: QuotaWindowView;
+	win10080?: QuotaWindowView;
 	totalUsedEq: number;
 	totalCount: number;
-	oldestFetchedAt: number;
+	fetchedAt: number;
 	expired: boolean;
-	anyLimited: boolean;
+	blocked: boolean;
 };
 
 const EXTRA_HEADERS = new Set([
@@ -116,6 +124,7 @@ export const normalizeObservation = (
 	inputHeaders: unknown,
 	previous?: CodexAccount,
 	now: number = Date.now(),
+	model?: string,
 ): CodexAccount => {
 	if (!id.startsWith("openai-codex")) throw new Error("provider is not Codex");
 	if (status !== 200 && status !== 429)
@@ -145,8 +154,14 @@ export const normalizeObservation = (
 		id,
 		plan,
 		windows,
+		...(sawWindowShape
+			? { windowsFetchedAt: now }
+			: previous?.windowsFetchedAt !== undefined
+				? { windowsFetchedAt: previous.windowsFetchedAt }
+				: previous ? { windowsFetchedAt: previous.fetchedAt } : {}),
 		status429: status === 429,
 		...(retryAfter === undefined ? {} : { retryAfter }),
+		...(model ?? previous?.lastModel ? { lastModel: model ?? previous?.lastModel } : {}),
 		fetchedAt: now,
 	};
 };
@@ -177,27 +192,30 @@ export const buildQuotaView = (
 	let totalUsedEq = 0;
 	let totalCount = 0;
 	for (const account of state.accounts) {
-		if (account.windows.length === 0) continue;
 		for (const window of account.windows) {
+			if (window.resetAt * 1000 <= now) continue;
 			totalUsedEq += window.pctUsed;
 			totalCount++;
 		}
 	}
-	const win300 = current?.windows.find((window) => window.minutes === 300);
-	const win10080 = current?.windows.find((window) => window.minutes === 10080);
+	const windowView = (minutes: number): QuotaWindowView | undefined => {
+		const window = current?.windows.find((candidate) => candidate.minutes === minutes);
+		return window && { ...window, expired: window.resetAt * 1000 <= now };
+	};
+	const win300 = windowView(300);
+	const win10080 = windowView(10080);
+	const fetchedAt = current?.windowsFetchedAt ?? current?.fetchedAt ?? now;
 	return {
 		currentLabel: current?.id ?? state.current ?? "",
 		...(win300 ? { win300 } : {}),
 		...(win10080 ? { win10080 } : {}),
 		totalUsedEq,
 		totalCount,
-		oldestFetchedAt: Math.min(...state.accounts.map((account) => account.fetchedAt)),
-		expired: state.accounts.some(
-			(account) =>
-				now - account.fetchedAt > 60 * 60_000 ||
-				account.windows.some((window) => window.resetAt * 1000 < now),
-		),
-		anyLimited: state.accounts.some((account) => account.status429),
+		fetchedAt,
+		expired:
+			now - fetchedAt > 60 * 60_000 ||
+			Boolean(win300?.expired || win10080?.expired),
+		blocked: current?.status429 ?? false,
 	};
 };
 
@@ -225,8 +243,10 @@ const validAccount = (value: unknown): value is CodexAccount => {
 		account.plan.length > 0 &&
 		Array.isArray(account.windows) &&
 		account.windows.every(validWindow) &&
+		(account.windowsFetchedAt === undefined || Number.isFinite(account.windowsFetchedAt)) &&
 		typeof account.status429 === "boolean" &&
 		(account.retryAfter === undefined || Number.isFinite(account.retryAfter)) &&
+		(account.lastModel === undefined || typeof account.lastModel === "string") &&
 		Number.isFinite(account.fetchedAt)
 	);
 };
@@ -270,9 +290,15 @@ export class CodexUsageStore {
 		this.state.current = id;
 	}
 
-	observe(id: string, status: number, headers: unknown, now = Date.now()): CodexUsageState {
+	observe(
+		id: string,
+		status: number,
+		headers: unknown,
+		now = Date.now(),
+		model?: string,
+	): CodexUsageState {
 		const previous = this.state.accounts.find((account) => account.id === id);
-		const next = normalizeObservation(id, status, headers, previous, now);
+		const next = normalizeObservation(id, status, headers, previous, now, model);
 		const notes = resetNotes(previous, next);
 		this.state.accounts = [
 			...this.state.accounts.filter((account) => account.id !== id),

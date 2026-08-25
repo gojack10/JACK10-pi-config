@@ -6,6 +6,7 @@ import {
 	quotaBarColorForRemainingPercent,
 	quotaBarForRemainingPercent,
 	quotaPlacementForProvider,
+	quotaRemainingLabel,
 	quotaRemainingPercent,
 	quotaSegmentsForProvider,
 } from "./placement.ts";
@@ -46,6 +47,8 @@ test("displays remaining percentage with proportional bars", () => {
 	assert.equal(quotaRemainingPercent(122 / 2), 39);
 	assert.equal(quotaRemainingPercent(0), 100);
 	assert.equal(quotaRemainingPercent(100), 0);
+	assert.equal(quotaRemainingLabel(42), "58%");
+	assert.equal(quotaRemainingLabel(100), "~0% remaining");
 	assert.equal(quotaBarForRemainingPercent(58), "██████░░░░");
 	assert.equal(quotaBarForRemainingPercent(100), "██████████");
 	assert.equal(quotaBarForRemainingPercent(0), "░░░░░░░░░░");

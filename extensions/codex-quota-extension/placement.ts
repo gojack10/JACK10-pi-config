@@ -17,6 +17,9 @@ export const QUOTA_TEXT_COLOR = "dim" as const;
 export const quotaRemainingPercent = (pctUsed: number): number =>
 	100 - Math.max(0, Math.min(100, pctUsed));
 
+export const quotaRemainingLabel = (pctUsed: number): string =>
+	pctUsed === 100 ? "~0% remaining" : `${Math.round(quotaRemainingPercent(pctUsed))}%`;
+
 export const quotaBarForRemainingPercent = (remaining: number): string => {
 	const filled = Math.round(Math.max(0, Math.min(100, remaining)) / 10);
 	return `${"█".repeat(filled)}${"░".repeat(10 - filled)}`;
