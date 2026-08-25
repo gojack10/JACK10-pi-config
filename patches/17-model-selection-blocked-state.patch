@@ -6,7 +6,7 @@ index f6f7c1c..988f18f 100644
  	readonly id: string;
  	readonly name: string;
  	readonly selectable?: boolean;
-+	readonly modelSelectionError?: (model: Model<TApi>) => string | undefined;
++	modelSelectionError?(model: Model<TApi>): string | undefined;
  
  	readonly baseUrl?: string;
  	readonly headers?: ProviderHeaders;
