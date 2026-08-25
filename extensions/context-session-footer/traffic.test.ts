@@ -176,6 +176,7 @@ test("identity mismatch reports UNKNOWN and offline cannot classify", () => {
 test("nettop includes loopback traffic and meter marks an empty stream degraded", () => {
 	const args = nettopArgs(123);
 	assert.deepEqual(args.slice(-2), ["-p", "123"]);
+	assert.deepEqual(args.slice(args.indexOf("-L"), args.indexOf("-L") + 2), ["-L", "2"]);
 	assert.equal(args.includes("external"), false);
 	assert.equal(args.includes("-t"), false);
 
