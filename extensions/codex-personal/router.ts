@@ -75,7 +75,12 @@ const formatBlockedError = (
 	for (const evaluation of accounts) {
 		const telemetry = evaluation.telemetry;
 		if (!telemetry) continue;
-		if (telemetry.notBefore != null)
+		if (
+			telemetry.captureHealth === "healthy" &&
+			telemetry.fetchedAt > 0 &&
+			now - telemetry.fetchedAt <= FIFTEEN_MINUTES &&
+			telemetry.notBefore != null
+		)
 			notBeforeValues.push({ value: telemetry.notBefore, elapsed429: telemetry.status429 && telemetry.notBefore * 1000 <= now });
 		const nonTimeReasons = evaluation.reasons.filter(
 			(reason) =>
