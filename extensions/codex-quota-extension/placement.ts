@@ -14,12 +14,20 @@ export const quotaSegmentsForProvider = (
 
 export const QUOTA_TEXT_COLOR = "dim" as const;
 
-export const quotaBarColorForUsedPercent = (
-	pctUsed: number,
+export const quotaRemainingPercent = (pctUsed: number): number =>
+	100 - Math.max(0, Math.min(100, pctUsed));
+
+export const quotaBarForRemainingPercent = (remaining: number): string => {
+	const filled = Math.round(Math.max(0, Math.min(100, remaining)) / 10);
+	return `${"█".repeat(filled)}${"░".repeat(10 - filled)}`;
+};
+
+export const quotaBarColorForRemainingPercent = (
+	remaining: number,
 ): "text" | "warning" | "error" => {
-	const remaining = 100 - Math.max(0, Math.min(100, pctUsed));
-	if (remaining <= 15) return "error";
-	if (remaining < 30) return "warning";
+	const clamped = Math.max(0, Math.min(100, remaining));
+	if (clamped <= 15) return "error";
+	if (clamped < 30) return "warning";
 	return "text";
 };
 

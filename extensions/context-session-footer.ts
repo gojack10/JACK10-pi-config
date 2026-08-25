@@ -9,8 +9,10 @@ import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
 	appendQuotaBesideCache,
 	QUOTA_TEXT_COLOR,
-	quotaBarColorForUsedPercent,
+	quotaBarColorForRemainingPercent,
+	quotaBarForRemainingPercent,
 	quotaPlacementForProvider,
+	quotaRemainingPercent,
 	quotaSegmentsForProvider,
 	type QuotaSegment,
 } from "./codex-quota-extension/placement.ts";
@@ -225,11 +227,6 @@ const formatQuotaAge = (milliseconds: number): string => {
 	return `${Math.floor(seconds / 86400)}D`;
 };
 
-const quotaBar = (pctUsed: number): string => {
-	const used = Math.round(Math.max(0, Math.min(100, pctUsed)) / 10);
-	return `${"█".repeat(used)}${"░".repeat(10 - used)}`;
-};
-
 const renderQuotaLine = (
 	view: QuotaView | undefined,
 	width: number,
@@ -242,28 +239,33 @@ const renderQuotaLine = (
 	const now = Date.now();
 	const ageMs = Math.max(0, now - view.oldestFetchedAt);
 	const separator = grey(" | ");
-	const paintBar = (pctUsed: number) =>
-		theme.fg(quotaBarColorForUsedPercent(pctUsed), quotaBar(pctUsed));
+	const paintBar = (remaining: number) =>
+		theme.fg(
+			quotaBarColorForRemainingPercent(remaining),
+			quotaBarForRemainingPercent(remaining),
+		);
 	const windowText = (
 		label: string,
 		window: { pctUsed: number; resetAt: number } | undefined,
 		wide: boolean,
 	): string => {
 		if (!window) return grey(`${label} -`);
-		const pct = `${Math.round(window.pctUsed)}%`;
+		const remaining = quotaRemainingPercent(window.pctUsed);
+		const pct = `${Math.round(remaining)}%`;
 		const timer = formatCacheTimerValue(window.resetAt * 1000 - now);
 		return wide
-			? `${grey(`${label} `)}${paintBar(window.pctUsed)}${grey(` ${pct} / RESET ${timer}`)}`
+			? `${grey(`${label} `)}${paintBar(remaining)}${grey(` ${pct} / RESET ${timer}`)}`
 			: grey(`${label} ${pct} / ${timer}`);
 	};
-	const totalPct = view.totalCount > 0
-		? Math.round(view.totalUsedEq / view.totalCount)
+	const totalRemaining = view.totalCount > 0
+		? quotaRemainingPercent(view.totalUsedEq / view.totalCount)
 		: undefined;
 	const totalText = (wide: boolean) => {
-		if (totalPct === undefined) return grey("TOTAL -");
+		if (totalRemaining === undefined) return grey("TOTAL -");
+		const pct = Math.round(totalRemaining);
 		return wide
-			? `${grey("TOTAL ")}${paintBar(totalPct)}${grey(` ${totalPct}%`)}`
-			: grey(`TOTAL ${totalPct}%`);
+			? `${grey("TOTAL ")}${paintBar(totalRemaining)}${grey(` ${pct}%`)}`
+			: grey(`TOTAL ${pct}%`);
 	};
 	const suffix = `${separator}${grey(`AGE ${formatQuotaAge(ageMs)}`)}`;
 	const build = (wide: boolean) => {
