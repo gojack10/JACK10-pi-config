@@ -16,11 +16,11 @@ export const QUOTA_TEXT_COLOR = "dim" as const;
 
 export const quotaBarColorForUsedPercent = (
 	pctUsed: number,
-): "success" | "warning" | "error" => {
+): "text" | "warning" | "error" => {
 	const remaining = 100 - Math.max(0, Math.min(100, pctUsed));
 	if (remaining <= 15) return "error";
 	if (remaining < 30) return "warning";
-	return "success";
+	return "text";
 };
 
 export const appendQuotaBesideCache = (
