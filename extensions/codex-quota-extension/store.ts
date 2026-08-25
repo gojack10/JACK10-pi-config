@@ -15,6 +15,7 @@ export type CodexAccount = {
 	windowsFetchedAt?: number;
 	status429: boolean;
 	retryAfter?: number;
+	notBefore?: number;
 	lastModel?: string;
 	fetchedAt: number;
 };
@@ -40,6 +41,7 @@ export type QuotaView = {
 	fetchedAt: number;
 	expired: boolean;
 	blocked: boolean;
+	notBefore?: number;
 };
 
 const EXTRA_HEADERS = new Set([
@@ -149,6 +151,12 @@ export const normalizeObservation = (
 		? [...new Map(parsed.map((window) => [window.minutes, window])).values()]
 		: (previous?.windows ?? []);
 	const retryAfter = parseRetryAfter(headers, now);
+	const activeResets = windows
+		.filter((window) => window.resetAt * 1000 > now)
+		.map((window) => window.resetAt);
+	const notBefore = status === 429 && activeResets.length > 0
+		? Math.min(...activeResets)
+		: undefined;
 
 	return {
 		id,
@@ -161,6 +169,7 @@ export const normalizeObservation = (
 				: previous ? { windowsFetchedAt: previous.fetchedAt } : {}),
 		status429: status === 429,
 		...(retryAfter === undefined ? {} : { retryAfter }),
+		...(notBefore === undefined ? {} : { notBefore }),
 		...(model ?? previous?.lastModel ? { lastModel: model ?? previous?.lastModel } : {}),
 		fetchedAt: now,
 	};
@@ -216,6 +225,7 @@ export const buildQuotaView = (
 			now - fetchedAt > 60 * 60_000 ||
 			Boolean(win300?.expired || win10080?.expired),
 		blocked: current?.status429 ?? false,
+		...(current?.notBefore === undefined ? {} : { notBefore: current.notBefore }),
 	};
 };
 
@@ -246,6 +256,7 @@ const validAccount = (value: unknown): value is CodexAccount => {
 		(account.windowsFetchedAt === undefined || Number.isFinite(account.windowsFetchedAt)) &&
 		typeof account.status429 === "boolean" &&
 		(account.retryAfter === undefined || Number.isFinite(account.retryAfter)) &&
+		(account.notBefore === undefined || Number.isFinite(account.notBefore)) &&
 		(account.lastModel === undefined || typeof account.lastModel === "string") &&
 		Number.isFinite(account.fetchedAt)
 	);

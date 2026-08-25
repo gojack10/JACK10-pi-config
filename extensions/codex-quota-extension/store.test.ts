@@ -78,10 +78,20 @@ test("headerless 429 retains window provenance while updating response status", 
 	assert.equal(blocked.fetchedAt, 1_100_000);
 	assert.equal(blocked.lastModel, "gpt-5.6-sol");
 	assert.equal(blocked.status429, true);
-	assert.equal(
-		buildQuotaView({ current: blocked.id, accounts: [blocked] }, 1_100_000)?.blocked,
-		true,
+	assert.equal(blocked.notBefore, 2000);
+	const view = buildQuotaView({ current: blocked.id, accounts: [blocked] }, 1_100_000);
+	assert.equal(view?.blocked, true);
+	assert.equal(view?.notBefore, 2000);
+
+	const cleared = normalizeObservation(
+		"openai-codex-alt",
+		200,
+		headers(),
+		blocked,
+		1_200_000,
 	);
+	assert.equal(cleared.status429, false);
+	assert.equal(cleared.notBefore, undefined);
 });
 
 test("detects reset epochs and percentage drops", () => {
@@ -174,8 +184,16 @@ test("writes state atomically with mode 0600", async (t) => {
 	const path = join(directory, "state.json");
 	const store = new CodexUsageStore(path);
 	store.observe("openai-codex-alt", 200, headers(), 1_000_000);
+	store.observe("openai-codex-alt", 429, {}, 1_100_000);
 	await store.write();
 	assert.equal((await stat(path)).mode & 0o777, 0o600);
-	assert.equal(JSON.parse(await readFile(path, "utf8")).current, "openai-codex-alt");
+	const blocked = JSON.parse(await readFile(path, "utf8"));
+	assert.equal(blocked.current, "openai-codex-alt");
+	assert.equal(blocked.accounts[0].notBefore, 2000);
+
+	store.observe("openai-codex-alt", 200, headers(), 1_200_000);
+	await store.write();
+	const cleared = JSON.parse(await readFile(path, "utf8"));
+	assert.equal(cleared.accounts[0].notBefore, undefined);
 	assert.deepEqual((await readdir(directory)).sort(), ["state.json"]);
 });

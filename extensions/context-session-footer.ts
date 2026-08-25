@@ -270,7 +270,10 @@ const renderQuotaLine = (
 			? `${grey("TOTAL ")}${paintBar(totalRemaining)}${grey(` ${pct}%`)}`
 			: grey(`TOTAL ${pct}%`);
 	};
-	const suffix = `${view.blocked ? `${separator}${grey("BLOCKED")}` : ""}${separator}${grey(`AGE ${formatQuotaAge(ageMs)}`)}`;
+	const blocked = view.blocked
+		? `BLOCKED${view.notBefore === undefined ? "" : ` / RESET ${formatCacheTimerValue(view.notBefore * 1000 - now)}`}`
+		: undefined;
+	const suffix = `${blocked ? `${separator}${grey(blocked)}` : ""}${separator}${grey(`AGE ${formatQuotaAge(ageMs)}`)}`;
 	const build = (wide: boolean) => {
 		const content: string[] = [];
 		if (segments.includes("5H"))
