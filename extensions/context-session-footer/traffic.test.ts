@@ -72,12 +72,12 @@ test("manual HOTSPOT only applies to its matching network identity", () => {
 	assert.deepEqual(state.cycle.unknown, { bytesIn: 9, bytesOut: 10 });
 	assert.deepEqual(trafficRow(state, false, () => "01:02:03", july22, networkA), {
 		type: "HOTSPOT:manual",
-		data: "0.0 GB/25 GB",
+		data: "0.0 MB/25 GB",
 		time: "01:02:03",
 	});
 	assert.deepEqual(trafficRow(state, false, () => "-", july22, networkB), {
 		type: "UNKNOWN",
-		data: "0.0 GB!",
+		data: "0.0 MB!",
 		time: "-",
 	});
 	assert.deepEqual(trafficRow(state, false, () => "-", july22, { status: "OFFLINE" }), {
@@ -85,6 +85,14 @@ test("manual HOTSPOT only applies to its matching network identity", () => {
 		data: "!",
 		time: "-",
 	});
+});
+
+test("traffic formats sub-gigabyte totals as MB and switches at one GB", () => {
+	const state = newTrafficState(july22);
+	state.local = { bytesIn: 900_000_000, bytesOut: 0 };
+	assert.equal(trafficRow(state, true, () => "-", july22).data, "900.0 MB");
+	state.local.bytesIn = 1_000_000_000;
+	assert.equal(trafficRow(state, true, () => "-", july22).data, "1.0 GB");
 });
 
 test("/traffic parses hotspot, lan, status, and usage errors", () => {
@@ -214,7 +222,7 @@ test("atomic writer preserves 0600 mode", () => {
 });
 
 test("TRAFFIC uses CACHE rows, degrades after QUOTA, then skips", () => {
-	const row = { type: "LOCAL" as const, data: "0.0 GB", time: "-" };
+	const row = { type: "LOCAL" as const, data: "0.0 MB", time: "-" };
 	const initial = [
 		"CACHE────────┬────┐",
 		"│ CACHE ROW  │ CODEX-QUOTA: TOTAL 40%",
@@ -227,7 +235,7 @@ test("TRAFFIC uses CACHE rows, degrades after QUOTA, then skips", () => {
 		"condensed",
 	);
 	assert.equal(lines.length, initial.length);
-	assert.match(lines[1], /CODEX-QUOTA: TOTAL 40%.*TRAF LOCAL 0\.0GB/);
+	assert.match(lines[1], /CODEX-QUOTA: TOTAL 40%.*TRAF LOCAL 0\.0 MB/);
 
 	const skipped = [...initial];
 	assert.equal(
