@@ -61,7 +61,9 @@ async function main(): Promise<number> {
 				account.label.toLowerCase() === normalized,
 		);
 		if (matches.length !== 1) throw new Error(`No unique Codex account matches ${loginRef}`);
-		console.error(`Account maintenance enabled. Run /login ${matches[0]!.providerId}`);
+		console.error(
+			`Account maintenance enabled. Run /login ${matches[0]!.providerId}; a minimal prompt refreshes stale quota telemetry.`,
+		);
 		const result = spawnSync(process.env.PI_CODEX_PI_BIN ?? "pi", piArgs, {
 			stdio: "inherit",
 			env: { ...process.env, [maintenanceEnv]: matches[0]!.providerId },

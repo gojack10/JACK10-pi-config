@@ -165,12 +165,18 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			},
 			getModels: () => source.getModels().map((model) => ({ ...model, provider: account.providerId })),
 			stream: (model, context, options) => {
-				if (pin?.accountKey !== account.accountKey)
+				if (
+					pin?.accountKey !== account.accountKey &&
+					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
+				)
 					throw new Error("ROUTE DENIED: launch real Codex accounts through pi-codex-personal");
 				return source.stream(model, context, options);
 			},
 			streamSimple: (model, context, options) => {
-				if (pin?.accountKey !== account.accountKey)
+				if (
+					pin?.accountKey !== account.accountKey &&
+					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
+				)
 					throw new Error("ROUTE DENIED: launch real Codex accounts through pi-codex-personal");
 				return source.streamSimple(model, context, options);
 			},
