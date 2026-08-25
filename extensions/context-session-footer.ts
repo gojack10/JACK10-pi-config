@@ -8,7 +8,8 @@ import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
 	appendQuotaBesideCache,
-	quotaColorForUsedPercent,
+	QUOTA_TEXT_COLOR,
+	quotaBarColorForUsedPercent,
 	quotaPlacementForProvider,
 	quotaSegmentsForProvider,
 	type QuotaSegment,
@@ -236,47 +237,40 @@ const quotaBar = (pctUsed: number): string => {
 
 const renderQuotaLine = (
 	view: QuotaView | undefined,
-	degraded: boolean,
 	width: number,
 	theme: Theme,
 	segments: readonly QuotaSegment[],
 ): string | undefined => {
-	if (!view && !degraded) return undefined;
-	if (!view) return fitToWidth("CODEX-QUOTA: CAPTURE DEGRADED", width);
+	if (!view) return undefined;
+	const grey = (text: string) => theme.fg(QUOTA_TEXT_COLOR, text);
 
 	const now = Date.now();
 	const ageMs = Math.max(0, now - view.oldestFetchedAt);
-	const separator = " | ";
-	const paintSegment = (text: string, pctUsed: number) =>
-		theme.fg(quotaColorForUsedPercent(pctUsed), text);
+	const separator = grey(" | ");
+	const paintBar = (pctUsed: number) =>
+		theme.fg(quotaBarColorForUsedPercent(pctUsed), quotaBar(pctUsed));
 	const windowText = (
 		label: string,
 		window: { pctUsed: number; resetAt: number } | undefined,
 		wide: boolean,
 	): string => {
-		if (!window) return `${label} -`;
+		if (!window) return grey(`${label} -`);
 		const pct = `${Math.round(window.pctUsed)}%`;
 		const timer = formatCacheTimerValue(window.resetAt * 1000 - now);
-		return paintSegment(
-			wide
-				? `${label} ${quotaBar(window.pctUsed)} ${pct} / RESET ${timer}`
-				: `${label} ${pct} / ${timer}`,
-			window.pctUsed,
-		);
+		return wide
+			? `${grey(`${label} `)}${paintBar(window.pctUsed)}${grey(` ${pct} / RESET ${timer}`)}`
+			: grey(`${label} ${pct} / ${timer}`);
 	};
 	const totalPct = view.totalCount > 0
 		? Math.round(view.totalUsedEq / view.totalCount)
 		: undefined;
-	const totalText = (wide: boolean) =>
-		totalPct === undefined
-			? "TOTAL -"
-			: paintSegment(
-				`TOTAL ${wide ? `${quotaBar(totalPct)} ` : ""}${totalPct}%`,
-				totalPct,
-			);
-	const suffix = `${separator}AGE ${formatQuotaAge(ageMs)}${
-		degraded ? `${separator}CAPTURE DEGRADED` : ""
-	}`;
+	const totalText = (wide: boolean) => {
+		if (totalPct === undefined) return grey("TOTAL -");
+		return wide
+			? `${grey("TOTAL ")}${paintBar(totalPct)}${grey(` ${totalPct}%`)}`
+			: grey(`TOTAL ${totalPct}%`);
+	};
+	const suffix = `${separator}${grey(`AGE ${formatQuotaAge(ageMs)}`)}`;
 	const build = (wide: boolean) => {
 		const content: string[] = [];
 		if (segments.includes("5H"))
@@ -284,7 +278,7 @@ const renderQuotaLine = (
 		if (segments.includes("WEEK"))
 			content.push(windowText("WEEK", view.win10080, wide));
 		if (segments.includes("TOTAL")) content.push(totalText(wide));
-		return `CODEX-QUOTA: ${content.join(separator)}${suffix}`;
+		return `${grey("CODEX-QUOTA: ")}${content.join(separator)}${suffix}`;
 	};
 	const wideLine = build(true);
 	return fitToWidth(
@@ -296,12 +290,11 @@ const renderQuotaLine = (
 const appendQuotaLine = (
 	state: FooterLineState,
 	view: QuotaView | undefined,
-	degraded: boolean,
 	width: number,
 	theme: Theme,
 	segments: readonly QuotaSegment[],
 ): void => {
-	const line = renderQuotaLine(view, degraded, width, theme, segments);
+	const line = renderQuotaLine(view, width, theme, segments);
 	if (!line) return;
 	flushFooterLine(state, width);
 	state.lines.push(line);
@@ -376,19 +369,15 @@ export default function (pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
 	let cacheTimers: CacheStatusRow[] = [];
 	let quotaView: QuotaView | undefined;
-	let quotaDegraded = false;
 	pi.events.on("cache-status:update", (data) => {
 		if (Array.isArray(data)) cacheTimers = data as CacheStatusRow[];
 		requestRender?.();
 	});
 	pi.events.on("codex-usage:update", (data) => {
 		if (!data || typeof data !== "object") return;
-		const update = data as
-			| CodexUsageState
-			| { state?: CodexUsageState; degraded?: string };
+		const update = data as CodexUsageState | { state?: CodexUsageState };
 		const state = "accounts" in update ? update : update.state;
 		if (state) quotaView = buildQuotaView(state);
-		quotaDegraded = "degraded" in update && Boolean(update.degraded);
 		requestRender?.();
 	});
 
@@ -485,7 +474,6 @@ export default function (pi: ExtensionAPI) {
 						appendQuotaLine(
 							lineState,
 							quotaView,
-							quotaDegraded,
 							width,
 							theme,
 							quotaSegments,
@@ -503,7 +491,6 @@ export default function (pi: ExtensionAPI) {
 							(available) =>
 								renderQuotaLine(
 									quotaView,
-									quotaDegraded,
 									available,
 									theme,
 									quotaSegments,

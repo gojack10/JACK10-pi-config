@@ -12,7 +12,9 @@ export const quotaSegmentsForProvider = (
 		? ["5H", "WEEK", "TOTAL"]
 		: ["TOTAL"];
 
-export const quotaColorForUsedPercent = (
+export const QUOTA_TEXT_COLOR = "dim" as const;
+
+export const quotaBarColorForUsedPercent = (
 	pctUsed: number,
 ): "success" | "warning" | "error" => {
 	const remaining = 100 - Math.max(0, Math.min(100, pctUsed));

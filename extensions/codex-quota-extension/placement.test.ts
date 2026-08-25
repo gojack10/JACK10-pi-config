@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	appendQuotaBesideCache,
-	quotaColorForUsedPercent,
+	QUOTA_TEXT_COLOR,
+	quotaBarColorForUsedPercent,
 	quotaPlacementForProvider,
 	quotaSegmentsForProvider,
 } from "./placement.ts";
@@ -38,9 +39,10 @@ test("places full Codex quota above and total-only quota beside cache", () => {
 	assert.doesNotMatch(lines[3], /CODEX-QUOTA:/);
 });
 
-test("colors used percentages by remaining quota thresholds", () => {
-	assert.equal(quotaColorForUsedPercent(70), "success");
-	assert.equal(quotaColorForUsedPercent(71), "warning");
-	assert.equal(quotaColorForUsedPercent(84), "warning");
-	assert.equal(quotaColorForUsedPercent(85), "error");
+test("colors only bars by remaining thresholds and keeps text grey", () => {
+	assert.equal(QUOTA_TEXT_COLOR, "dim");
+	assert.equal(quotaBarColorForUsedPercent(70), "success");
+	assert.equal(quotaBarColorForUsedPercent(71), "warning");
+	assert.equal(quotaBarColorForUsedPercent(84), "warning");
+	assert.equal(quotaBarColorForUsedPercent(85), "error");
 });
