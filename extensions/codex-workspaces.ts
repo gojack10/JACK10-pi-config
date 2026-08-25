@@ -1,37 +1,35 @@
-/**
- * Codex workspace aliases.
- *
- * Pi's built-in openai-codex provider stores one OAuth credential under the
- * provider id. This extension registers additional provider ids that reuse the
- * same ChatGPT/Codex OAuth flow and the same Codex model catalog, so /login can
- * store separate workspace/account tokens without overwriting each other.
- *
- * Usage:
- *   /login openai-codex-alt
- *   /login openai-codex-team
- *   pi --model openai-codex-team/gpt-5.5
- */
-
-import { appendFileSync } from "node:fs";
+import { appendFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { OAuthCredential } from "@earendil-works/pi-ai";
+import type { Model, OAuthCredential, Provider } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-const AUTH_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-workspace-auth-observability.jsonl");
+import { parseRegistry, type RegistryAccount } from "./codex-quota-extension/store.ts";
+import { evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal/router.ts";
 
-const CODEX_ALIASES = [
-	{
-		provider: "openai-codex-alt",
-		name: "ChatGPT Edu / Alt (Codex)",
-		modelSuffix: "Alt",
-	},
-	{
-		provider: "openai-codex-team",
-		name: "ChatGPT Team (Codex)",
-		modelSuffix: "Team",
-	},
-] as const;
+const AGENT_DIR = join(homedir(), ".pi", "agent");
+const REGISTRY_PATH = join(AGENT_DIR, "codex-accounts.json");
+const FEED_PATH = join(AGENT_DIR, "codex-usage-state.json");
+const CHOICE_PATH = join(AGENT_DIR, "codex-personal-choice.json");
+const AUTH_OBSERVABILITY_PATH = join(AGENT_DIR, "codex-workspace-auth-observability.jsonl");
+const ROUTE_ENV = "PI_CODEX_PERSONAL_ROUTE";
+const SOL_MODEL = /(^|-)sol($|-)/;
+
+type RoutePin = {
+	umbrella: string;
+	accountKey: string;
+	model: string;
+	actualProviderId: string;
+	feedGeneration: number;
+	routedAt: number;
+	workClass: "short" | "long" | "unpredictable";
+	horizonMinutes?: number;
+};
+
+type SelectorProvider = Provider & {
+	selectable?: boolean;
+	modelSelectionError?: (model: Model) => string | undefined;
+};
 
 function decodeJwtPayload(token: string | undefined): Record<string, unknown> | undefined {
 	try {
@@ -77,27 +75,73 @@ function appendAuthObservation(
 	}
 }
 
+function parseRoute(value: string | undefined): RoutePin | undefined {
+	if (!value) return undefined;
+	const route = JSON.parse(value) as Partial<RoutePin>;
+	if (
+		typeof route.umbrella !== "string" ||
+		typeof route.accountKey !== "string" ||
+		typeof route.model !== "string" ||
+		typeof route.actualProviderId !== "string" ||
+		!Number.isInteger(route.feedGeneration) ||
+		!Number.isFinite(route.routedAt) ||
+		!(["short", "long", "unpredictable"] as unknown[]).includes(route.workClass)
+	)
+		throw new Error("Invalid Codex route environment");
+	return route as RoutePin;
+}
+
+function routeEntry(entries: readonly unknown[]): RoutePin | undefined {
+	const routes = entries
+		.filter(
+			(entry): entry is { type: "custom"; customType: "codex-route/v1"; data: RoutePin } =>
+				!!entry &&
+				typeof entry === "object" &&
+				(entry as { type?: string }).type === "custom" &&
+				(entry as { customType?: string }).customType === "codex-route/v1",
+		)
+		.map((entry) => entry.data);
+	return routes.at(-1);
+}
+
+function validatePin(pin: RoutePin, account: RegistryAccount, umbrella: string): void {
+	if (
+		pin.umbrella !== umbrella ||
+		pin.actualProviderId !== account.providerId ||
+		!account.supportedModels.includes(pin.model)
+	)
+		throw new Error("ROUTE DENIED: Codex route pin does not match the private account registry");
+}
+
+function writeChoice(model: string): void {
+	writeFileSync(CHOICE_PATH, `${JSON.stringify({ model }, null, 2)}\n`, { mode: 0o600 });
+	chmodSync(CHOICE_PATH, 0o600);
+}
+
 export default function codexWorkspaces(pi: ExtensionAPI) {
+	const registry = parseRegistry(JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as unknown);
 	const source = builtinProviders().find((provider) => provider.id === "openai-codex");
 	const oauth = source?.auth.oauth;
 	if (!source || !oauth) throw new Error("Built-in Codex provider has no OAuth flow");
-
-	for (const alias of CODEX_ALIASES) {
+	for (const account of registry.accounts) {
+		if (account.credentialRef !== account.providerId)
+			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
 		pi.registerProvider({
 			...source,
-			id: alias.provider,
-			name: alias.name,
+			id: account.providerId,
+			name: `${account.label} (Codex account)`,
+			selectable: false,
 			auth: {
 				oauth: {
 					...oauth,
-					name: alias.name,
+					name: `${account.label} (Codex account)`,
 					login: async (interaction) => {
 						try {
 							const credentials = await oauth.login(interaction);
-							appendAuthObservation(alias.provider, "login", "success", summarizeCredentials(credentials));
+							appendAuthObservation(account.providerId, "login", "success", summarizeCredentials(credentials));
 							return credentials;
 						} catch (error) {
-							appendAuthObservation(alias.provider, "login", "error", {
+							appendAuthObservation(account.providerId, "login", "error", {
 								error: error instanceof Error ? error.message : String(error),
 							});
 							throw error;
@@ -106,10 +150,10 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					refresh: async (credentials, signal) => {
 						try {
 							const refreshed = await oauth.refresh(credentials, signal);
-							appendAuthObservation(alias.provider, "refresh", "success", summarizeCredentials(refreshed));
+							appendAuthObservation(account.providerId, "refresh", "success", summarizeCredentials(refreshed));
 							return refreshed;
 						} catch (error) {
-							appendAuthObservation(alias.provider, "refresh", "error", {
+							appendAuthObservation(account.providerId, "refresh", "error", {
 								accountId: redactId(credentials.accountId),
 								error: error instanceof Error ? error.message : String(error),
 							});
@@ -118,12 +162,107 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					},
 				},
 			},
-			getModels: () =>
-				source.getModels().map((model) => ({
-					...model,
-					provider: alias.provider,
-					name: `${model.name ?? model.id} (${alias.modelSuffix})`,
-				})),
-		});
+			getModels: () => source.getModels().map((model) => ({ ...model, provider: account.providerId })),
+		} as Provider);
 	}
+
+	const selectionError = (model: Model): string | undefined =>
+		evaluateCodexRouteFromFiles({
+			model: model.id,
+			work: parseWorkInput(process.env.PI_CODEX_WORK),
+			registryPath: REGISTRY_PATH,
+			feedPath: FEED_PATH,
+		}).error;
+	const failBeforeNetwork = (model: Model): never => {
+		const blocked = selectionError(model);
+		throw new Error(blocked ?? "launch through the Codex personal router");
+	};
+	const umbrella: SelectorProvider = {
+		...source,
+		id: registry.umbrellaProviderId,
+		name: "OpenAI Codex Personal",
+		selectable: true,
+		auth: {
+			apiKey: {
+				name: "Local Codex personal router",
+				resolve: async () => ({ auth: { apiKey: "selector-only" }, source: "local selector" }),
+			},
+		},
+		getModels: () =>
+			source
+				.getModels()
+				.filter((model) => SOL_MODEL.test(model.id))
+				.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
+		modelSelectionError: selectionError,
+		stream: (model) => failBeforeNetwork(model),
+		streamSimple: (model) => failBeforeNetwork(model),
+	};
+	pi.registerProvider(umbrella as Provider);
+
+	let pin: RoutePin | undefined;
+	let translating = false;
+	pi.on("session_start", (event, ctx) => {
+		pin = routeEntry(ctx.sessionManager.getBranch());
+		const envRoute = parseRoute(process.env[ROUTE_ENV]);
+		if (!pin && envRoute) {
+			pin = envRoute;
+			pi.appendEntry("codex-route/v1", pin);
+		} else if (!pin && ctx.model?.provider.startsWith("openai-codex") && ctx.model.provider !== registry.umbrellaProviderId) {
+			const matches = registry.accounts.filter((account) => account.providerId === ctx.model?.provider);
+			if (matches.length !== 1) throw new Error("ROUTE DENIED: historical Codex session has no unique account mapping");
+			pin = {
+				umbrella: registry.umbrellaProviderId,
+				accountKey: matches[0]!.accountKey,
+				model: ctx.model.id,
+				actualProviderId: matches[0]!.providerId,
+				feedGeneration: 0,
+				routedAt: Date.now(),
+				workClass: "unpredictable",
+			};
+			pi.appendEntry("codex-route/v1", pin);
+		}
+		if (!pin) return;
+		const account = registry.accounts.find((entry) => entry.accountKey === pin!.accountKey);
+		if (!account) throw new Error("ROUTE DENIED: pinned Codex account is absent from the registry");
+		validatePin(pin, account, registry.umbrellaProviderId);
+		if (ctx.model && (ctx.model.provider !== pin.actualProviderId || ctx.model.id !== pin.model))
+			throw new Error("PIN VIOLATION: active model differs from the durable Codex route");
+		if (event.reason === "new" && ctx.hasUI)
+			ctx.ui.notify("NOT REBALANCED; RELAUNCH FOR ROUTING", "warning");
+	});
+
+	pi.on("model_select", async (event, ctx) => {
+		if (translating) return;
+		if (event.model.provider === registry.umbrellaProviderId) {
+			const blocked = selectionError(event.model);
+			if (blocked) {
+				if (ctx.hasUI) ctx.ui.notify(blocked, "error");
+				if (event.previousModel) {
+					translating = true;
+					try {
+						await pi.setModel(event.previousModel);
+					} finally {
+						translating = false;
+					}
+				}
+				return;
+			}
+			if (!pin) {
+				writeChoice(event.model.id);
+				if (ctx.hasUI) ctx.ui.notify("Codex model saved; launch through pi-codex-personal to route an account", "warning");
+				return;
+			}
+			const account = registry.accounts.find((entry) => entry.accountKey === pin!.accountKey)!;
+			const actual = ctx.modelRegistry.find(account.providerId, event.model.id);
+			if (!actual) throw new Error(`Pinned account does not support ${event.model.id}`);
+			translating = true;
+			try {
+				if (!(await pi.setModel(actual))) throw new Error(`AUTH UNAVAILABLE: ${account.label}`);
+			} finally {
+				translating = false;
+			}
+			pin = { ...pin, model: event.model.id };
+			pi.appendEntry("codex-route/v1", pin);
+		}
+	});
 }
