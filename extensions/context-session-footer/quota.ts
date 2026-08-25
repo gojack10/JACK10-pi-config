@@ -26,29 +26,15 @@ export const renderQuotaLine = (
 	width: number,
 	theme: QuotaTheme,
 	now: number = Date.now(),
-	besideCache = false,
 	measure: (text: string) => number = (text) => text.length,
 	fit: (text: string, width: number) => string = (text, limit) => text.slice(0, limit),
 ): string | undefined => {
 	const grey = (text: string) => theme.fg(QUOTA_TEXT_COLOR, text);
-	if (!status) {
-		const text = besideCache ? "Q STALE" : "CODEX   5H   --   |   WEEK --   |   STALE";
-		return fit(theme.fg("error", text), width);
-	}
-	if (status.stale) {
-		const text = besideCache ? "Q STALE" : "CODEX   5H   --   |   WEEK --   |   STALE";
-		return fit(theme.fg("error", text), width);
+	if (!status || status.stale) {
+		return fit(theme.fg("error", "CODEX   5H   --   |   WEEK --   |   STALE"), width);
 	}
 	const colorFor = (value: number) => status.aged ? "dim" : quotaBarColorForRemainingPercent(value);
 	const back = `BACK ${status.recoveryAt === undefined ? "?" : formatQuotaCountdown(status.recoveryAt * 1000 - now)}`;
-	if (besideCache) {
-		if (!status.routable) return fit(theme.fg("error", `Q ${back}`), width);
-		if (status.h5 === undefined || status.week === undefined) return undefined;
-		return fit(
-			`${grey("Q 5H ")}${theme.fg(colorFor(status.h5), `${Math.round(status.h5)}%`)}${grey(" · W ")}${theme.fg(colorFor(status.week), `${Math.round(status.week)}%`)}`,
-			width,
-		);
-	}
 	const pool = (label: string, value: number | undefined, cells: number) => {
 		if (value === undefined) return grey(`${label} --`);
 		const color = colorFor(value);
