@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const MODEL = "gpt-5.6-luna";
-const TIMEOUT_MS = 15_000;
+const TIMEOUT_MS = 30_000;
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 
 type ProbeObservation = (
@@ -47,7 +47,8 @@ export const launchLoginProbe = (
 			"--no-extensions",
 			"--extension", join(AGENT_DIR, "extensions", "codex-workspaces.ts"),
 			"--extension", join(AGENT_DIR, "extensions", "codex-quota-extension", "index.ts"),
-			"--model", `${provider}/${MODEL}`,
+			"--provider", provider,
+			"--model", MODEL,
 			"--thinking", "off",
 			"--system-prompt", "",
 			"--no-context-files",
@@ -56,7 +57,7 @@ export const launchLoginProbe = (
 			"--no-tools",
 			"--no-session",
 			"--print",
-			"Reply only: ok",
+			"ok",
 		], {
 			stdio: "ignore",
 			env: { ...process.env, PI_CODEX_ACCOUNT_MAINTENANCE: provider },

@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { ProbeScheduler } from "./probe-scheduler.ts";
 import { CodexUsageStore } from "./store.ts";
 
 const isCodex = (provider: unknown): provider is string =>
@@ -11,14 +12,22 @@ type CaptureContext = {
 
 export default function (pi: ExtensionAPI) {
 	const store = new CodexUsageStore();
+	const probes = new ProbeScheduler();
 	let awaitingResponse = 0;
 	let pending = Promise.resolve();
 
-	const publish = (degraded?: string) =>
+	const publish = async (ctx: CaptureContext, degraded?: string) => {
+		const state = store.snapshot();
 		pi.events.emit("codex-usage:update", {
-			state: store.snapshot(),
+			state,
 			...(degraded ? { degraded } : {}),
 		});
+		try { await probes.reconcile(state); }
+		catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (ctx.hasUI) ctx.ui.notify(`Codex probe scheduling degraded: ${message}`, "error");
+		}
+	};
 	const reportFailure = async (ctx: CaptureContext, provider: string | undefined, error: unknown) => {
 		const message = error instanceof Error ? error.message : String(error);
 		if (provider) {
@@ -29,7 +38,7 @@ export default function (pi: ExtensionAPI) {
 				// Registry/feed failures are already fail-closed to the router.
 			}
 		}
-		publish(message);
+		await publish(ctx, message);
 		if (ctx.hasUI) ctx.ui.notify(`Codex quota capture degraded: ${message}`, "error");
 	};
 	const enqueue = (ctx: CaptureContext, provider: string | undefined, work: () => Promise<void>) => {
@@ -44,7 +53,7 @@ export default function (pi: ExtensionAPI) {
 			await store.load();
 			if (provider) store.setCurrent(provider);
 			await store.write();
-			publish();
+			await publish(ctx);
 		});
 	});
 
@@ -59,7 +68,7 @@ export default function (pi: ExtensionAPI) {
 		return enqueue(ctx, provider, async () => {
 			store.observe(provider, event.status, event.headers);
 			await store.write();
-			publish();
+			await publish(ctx);
 		});
 	});
 
@@ -78,11 +87,12 @@ export default function (pi: ExtensionAPI) {
 		return enqueue(ctx, provider, async () => {
 			store.setCurrent(provider);
 			await store.write();
-			publish();
+			await publish(ctx);
 		});
 	});
 
 	pi.on("session_shutdown", async () => {
+		probes.close();
 		await pending;
 	});
 }
