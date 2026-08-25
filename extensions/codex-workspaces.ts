@@ -131,7 +131,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			...source,
 			id: account.providerId,
 			name: `${account.label} (Codex account)`,
-			selectable: false,
+			selectable: process.env.PI_CODEX_ACCOUNT_MAINTENANCE === account.providerId,
 			auth: {
 				oauth: {
 					...oauth,
