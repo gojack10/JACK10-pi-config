@@ -281,8 +281,12 @@ export const addTrafficSample = (
 	return next;
 };
 
-const formatBytes = (bytes: WireBytes): string =>
-	`${((bytes.bytesIn + bytes.bytesOut) / 1_000_000_000).toFixed(1)} GB`;
+const formatBytes = (bytes: WireBytes): string => {
+	const total = bytes.bytesIn + bytes.bytesOut;
+	return total < 1_000_000_000
+		? `${(total / 1_000_000).toFixed(1)} MB`
+		: `${(total / 1_000_000_000).toFixed(1)} GB`;
+};
 
 export const trafficRow = (
 	state: TrafficState,
