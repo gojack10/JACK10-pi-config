@@ -1,15 +1,40 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
 	allowlistedHeaders,
 	buildQuotaView,
+	type CodexAccountRegistry,
 	CodexUsageStore,
 	normalizeObservation,
+	parseRegistry,
 	resetNotes,
+	type RegistryAccount,
 } from "./store.ts";
+
+const alt: RegistryAccount = {
+	accountKey: "account-alt",
+	providerId: "openai-codex-alt",
+	credentialRef: "openai-codex-alt",
+	label: "Alt",
+	policyClass: "perishable",
+	supportedModels: ["gpt-5.6-sol"],
+};
+const team: RegistryAccount = {
+	accountKey: "account-team",
+	providerId: "openai-codex-team",
+	credentialRef: "openai-codex-team",
+	label: "Team",
+	policyClass: "unknown",
+	supportedModels: ["gpt-5.6-sol"],
+};
+const registry: CodexAccountRegistry = {
+	schemaVersion: 1,
+	umbrellaProviderId: "openai-codex-personal",
+	accounts: [alt, team],
+};
 
 const headers = (primaryPct = "46", primaryReset = "2000") => ({
 	"X-Codex-Plan-Type": "edu",
@@ -22,6 +47,15 @@ const headers = (primaryPct = "46", primaryReset = "2000") => ({
 	Authorization: "secret",
 	Cookie: "secret",
 	"X-Request-Id": "request-1",
+});
+
+const state = (accounts: ReturnType<typeof normalizeObservation>[], current = alt) => ({
+	schemaVersion: 2 as const,
+	generation: 1,
+	generatedAt: 1_000_000,
+	accounts,
+	current: current.providerId,
+	currentAccountKey: current.accountKey,
 });
 
 test("allowlists quota diagnostics without credentials", () => {
@@ -37,163 +71,172 @@ test("allowlists quota diagnostics without credentials", () => {
 	});
 });
 
-test("normalizes windows by minutes and suppresses zero-minute windows", () => {
-	const account = normalizeObservation(
-		"openai-codex-alt",
-		200,
-		{
-			...headers(),
-			"X-Codex-Secondary-Window-Minutes": "0",
-			"X-Codex-Secondary-Reset-At": "",
-		},
-		undefined,
-		1_000_000,
-		"gpt-5.6-luna",
+test("rejects ambiguous provider mappings", () => {
+	assert.throws(
+		() => parseRegistry({ ...registry, accounts: [alt, { ...team, providerId: alt.providerId }] }),
+		/mappings must be unique/,
 	);
-	assert.deepEqual(account.windows, [{ minutes: 300, pctUsed: 46, resetAt: 2000 }]);
-	assert.equal(account.windowsFetchedAt, 1_000_000);
-	assert.equal(account.lastModel, "gpt-5.6-luna");
-	assert.equal(account.status429, false);
 });
 
-test("headerless 429 retains window provenance while updating response status", () => {
-	const before = normalizeObservation(
-		"openai-codex-alt",
+test("normalizes schema-2 identity and suppresses zero-minute windows", () => {
+	const account = normalizeObservation(
+		alt,
 		200,
-		headers(),
+		{ ...headers(), "X-Codex-Secondary-Window-Minutes": "0", "X-Codex-Secondary-Reset-At": "" },
 		undefined,
 		1_000_000,
-		"gpt-5.6-luna",
 	);
-	const blocked = normalizeObservation(
-		"openai-codex-alt",
-		429,
-		{},
-		before,
-		1_100_000,
-		"gpt-5.6-sol",
-	);
+	assert.equal(account.accountKey, alt.accountKey);
+	assert.equal(account.policyClass, "perishable");
+	assert.deepEqual(account.supportedModels, ["gpt-5.6-sol"]);
+	assert.deepEqual(account.windows, [
+		{ minutes: 300, pctUsed: 46, resetAt: 2000, slopePctPerHour: null, projectedExhaustAt: null },
+	]);
+	assert.equal(account.captureHealth, "healthy");
+	assert.equal(account.lastAttemptAt, 1_000_000);
+});
+
+test("projects exhaustion only from sufficiently separated same-epoch samples", () => {
+	const before = normalizeObservation(alt, 200, headers("40", "2000"), undefined, 1_000_000);
+	const projected = normalizeObservation(alt, 200, headers("42", "2000"), before, 1_600_000);
+	assert.equal(projected.windows[0]?.slopePctPerHour, 12);
+	assert.equal(projected.windows[0]?.projectedExhaustAt, 19_000);
+	const tooSoon = normalizeObservation(alt, 200, headers("44", "2000"), projected, 1_800_000);
+	assert.equal(tooSoon.windows[0]?.slopePctPerHour, null);
+	assert.equal(tooSoon.windows[0]?.projectedExhaustAt, null);
+});
+
+test("headerless 429 retains windows and only a valid 200 clears blocking", () => {
+	const before = normalizeObservation(alt, 200, headers(), undefined, 1_000_000);
+	const blocked = normalizeObservation(alt, 429, {}, before, 1_100_000);
 	assert.deepEqual(blocked.windows, before.windows);
-	assert.equal(blocked.windowsFetchedAt, 1_000_000);
 	assert.equal(blocked.fetchedAt, 1_100_000);
-	assert.equal(blocked.lastModel, "gpt-5.6-sol");
 	assert.equal(blocked.status429, true);
 	assert.equal(blocked.notBefore, 2000);
-	const view = buildQuotaView({ current: blocked.id, accounts: [blocked] }, 1_100_000);
+	const view = buildQuotaView(state([blocked]), 1_100_000);
 	assert.equal(view?.blocked, true);
 	assert.equal(view?.notBefore, 2000);
 
-	const cleared = normalizeObservation(
-		"openai-codex-alt",
-		200,
-		headers(),
-		blocked,
-		1_200_000,
-	);
+	const cleared = normalizeObservation(alt, 200, headers(), blocked, 1_200_000);
 	assert.equal(cleared.status429, false);
-	assert.equal(cleared.notBefore, undefined);
+	assert.equal(cleared.notBefore, null);
 });
 
 test("detects reset epochs and percentage drops", () => {
-	const before = normalizeObservation(
-		"openai-codex-alt",
-		200,
-		headers("46", "2000"),
-		undefined,
-		1_000_000,
-	);
-	const next = normalizeObservation(
-		"openai-codex-alt",
-		200,
-		headers("40", "3000"),
-		before,
-		1_100_000,
-	);
-	assert.deepEqual(resetNotes(before, next), [
-		"openai-codex-alt 300m reset observed",
-	]);
+	const before = normalizeObservation(alt, 200, headers("46", "2000"), undefined, 1_000_000);
+	const next = normalizeObservation(alt, 200, headers("40", "3000"), before, 1_100_000);
+	assert.deepEqual(resetNotes(before, next), ["openai-codex-alt 300m reset observed"]);
 });
 
 test("builds active windows and excludes unknown regimes from totals", () => {
-	const account = normalizeObservation(
-		"openai-codex-alt",
+	const account = normalizeObservation(alt, 200, headers(), undefined, 1_000_000);
+	const unknown = normalizeObservation(
+		team,
 		200,
-		headers(),
+		{
+			"x-codex-plan-type": "business",
+			"x-codex-primary-window-minutes": "0",
+			"x-codex-secondary-window-minutes": "0",
+		},
 		undefined,
 		1_000_000,
 	);
-	const view = buildQuotaView(
-		{
-			current: account.id,
-			accounts: [
-				account,
-				{
-					id: "openai-codex-team",
-					plan: "business",
-					windows: [],
-					status429: false,
-					fetchedAt: 1_000_000,
-				},
-			],
-		},
-		1_000_000,
-	);
+	const view = buildQuotaView(state([account, unknown]), 1_000_000);
 	assert.equal(view?.win300?.pctUsed, 46);
 	assert.equal(view?.win10080?.pctUsed, 76);
 	assert.equal(view?.totalUsedEq, 122);
 	assert.equal(view?.totalCount, 2);
 });
 
-test("scopes age and blocking to the current account", () => {
-	const current = normalizeObservation(
-		"openai-codex-alt",
-		200,
-		headers(),
-		undefined,
-		2_000_000,
-	);
-	const staleBlocked = {
-		...normalizeObservation("openai-codex-team", 200, headers(), undefined, 1_000_000),
-		status429: true,
-	};
-	const view = buildQuotaView({
-		current: current.id,
-		accounts: [staleBlocked, current],
-	}, 2_100_000);
-	assert.equal(view?.fetchedAt, 2_000_000);
-	assert.equal(view?.blocked, false);
-});
-
-test("marks reset windows expired and excludes their stale percentage", () => {
-	const account = normalizeObservation(
-		"openai-codex-alt",
-		200,
-		headers("100", "2000"),
-		undefined,
-		1_000_000,
-	);
-	const view = buildQuotaView({ current: account.id, accounts: [account] }, 2_000_000);
+test("marks reset windows expired and excludes stale percentages", () => {
+	const account = normalizeObservation(alt, 200, headers("100", "2000"), undefined, 1_000_000);
+	const view = buildQuotaView(state([account]), 2_000_000);
 	assert.equal(view?.win300?.expired, true);
 	assert.equal(view?.totalUsedEq, 76);
 	assert.equal(view?.totalCount, 1);
+});
+
+test("migrates schema-1 state through immutable registry identity", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-quota-v1-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const path = join(directory, "state.json");
+	await writeFile(
+		path,
+		JSON.stringify({
+			accounts: [
+				{
+					id: alt.providerId,
+					plan: "edu",
+					windows: [{ minutes: 300, pctUsed: 46, resetAt: 2000 }],
+					status429: false,
+					fetchedAt: 1_000_000,
+				},
+			],
+			current: alt.providerId,
+		}),
+	);
+	const migrated = await new CodexUsageStore(path, registry).load();
+	assert.equal(migrated.schemaVersion, 2);
+	assert.equal(migrated.currentAccountKey, alt.accountKey);
+	assert.equal(migrated.accounts[0]?.accountKey, alt.accountKey);
+	assert.equal(migrated.accounts[0]?.windows[0]?.slopePctPerHour, null);
+});
+
+test("persists degraded capture health without replacing accepted windows", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-quota-failure-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const store = new CodexUsageStore(join(directory, "state.json"), registry);
+	store.observe(alt.providerId, 200, headers(), 1_000_000);
+	store.recordFailure(alt.providerId, new Error("bad headers"), 1_100_000);
+	const degraded = store.snapshot().accounts[0]!;
+	assert.equal(degraded.captureHealth, "degraded");
+	assert.equal(degraded.lastAttemptAt, 1_100_000);
+	assert.equal(degraded.fetchedAt, 1_000_000);
+	assert.equal(degraded.windows.length, 2);
+	assert.deepEqual(degraded.parseErrors, ["bad headers"]);
+});
+
+test("merges concurrent account writers under a lock", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-quota-merge-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const path = join(directory, "state.json");
+	const first = new CodexUsageStore(path, registry);
+	const second = new CodexUsageStore(path, registry);
+	await Promise.all([first.load(), second.load()]);
+	first.observe(alt.providerId, 200, headers(), 1_000_000);
+	second.observe(
+		team.providerId,
+		200,
+		{
+			"x-codex-plan-type": "business",
+			"x-codex-primary-window-minutes": "0",
+			"x-codex-secondary-window-minutes": "0",
+		},
+		1_000_000,
+	);
+	await Promise.all([first.write(), second.write()]);
+	const merged = JSON.parse(await readFile(path, "utf8"));
+	assert.equal(merged.schemaVersion, 2);
+	assert.equal(merged.generation, 2);
+	assert.deepEqual(
+		merged.accounts.map((account: { accountKey: string }) => account.accountKey).sort(),
+		[team.accountKey, alt.accountKey].sort(),
+	);
 });
 
 test("writes state atomically with mode 0600", async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), "codex-quota-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const path = join(directory, "state.json");
-	const store = new CodexUsageStore(path);
-	store.observe("openai-codex-alt", 200, headers(), 1_000_000);
-	store.observe("openai-codex-alt", 429, {}, 1_100_000);
+	const store = new CodexUsageStore(path, registry);
+	store.observe(alt.providerId, 200, headers(), 1_000_000);
+	store.observe(alt.providerId, 429, {}, 1_100_000);
 	await store.write();
 	assert.equal((await stat(path)).mode & 0o777, 0o600);
 	const blocked = JSON.parse(await readFile(path, "utf8"));
-	assert.equal(blocked.current, "openai-codex-alt");
+	assert.equal(blocked.schemaVersion, 2);
+	assert.equal(blocked.generation, 1);
+	assert.equal(blocked.currentAccountKey, alt.accountKey);
 	assert.equal(blocked.accounts[0].notBefore, 2000);
-
-	store.observe("openai-codex-alt", 200, headers(), 1_200_000);
-	await store.write();
-	const cleared = JSON.parse(await readFile(path, "utf8"));
-	assert.equal(cleared.accounts[0].notBefore, undefined);
 	assert.deepEqual((await readdir(directory)).sort(), ["state.json"]);
 });

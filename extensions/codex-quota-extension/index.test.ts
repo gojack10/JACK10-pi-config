@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const wait = () => new Promise((resolve) => setTimeout(resolve, 20));
+const accountKey = "account-alt";
 
-test("captures Codex response headers and publishes state", async (t) => {
+test("captures Codex response state and persists degraded attempts", async (t) => {
 	const home = await mkdtemp(join(tmpdir(), "codex-quota-home-"));
 	t.after(() => rm(home, { recursive: true, force: true }));
 	const oldHome = process.env.HOME;
@@ -14,6 +14,25 @@ test("captures Codex response headers and publishes state", async (t) => {
 	t.after(() => {
 		process.env.HOME = oldHome;
 	});
+	const agentDir = join(home, ".pi", "agent");
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(
+		join(agentDir, "codex-accounts.json"),
+		JSON.stringify({
+			schemaVersion: 1,
+			umbrellaProviderId: "openai-codex-personal",
+			accounts: [
+				{
+					accountKey,
+					providerId: "openai-codex-alt",
+					credentialRef: "openai-codex-alt",
+					label: "Alt",
+					policyClass: "perishable",
+					supportedModels: ["gpt-5.6-sol"],
+				},
+			],
+		}),
+	);
 	const { default: activate } = await import(`./index.ts?test=${Date.now()}`);
 	const handlers = new Map<string, (event: any, ctx: any) => unknown>();
 	const updates: any[] = [];
@@ -25,7 +44,7 @@ test("captures Codex response headers and publishes state", async (t) => {
 	};
 	const ctx = {
 		hasUI: false,
-		model: { provider: "openai-codex-alt", id: "gpt-5.6-luna" },
+		model: { provider: "openai-codex-alt", id: "gpt-5.6-sol" },
 		ui: { notify() {} },
 	};
 	activate(pi as never);
@@ -43,13 +62,20 @@ test("captures Codex response headers and publishes state", async (t) => {
 		},
 		ctx,
 	);
-	await wait();
-	const state = JSON.parse(
-		await readFile(join(home, ".pi", "agent", "codex-usage-state.json"), "utf8"),
-	);
+	let state = JSON.parse(await readFile(join(agentDir, "codex-usage-state.json"), "utf8"));
+	assert.equal(state.schemaVersion, 2);
+	assert.equal(state.accounts[0].accountKey, accountKey);
 	assert.equal(state.accounts[0].windows[0].minutes, 300);
 	assert.equal(state.current, "openai-codex-alt");
-	assert.equal(state.accounts[0].lastModel, "gpt-5.6-luna");
+	assert.equal(state.currentAccountKey, accountKey);
+	assert.equal(state.accounts[0].captureHealth, "healthy");
 	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 46);
+
+	await handlers.get("after_provider_response")?.({ status: 200, headers: {} }, ctx);
+	state = JSON.parse(await readFile(join(agentDir, "codex-usage-state.json"), "utf8"));
+	assert.equal(state.accounts[0].captureHealth, "degraded");
+	assert.match(state.accounts[0].parseErrors[0], /quota headers are missing/);
+	assert.equal(state.accounts[0].windows[0].pctUsed, 46);
+	assert.match(updates.at(-1).degraded, /quota headers are missing/);
 	await handlers.get("session_shutdown")?.({}, ctx);
 });
