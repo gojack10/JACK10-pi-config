@@ -8,8 +8,8 @@ import type {
 	CodexAccountRegistry,
 	CodexUsageState,
 	RegistryAccount,
-} from "./codex-quota-extension/store.ts";
-import { evaluateCodexRoute, evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal-router.ts";
+} from "../codex-quota-extension/store.ts";
+import { evaluateCodexRoute, evaluateCodexRouteFromFiles, parseWorkInput } from "./router.ts";
 
 const now = 2_000_000_000_000;
 const nowSeconds = now / 1000;

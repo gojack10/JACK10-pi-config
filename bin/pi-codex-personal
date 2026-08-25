@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node /Users/USER/.pi/agent/extensions/codex-personal/launcher.ts "$@"

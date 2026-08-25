@@ -8,7 +8,7 @@ import {
 	parseRegistry,
 	parseUsageState,
 	type RegistryAccount,
-} from "./codex-quota-extension/store.ts";
+} from "../codex-quota-extension/store.ts";
 
 export type WorkClass = "short" | "long" | "unpredictable";
 export type WorkInput = { workClass: WorkClass; horizonMinutes?: number };
