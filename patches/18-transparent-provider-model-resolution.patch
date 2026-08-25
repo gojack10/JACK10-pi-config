@@ -1,0 +1,159 @@
+diff --git a/packages/ai/src/models.ts b/packages/ai/src/models.ts
+index c91284c..a1453d6 100644
+--- a/packages/ai/src/models.ts
++++ b/packages/ai/src/models.ts
+@@ -94,11 +94,18 @@ export type ModelsDeferredCancelOptions = DeferredCancelOptions & ModelsRequestT
+  * giving typed model lists to direct factory users. Inside a `Models`
+  * collection providers are held as `Provider<Api>`.
+  */
++export interface ModelResolutionContext {
++	readonly previousModel?: Model<Api>;
++	getModel(providerId: string, modelId: string): Model<Api> | undefined;
++	hasAuth(providerId: string): Promise<boolean>;
++}
++
+ export interface Provider<TApi extends Api = Api> {
+ 	readonly id: string;
+ 	readonly name: string;
+ 	readonly selectable?: boolean;
+ 	modelSelectionError?(model: Model<TApi>): string | undefined;
++	resolveModel?(model: Model<TApi>, context: ModelResolutionContext): Model<Api> | Promise<Model<Api>>;
+ 
+ 	readonly baseUrl?: string;
+ 	readonly headers?: ProviderHeaders;
+diff --git a/packages/coding-agent/src/core/model-runtime.ts b/packages/coding-agent/src/core/model-runtime.ts
+index 3b1ff52..0934014 100644
+--- a/packages/coding-agent/src/core/model-runtime.ts
++++ b/packages/coding-agent/src/core/model-runtime.ts
+@@ -397,6 +397,19 @@ export class ModelRuntime implements Models {
+ 		return this.models.getModel(providerId, modelId);
+ 	}
+ 
++	async resolveModel(model: Model<Api>, previousModel?: Model<Api>): Promise<Model<Api>> {
++		const resolver = this.getProvider(model.provider)?.resolveModel;
++		if (!resolver) return model;
++		const resolved = await resolver(model, {
++			previousModel,
++			getModel: (providerId, modelId) => this.getModel(providerId, modelId),
++			hasAuth: async (providerId) => !!(await this.checkAuth(providerId)),
++		});
++		const registered = this.getModel(resolved.provider, resolved.id);
++		if (!registered) throw new Error(`Model resolver returned unknown model ${resolved.provider}/${resolved.id}`);
++		return registered;
++	}
++
+ 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
+ 		return this.models.checkAuth(providerId, options);
+ 	}
+diff --git a/packages/coding-agent/src/core/sdk.ts b/packages/coding-agent/src/core/sdk.ts
+index 7f662d3..3022853 100644
+--- a/packages/coding-agent/src/core/sdk.ts
++++ b/packages/coding-agent/src/core/sdk.ts
+@@ -191,10 +191,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 
+ 	let model = options.model;
+ 	let modelFallbackMessage: string | undefined;
++	const restoredModel = existingSession.model
++		? modelRuntime.getModel(existingSession.model.provider, existingSession.model.modelId)
++		: undefined;
+ 
+ 	// If session has data, try to restore model from it
+ 	if (!model && hasExistingSession && existingSession.model) {
+-		const restoredModel = modelRuntime.getModel(existingSession.model.provider, existingSession.model.modelId);
+ 		if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
+ 			model = restoredModel;
+ 		}
+@@ -221,6 +223,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
+ 		}
+ 	}
+ 
++	if (model) model = await modelRuntime.resolveModel(model, restoredModel);
++
+ 	let thinkingLevel = options.thinkingLevel;
+ 
+ 	// If session has data, restore thinking level from it
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index f41177c..a481010 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -1580,23 +1580,30 @@ export class AgentSession {
+ 		});
+ 	}
+ 
++	private async _resolveSelectedModel(model: Model<any>, previousModel?: Model<any>): Promise<Model<any>> {
++		const selectionError = this._modelRuntime.getProvider(model.provider)?.modelSelectionError?.(model);
++		if (selectionError) throw new Error(selectionError);
++		const resolved = await this._modelRuntime.resolveModel(model, previousModel);
++		if (!(await this._modelRuntime.checkAuth(resolved.provider))) {
++			throw new Error(`No API key for ${resolved.provider}/${resolved.id}`);
++		}
++		return resolved;
++	}
++
+ 	/**
+ 	 * Set model directly.
+ 	 * Validates that auth is configured, saves to session and settings.
+ 	 * @throws Error if no auth is configured for the model
+ 	 */
+ 	async setModel(model: Model<any>): Promise<void> {
+-		const selectionError = this._modelRuntime.getProvider(model.provider)?.modelSelectionError?.(model);
+-		if (selectionError) throw new Error(selectionError);
+-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+-			throw new Error(`No API key for ${model.provider}/${model.id}`);
+-		}
+-
++		const selectedModel = model;
+ 		const previousModel = this.model;
++		model = await this._resolveSelectedModel(model, previousModel);
++
+ 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+ 		this.agent.state.model = model;
+ 		this.sessionManager.appendModelChange(model.provider, model.id);
+-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
++		this.settingsManager.setDefaultModelAndProvider(selectedModel.provider, selectedModel.id);
+ 
+ 		// Re-clamp thinking level for new model's capabilities
+ 		this.setThinkingLevel(thinkingLevel);
+@@ -1633,11 +1640,12 @@ export class AgentSession {
+ 		const len = scopedModels.length;
+ 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+ 		const next = scopedModels[nextIndex];
++		const nextModel = await this._resolveSelectedModel(next.model, currentModel);
+ 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
+ 
+ 		// Apply model
+-		this.agent.state.model = next.model;
+-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
++		this.agent.state.model = nextModel;
++		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+ 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+ 
+ 		// Apply thinking level.
+@@ -1646,9 +1654,9 @@ export class AgentSession {
+ 		// setThinkingLevel clamps to model capabilities.
+ 		this.setThinkingLevel(thinkingLevel);
+ 
+-		await this._emitModelSelect(next.model, currentModel, "cycle");
++		await this._emitModelSelect(nextModel, currentModel, "cycle");
+ 
+-		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
++		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: true };
+ 	}
+ 
+ 	private async _cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
+@@ -1661,12 +1669,13 @@ export class AgentSession {
+ 		if (currentIndex === -1) currentIndex = 0;
+ 		const len = availableModels.length;
+ 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
+-		const nextModel = availableModels[nextIndex];
++		const selectedModel = availableModels[nextIndex];
++		const nextModel = await this._resolveSelectedModel(selectedModel, currentModel);
+ 
+ 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+ 		this.agent.state.model = nextModel;
+ 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+-		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
++		this.settingsManager.setDefaultModelAndProvider(selectedModel.provider, selectedModel.id);
+ 
+ 		// Re-clamp thinking level for new model's capabilities
+ 		this.setThinkingLevel(thinkingLevel);
