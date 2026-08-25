@@ -25,6 +25,11 @@ import {
 	getSessionUsage,
 	type UsageTotals,
 } from "./context-session-footer/session-usage.ts";
+import {
+	appendTrafficBesideCache,
+	TrafficMeter,
+	trafficRow,
+} from "./context-session-footer/traffic.ts";
 
 const fitToWidth = (s: string, width: number): string => {
 	if (width <= 0) return "";
@@ -108,12 +113,6 @@ const cacheCell = (value: string, width: number): string => {
 	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
 };
 
-const formatCacheCount = (count: number): string => {
-	if (count < 1000) return String(Math.max(0, Math.round(count)));
-	if (count < 1_000_000) return `${(count / 1000).toFixed(2)} K`;
-	return `${(count / 1_000_000).toFixed(2)} M`;
-};
-
 const CACHE_FLASH_MS = 3000;
 const CACHE_FLASH_HOLD_MS = 1000;
 const CACHE_FLASH_PALETTE = [46, 82, 83, 119, 120, 156, 157, 193, 194, 252];
@@ -151,7 +150,7 @@ const appendCacheTable = (
 	if (rows.length === 0) return;
 	flushFooterLine(state, width);
 
-	const headers = ["PROVIDER", "MODEL", "STATUS", "TIME", "READ", "ADDED"];
+	const headers = ["PROVIDER", "MODEL", "STATUS", "TIME"];
 	const values = rows.map((row) => {
 		const expired =
 			row.result !== "CHECKING" &&
@@ -165,10 +164,6 @@ const appendCacheTable = (
 			row.durationMs !== undefined && row.remainingMs > 0
 				? formatCacheTimerValue(row.remainingMs)
 				: "-",
-			row.cacheRead === undefined ? "-" : formatCacheCount(row.cacheRead),
-			row.cacheWrite === undefined
-				? "-"
-				: `+${formatCacheCount(row.cacheWrite)}`,
 		];
 	});
 	const desired = headers.map((header, index) =>
@@ -194,7 +189,7 @@ const appendCacheTable = (
 	state.lines.push(theme.fg("dim", top));
 
 	for (const [index, row] of rows.entries()) {
-		const [provider, model, status, time, read, added] = values[index];
+		const [provider, model, status, time] = values[index];
 		const flashing = (row.flashUntil ?? 0) > Date.now();
 		const statusColor: ThemeColor =
 			status === "EXPIRED" || status === "NO CACHE" ? "text" : "dim";
@@ -205,7 +200,7 @@ const appendCacheTable = (
 				? cacheFlashText(theme, text, row.flashUntil ?? 0)
 				: theme.fg(color, text);
 		state.lines.push(
-			`${theme.fg("dim", "│ ")}${paint(cacheCell(provider, columns[0]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(model, columns[1]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(status, columns[2]), statusColor)}${theme.fg("dim", " │ ")}${paint(cacheCell(time, columns[3]), timeColor)}${theme.fg("dim", " │ ")}${paint(cacheCell(read, columns[4]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(added, columns[5]), "dim")}${theme.fg("dim", " │")}`,
+			`${theme.fg("dim", "│ ")}${paint(cacheCell(provider, columns[0]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(model, columns[1]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(status, columns[2]), statusColor)}${theme.fg("dim", " │ ")}${paint(cacheCell(time, columns[3]), timeColor)}${theme.fg("dim", " │")}`,
 		);
 	}
 
@@ -316,6 +311,13 @@ function usageTokens(
 	];
 }
 
+const modelIsLocal = (model: unknown): boolean => {
+	const value = model as { baseURL?: unknown; baseUrl?: unknown } | undefined;
+	return /localhost|127\.0\.0\.1/i.test(
+		String(value?.baseURL ?? value?.baseUrl ?? ""),
+	);
+};
+
 function getDisplayPath(cwd: string): string {
 	const home = process.env.HOME || process.env.USERPROFILE;
 	if (home && cwd.startsWith(home)) {
@@ -383,6 +385,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
+		const traffic = new TrafficMeter(
+			() => modelIsLocal(ctx.model),
+			() => requestRender?.(),
+		);
+		traffic.start();
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const rerender = () => tui.requestRender();
@@ -394,6 +401,7 @@ export default function (pi: ExtensionAPI) {
 				dispose() {
 					clearInterval(timer);
 					unsubscribe();
+					traffic.stop();
 					if (requestRender === rerender) requestRender = undefined;
 				},
 				invalidate() {},
@@ -414,14 +422,7 @@ export default function (pi: ExtensionAPI) {
 					const currentPercent = contextUsage?.percent ?? 0;
 					const modelName = ctx.model?.id ?? "no-model";
 					const isClaudeCodeModel = ctx.model?.provider === "claude-code";
-					const modelUrl = ctx.model as
-						| { baseURL?: unknown; baseUrl?: unknown }
-						| undefined;
-					const isLocal = Boolean(
-						String(modelUrl?.baseURL ?? modelUrl?.baseUrl ?? "").match(
-							/localhost|127\.0\.0\.1/i,
-						),
-					);
+					const isLocal = modelIsLocal(ctx.model);
 					const thinkingSuffix =
 						ctx.model?.reasoning && !isClaudeCodeModel
 							? ` ${pi.getThinkingLevel()}`
@@ -478,15 +479,17 @@ export default function (pi: ExtensionAPI) {
 							theme,
 							quotaSegments,
 						);
-						appendCacheTable(lineState, cacheTimers, width, theme);
 					} else {
 						flushFooterLine(lineState, width);
-						const cacheStart = lineState.lines.length;
-						appendCacheTable(lineState, cacheTimers, width, theme);
+					}
+					const cacheStart = lineState.lines.length;
+					appendCacheTable(lineState, cacheTimers, width, theme);
+					const cacheEnd = lineState.lines.length;
+					if (quotaPlacement === "beside") {
 						appendQuotaBesideCache(
 							lineState.lines,
 							cacheStart,
-							lineState.lines.length,
+							cacheEnd,
 							width,
 							(available) =>
 								renderQuotaLine(
@@ -499,6 +502,15 @@ export default function (pi: ExtensionAPI) {
 							fitToWidth,
 						);
 					}
+					appendTrafficBesideCache(
+						lineState.lines,
+						cacheStart,
+						cacheEnd,
+						width,
+						trafficRow(traffic.snapshot(), isLocal, formatCacheTimerValue),
+						visibleWidth,
+						(text) => theme.fg("dim", text),
+					);
 					flushFooterLine(lineState, width);
 
 					return lineState.lines;
