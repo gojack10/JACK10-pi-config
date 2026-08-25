@@ -7,6 +7,10 @@ import type {
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
+	appendQuotaBesideCache,
+	quotaPlacementForProvider,
+} from "./codex-quota-extension/placement.ts";
+import {
 	buildQuotaView,
 	type CodexUsageState,
 	type QuotaView,
@@ -227,21 +231,18 @@ const quotaBar = (pctUsed: number): string => {
 	return `${"█".repeat(used)}${"░".repeat(10 - used)}`;
 };
 
-const appendQuotaLine = (
-	state: FooterLineState,
+const renderQuotaLine = (
 	view: QuotaView | undefined,
 	degraded: boolean,
 	width: number,
 	theme: Theme,
-): void => {
-	if (!view && !degraded) return;
-	flushFooterLine(state, width);
-	if (!view) {
-		state.lines.push(
-			fitToWidth(theme.fg("error", "CODEX-QUOTA: CAPTURE DEGRADED"), width),
+): string | undefined => {
+	if (!view && !degraded) return undefined;
+	if (!view)
+		return fitToWidth(
+			theme.fg("error", "CODEX-QUOTA: CAPTURE DEGRADED"),
+			width,
 		);
-		return;
-	}
 
 	const now = Date.now();
 	const ageMs = Math.max(0, now - view.oldestFetchedAt);
@@ -290,7 +291,23 @@ const appendQuotaLine = (
 	const build = (wide: boolean) =>
 		`${dim("CODEX-QUOTA: ")}${windowText("5H", view.win300, wide)}${separator}${windowText("WEEK", view.win10080, wide)}${separator}${totalText(wide)}${suffix}`;
 	const wideLine = build(true);
-	state.lines.push(fitToWidth(visibleWidth(wideLine) <= width ? wideLine : build(false), width));
+	return fitToWidth(
+		visibleWidth(wideLine) <= width ? wideLine : build(false),
+		width,
+	);
+};
+
+const appendQuotaLine = (
+	state: FooterLineState,
+	view: QuotaView | undefined,
+	degraded: boolean,
+	width: number,
+	theme: Theme,
+): void => {
+	const line = renderQuotaLine(view, degraded, width, theme);
+	if (!line) return;
+	flushFooterLine(state, width);
+	state.lines.push(line);
 };
 
 function usageTokens(
@@ -465,8 +482,25 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					appendQuotaLine(lineState, quotaView, quotaDegraded, width, theme);
-					appendCacheTable(lineState, cacheTimers, width, theme);
+					const quotaPlacement = quotaPlacementForProvider(ctx.model?.provider);
+					if (quotaPlacement === "above") {
+						appendQuotaLine(lineState, quotaView, quotaDegraded, width, theme);
+						appendCacheTable(lineState, cacheTimers, width, theme);
+					} else {
+						flushFooterLine(lineState, width);
+						const cacheStart = lineState.lines.length;
+						appendCacheTable(lineState, cacheTimers, width, theme);
+						appendQuotaBesideCache(
+							lineState.lines,
+							cacheStart,
+							lineState.lines.length,
+							width,
+							(available) =>
+								renderQuotaLine(quotaView, quotaDegraded, available, theme),
+							visibleWidth,
+							fitToWidth,
+						);
+					}
 					flushFooterLine(lineState, width);
 
 					return lineState.lines;
