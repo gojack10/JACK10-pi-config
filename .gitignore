@@ -12,6 +12,7 @@ tool-cache.json
 codex-usage-cache.json
 codex-*observability.jsonl
 traffic-state.json
+.traffic-key
 *.log
 
 # Dependencies (directories and symlinks)

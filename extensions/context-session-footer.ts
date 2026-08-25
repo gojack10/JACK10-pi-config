@@ -29,6 +29,7 @@ import {
 } from "./context-session-footer/session-usage.ts";
 import {
 	appendTrafficBesideCache,
+	registerTrafficCommand,
 	TrafficMeter,
 	trafficRow,
 } from "./context-session-footer/traffic.ts";
@@ -371,6 +372,7 @@ function getTemperature(): number | null {
 
 export default function (pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
+	registerTrafficCommand(pi, { changed: () => requestRender?.() });
 	let cacheTimers: CacheStatusRow[] = [];
 	let quotaView: QuotaView | undefined;
 	pi.events.on("cache-status:update", (data) => {
@@ -509,7 +511,13 @@ export default function (pi: ExtensionAPI) {
 						cacheStart,
 						cacheEnd,
 						width,
-						trafficRow(traffic.snapshot(), isLocal, formatCacheTimerValue),
+						trafficRow(
+							traffic.snapshot(),
+							isLocal,
+							formatCacheTimerValue,
+							Date.now(),
+							traffic.currentIdentity(),
+						),
 						visibleWidth,
 						(text) => theme.fg("dim", text),
 					);
