@@ -1,7 +1,25 @@
+export type QuotaSegment = "5H" | "WEEK" | "TOTAL";
+
 export const quotaPlacementForProvider = (
 	provider: string | undefined,
 ): "above" | "beside" =>
 	provider?.startsWith("openai-codex") ? "above" : "beside";
+
+export const quotaSegmentsForProvider = (
+	provider: string | undefined,
+): readonly QuotaSegment[] =>
+	provider?.startsWith("openai-codex")
+		? ["5H", "WEEK", "TOTAL"]
+		: ["TOTAL"];
+
+export const quotaColorForUsedPercent = (
+	pctUsed: number,
+): "success" | "warning" | "error" => {
+	const remaining = 100 - Math.max(0, Math.min(100, pctUsed));
+	if (remaining <= 15) return "error";
+	if (remaining < 30) return "warning";
+	return "success";
+};
 
 export const appendQuotaBesideCache = (
 	lines: string[],
