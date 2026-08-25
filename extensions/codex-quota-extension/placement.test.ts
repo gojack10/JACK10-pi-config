@@ -39,10 +39,13 @@ test("places full Codex quota above and total-only quota beside cache", () => {
 	assert.doesNotMatch(lines[3], /CODEX-QUOTA:/);
 });
 
-test("colors only bars by remaining thresholds and keeps text grey", () => {
+test("colors bars white, yellow, or red by remaining thresholds", () => {
 	assert.equal(QUOTA_TEXT_COLOR, "dim");
-	assert.equal(quotaBarColorForUsedPercent(70), "success");
+	assert.equal(quotaBarColorForUsedPercent(0), "text");
+	assert.equal(quotaBarColorForUsedPercent(70), "text");
 	assert.equal(quotaBarColorForUsedPercent(71), "warning");
 	assert.equal(quotaBarColorForUsedPercent(84), "warning");
 	assert.equal(quotaBarColorForUsedPercent(85), "error");
+	for (const used of [42, 3, 22])
+		assert.equal(quotaBarColorForUsedPercent(used), "text");
 });
