@@ -8,7 +8,10 @@ import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
 	appendQuotaBesideCache,
+	quotaColorForUsedPercent,
 	quotaPlacementForProvider,
+	quotaSegmentsForProvider,
+	type QuotaSegment,
 } from "./codex-quota-extension/placement.ts";
 import {
 	buildQuotaView,
@@ -236,6 +239,7 @@ const renderQuotaLine = (
 	degraded: boolean,
 	width: number,
 	theme: Theme,
+	segments: readonly QuotaSegment[],
 ): string | undefined => {
 	if (!view && !degraded) return undefined;
 	if (!view)
@@ -253,17 +257,17 @@ const renderQuotaLine = (
 			(window) => window !== undefined && window.resetAt * 1000 < now,
 		);
 	const stale = expired || ageMs > 15 * 60_000;
-	const pctColor = (pct: number): ThemeColor =>
-		view.anyLimited || pct >= 90
-			? "error"
-			: pct >= 70
-				? "warning"
-				: "success";
-	const paintPct = (text: string, pct: number) =>
-		theme.fg(stale ? "dim" : pctColor(pct), text);
 	const dim = (text: string) => theme.fg("dim", text);
 	const separator = dim(" | ");
-	const slash = dim(" / ");
+	const paintSegment = (text: string, pctUsed: number) =>
+		theme.fg(
+			stale
+				? "dim"
+				: view.anyLimited
+					? "error"
+					: quotaColorForUsedPercent(pctUsed),
+			text,
+		);
 	const windowText = (
 		label: string,
 		window: { pctUsed: number; resetAt: number } | undefined,
@@ -272,9 +276,12 @@ const renderQuotaLine = (
 		if (!window) return dim(`${label} -`);
 		const pct = `${Math.round(window.pctUsed)}%`;
 		const timer = formatCacheTimerValue(window.resetAt * 1000 - now);
-		return wide
-			? `${dim(`${label} `)}${paintPct(`${quotaBar(window.pctUsed)} ${pct}`, window.pctUsed)}${slash}${dim(`RESET ${timer}`)}`
-			: `${dim(`${label} `)}${paintPct(pct, window.pctUsed)}${slash}${dim(timer)}`;
+		return paintSegment(
+			wide
+				? `${label} ${quotaBar(window.pctUsed)} ${pct} / RESET ${timer}`
+				: `${label} ${pct} / ${timer}`,
+			window.pctUsed,
+		);
 	};
 	const totalPct = view.totalCount > 0
 		? Math.round(view.totalUsedEq / view.totalCount)
@@ -282,14 +289,24 @@ const renderQuotaLine = (
 	const totalText = (wide: boolean) =>
 		totalPct === undefined
 			? dim("TOTAL -")
-			: `${dim("TOTAL ")}${paintPct(`${wide ? `${quotaBar(totalPct)} ` : ""}${totalPct}%`, totalPct)}`;
+			: paintSegment(
+				`TOTAL ${wide ? `${quotaBar(totalPct)} ` : ""}${totalPct}%`,
+				totalPct,
+			);
 	const suffix = `${view.anyLimited ? theme.fg("error", " LIMIT") : ""}${separator}${
 		expired
 			? theme.fg("error", `AGE ${formatQuotaAge(ageMs)} EXPIRED`)
 			: dim(`AGE ${formatQuotaAge(ageMs)}`)
 	}${degraded ? `${separator}${theme.fg("error", "CAPTURE DEGRADED")}` : ""}`;
-	const build = (wide: boolean) =>
-		`${dim("CODEX-QUOTA: ")}${windowText("5H", view.win300, wide)}${separator}${windowText("WEEK", view.win10080, wide)}${separator}${totalText(wide)}${suffix}`;
+	const build = (wide: boolean) => {
+		const content: string[] = [];
+		if (segments.includes("5H"))
+			content.push(windowText("5H", view.win300, wide));
+		if (segments.includes("WEEK"))
+			content.push(windowText("WEEK", view.win10080, wide));
+		if (segments.includes("TOTAL")) content.push(totalText(wide));
+		return `${dim("CODEX-QUOTA: ")}${content.join(separator)}${suffix}`;
+	};
 	const wideLine = build(true);
 	return fitToWidth(
 		visibleWidth(wideLine) <= width ? wideLine : build(false),
@@ -303,8 +320,9 @@ const appendQuotaLine = (
 	degraded: boolean,
 	width: number,
 	theme: Theme,
+	segments: readonly QuotaSegment[],
 ): void => {
-	const line = renderQuotaLine(view, degraded, width, theme);
+	const line = renderQuotaLine(view, degraded, width, theme, segments);
 	if (!line) return;
 	flushFooterLine(state, width);
 	state.lines.push(line);
@@ -483,8 +501,16 @@ export default function (pi: ExtensionAPI) {
 						dim,
 					);
 					const quotaPlacement = quotaPlacementForProvider(ctx.model?.provider);
+					const quotaSegments = quotaSegmentsForProvider(ctx.model?.provider);
 					if (quotaPlacement === "above") {
-						appendQuotaLine(lineState, quotaView, quotaDegraded, width, theme);
+						appendQuotaLine(
+							lineState,
+							quotaView,
+							quotaDegraded,
+							width,
+							theme,
+							quotaSegments,
+						);
 						appendCacheTable(lineState, cacheTimers, width, theme);
 					} else {
 						flushFooterLine(lineState, width);
@@ -496,7 +522,13 @@ export default function (pi: ExtensionAPI) {
 							lineState.lines.length,
 							width,
 							(available) =>
-								renderQuotaLine(quotaView, quotaDegraded, available, theme),
+								renderQuotaLine(
+									quotaView,
+									quotaDegraded,
+									available,
+									theme,
+									quotaSegments,
+								),
 							visibleWidth,
 							fitToWidth,
 						);
