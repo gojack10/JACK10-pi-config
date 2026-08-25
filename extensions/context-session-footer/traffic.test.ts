@@ -13,6 +13,7 @@ import {
 	appendTrafficBesideCache,
 	getNetworkIdentity,
 	newTrafficState,
+	nettopArgs,
 	readTrafficState,
 	registerTrafficCommand,
 	runTrafficCommand,
@@ -170,6 +171,22 @@ test("identity mismatch reports UNKNOWN and offline cannot classify", () => {
 	assert.deepEqual(getNetworkIdentity({ exec: () => { throw new Error("no route"); } }), {
 		status: "OFFLINE",
 	});
+});
+
+test("nettop includes loopback traffic and meter marks an empty stream degraded", () => {
+	const args = nettopArgs(123);
+	assert.deepEqual(args.slice(-2), ["-p", "123"]);
+	assert.equal(args.includes("external"), false);
+	assert.equal(args.includes("-t"), false);
+
+	const meter = new TrafficMeter(() => false, () => {});
+	(meter as any).startedAt = 1_000;
+	assert.equal(meter.degraded(90_999), false);
+	assert.equal(meter.degraded(91_000), true);
+	assert.match(
+		trafficRow(newTrafficState(july22), true, () => "-", july22, networkA, true).data,
+		/!$/,
+	);
 });
 
 test("nettop deltas and the shared classification persist across meter restarts", () => {

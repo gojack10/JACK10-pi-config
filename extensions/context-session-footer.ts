@@ -517,6 +517,7 @@ export default function (pi: ExtensionAPI) {
 							formatCacheTimerValue,
 							Date.now(),
 							traffic.currentIdentity(),
+							traffic.degraded(),
 						),
 						visibleWidth,
 						(text) => theme.fg("dim", text),

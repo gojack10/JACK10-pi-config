@@ -290,27 +290,34 @@ export const trafficRow = (
 	formatTimer: (milliseconds: number) => string,
 	now = Date.now(),
 	identity: NetworkIdentity = { status: "OFFLINE" },
+	degraded = false,
 ): TrafficRow => {
 	const current = parseState(state, now) ?? newTrafficState(now);
-	if (isLocal) return { type: "LOCAL", data: formatBytes(current.local), time: "-" };
+	const health = degraded ? "!" : "";
+	if (isLocal) return { type: "LOCAL", data: `${formatBytes(current.local)}${health}`, time: "-" };
 	if (identity.status === "OFFLINE") return { type: "OFFLINE", data: "!", time: "-" };
 	const classification = activeClass(current, identity);
 	if (classification === "HOTSPOT") {
 		return {
 			type: "HOTSPOT:manual",
-			data: `${formatBytes(current.cycle.hotspot)}/25 GB`,
+			data: `${formatBytes(current.cycle.hotspot)}/25 GB${health}`,
 			time: formatTimer(current.cycle.resetAt - now),
 		};
 	}
 	if (classification === "LAN") {
 		return {
 			type: "LAN:manual",
-			data: formatBytes(current.cycle.lan),
+			data: `${formatBytes(current.cycle.lan)}${health}`,
 			time: formatTimer(current.cycle.resetAt - now),
 		};
 	}
 	return { type: "UNKNOWN", data: `${formatBytes(current.cycle.unknown)}!`, time: "-" };
 };
+
+export const nettopArgs = (pid = process.pid): string[] => [
+	"-n", "-P", "-x", "-d", "-L", "0", "-s", "5",
+	"-J", "bytes_in,bytes_out", "-p", String(pid),
+];
 
 export const renderTrafficTable = (row: TrafficRow): string[] => {
 	const headers = ["TYPE", "DATA", "TIME"];
@@ -431,6 +438,8 @@ export class TrafficMeter {
 	private bytesInColumn = -1;
 	private bytesOutColumn = -1;
 	private detected?: { at: number; identity: NetworkIdentity };
+	private startedAt?: number;
+	private lastSampleAt?: number;
 	readonly path: string;
 
 	constructor(
@@ -457,10 +466,9 @@ export class TrafficMeter {
 
 	start(): void {
 		if (this.child) return;
-		this.child = spawn("nettop", [
-			"-n", "-P", "-x", "-d", "-L", "0", "-s", "5", "-t", "external",
-			"-J", "bytes_in,bytes_out", "-p", String(process.pid),
-		], { stdio: ["ignore", "pipe", "ignore"] });
+		this.startedAt = Date.now();
+		this.lastSampleAt = undefined;
+		this.child = spawn("nettop", nettopArgs(), { stdio: ["ignore", "pipe", "ignore"] });
 		this.child.on("error", () => { this.child = undefined; });
 		this.child.stdout?.on("data", (chunk: Buffer) => this.consume(String(chunk)));
 	}
@@ -468,6 +476,12 @@ export class TrafficMeter {
 	stop(): void {
 		this.child?.kill("SIGTERM");
 		this.child = undefined;
+		this.startedAt = undefined;
+		this.lastSampleAt = undefined;
+	}
+
+	degraded(now = Date.now()): boolean {
+		return this.startedAt !== undefined && now - (this.lastSampleAt ?? this.startedAt) >= 90_000;
 	}
 
 	private consume(chunk: string): void {
@@ -487,6 +501,7 @@ export class TrafficMeter {
 			const bytesOut = Number(fields[this.bytesOutColumn]);
 			if (!Number.isFinite(bytesIn) || !Number.isFinite(bytesOut)) continue;
 			const now = Date.now();
+			this.lastSampleAt = now;
 			this.state = updateTrafficState(
 				this.path,
 				(state) => addTrafficSample(
