@@ -156,29 +156,29 @@ test("429 remains blocked until a valid sample and reports recovery", () => {
 	assert.equal(stillBlocked.allBlocked, true);
 });
 
-test("stale telemetry refuses routing with visible conservative degradation", () => {
+test("aged telemetry routes with visible conservative degradation", () => {
 	const aged = stable(20, 30);
 	aged.fetchedAt = now - 16 * 60_000;
 	aged.captureHealth = "degraded";
 	aged.parseErrors = ["meter offline"];
 	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [personal] }, feed: feed(aged), model, now });
-	assert.equal(result.allBlocked, true);
+	assert.equal(result.allBlocked, false);
 	const account = result.accounts[0]!;
 	assert.equal(account.freshness, "aged");
 	assert.equal(account.ageMs, 16 * 60_000);
 	assert.deepEqual(account.effectiveWindows.map((window) => window.pctUsed), [90, 90]);
 	assert.match(account.degradations.join(" "), /STALE TELEMETRY/);
 	assert.match(account.degradations.join(" "), /meter offline/);
-	assert.equal(result.candidates.length, 0);
+	assert.equal(result.candidates.length, 1);
 });
 
-test("stale telemetry remains blocked even when a slope can be projected", () => {
+test("aged telemetry routes when a safe slope can be projected", () => {
 	const aged = perishable(20);
 	aged.fetchedAt = now - 30 * 60_000;
 	aged.windows[0]!.slopePctPerHour = 20;
 	aged.windows[0]!.projectedExhaustAt = nowSeconds + 4 * 3600;
 	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(aged), model, now });
-	assert.equal(result.allBlocked, true);
+	assert.equal(result.allBlocked, false);
 	assert.equal(result.accounts[0]!.effectiveWindows[0]!.pctUsed, 30);
 });
 
@@ -241,14 +241,14 @@ test("uses last-known observability quota when the state feed is corrupt", async
 		})}\n`,
 	);
 	const result = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
-	assert.equal(result.allBlocked, true);
+	assert.equal(result.allBlocked, false);
 	assert.equal(result.feedSource, "observability");
 	assert.equal(result.accounts[0]!.freshness, "aged");
 	assert.match(result.feedNotice!, /using .*observability\.jsonl/);
-	assert.equal(result.candidates.length, 0);
+	assert.equal(result.candidates.length, 1);
 
 	await rm(feedPath);
 	const missing = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
-	assert.equal(missing.allBlocked, true);
+	assert.equal(missing.allBlocked, false);
 	assert.equal(missing.feedSource, "observability");
 });

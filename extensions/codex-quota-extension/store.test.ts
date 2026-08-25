@@ -137,16 +137,46 @@ test("quota status takes max remaining capacity across accounts", () => {
 	assert.equal(status?.routable, true);
 });
 
-test("quota status follows whole-account routing, earliest recovery, and feed TTL", () => {
+test("quota status follows router eligibility and keeps aged windows usable", () => {
 	const shortOnly = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
 	shortOnly.windows = shortOnly.windows.filter((window) => window.minutes === 300);
 	shortOnly.notBefore = 1900;
 	const weekOnly = normalizeObservation(team, 200, headers("30"), undefined, 1_000_000);
 	weekOnly.windows = weekOnly.windows.filter((window) => window.minutes === 10080);
 	weekOnly.notBefore = 1800;
-	const blocked = quotaStatus(state([shortOnly, weekOnly]), 1_000_000);
-	assert.deepEqual(blocked, { h5: 80, week: 24, routable: false, recoveryAt: 1800, stale: false });
-	assert.deepEqual(quotaStatus(state([shortOnly, weekOnly]), 1_000_000 + 15 * 60_000 + 1), {
+	assert.deepEqual(quotaStatus(state([shortOnly, weekOnly]), 1_000_000), {
+		h5: 80,
+		week: 24,
+		routable: false,
+		stale: true,
+	});
+
+	const aged = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
+	assert.deepEqual(quotaStatus(state([aged]), 1_000_000 + 15 * 60_000 + 1), {
+		h5: 10,
+		week: 10,
+		routable: true,
+		stale: false,
+		aged: true,
+	});
+});
+
+test("quota status is stale only when the router has no route or recovery", () => {
+	assert.deepEqual(quotaStatus(undefined), { routable: false, stale: true });
+	const blocked = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
+	blocked.notBefore = 2000;
+	assert.deepEqual(quotaStatus(state([blocked]), 1_000_000), {
+		h5: 80,
+		week: 24,
+		routable: false,
+		recoveryAt: 2000,
+		stale: false,
+	});
+
+	const elapsed429 = normalizeObservation(alt, 429, { "Retry-After": "10" }, blocked, 1_100_000);
+	assert.deepEqual(quotaStatus(state([elapsed429]), 1_200_000), {
+		h5: 80,
+		week: 24,
 		routable: false,
 		stale: true,
 	});
