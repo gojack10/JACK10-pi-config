@@ -55,23 +55,15 @@ export type CodexUsageState = {
 	resetObserved?: string;
 };
 
-export type QuotaWindowView = {
-	pctUsed: number;
-	resetAt: number;
-	expired: boolean;
+export type QuotaStatus = {
+	h5?: number;
+	week?: number;
+	routable: boolean;
+	recoveryAt?: number;
+	stale: boolean;
 };
 
-export type QuotaView = {
-	currentLabel: string;
-	win300?: QuotaWindowView;
-	win10080?: QuotaWindowView;
-	totalUsedEq: number;
-	totalCount: number;
-	fetchedAt: number;
-	expired: boolean;
-	blocked: boolean;
-	notBefore?: number;
-};
+export const QUOTA_FEED_TTL_MS = 15 * 60_000;
 
 type LegacyWindow = Omit<CodexWindow, "slopePctPerHour" | "projectedExhaustAt">;
 type LegacyAccount = {
@@ -226,37 +218,50 @@ export const resetNotes = (previous: CodexAccount | undefined, next: CodexAccoun
 	return notes;
 };
 
-export const buildQuotaView = (state: CodexUsageState, now: number = Date.now()): QuotaView | undefined => {
-	if (state.accounts.length === 0) return undefined;
-	const current = state.accounts.find(
-		(account) => account.accountKey === state.currentAccountKey || account.id === state.current,
+export const quotaStatus = (
+	feed: CodexUsageState | undefined,
+	now: number = Date.now(),
+): QuotaStatus | undefined => {
+	if (!feed || feed.accounts.length === 0) return undefined;
+	const fresh = feed.accounts.filter(
+		(account) => account.fetchedAt > 0 && now - account.fetchedAt <= QUOTA_FEED_TTL_MS,
 	);
-	let totalUsedEq = 0;
-	let totalCount = 0;
-	for (const account of state.accounts) {
-		for (const window of account.windows) {
-			if (window.resetAt * 1000 <= now) continue;
-			totalUsedEq += window.pctUsed;
-			totalCount++;
-		}
-	}
-	const windowView = (minutes: number): QuotaWindowView | undefined => {
-		const window = current?.windows.find((candidate) => candidate.minutes === minutes);
-		return window && { pctUsed: window.pctUsed, resetAt: window.resetAt, expired: window.resetAt * 1000 <= now };
+	if (fresh.length === 0) return { routable: false, stale: true };
+	const remaining = (minutes: number): number | undefined => {
+		const values = fresh.flatMap((account) =>
+			account.windows
+				.filter((window) => window.minutes === minutes)
+				.map((window) => 100 - window.pctUsed),
+		);
+		return values.length > 0 ? Math.max(...values) : undefined;
 	};
-	const win300 = windowView(300);
-	const win10080 = windowView(10080);
-	const fetchedAt = current?.fetchedAt ?? now;
+	const routable = fresh.some((account) => {
+		if (account.policyClass === "unknown" || account.captureHealth !== "healthy" || account.status429) return false;
+		if (account.notBefore != null && account.notBefore * 1000 > now) return false;
+		const windows = [300, 10080].map((minutes) =>
+			account.windows.find((window) => window.minutes === minutes),
+		);
+		return windows.every(
+			(window) =>
+				window !== undefined &&
+				window.resetAt * 1000 > now &&
+				window.pctUsed < 100 &&
+				(window.projectedExhaustAt != null
+					? window.projectedExhaustAt >= window.resetAt
+					: window.pctUsed < 90),
+		);
+	});
+	const recoveries = fresh
+		.map((account) => account.notBefore)
+		.filter((value): value is number => value != null && value * 1000 > now);
+	const h5 = remaining(300);
+	const week = remaining(10080);
 	return {
-		currentLabel: current?.label ?? current?.id ?? state.current ?? "",
-		...(win300 ? { win300 } : {}),
-		...(win10080 ? { win10080 } : {}),
-		totalUsedEq,
-		totalCount,
-		fetchedAt,
-		expired: now - fetchedAt > 60 * 60_000 || Boolean(win300?.expired || win10080?.expired),
-		blocked: current?.status429 ?? false,
-		...(current?.notBefore == null ? {} : { notBefore: current.notBefore }),
+		...(h5 === undefined ? {} : { h5 }),
+		...(week === undefined ? {} : { week }),
+		routable,
+		...(recoveries.length === 0 ? {} : { recoveryAt: Math.min(...recoveries) }),
+		stale: false,
 	};
 };
 

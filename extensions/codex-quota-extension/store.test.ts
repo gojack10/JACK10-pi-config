@@ -5,11 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import {
 	allowlistedHeaders,
-	buildQuotaView,
 	type CodexAccountRegistry,
 	CodexUsageStore,
 	normalizeObservation,
 	parseRegistry,
+	quotaStatus,
 	resetNotes,
 	type RegistryAccount,
 } from "./store.ts";
@@ -113,9 +113,9 @@ test("headerless 429 retains windows and only a valid 200 clears blocking", () =
 	assert.equal(blocked.fetchedAt, 1_100_000);
 	assert.equal(blocked.status429, true);
 	assert.equal(blocked.notBefore, 2000);
-	const view = buildQuotaView(state([blocked]), 1_100_000);
-	assert.equal(view?.blocked, true);
-	assert.equal(view?.notBefore, 2000);
+	const status = quotaStatus(state([blocked]), 1_100_000);
+	assert.equal(status?.routable, false);
+	assert.equal(status?.recoveryAt, 2000);
 
 	const cleared = normalizeObservation(alt, 200, headers(), blocked, 1_200_000);
 	assert.equal(cleared.status429, false);
@@ -128,32 +128,28 @@ test("detects reset epochs and percentage drops", () => {
 	assert.deepEqual(resetNotes(before, next), ["openai-codex-alt 300m reset observed"]);
 });
 
-test("builds active windows and excludes unknown regimes from totals", () => {
-	const account = normalizeObservation(alt, 200, headers(), undefined, 1_000_000);
-	const unknown = normalizeObservation(
-		team,
-		200,
-		{
-			"x-codex-plan-type": "business",
-			"x-codex-primary-window-minutes": "0",
-			"x-codex-secondary-window-minutes": "0",
-		},
-		undefined,
-		1_000_000,
-	);
-	const view = buildQuotaView(state([account, unknown]), 1_000_000);
-	assert.equal(view?.win300?.pctUsed, 46);
-	assert.equal(view?.win10080?.pctUsed, 76);
-	assert.equal(view?.totalUsedEq, 122);
-	assert.equal(view?.totalCount, 2);
+test("quota status takes max remaining capacity across accounts", () => {
+	const full = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
+	const used = normalizeObservation(team, 200, headers("100"), undefined, 1_000_000);
+	const status = quotaStatus(state([used, full]), 1_000_000);
+	assert.equal(status?.h5, 100);
+	assert.equal(status?.week, 24);
+	assert.equal(status?.routable, true);
 });
 
-test("marks reset windows expired and excludes stale percentages", () => {
-	const account = normalizeObservation(alt, 200, headers("100", "2000"), undefined, 1_000_000);
-	const view = buildQuotaView(state([account]), 2_000_000);
-	assert.equal(view?.win300?.expired, true);
-	assert.equal(view?.totalUsedEq, 76);
-	assert.equal(view?.totalCount, 1);
+test("quota status follows whole-account routing, earliest recovery, and feed TTL", () => {
+	const shortOnly = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
+	shortOnly.windows = shortOnly.windows.filter((window) => window.minutes === 300);
+	shortOnly.notBefore = 1900;
+	const weekOnly = normalizeObservation(team, 200, headers("30"), undefined, 1_000_000);
+	weekOnly.windows = weekOnly.windows.filter((window) => window.minutes === 10080);
+	weekOnly.notBefore = 1800;
+	const blocked = quotaStatus(state([shortOnly, weekOnly]), 1_000_000);
+	assert.deepEqual(blocked, { h5: 80, week: 24, routable: false, recoveryAt: 1800, stale: false });
+	assert.deepEqual(quotaStatus(state([shortOnly, weekOnly]), 1_000_000 + 15 * 60_000 + 1), {
+		routable: false,
+		stale: true,
+	});
 });
 
 test("migrates schema-1 state through immutable registry identity", async (t) => {
