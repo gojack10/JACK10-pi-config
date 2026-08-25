@@ -150,7 +150,11 @@ test("wholly stale or malformed feeds fail closed", async (t) => {
 	const stalePersonal = stable();
 	const staleAlt = perishable();
 	stalePersonal.fetchedAt = staleAlt.fetchedAt = now - 16 * 60_000;
-	assert.equal(evaluateCodexRoute({ registry, feed: feed(stalePersonal, staleAlt), model, now }).allBlocked, true);
+	stalePersonal.status429 = true;
+	stalePersonal.notBefore = nowSeconds + 60;
+	const staleResult = evaluateCodexRoute({ registry, feed: feed(stalePersonal, staleAlt), model, now });
+	assert.equal(staleResult.allBlocked, true);
+	assert.match(staleResult.error!, /earliest notBefore: none/);
 
 	const directory = await mkdtemp(join(tmpdir(), "codex-router-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
