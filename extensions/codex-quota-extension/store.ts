@@ -355,6 +355,11 @@ const validState = (value: unknown): value is CodexUsageState => {
 	);
 };
 
+export const parseUsageState = (value: unknown): CodexUsageState => {
+	if (!validState(value)) throw new Error("Codex usage state has an invalid schema-2 shape");
+	return value;
+};
+
 const validLegacyState = (value: unknown): value is LegacyState => {
 	if (!value || typeof value !== "object") return false;
 	const state = value as Partial<LegacyState>;
