@@ -6,7 +6,7 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseRegistry, type RegistryAccount } from "./codex-quota-extension/store.ts";
 import { evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal/router.ts";
-import { scheduleLoginProbe, withFreshLoginProbe } from "./codex-workspace-login-probe.ts";
+import { scheduleLoginProbe, withFreshLoginProbe } from "./codex-workspaces/probe.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const REGISTRY_PATH = join(AGENT_DIR, "codex-accounts.json");
