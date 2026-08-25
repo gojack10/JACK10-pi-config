@@ -1,10 +1,34 @@
-import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { createHmac, randomBytes } from "node:crypto";
+import {
+	chmodSync,
+	closeSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 export type WireBytes = { bytesIn: number; bytesOut: number };
 export type TrafficMode = "LAN" | "HOTSPOT";
+export type NetworkClass = "lan" | "hotspot";
+export type NetworkLabel = {
+	kind: "network_label";
+	networkId: string;
+	class: NetworkClass;
+	setAt: string;
+	profileRevision: 1;
+	signals: string[];
+	reason: "manual";
+};
+export type NetworkIdentity =
+	| { status: "ONLINE"; networkId: string; signals: string[] }
+	| { status: "OFFLINE" };
 export type TrafficState = {
 	mode: TrafficMode;
 	local: WireBytes;
@@ -13,10 +37,30 @@ export type TrafficState = {
 		resetAt: number;
 		lan: WireBytes;
 		hotspot: WireBytes;
+		unknown: WireBytes;
 	};
+	networkLabel?: NetworkLabel;
 };
-export type TrafficRow = { type: "LOCAL" | TrafficMode; data: string; time: string };
+export type TrafficRow = {
+	type: "LOCAL" | "LAN:manual" | "HOTSPOT:manual" | "UNKNOWN" | "OFFLINE";
+	data: string;
+	time: string;
+};
 
+type Exec = (command: string, args: string[]) => string;
+type CommandLevel = "info" | "warning" | "error";
+export type TrafficCommandResult = { level: CommandLevel; text: string };
+export type TrafficCommandOptions = {
+	path?: string;
+	keyPath?: string;
+	identity?: () => NetworkIdentity;
+	now?: () => number;
+	changed?: () => void;
+};
+
+const DEFAULT_STATE_PATH = join(homedir(), ".pi", "agent", "traffic-state.json");
+const DEFAULT_KEY_PATH = join(homedir(), ".pi", "agent", ".traffic-key");
+const USAGE = "Usage: /traffic [hotspot|lan]";
 const emptyBytes = (): WireBytes => ({ bytesIn: 0, bytesOut: 0 });
 const validBytes = (value: unknown): value is WireBytes => {
 	const bytes = value as WireBytes | undefined;
@@ -40,14 +84,180 @@ export const billingCycle = (now = Date.now()): { key: string; resetAt: number }
 export const newTrafficState = (now = Date.now()): TrafficState => ({
 	mode: "LAN",
 	local: emptyBytes(),
-	cycle: { ...billingCycle(now), lan: emptyBytes(), hotspot: emptyBytes() },
+	cycle: {
+		...billingCycle(now),
+		lan: emptyBytes(),
+		hotspot: emptyBytes(),
+		unknown: emptyBytes(),
+	},
 });
 
-const normalizeCycle = (state: TrafficState, now: number): TrafficState => {
+const validLabel = (value: unknown): value is NetworkLabel => {
+	const label = value as NetworkLabel | undefined;
+	return Boolean(
+		label &&
+		label.kind === "network_label" &&
+		/^hmac:[a-f0-9]{64}$/.test(label.networkId) &&
+		(label.class === "lan" || label.class === "hotspot") &&
+		typeof label.setAt === "string" &&
+		label.profileRevision === 1 &&
+		Array.isArray(label.signals) && label.signals.every((signal) => typeof signal === "string") &&
+		label.reason === "manual",
+	);
+};
+
+const parseState = (value: unknown, now: number): TrafficState | undefined => {
+	const state = value as TrafficState | undefined;
+	if (!state || (state.mode !== "LAN" && state.mode !== "HOTSPOT")) return undefined;
+	if (!validBytes(state.local) || typeof state.cycle?.key !== "string") return undefined;
+	if (!Number.isFinite(state.cycle.resetAt) || !validBytes(state.cycle.lan)) return undefined;
+	if (!validBytes(state.cycle.hotspot)) return undefined;
 	const cycle = billingCycle(now);
-	return state.cycle.key === cycle.key
-		? state
-		: { ...state, cycle: { ...cycle, lan: emptyBytes(), hotspot: emptyBytes() } };
+	if (state.cycle.key !== cycle.key) {
+		return {
+			mode: state.mode,
+			local: state.local,
+			cycle: { ...cycle, lan: emptyBytes(), hotspot: emptyBytes(), unknown: emptyBytes() },
+			...(validLabel(state.networkLabel) ? { networkLabel: state.networkLabel } : {}),
+		};
+	}
+	return {
+		mode: state.mode,
+		local: state.local,
+		cycle: {
+			key: state.cycle.key,
+			resetAt: state.cycle.resetAt,
+			lan: state.cycle.lan,
+			hotspot: state.cycle.hotspot,
+			unknown: validBytes(state.cycle.unknown) ? state.cycle.unknown : emptyBytes(),
+		},
+		...(validLabel(state.networkLabel) ? { networkLabel: state.networkLabel } : {}),
+	};
+};
+
+export const readTrafficState = (path = DEFAULT_STATE_PATH, now = Date.now()): TrafficState => {
+	try {
+		return parseState(JSON.parse(readFileSync(path, "utf8")), now) ?? newTrafficState(now);
+	} catch {
+		return newTrafficState(now);
+	}
+};
+
+export const writeTrafficState = (path: string, state: TrafficState): void => {
+	mkdirSync(dirname(path), { recursive: true });
+	const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+	let fd: number | undefined;
+	try {
+		fd = openSync(temporary, "wx", 0o600);
+		writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		chmodSync(temporary, 0o600);
+		renameSync(temporary, path);
+	} catch (error) {
+		if (fd !== undefined) closeSync(fd);
+		try { unlinkSync(temporary); } catch {}
+		throw error;
+	}
+};
+
+const sleep = (milliseconds: number) =>
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+
+const updateTrafficState = (
+	path: string,
+	update: (state: TrafficState) => TrafficState,
+	now = Date.now(),
+): TrafficState => {
+	mkdirSync(dirname(path), { recursive: true });
+	const lock = `${path}.lock`;
+	let fd: number | undefined;
+	for (let attempt = 0; attempt < 100; attempt++) {
+		try {
+			fd = openSync(lock, "wx", 0o600);
+			writeFileSync(fd, String(process.pid));
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt === 99) throw error;
+			try {
+				const owner = Number(readFileSync(lock, "utf8"));
+				process.kill(owner, 0);
+			} catch (ownerError) {
+				if ((ownerError as NodeJS.ErrnoException).code === "ESRCH") {
+					try { unlinkSync(lock); } catch {}
+				}
+			}
+			sleep(10);
+		}
+	}
+	try {
+		const state = update(readTrafficState(path, now));
+		writeTrafficState(path, state);
+		return state;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+		try { unlinkSync(lock); } catch {}
+	}
+};
+
+const readOrCreateKey = (path: string): Buffer => {
+	mkdirSync(dirname(path), { recursive: true });
+	try {
+		const key = readFileSync(path);
+		if (key.length < 32) throw new Error(`Traffic key is too short: ${path}`);
+		chmodSync(path, 0o600);
+		return key;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const key = randomBytes(32);
+	let fd: number | undefined;
+	try {
+		fd = openSync(path, "wx", 0o600);
+		writeFileSync(fd, key);
+		closeSync(fd);
+		fd = undefined;
+		chmodSync(path, 0o600);
+		return key;
+	} catch (error) {
+		if (fd !== undefined) closeSync(fd);
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return readOrCreateKey(path);
+		throw error;
+	}
+};
+
+export const getNetworkIdentity = (options: { keyPath?: string; exec?: Exec } = {}): NetworkIdentity => {
+	const run = options.exec ?? ((command, args) => execFileSync(command, args, {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	}));
+	let route: string;
+	try {
+		route = run("route", ["-n", "get", "default"]);
+	} catch {
+		return { status: "OFFLINE" };
+	}
+	const networkInterface = route.match(/^\s*interface:\s*(\S+)/m)?.[1];
+	if (!networkInterface) return { status: "OFFLINE" };
+	const gateway = route.match(/^\s*gateway:\s*(\S+)/m)?.[1] ?? "";
+	let ssid = "";
+	try {
+		const output = run("networksetup", ["-getairportnetwork", networkInterface]);
+		ssid = output.match(/^Current Wi-Fi Network:\s*(.+)$/m)?.[1]?.trim() ?? "";
+	} catch {}
+	const signals = ["route", ...(gateway ? ["gateway"] : []), ...(ssid ? ["wifi"] : [])];
+	const key = readOrCreateKey(options.keyPath ?? DEFAULT_KEY_PATH);
+	const digest = createHmac("sha256", key)
+		.update(JSON.stringify([networkInterface, gateway, ssid]))
+		.digest("hex");
+	return { status: "ONLINE", networkId: `hmac:${digest}`, signals };
+};
+
+const activeClass = (state: TrafficState, identity: NetworkIdentity): TrafficMode | undefined => {
+	if (identity.status !== "ONLINE" || !state.networkLabel) return undefined;
+	if (identity.networkId !== state.networkLabel.networkId) return undefined;
+	return state.networkLabel.class.toUpperCase() as TrafficMode;
 };
 
 export const addTrafficSample = (
@@ -55,13 +265,17 @@ export const addTrafficSample = (
 	sample: WireBytes,
 	isLocal: boolean,
 	now = Date.now(),
+	identity: NetworkIdentity = { status: "OFFLINE" },
 ): TrafficState => {
-	const next = structuredClone(normalizeCycle(state, now));
+	const next = structuredClone(parseState(state, now) ?? newTrafficState(now));
+	const classification = activeClass(next, identity);
 	const target = isLocal
 		? next.local
-		: next.mode === "HOTSPOT"
+		: classification === "HOTSPOT"
 			? next.cycle.hotspot
-			: next.cycle.lan;
+			: classification === "LAN"
+				? next.cycle.lan
+				: next.cycle.unknown;
 	target.bytesIn += Math.max(0, sample.bytesIn);
 	target.bytesOut += Math.max(0, sample.bytesOut);
 	return next;
@@ -75,16 +289,27 @@ export const trafficRow = (
 	isLocal: boolean,
 	formatTimer: (milliseconds: number) => string,
 	now = Date.now(),
+	identity: NetworkIdentity = { status: "OFFLINE" },
 ): TrafficRow => {
-	const current = normalizeCycle(state, now);
+	const current = parseState(state, now) ?? newTrafficState(now);
 	if (isLocal) return { type: "LOCAL", data: formatBytes(current.local), time: "-" };
-	if (current.mode === "HOTSPOT")
-		return { type: "HOTSPOT", data: "manual", time: "-" };
-	return {
-		type: "LAN",
-		data: formatBytes(current.cycle.lan),
-		time: formatTimer(current.cycle.resetAt - now),
-	};
+	if (identity.status === "OFFLINE") return { type: "OFFLINE", data: "!", time: "-" };
+	const classification = activeClass(current, identity);
+	if (classification === "HOTSPOT") {
+		return {
+			type: "HOTSPOT:manual",
+			data: `${formatBytes(current.cycle.hotspot)}/25 GB`,
+			time: formatTimer(current.cycle.resetAt - now),
+		};
+	}
+	if (classification === "LAN") {
+		return {
+			type: "LAN:manual",
+			data: formatBytes(current.cycle.lan),
+			time: formatTimer(current.cycle.resetAt - now),
+		};
+	}
+	return { type: "UNKNOWN", data: `${formatBytes(current.cycle.unknown)}!`, time: "-" };
 };
 
 export const renderTrafficTable = (row: TrafficRow): string[] => {
@@ -120,7 +345,7 @@ export const appendTrafficBesideCache = (
 		table.forEach((line, index) => append(index, line));
 		return "wide";
 	}
-	const condensed = `TRAF ${row.type} ${row.data.replace(" GB", "GB")}${row.time === "-" ? "" : ` ${row.time}`}`;
+	const condensed = `TRAF ${row.type} ${row.data.replaceAll(" GB", "GB")}${row.time === "-" ? "" : ` ${row.time}`}`;
 	if (available >= measure(condensed)) {
 		append(1, condensed);
 		return "condensed";
@@ -128,17 +353,74 @@ export const appendTrafficBesideCache = (
 	return "skipped";
 };
 
-const validState = (value: unknown): value is TrafficState => {
-	const state = value as TrafficState | undefined;
-	return Boolean(
-		state &&
-		(state.mode === "LAN" || state.mode === "HOTSPOT") &&
-		validBytes(state.local) &&
-		typeof state.cycle?.key === "string" &&
-		Number.isFinite(state.cycle.resetAt) &&
-		validBytes(state.cycle.lan) &&
-		validBytes(state.cycle.hotspot),
-	);
+export const runTrafficCommand = (
+	args: string,
+	options: TrafficCommandOptions = {},
+): TrafficCommandResult => {
+	const argument = args.trim().toLowerCase();
+	if (argument && argument !== "hotspot" && argument !== "lan") {
+		return { level: "warning", text: USAGE };
+	}
+	const identity = options.identity?.() ?? getNetworkIdentity({ keyPath: options.keyPath });
+	if (identity.status === "OFFLINE") {
+		return { level: "error", text: "OFFLINE — no default route; cannot classify." };
+	}
+	const path = options.path ?? DEFAULT_STATE_PATH;
+	if (argument) {
+		const networkClass = argument as NetworkClass;
+		const setAt = new Date(options.now?.() ?? Date.now()).toISOString();
+		updateTrafficState(path, (state) => ({
+			...state,
+			mode: networkClass.toUpperCase() as TrafficMode,
+			networkLabel: {
+				kind: "network_label",
+				networkId: identity.networkId,
+				class: networkClass,
+				setAt,
+				profileRevision: 1,
+				signals: identity.signals,
+				reason: "manual",
+			},
+		}));
+		options.changed?.();
+		return {
+			level: "info",
+			text: `${networkClass.toUpperCase()}:manual set for ${identity.networkId} (signals: ${identity.signals.join(",")})`,
+		};
+	}
+	const state = readTrafficState(path, options.now?.() ?? Date.now());
+	const matches = state.networkLabel?.networkId === identity.networkId;
+	const currentClass = matches && state.networkLabel
+		? `${state.networkLabel.class.toUpperCase()}:manual`
+		: "UNKNOWN";
+	const setAt = state.networkLabel?.setAt ?? "-";
+	const prompt = matches ? "" : " Re-classify with /traffic hotspot or /traffic lan.";
+	return {
+		level: matches ? "info" : "warning",
+		text: `Network ${identity.networkId} (signals: ${identity.signals.join(",")}) | class ${currentClass} | setAt ${setAt} | matches ${matches ? "yes" : "no"}.${prompt}`,
+	};
+};
+
+type TrafficCommandRegistrar = {
+	registerCommand: (name: string, options: {
+		description: string;
+		handler: (args: string, ctx: {
+			ui: { notify: (message: string, level: CommandLevel) => void };
+		}) => void;
+	}) => void;
+};
+
+export const registerTrafficCommand = (
+	pi: TrafficCommandRegistrar,
+	options: TrafficCommandOptions = {},
+): void => {
+	pi.registerCommand("traffic", {
+		description: "Classify this network as hotspot or LAN, or show its current classification",
+		handler: (args, ctx) => {
+			const result = runTrafficCommand(args, options);
+			ctx.ui.notify(result.text, result.level);
+		},
+	});
 };
 
 export class TrafficMeter {
@@ -148,25 +430,29 @@ export class TrafficMeter {
 	private headers = 0;
 	private bytesInColumn = -1;
 	private bytesOutColumn = -1;
+	private detected?: { at: number; identity: NetworkIdentity };
 	readonly path: string;
 
 	constructor(
 		private readonly isLocal: () => boolean,
 		private readonly changed: () => void,
-		path = join(homedir(), ".pi", "agent", "traffic-state.json"),
+		path = DEFAULT_STATE_PATH,
+		private readonly detect: () => NetworkIdentity = () => getNetworkIdentity(),
 	) {
 		this.path = path;
-		try {
-			const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
-			this.state = validState(value) ? normalizeCycle(value, Date.now()) : newTrafficState();
-		} catch {
-			this.state = newTrafficState();
-		}
+		this.state = readTrafficState(path);
 	}
 
 	snapshot(): TrafficState {
-		this.state = normalizeCycle(this.state, Date.now());
+		this.state = readTrafficState(this.path);
 		return structuredClone(this.state);
+	}
+
+	currentIdentity(now = Date.now()): NetworkIdentity {
+		if (!this.detected || now - this.detected.at >= 5000) {
+			this.detected = { at: now, identity: this.detect() };
+		}
+		return this.detected.identity;
 	}
 
 	start(): void {
@@ -196,25 +482,23 @@ export class TrafficMeter {
 				this.bytesOutColumn = fields.indexOf("bytes_out");
 				continue;
 			}
-			if (this.headers < 2) continue; // First sample establishes the baseline.
+			if (this.headers < 2) continue;
 			const bytesIn = Number(fields[this.bytesInColumn]);
 			const bytesOut = Number(fields[this.bytesOutColumn]);
 			if (!Number.isFinite(bytesIn) || !Number.isFinite(bytesOut)) continue;
-			this.state = addTrafficSample(
-				this.state,
-				{ bytesIn, bytesOut },
-				this.isLocal(),
+			const now = Date.now();
+			this.state = updateTrafficState(
+				this.path,
+				(state) => addTrafficSample(
+					state,
+					{ bytesIn, bytesOut },
+					this.isLocal(),
+					now,
+					this.currentIdentity(now),
+				),
+				now,
 			);
-			this.write();
 			this.changed();
 		}
-	}
-
-	private write(): void {
-		// ponytail: single writer; add locking if concurrent Pi sessions must be counted.
-		mkdirSync(dirname(this.path), { recursive: true });
-		const temporary = `${this.path}.${process.pid}.tmp`;
-		writeFileSync(temporary, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
-		renameSync(temporary, this.path);
 	}
 }
