@@ -13,6 +13,7 @@ const registryPath = join(agentDir, "codex-accounts.json");
 const feedPath = join(agentDir, "codex-usage-state.json");
 const choicePath = join(agentDir, "codex-personal-choice.json");
 const routeEnv = "PI_CODEX_PERSONAL_ROUTE";
+const maintenanceEnv = "PI_CODEX_ACCOUNT_MAINTENANCE";
 
 function takeOption(args: string[], name: string): string | undefined {
 	const index = args.indexOf(name);
@@ -40,13 +41,33 @@ function authBlocked(model: string, evaluation: ReturnType<typeof evaluateCodexR
 
 async function main(): Promise<number> {
 	const args = process.argv.slice(2);
-	if (args.includes("--no-session")) throw new Error("openai-codex-personal refuses --no-session because routing requires a durable pin");
+	const loginRef = takeOption(args, "--codex-login");
+	if (!loginRef && args.includes("--no-session"))
+		throw new Error("openai-codex-personal refuses --no-session because routing requires a durable pin");
 	const workValue = takeOption(args, "--codex-work");
 	const requested = takeOption(args, "--model");
 	const existingScope = args.indexOf("--models");
 	if (existingScope >= 0) args.splice(existingScope, 2);
 	const resume = args.some((arg) => ["--continue", "-c", "--resume", "-r", "--session", "--fork"].includes(arg));
 	const piArgs = [...args, "--models", "openai-codex-personal/*"];
+	if (loginRef) {
+		if (requested || workValue) throw new Error("--codex-login cannot be combined with --model or --codex-work");
+		const registry = parseRegistry(JSON.parse(readFileSync(registryPath, "utf8")) as unknown);
+		const normalized = loginRef.toLowerCase();
+		const matches = registry.accounts.filter(
+			(account) =>
+				account.accountKey.toLowerCase() === normalized ||
+				account.providerId.toLowerCase() === normalized ||
+				account.label.toLowerCase() === normalized,
+		);
+		if (matches.length !== 1) throw new Error(`No unique Codex account matches ${loginRef}`);
+		console.error(`Account maintenance enabled. Run /login ${matches[0]!.providerId}`);
+		const result = spawnSync(process.env.PI_CODEX_PI_BIN ?? "pi", piArgs, {
+			stdio: "inherit",
+			env: { ...process.env, [maintenanceEnv]: matches[0]!.providerId },
+		});
+		return result.status ?? 1;
+	}
 	if (resume) {
 		if (requested) throw new Error("Do not override the model when resuming a pinned Codex session");
 		const result = spawnSync(process.env.PI_CODEX_PI_BIN ?? "pi", piArgs, { stdio: "inherit", env: process.env });
