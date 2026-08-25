@@ -1,0 +1,178 @@
+diff --git a/packages/ai/src/api/azure-openai-responses.ts b/packages/ai/src/api/azure-openai-responses.ts
+index 519fc0dcf..c4a56fd47 100644
+--- a/packages/ai/src/api/azure-openai-responses.ts
++++ b/packages/ai/src/api/azure-openai-responses.ts
+@@ -277,7 +277,7 @@ function buildParams(
+ 		model.compat?.supportsOpenAIGrammarTools ?? false,
+ 	),
+ ) {
+-	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS, {
++	const messages = convertResponsesMessages(model, context, (provider) => AZURE_TOOL_CALL_PROVIDERS.has(provider), {
+ 		grammarToolInputProperties,
+ 	});
+ 
+diff --git a/packages/ai/src/api/openai-codex-responses.ts b/packages/ai/src/api/openai-codex-responses.ts
+index 52e1becfb..3f04259f8 100644
+--- a/packages/ai/src/api/openai-codex-responses.ts
++++ b/packages/ai/src/api/openai-codex-responses.ts
+@@ -66,12 +66,8 @@ const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
+ // endpoint (the same endpoint the official Codex client compresses against).
+ const REQUEST_COMPRESSION_ZSTD_LEVEL = 3;
+-const CODEX_TOOL_CALL_PROVIDERS = new Set([
+-	"openai",
+-	"openai-codex",
+-	"openai-codex-alt",
+-	"openai-codex-team",
+-	"opencode",
+-]);
++const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
++export const isCodexToolCallProvider = (provider: string): boolean =>
++	CODEX_TOOL_CALL_PROVIDERS.has(provider) || provider.startsWith("openai-codex-");
+ const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+ const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
+ const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+@@ -540,7 +542,7 @@ function buildRequestBody(
+ 	const supportsStrictMode = model.compat?.supportsStrictMode ?? true;
+ 	const supportsOpenAIGrammarTools = model.compat?.supportsOpenAIGrammarTools ?? false;
+ 	const toolPlacement = splitDeferredTools(context, model.compat?.supportsToolSearch ?? false);
+-	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
++	const messages = convertResponsesMessages(model, context, isCodexToolCallProvider, {
+ 		includeSystemPrompt: false,
+ 		grammarToolInputProperties,
+ 		deferredTools: toolPlacement.deferred,
+@@ -1520,7 +1522,7 @@ async function processWebSocketStream(
+ 		if (options?.signal?.aborted) {
+ 			keepConnection = false;
+ 		} else if (useCachedContext && entry && output.responseId) {
+-			const responseItems = convertResponsesMessages(model, { messages: [output] }, CODEX_TOOL_CALL_PROVIDERS, {
++			const responseItems = convertResponsesMessages(model, { messages: [output] }, isCodexToolCallProvider, {
+ 				includeSystemPrompt: false,
+ 				grammarToolInputProperties,
+ 			}).filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output");
+diff --git a/packages/ai/src/api/openai-responses-shared.ts b/packages/ai/src/api/openai-responses-shared.ts
+index ad24c8d46..28ceff5e0 100644
+--- a/packages/ai/src/api/openai-responses-shared.ts
++++ b/packages/ai/src/api/openai-responses-shared.ts
+@@ -136,7 +136,7 @@ export interface ConvertResponsesToolsOptions {
+ export function convertResponsesMessages<TApi extends Api>(
+ 	model: Model<TApi>,
+ 	context: Context,
+-	allowedToolCallProviders: ReadonlySet<string>,
++	isAllowedToolCallProvider: (provider: string) => boolean,
+ 	options?: ConvertResponsesMessagesOptions,
+ ): ResponseInput {
+ 	const messages: ResponseInput = [];
+@@ -154,7 +154,7 @@ export function convertResponsesMessages<TApi extends Api>(
+ 	};
+ 
+ 	const normalizeToolCallId = (id: string, _targetModel: Model<TApi>, source: AssistantMessage): string => {
+-		if (!allowedToolCallProviders.has(model.provider)) return normalizeIdPart(id);
++		if (!isAllowedToolCallProvider(model.provider)) return normalizeIdPart(id);
+ 		if (!id.includes("|")) return normalizeIdPart(id);
+ 		const [callId, itemId] = id.split("|");
+ 		const normalizedCallId = normalizeIdPart(callId);
+diff --git a/packages/ai/src/api/openai-responses.ts b/packages/ai/src/api/openai-responses.ts
+index b90de3b76..5c62a7ac1 100644
+--- a/packages/ai/src/api/openai-responses.ts
++++ b/packages/ai/src/api/openai-responses.ts
+@@ -265,7 +265,7 @@ function buildParams(
+ 	),
+ ) {
+ 	const toolPlacement = splitDeferredTools(context, compat.supportsToolSearch);
+-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
++	const messages = convertResponsesMessages(model, context, (provider) => OPENAI_TOOL_CALL_PROVIDERS.has(provider), {
+ 		grammarToolInputProperties,
+ 		deferredTools: toolPlacement.deferred,
+ 		toolOptions: {
+diff --git a/packages/ai/test/azure-openai-responses-reasoning-replay.test.ts b/packages/ai/test/azure-openai-responses-reasoning-replay.test.ts
+index 762638a32..5a6b1ddc8 100644
+--- a/packages/ai/test/azure-openai-responses-reasoning-replay.test.ts
++++ b/packages/ai/test/azure-openai-responses-reasoning-replay.test.ts
+@@ -74,7 +74,7 @@ function getReplayedReasoning(model: Model<"azure-openai-responses">, assistant:
+ 			{ role: "user", content: "follow-up", timestamp: Date.now() },
+ 		],
+ 	};
+-	const input = convertResponsesMessages(model, context, new Set(["azure-openai-responses"]));
++	const input = convertResponsesMessages(model, context, (provider) => provider === "azure-openai-responses");
+ 	return input.find((item) => item.type === "reasoning");
+ }
+ 
+diff --git a/packages/ai/test/constrained-sampling.test.ts b/packages/ai/test/constrained-sampling.test.ts
+index 9cf962e70..1e1f5c5c2 100644
+--- a/packages/ai/test/constrained-sampling.test.ts
++++ b/packages/ai/test/constrained-sampling.test.ts
+@@ -146,14 +146,14 @@ describe("constrained tool sampling", () => {
+ 		for (const invalidArguments of [{}, { payload: 42 }]) {
+ 			replayedToolCall.arguments = invalidArguments;
+ 			expect(() =>
+-				convertResponsesMessages(makeModel(), context, new Set(["openai"]), {
++				convertResponsesMessages(makeModel(), context, (provider) => provider === "openai", {
+ 					grammarToolInputProperties: new Map([["sample_tool", "payload"]]),
+ 				}),
+ 			).toThrow('Grammar tool call "sample_tool" requires argument "payload" to be a string');
+ 		}
+ 
+ 		replayedToolCall.arguments = { payload: "abc" };
+-		const messages = convertResponsesMessages(makeModel(), context, new Set(["openai"]), {
++		const messages = convertResponsesMessages(makeModel(), context, (provider) => provider === "openai", {
+ 			grammarToolInputProperties: new Map([["sample_tool", "payload"]]),
+ 		});
+ 
+diff --git a/packages/ai/test/openai-responses-empty-tool-result.test.ts b/packages/ai/test/openai-responses-empty-tool-result.test.ts
+index 0db912377..03c3afff0 100644
+--- a/packages/ai/test/openai-responses-empty-tool-result.test.ts
++++ b/packages/ai/test/openai-responses-empty-tool-result.test.ts
+@@ -46,7 +46,7 @@ describe("OpenAI Responses convertResponsesMessages empty tool result", () => {
+ 			],
+ 		};
+ 
+-		const input = convertResponsesMessages(model, context, new Set(["openai", "openai-codex", "opencode"]));
++		const input = convertResponsesMessages(model, context, (provider) => new Set(["openai", "openai-codex", "opencode"]).has(provider));
+ 		const functionCallOutput = input.find((item) => item.type === "function_call_output") as
+ 			| { type: "function_call_output"; output: string }
+ 			| undefined;
+diff --git a/packages/ai/test/openai-responses-foreign-toolcall-id.test.ts b/packages/ai/test/openai-responses-foreign-toolcall-id.test.ts
+index b82316582..1416246c1 100644
+--- a/packages/ai/test/openai-responses-foreign-toolcall-id.test.ts
++++ b/packages/ai/test/openai-responses-foreign-toolcall-id.test.ts
+@@ -1,4 +1,5 @@
+ import { describe, expect, it } from "vitest";
++import { isCodexToolCallProvider } from "../src/api/openai-codex-responses.ts";
+ import { convertResponsesMessages } from "../src/api/openai-responses-shared.ts";
+ import { getModel } from "../src/compat.ts";
+ import type { AssistantMessage, Context, ToolResultMessage, Usage } from "../src/types.ts";
+@@ -17,6 +18,12 @@ const usage: Usage = {
+ };
+ 
+ describe("OpenAI Responses foreign tool call ID normalization", () => {
++	it("recognizes Codex account aliases by provider prefix", () => {
++		expect(isCodexToolCallProvider("openai-codex-personal")).toBe(true);
++		expect(isCodexToolCallProvider("openai-codex-future-alias")).toBe(true);
++		expect(isCodexToolCallProvider("azure-openai-responses")).toBe(false);
++	});
++
+ 	it("hashes foreign Copilot tool item IDs into a bounded Codex-safe fc_<hash> shape", () => {
+ 		const model = getModel("openai-codex", "gpt-5.5");
+ 		const assistant: AssistantMessage = {
+@@ -49,7 +56,7 @@ describe("OpenAI Responses foreign tool call ID normalization", () => {
+ 			messages: [{ role: "user", content: "Use the tool.", timestamp: Date.now() - 3000 }, assistant, toolResult],
+ 		};
+ 
+-		const input = convertResponsesMessages(model, context, new Set(["openai", "openai-codex", "opencode"]));
++		const input = convertResponsesMessages(model, context, isCodexToolCallProvider);
+ 		const functionCall = input.find((item) => item.type === "function_call");
+ 
+ 		expect(functionCall).toBeDefined();
+diff --git a/packages/ai/test/openai-responses-message-id.test.ts b/packages/ai/test/openai-responses-message-id.test.ts
+index cb2fd0c04..d41b641a9 100644
+--- a/packages/ai/test/openai-responses-message-id.test.ts
++++ b/packages/ai/test/openai-responses-message-id.test.ts
+@@ -34,7 +34,7 @@ describe("OpenAI Responses message ID conversion", () => {
+ 			messages: [{ role: "user", content: "hello", timestamp: Date.now() - 2000 }, assistant],
+ 		};
+ 
+-		const input = convertResponsesMessages(model, context, new Set(["openai", "openai-codex", "opencode"]));
++		const input = convertResponsesMessages(model, context, (provider) => new Set(["openai", "openai-codex", "opencode"]).has(provider));
+ 		const messageIds = input
+ 			.filter(
+ 				(item): item is ResponseOutputMessage =>
