@@ -126,43 +126,113 @@ test("mixed short and weekly exhaustion still blocks the whole fleet", () => {
 	assert.match(result.error!, /WINDOW EXHAUSTED 300m/);
 });
 
-test("429 gates remain blocked and report elapsed notBefore explicitly", () => {
-	const elapsed = telemetry(alt, [{ minutes: 300, pctUsed: 20, resetIn: 7200 }], {
+test("429 blocks only until notBefore and reports the recovery", () => {
+	const blocked = telemetry(alt, [{ minutes: 300, pctUsed: 20, resetIn: 7200 }], {
 		status429: true,
-		notBefore: nowSeconds - 60,
+		notBefore: nowSeconds + 60,
 	});
-	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(elapsed), model, now });
-	assert.equal(result.allBlocked, true);
-	assert.match(result.error!, /elapsed; newer valid 200 required/);
-	assert.match(result.error!, /RATE LIMITED/);
+	const blockedResult = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(blocked), model, now });
+	assert.equal(blockedResult.allBlocked, true);
+	assert.match(blockedResult.error!, new RegExp(`Earliest recovery: ${new Date((nowSeconds + 60) * 1000).toISOString()}`));
+	assert.match(blockedResult.error!, /RATE LIMITED/);
+
+	blocked.notBefore = nowSeconds - 60;
+	const recovered = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(blocked), model, now });
+	assert.equal(recovered.allBlocked, false);
+	assert.match(recovered.candidates[0]!.warnings.join(" "), /COOLDOWN ELAPSED/);
 });
 
-test("one fresh sibling remains routable while a stale sibling is excluded", () => {
-	const stale = stable();
-	stale.fetchedAt = now - 16 * 60_000;
-	const result = evaluateCodexRoute({ registry, feed: feed(stale, perishable()), model, now });
+test("aged telemetry remains routable with visible conservative degradation", () => {
+	const aged = stable(20, 30);
+	aged.fetchedAt = now - 16 * 60_000;
+	aged.captureHealth = "degraded";
+	aged.parseErrors = ["meter offline"];
+	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [personal] }, feed: feed(aged), model, now });
 	assert.equal(result.allBlocked, false);
-	assert.equal(result.candidates[0]?.accountKey, alt.accountKey);
-	assert.match(result.accounts.find((entry) => entry.account.accountKey === personal.accountKey)!.reasons[0]!, /STALE/);
+	const account = result.accounts[0]!;
+	assert.equal(account.freshness, "aged");
+	assert.equal(account.ageMs, 16 * 60_000);
+	assert.deepEqual(account.effectiveWindows.map((window) => window.pctUsed), [90, 90]);
+	assert.match(account.degradations.join(" "), /STALE TELEMETRY/);
+	assert.match(account.degradations.join(" "), /meter offline/);
+	assert.match(result.candidates[0]!.warnings.join(" "), /degraded 30%→90.0%/);
 });
 
-test("wholly stale or malformed feeds fail closed", async (t) => {
-	const stalePersonal = stable();
-	const staleAlt = perishable();
-	stalePersonal.fetchedAt = staleAlt.fetchedAt = now - 16 * 60_000;
-	stalePersonal.status429 = true;
-	stalePersonal.notBefore = nowSeconds + 60;
-	const staleResult = evaluateCodexRoute({ registry, feed: feed(stalePersonal, staleAlt), model, now });
-	assert.equal(staleResult.allBlocked, true);
-	assert.match(staleResult.error!, /earliest notBefore: none/);
+test("aged telemetry projects known slope instead of applying the floor", () => {
+	const aged = perishable(20);
+	aged.fetchedAt = now - 30 * 60_000;
+	aged.windows[0]!.slopePctPerHour = 20;
+	aged.windows[0]!.projectedExhaustAt = nowSeconds + 4 * 3600;
+	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(aged), model, now });
+	assert.equal(result.allBlocked, false);
+	assert.equal(result.accounts[0]!.effectiveWindows[0]!.pctUsed, 30);
+});
 
-	const directory = await mkdtemp(join(tmpdir(), "codex-router-"));
+test("past-reset windows become unknown and are excluded", () => {
+	const expired = perishable();
+	expired.windows[0]!.resetAt = nowSeconds - 1;
+	const mixed = evaluateCodexRoute({ registry, feed: feed(stable(), expired), model, now });
+	assert.equal(mixed.allBlocked, false);
+	assert.equal(mixed.candidates.some((candidate) => candidate.accountKey === alt.accountKey), false);
+	assert.match(mixed.accounts.find((entry) => entry.account.accountKey === alt.accountKey)!.reasons.join(" "), /WINDOW UNKNOWN AFTER RESET/);
+
+	const unknown = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(expired), model, now });
+	assert.equal(unknown.allBlocked, true);
+	assert.match(unknown.error!, /Earliest recovery: unknown/);
+});
+
+test("malformed feeds refuse when observability has no usable fallback", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-router-malformed-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const registryPath = join(directory, "registry.json");
 	const feedPath = join(directory, "feed.json");
 	await writeFile(registryPath, JSON.stringify(registry));
 	await writeFile(feedPath, "{broken");
-	const malformed = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath });
+	const malformed = evaluateCodexRouteFromFiles({
+		model,
+		now,
+		registryPath,
+		feedPath,
+		observabilityPath: join(directory, "missing.jsonl"),
+	});
 	assert.equal(malformed.allBlocked, true);
 	assert.match(malformed.error!, /unreadable or malformed/);
+	assert.match(malformed.error!, /observability fallback unavailable/);
+});
+
+test("uses last-known observability quota when the state feed is corrupt", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-router-observability-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const registryPath = join(directory, "registry.json");
+	const feedPath = join(directory, "feed.json");
+	const observabilityPath = join(directory, "observability.jsonl");
+	await writeFile(registryPath, JSON.stringify({ ...registry, accounts: [alt] }));
+	await writeFile(feedPath, "{broken");
+	await writeFile(
+		observabilityPath,
+		`${JSON.stringify({
+			capturedAt: new Date(now - 16 * 60_000).toISOString(),
+			kind: "http_response",
+			provider: alt.providerId,
+			status: 200,
+			headers: {
+				"x-codex-plan-type": "edu",
+				"x-codex-primary-window-minutes": "300",
+				"x-codex-primary-used-percent": "20",
+				"x-codex-primary-reset-at": String(nowSeconds + 7200),
+				"x-codex-secondary-window-minutes": "0",
+			},
+		})}\n`,
+	);
+	const result = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
+	assert.equal(result.allBlocked, false);
+	assert.equal(result.feedSource, "observability");
+	assert.equal(result.accounts[0]!.freshness, "aged");
+	assert.match(result.feedNotice!, /using .*observability\.jsonl/);
+	assert.match(result.candidates[0]!.warnings.join(" "), /STATE FEED UNREADABLE OR MALFORMED/);
+
+	await rm(feedPath);
+	const missing = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
+	assert.equal(missing.allBlocked, false);
+	assert.equal(missing.feedSource, "observability");
 });

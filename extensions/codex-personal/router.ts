@@ -5,6 +5,8 @@ import {
 	type CodexAccount,
 	type CodexAccountRegistry,
 	type CodexUsageState,
+	type CodexWindow,
+	normalizeObservation,
 	parseRegistry,
 	parseUsageState,
 	type RegistryAccount,
@@ -27,12 +29,18 @@ export type AccountEligibility = {
 	telemetry?: CodexAccount;
 	routable: boolean;
 	reasons: string[];
+	ageMs: number | null;
+	freshness: "fresh" | "aged" | "unknown";
+	degradations: string[];
+	effectiveWindows: CodexWindow[];
 };
 
 export type RouteEvaluation = {
 	allBlocked: boolean;
 	candidates: RouteCandidate[];
 	accounts: AccountEligibility[];
+	feedSource: "state" | "observability";
+	feedNotice?: string;
 	error?: string;
 };
 
@@ -48,6 +56,7 @@ type RankedAccount = AccountEligibility & {
 const FIFTEEN_MINUTES = 15 * 60_000;
 const DEFAULT_REGISTRY_PATH = join(homedir(), ".pi", "agent", "codex-accounts.json");
 const DEFAULT_FEED_PATH = join(homedir(), ".pi", "agent", "codex-usage-state.json");
+const DEFAULT_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-usage-observability.jsonl");
 
 export const parseWorkInput = (value: string | undefined): WorkInput => {
 	if (!value || value === "unpredictable") return { workClass: "unpredictable" };
@@ -75,12 +84,7 @@ const formatBlockedError = (
 	for (const evaluation of accounts) {
 		const telemetry = evaluation.telemetry;
 		if (!telemetry) continue;
-		if (
-			telemetry.captureHealth === "healthy" &&
-			telemetry.fetchedAt > 0 &&
-			now - telemetry.fetchedAt <= FIFTEEN_MINUTES &&
-			telemetry.notBefore != null
-		)
+		if (telemetry.notBefore != null)
 			notBeforeValues.push({ value: telemetry.notBefore, elapsed429: telemetry.status429 && telemetry.notBefore * 1000 <= now });
 		const nonTimeReasons = evaluation.reasons.filter(
 			(reason) =>
@@ -125,7 +129,7 @@ const rank = (
 	const ranked = accounts
 		.filter((entry): entry is AccountEligibility & { telemetry: CodexAccount } => entry.routable && !!entry.telemetry)
 		.map((entry): RankedAccount => {
-			const windows = entry.telemetry.windows;
+			const windows = entry.effectiveWindows;
 			const shortWindow = [...windows].sort((a, b) => a.minutes - b.minutes)[0]!;
 			const weekly = windows.find((window) => window.minutes === 10080);
 			return {
@@ -179,7 +183,7 @@ const rank = (
 				work.workClass === "short"
 					? `short work ranked by burn urgency ${entry.burnUrgency}`
 					: `${work.workClass} work ranked by weekly/bottleneck headroom`,
-			warnings: warning ? [warning] : [],
+			warnings: [...entry.degradations, ...(warning ? [warning] : [])],
 			feedGeneration: generation,
 		};
 	});
@@ -192,58 +196,155 @@ export const evaluateCodexRoute = (options: {
 	work?: WorkInput;
 	now?: number;
 	feedPath?: string;
+	feedSource?: "state" | "observability";
+	feedNotice?: string;
 }): RouteEvaluation => {
 	const { registry, feed, model } = options;
 	const work = options.work ?? { workClass: "unpredictable" };
 	const now = options.now ?? Date.now();
+	const feedSource = options.feedSource ?? "state";
 	const horizon = work.horizonMinutes === undefined ? undefined : now / 1000 + work.horizonMinutes * 60;
 	const telemetryByKey = new Map(feed.accounts.map((account) => [account.accountKey, account]));
 	const accounts = registry.accounts.map((account): AccountEligibility => {
 		const telemetry = telemetryByKey.get(account.accountKey);
 		const reasons: string[] = [];
+		const degradations: string[] = options.feedNotice ? [options.feedNotice] : [];
 		if (!account.supportedModels.includes(model)) reasons.push("UNSUPPORTED MODEL");
 		if (account.policyClass === "unknown") reasons.push("POLICY UNKNOWN");
-		if (!telemetry) return { account, routable: false, reasons: [...reasons, "TELEMETRY MISSING"] };
+		if (!telemetry)
+			return {
+				account,
+				routable: false,
+				reasons: [...reasons, "TELEMETRY MISSING"],
+				ageMs: null,
+				freshness: "unknown",
+				degradations,
+				effectiveWindows: [],
+			};
 		if (
 			telemetry.id !== account.providerId ||
 			telemetry.policyClass !== account.policyClass ||
 			!telemetry.supportedModels.includes(model)
 		)
 			reasons.push("REGISTRY/FEED MISMATCH");
-		if (telemetry.captureHealth !== "healthy") reasons.push(`CAPTURE ${telemetry.captureHealth.toUpperCase()}`);
-		if (telemetry.fetchedAt <= 0) reasons.push("NO ACCEPTED SAMPLE");
-		else if (now - telemetry.fetchedAt > FIFTEEN_MINUTES)
-			reasons.push(`STALE TELEMETRY age ${ageText(now - telemetry.fetchedAt)}`);
-		if (telemetry.status429) reasons.push("RATE LIMITED");
-		if (telemetry.notBefore != null && now < telemetry.notBefore * 1000)
+		if (telemetry.captureHealth !== "healthy")
+			degradations.push(`CAPTURE ${telemetry.captureHealth.toUpperCase()}: ${telemetry.parseErrors.join(", ") || "meter unavailable"}`);
+		const ageMs = telemetry.fetchedAt > 0 ? Math.max(0, now - telemetry.fetchedAt) : null;
+		const aged = ageMs != null && ageMs > FIFTEEN_MINUTES;
+		if (ageMs == null) reasons.push("NO ACCEPTED SAMPLE");
+		else if (aged) degradations.push(`STALE TELEMETRY age ${ageText(ageMs)}`);
+		if (telemetry.notBefore != null && now < telemetry.notBefore * 1000) {
+			if (telemetry.status429) reasons.push("RATE LIMITED");
 			reasons.push(`NOT BEFORE ${iso(telemetry.notBefore)}`);
+		} else if (telemetry.status429) {
+			degradations.push(
+				telemetry.notBefore == null
+					? "RATE LIMIT OBSERVED WITHOUT ACTIVE COOLDOWN"
+					: `RATE LIMIT COOLDOWN ELAPSED ${iso(telemetry.notBefore)}`,
+			);
+		}
 		if (telemetry.windows.length === 0) reasons.push("CAPACITY UNKNOWN");
 		if (account.policyClass === "stable-weekly" && !telemetry.windows.some((window) => window.minutes === 10080))
 			reasons.push("WEEKLY WINDOW MISSING");
 		if (account.policyClass === "perishable" && !telemetry.windows.some((window) => window.minutes < 10080))
 			reasons.push("SHORT WINDOW MISSING");
+		const effectiveWindows: CodexWindow[] = [];
 		for (const window of telemetry.windows) {
-			if (window.resetAt * 1000 <= now) reasons.push(`RESET ELAPSED ${window.minutes}m`);
-			if (window.pctUsed >= 100) {
+			if (window.resetAt * 1000 <= now) {
+				reasons.push(`WINDOW UNKNOWN AFTER RESET ${window.minutes}m`);
+				degradations.push(`WINDOW ${window.minutes}m snapshot expired at ${iso(window.resetAt)}`);
+				continue;
+			}
+			const slope = aged && window.slopePctPerHour != null && window.slopePctPerHour > 0 ? window.slopePctPerHour : null;
+			const pctUsed = aged
+				? Math.min(100, slope == null ? Math.max(window.pctUsed, 90) : window.pctUsed + slope * (ageMs! / 3_600_000))
+				: window.pctUsed;
+			const projectedExhaustAt =
+				slope == null
+					? window.projectedExhaustAt
+					: (window.projectedExhaustAt ?? Math.ceil(now / 1000 + ((100 - pctUsed) / slope) * 3600));
+			const effective = { ...window, pctUsed, projectedExhaustAt };
+			effectiveWindows.push(effective);
+			if (aged && pctUsed !== window.pctUsed)
+				degradations.push(`WINDOW ${window.minutes}m degraded ${window.pctUsed}%→${pctUsed.toFixed(1)}%`);
+			if (pctUsed >= 100) {
 				reasons.push(`WINDOW EXHAUSTED ${window.minutes}m`);
 				continue;
 			}
 			const boundary = horizon === undefined ? window.resetAt : Math.min(horizon, window.resetAt);
-			const safe = window.projectedExhaustAt != null ? window.projectedExhaustAt >= boundary : window.pctUsed < 90;
+			const safe = aged && slope == null ? true : projectedExhaustAt != null ? projectedExhaustAt >= boundary : pctUsed < 90;
 			if (!safe) reasons.push(`UNSAFE WINDOW ${window.minutes}m`);
 		}
-		return { account, telemetry, routable: reasons.length === 0, reasons };
+		return {
+			account,
+			telemetry,
+			routable: reasons.length === 0,
+			reasons,
+			ageMs,
+			freshness: ageMs == null ? "unknown" : aged ? "aged" : "fresh",
+			degradations,
+			effectiveWindows,
+		};
 	});
 	const candidates = rank(accounts, work, model, feed.generation, now);
-	if (candidates.length > 0) return { allBlocked: false, candidates, accounts };
+	if (candidates.length > 0)
+		return { allBlocked: false, candidates, accounts, feedSource, ...(options.feedNotice ? { feedNotice: options.feedNotice } : {}) };
 	const healthy = feed.accounts.filter((account) => account.captureHealth === "healthy").length;
 	const ages = feed.accounts.filter((account) => account.fetchedAt > 0).map((account) => now - account.fetchedAt);
-	const summary = `schema 2 generation ${feed.generation}; healthy ${healthy}/${feed.accounts.length}; freshest age ${ages.length ? ageText(Math.min(...ages)) : "unknown"}`;
+	const summary = `${feedSource} schema 2 generation ${feed.generation}; healthy ${healthy}/${feed.accounts.length}; freshest age ${ages.length ? ageText(Math.min(...ages)) : "unknown"}${options.feedNotice ? `; ${options.feedNotice}` : ""}`;
 	return {
 		allBlocked: true,
 		candidates: [],
 		accounts,
+		feedSource,
+		...(options.feedNotice ? { feedNotice: options.feedNotice } : {}),
 		error: formatBlockedError(model, options.feedPath ?? DEFAULT_FEED_PATH, summary, accounts, now),
+	};
+};
+
+const loadObservabilityFallback = (
+	registry: CodexAccountRegistry,
+	path: string,
+): CodexUsageState => {
+	type Observation = { capturedAt?: unknown; kind?: unknown; provider?: unknown; status?: unknown; headers?: unknown };
+	const pending429 = new Map<string, { status: 429; headers: unknown; at: number }>();
+	const recovered = new Map<string, CodexAccount>();
+	const byProvider = new Map(registry.accounts.map((account) => [account.providerId, account]));
+	// ponytail: fallback reads the whole log; scan chunks only if rare recovery latency becomes material.
+	const lines = readFileSync(path, "utf8").trimEnd().split("\n");
+	for (let index = lines.length - 1; index >= 0 && recovered.size < registry.accounts.length; index--) {
+		let observation: Observation;
+		try {
+			observation = JSON.parse(lines[index]!) as Observation;
+		} catch {
+			continue;
+		}
+		if (observation.kind !== "http_response" || typeof observation.provider !== "string") continue;
+		const account = byProvider.get(observation.provider);
+		if (!account || recovered.has(account.accountKey)) continue;
+		const at = typeof observation.capturedAt === "string" ? Date.parse(observation.capturedAt) : Number.NaN;
+		if (!Number.isFinite(at) || (observation.status !== 200 && observation.status !== 429)) continue;
+		if (observation.status === 429) {
+			if (!pending429.has(account.accountKey))
+				pending429.set(account.accountKey, { status: 429, headers: observation.headers, at });
+			continue;
+		}
+		try {
+			let telemetry = normalizeObservation(account, 200, observation.headers, undefined, at);
+			const blocked = pending429.get(account.accountKey);
+			if (blocked && blocked.at > at)
+				telemetry = normalizeObservation(account, blocked.status, blocked.headers, telemetry, blocked.at);
+			recovered.set(account.accountKey, telemetry);
+		} catch {
+			// Best effort: keep scanning for an older valid accepted observation.
+		}
+	}
+	if (recovered.size === 0) throw new Error("observability has no usable Codex quota observations");
+	return {
+		schemaVersion: 2,
+		generation: 0,
+		generatedAt: Math.max(...[...recovered.values()].map((account) => account.fetchedAt)),
+		accounts: [...recovered.values()],
 	};
 };
 
@@ -253,9 +354,11 @@ export const evaluateCodexRouteFromFiles = (options: {
 	now?: number;
 	registryPath?: string;
 	feedPath?: string;
+	observabilityPath?: string;
 }): RouteEvaluation => {
 	const registryPath = options.registryPath ?? DEFAULT_REGISTRY_PATH;
 	const feedPath = options.feedPath ?? DEFAULT_FEED_PATH;
+	const observabilityPath = options.observabilityPath ?? DEFAULT_OBSERVABILITY_PATH;
 	const now = options.now ?? Date.now();
 	let registry: CodexAccountRegistry;
 	try {
@@ -266,6 +369,7 @@ export const evaluateCodexRouteFromFiles = (options: {
 			allBlocked: true,
 			candidates: [],
 			accounts: [],
+			feedSource: "state",
 			error: formatBlockedError(options.model, feedPath, `registry ${registryPath} unreadable or malformed: ${message}`, [], now),
 		};
 	}
@@ -274,16 +378,41 @@ export const evaluateCodexRouteFromFiles = (options: {
 		return evaluateCodexRoute({ ...options, registry, feed, now, feedPath });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		const accounts = registry.accounts.map((account) => ({
-			account,
-			routable: false,
-			reasons: [`FEED UNREADABLE OR MALFORMED: ${message}`],
-		}));
-		return {
-			allBlocked: true,
-			candidates: [],
-			accounts,
-			error: formatBlockedError(options.model, feedPath, `unreadable or malformed: ${message}`, accounts, now),
-		};
+		try {
+			const feed = loadObservabilityFallback(registry, observabilityPath);
+			return evaluateCodexRoute({
+				...options,
+				registry,
+				feed,
+				now,
+				feedPath,
+				feedSource: "observability",
+				feedNotice: `STATE FEED UNREADABLE OR MALFORMED: ${message}; using ${observabilityPath}`,
+			});
+		} catch (fallbackError) {
+			const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+			const accounts: AccountEligibility[] = registry.accounts.map((account) => ({
+				account,
+				routable: false,
+				reasons: [`FEED UNREADABLE OR MALFORMED: ${message}`],
+				ageMs: null,
+				freshness: "unknown",
+				degradations: [`OBSERVABILITY FALLBACK UNAVAILABLE: ${fallbackMessage}`],
+				effectiveWindows: [],
+			}));
+			return {
+				allBlocked: true,
+				candidates: [],
+				accounts,
+				feedSource: "state",
+				error: formatBlockedError(
+					options.model,
+					feedPath,
+					`unreadable or malformed: ${message}; observability fallback unavailable: ${fallbackMessage}`,
+					accounts,
+					now,
+				),
+			};
+		}
 	}
 };
