@@ -123,6 +123,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	const source = builtinProviders().find((provider) => provider.id === "openai-codex");
 	const oauth = source?.auth.oauth;
 	if (!source || !oauth) throw new Error("Built-in Codex provider has no OAuth flow");
+	let pin: RoutePin | undefined;
 	for (const account of registry.accounts) {
 		if (account.credentialRef !== account.providerId)
 			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
@@ -163,6 +164,16 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				},
 			},
 			getModels: () => source.getModels().map((model) => ({ ...model, provider: account.providerId })),
+			stream: (model, context, options) => {
+				if (pin?.accountKey !== account.accountKey)
+					throw new Error("ROUTE DENIED: launch real Codex accounts through pi-codex-personal");
+				return source.stream(model, context, options);
+			},
+			streamSimple: (model, context, options) => {
+				if (pin?.accountKey !== account.accountKey)
+					throw new Error("ROUTE DENIED: launch real Codex accounts through pi-codex-personal");
+				return source.streamSimple(model, context, options);
+			},
 		} as Provider);
 	}
 
@@ -199,15 +210,20 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	};
 	pi.registerProvider(umbrella as Provider);
 
-	let pin: RoutePin | undefined;
 	let translating = false;
 	pi.on("session_start", (event, ctx) => {
-		pin = routeEntry(ctx.sessionManager.getBranch());
+		const branch = ctx.sessionManager.getBranch();
+		pin = routeEntry(branch);
 		const envRoute = parseRoute(process.env[ROUTE_ENV]);
 		if (!pin && envRoute) {
 			pin = envRoute;
 			pi.appendEntry("codex-route/v1", pin);
-		} else if (!pin && ctx.model?.provider.startsWith("openai-codex") && ctx.model.provider !== registry.umbrellaProviderId) {
+		} else if (
+			!pin &&
+			branch.some((entry) => entry.type === "message") &&
+			ctx.model?.provider.startsWith("openai-codex") &&
+			ctx.model.provider !== registry.umbrellaProviderId
+		) {
 			const matches = registry.accounts.filter((account) => account.providerId === ctx.model?.provider);
 			if (matches.length !== 1) throw new Error("ROUTE DENIED: historical Codex session has no unique account mapping");
 			pin = {
