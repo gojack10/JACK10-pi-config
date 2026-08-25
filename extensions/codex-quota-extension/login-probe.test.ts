@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { launchLoginProbe, withFreshLoginProbe } from "../codex-workspace-login-probe.ts";
+import { launchLoginProbe, withFreshLoginProbe } from "../codex-workspaces/probe.ts";
 
 test("auto-probe runs after fresh login but not credential refresh", async () => {
 	let probes = 0;
