@@ -5,6 +5,7 @@ import type { Model, OAuthCredential, Provider } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseRegistry, type RegistryAccount } from "./codex-quota-extension/store.ts";
+import { resolveCodexPersonalSelection, type RoutePin } from "./codex-personal/resolution.ts";
 import { evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal/router.ts";
 import { scheduleLoginProbe, withFreshLoginProbe } from "./codex-workspaces/probe.ts";
 
@@ -15,17 +16,6 @@ const CHOICE_PATH = join(AGENT_DIR, "codex-personal-choice.json");
 const AUTH_OBSERVABILITY_PATH = join(AGENT_DIR, "codex-workspace-auth-observability.jsonl");
 const ROUTE_ENV = "PI_CODEX_PERSONAL_ROUTE";
 const SOL_MODEL = /(^|-)sol($|-)/;
-
-type RoutePin = {
-	umbrella: string;
-	accountKey: string;
-	model: string;
-	actualProviderId: string;
-	feedGeneration: number;
-	routedAt: number;
-	workClass: "short" | "long" | "unpredictable";
-	horizonMinutes?: number;
-};
 
 type SelectorProvider = Provider & {
 	selectable?: boolean;
@@ -125,6 +115,8 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	const oauth = source?.auth.oauth;
 	if (!source || !oauth) throw new Error("Built-in Codex provider has no OAuth flow");
 	let pin: RoutePin | undefined;
+	let pendingPin: RoutePin | undefined;
+	let sessionStarted = false;
 	for (const account of registry.accounts) {
 		if (account.credentialRef !== account.providerId)
 			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
@@ -220,6 +212,28 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				.filter((model) => SOL_MODEL.test(model.id))
 				.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
 		modelSelectionError: selectionError,
+		resolveModel: async (model, context) => {
+			const work = parseWorkInput(process.env.PI_CODEX_WORK);
+			const resolved = await resolveCodexPersonalSelection({
+				model,
+				previousModel: context.previousModel,
+				pin,
+				registry,
+				work,
+				evaluate: () =>
+					evaluateCodexRouteFromFiles({ model: model.id, work, registryPath: REGISTRY_PATH, feedPath: FEED_PATH }),
+				context,
+			});
+			if (resolved.pin) {
+				if (sessionStarted) {
+					pin = resolved.pin;
+					pi.appendEntry("codex-route/v1", pin);
+				} else {
+					pendingPin = resolved.pin;
+				}
+			}
+			return resolved.model;
+		},
 		stream: (model) => failBeforeNetwork(model),
 		streamSimple: (model) => failBeforeNetwork(model),
 	};
@@ -227,10 +241,14 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 
 	let translating = false;
 	pi.on("session_start", (event, ctx) => {
+		sessionStarted = true;
 		const branch = ctx.sessionManager.getBranch();
 		pin = routeEntry(branch);
 		const envRoute = parseRoute(process.env[ROUTE_ENV]);
-		if (!pin && envRoute) {
+		if (!pin && pendingPin) {
+			pin = pendingPin;
+			pi.appendEntry("codex-route/v1", pin);
+		} else if (!pin && envRoute) {
 			pin = envRoute;
 			pi.appendEntry("codex-route/v1", pin);
 		} else if (
@@ -252,6 +270,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			};
 			pi.appendEntry("codex-route/v1", pin);
 		}
+		pendingPin = undefined;
 		if (!pin) return;
 		const account = registry.accounts.find((entry) => entry.accountKey === pin!.accountKey);
 		if (!account) throw new Error("ROUTE DENIED: pinned Codex account is absent from the registry");
