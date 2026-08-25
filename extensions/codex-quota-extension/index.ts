@@ -48,7 +48,7 @@ export default function (pi: ExtensionAPI) {
 		if (!isCodex(provider)) return;
 		awaitingResponse = Math.max(0, awaitingResponse - 1);
 		return enqueue(ctx, async () => {
-			store.observe(provider, event.status, event.headers);
+			store.observe(provider, event.status, event.headers, Date.now(), ctx.model?.id);
 			await store.write();
 			publish();
 		});

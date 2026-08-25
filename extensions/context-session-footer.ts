@@ -12,6 +12,7 @@ import {
 	quotaBarColorForRemainingPercent,
 	quotaBarForRemainingPercent,
 	quotaPlacementForProvider,
+	quotaRemainingLabel,
 	quotaRemainingPercent,
 	quotaSegmentsForProvider,
 	type QuotaSegment,
@@ -238,7 +239,7 @@ const renderQuotaLine = (
 	const grey = (text: string) => theme.fg(QUOTA_TEXT_COLOR, text);
 
 	const now = Date.now();
-	const ageMs = Math.max(0, now - view.oldestFetchedAt);
+	const ageMs = Math.max(0, now - view.fetchedAt);
 	const separator = grey(" | ");
 	const paintBar = (remaining: number) =>
 		theme.fg(
@@ -247,12 +248,13 @@ const renderQuotaLine = (
 		);
 	const windowText = (
 		label: string,
-		window: { pctUsed: number; resetAt: number } | undefined,
+		window: { pctUsed: number; resetAt: number; expired: boolean } | undefined,
 		wide: boolean,
 	): string => {
 		if (!window) return grey(`${label} -`);
+		if (window.expired || window.resetAt * 1000 <= now) return grey(`${label} RESET`);
 		const remaining = quotaRemainingPercent(window.pctUsed);
-		const pct = `${Math.round(remaining)}%`;
+		const pct = quotaRemainingLabel(window.pctUsed);
 		const timer = formatCacheTimerValue(window.resetAt * 1000 - now);
 		return wide
 			? `${grey(`${label} `)}${paintBar(remaining)}${grey(` ${pct} / RESET ${timer}`)}`
@@ -268,7 +270,7 @@ const renderQuotaLine = (
 			? `${grey("TOTAL ")}${paintBar(totalRemaining)}${grey(` ${pct}%`)}`
 			: grey(`TOTAL ${pct}%`);
 	};
-	const suffix = `${separator}${grey(`AGE ${formatQuotaAge(ageMs)}`)}`;
+	const suffix = `${view.blocked ? `${separator}${grey("BLOCKED")}` : ""}${separator}${grey(`AGE ${formatQuotaAge(ageMs)}`)}`;
 	const build = (wide: boolean) => {
 		const content: string[] = [];
 		if (segments.includes("5H"))

@@ -25,7 +25,7 @@ test("captures Codex response headers and publishes state", async (t) => {
 	};
 	const ctx = {
 		hasUI: false,
-		model: { provider: "openai-codex-alt" },
+		model: { provider: "openai-codex-alt", id: "gpt-5.6-luna" },
 		ui: { notify() {} },
 	};
 	activate(pi as never);
@@ -49,6 +49,7 @@ test("captures Codex response headers and publishes state", async (t) => {
 	);
 	assert.equal(state.accounts[0].windows[0].minutes, 300);
 	assert.equal(state.current, "openai-codex-alt");
+	assert.equal(state.accounts[0].lastModel, "gpt-5.6-luna");
 	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 46);
 	await handlers.get("session_shutdown")?.({}, ctx);
 });
