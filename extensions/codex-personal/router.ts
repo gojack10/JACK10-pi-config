@@ -6,10 +6,10 @@ import {
 	type CodexAccountRegistry,
 	type CodexUsageState,
 	type CodexWindow,
+	evaluateQuotaAccount,
 	normalizeObservation,
 	parseRegistry,
 	parseUsageState,
-	quotaStatus,
 	type RegistryAccount,
 } from "../codex-quota-extension/store.ts";
 
@@ -54,7 +54,6 @@ type RankedAccount = AccountEligibility & {
 	bottleneckRemaining: number;
 };
 
-const FIFTEEN_MINUTES = 15 * 60_000;
 const DEFAULT_REGISTRY_PATH = join(homedir(), ".pi", "agent", "codex-accounts.json");
 const DEFAULT_FEED_PATH = join(homedir(), ".pi", "agent", "codex-usage-state.json");
 const DEFAULT_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-usage-observability.jsonl");
@@ -211,7 +210,6 @@ export const evaluateCodexRoute = (options: {
 		const reasons: string[] = [];
 		const degradations: string[] = options.feedNotice ? [options.feedNotice] : [];
 		if (!account.supportedModels.includes(model)) reasons.push("UNSUPPORTED MODEL");
-		if (account.policyClass === "unknown") reasons.push("POLICY UNKNOWN");
 		if (!telemetry)
 			return {
 				account,
@@ -228,66 +226,19 @@ export const evaluateCodexRoute = (options: {
 			!telemetry.supportedModels.includes(model)
 		)
 			reasons.push("REGISTRY/FEED MISMATCH");
-		if (telemetry.captureHealth !== "healthy")
-			degradations.push(`CAPTURE ${telemetry.captureHealth.toUpperCase()}: ${telemetry.parseErrors.join(", ") || "meter unavailable"}`);
-		const ageMs = telemetry.fetchedAt > 0 ? Math.max(0, now - telemetry.fetchedAt) : null;
-		const aged = ageMs != null && ageMs > FIFTEEN_MINUTES;
-		if (ageMs == null) reasons.push("NO ACCEPTED SAMPLE");
-		else if (aged) degradations.push(`STALE TELEMETRY age ${ageText(ageMs)}`);
-		if (telemetry.notBefore != null && now < telemetry.notBefore * 1000) {
-			if (telemetry.status429) reasons.push("RATE LIMITED");
-			reasons.push(`NOT BEFORE ${iso(telemetry.notBefore)}`);
-		} else if (telemetry.status429) {
-			degradations.push(
-				telemetry.notBefore == null
-					? "RATE LIMIT OBSERVED WITHOUT ACTIVE COOLDOWN"
-					: `RATE LIMIT COOLDOWN ELAPSED ${iso(telemetry.notBefore)}`,
-			);
-		}
-		if (telemetry.windows.length === 0) reasons.push("CAPACITY UNKNOWN");
-		if (!telemetry.windows.some((window) => window.minutes === 300)) reasons.push("5H WINDOW MISSING");
-		if (!telemetry.windows.some((window) => window.minutes === 10080)) reasons.push("WEEKLY WINDOW MISSING");
-		const effectiveWindows: CodexWindow[] = [];
-		for (const window of telemetry.windows) {
-			if (window.resetAt * 1000 <= now) {
-				reasons.push(`WINDOW UNKNOWN AFTER RESET ${window.minutes}m`);
-				degradations.push(`WINDOW ${window.minutes}m snapshot expired at ${iso(window.resetAt)}`);
-				continue;
-			}
-			const slope = aged && window.slopePctPerHour != null && window.slopePctPerHour > 0 ? window.slopePctPerHour : null;
-			const pctUsed = aged
-				? Math.min(100, slope == null ? Math.max(window.pctUsed, 90) : window.pctUsed + slope * (ageMs! / 3_600_000))
-				: window.pctUsed;
-			const projectedExhaustAt =
-				slope == null
-					? window.projectedExhaustAt
-					: (window.projectedExhaustAt ?? Math.ceil(now / 1000 + ((100 - pctUsed) / slope) * 3600));
-			const effective = { ...window, pctUsed, projectedExhaustAt };
-			effectiveWindows.push(effective);
-			if (aged && pctUsed !== window.pctUsed)
-				degradations.push(`WINDOW ${window.minutes}m degraded ${window.pctUsed}%→${pctUsed.toFixed(1)}%`);
-			if (pctUsed >= 100) {
-				reasons.push(`WINDOW EXHAUSTED ${window.minutes}m`);
-				continue;
-			}
-			const boundary = horizon === undefined ? window.resetAt : Math.min(horizon, window.resetAt);
-			const safe = aged && slope == null ? true : projectedExhaustAt != null ? projectedExhaustAt >= boundary : pctUsed < 90;
-			if (!safe) reasons.push(`UNSAFE WINDOW ${window.minutes}m`);
-		}
+		const quota = evaluateQuotaAccount(telemetry, now, horizon);
+		reasons.push(...quota.reasons);
 		return {
+			...quota,
 			account,
 			telemetry,
 			routable: reasons.length === 0,
 			reasons,
-			ageMs,
-			freshness: ageMs == null ? "unknown" : aged ? "aged" : "fresh",
-			degradations,
-			effectiveWindows,
+			degradations: [...degradations, ...quota.degradations],
 		};
 	});
-	const status = quotaStatus(feed, now);
 	const candidates = rank(accounts, work, model, feed.generation, now);
-	if (status?.routable && candidates.length > 0)
+	if (candidates.length > 0)
 		return { allBlocked: false, candidates, accounts, feedSource, ...(options.feedNotice ? { feedNotice: options.feedNotice } : {}) };
 	const healthy = feed.accounts.filter((account) => account.captureHealth === "healthy").length;
 	const ages = feed.accounts.filter((account) => account.fetchedAt > 0).map((account) => now - account.fetchedAt);

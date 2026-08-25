@@ -35,10 +35,13 @@ test("degrades to five-cell bars and then a minimal blocked gate", () => {
 	);
 });
 
-test("renders stale, absent, and beside-CACHE forms", () => {
+test("renders stale only for router refusal and keeps aged values", () => {
 	assert.equal(render({ routable: false, stale: true }), "CODEX   5H   --   |   WEEK --   |   STALE");
-	assert.equal(render(undefined), "CODEX   5H   --   |   WEEK --");
-	assert.equal(render({ h5: 72, week: 63, routable: true, stale: false }, 40, true), "Q 5H 72% · W 63%");
+	assert.equal(render(undefined), "CODEX   5H   --   |   WEEK --   |   STALE");
+	const aged = { h5: 10, week: 10, routable: true, stale: false, aged: true } as const;
+	assert.match(render(aged)!, /5H   █░{9}  10%.*WEEK █░{9}  10%/);
+	assert.equal(render(aged, 40, true), "Q 5H 10% · W 10%");
+	assert.equal(render(undefined, 40, true), "Q STALE");
 	assert.equal(
 		render({ h5: 0, week: 63, routable: false, recoveryAt: now / 1000 + 48 * 60 + 34, stale: false }, 40, true),
 		"Q BACK 48:34",

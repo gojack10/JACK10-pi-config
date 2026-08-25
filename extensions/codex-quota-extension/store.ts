@@ -61,9 +61,20 @@ export type QuotaStatus = {
 	routable: boolean;
 	recoveryAt?: number;
 	stale: boolean;
+	aged?: boolean;
 };
 
-export const QUOTA_FEED_TTL_MS = 15 * 60_000;
+export type QuotaAccountEvaluation = {
+	routable: boolean;
+	reasons: string[];
+	ageMs: number | null;
+	freshness: "fresh" | "aged" | "unknown";
+	degradations: string[];
+	effectiveWindows: CodexWindow[];
+	recoveryAt?: number;
+};
+
+const QUOTA_FEED_AGED_MS = 15 * 60_000;
 
 type LegacyWindow = Omit<CodexWindow, "slopePctPerHour" | "projectedExhaustAt">;
 type LegacyAccount = {
@@ -218,50 +229,116 @@ export const resetNotes = (previous: CodexAccount | undefined, next: CodexAccoun
 	return notes;
 };
 
+const quotaIso = (seconds: number): string => new Date(seconds * 1000).toISOString();
+const quotaAge = (milliseconds: number): string => `${Math.max(0, Math.floor(milliseconds / 1000))}s`;
+
+export const evaluateQuotaAccount = (
+	account: CodexAccount,
+	now: number = Date.now(),
+	horizon?: number,
+): QuotaAccountEvaluation => {
+	const reasons: string[] = [];
+	const degradations: string[] = [];
+	const recoveryGates: number[] = [];
+	if (account.policyClass === "unknown") reasons.push("POLICY UNKNOWN");
+	if (account.captureHealth !== "healthy")
+		degradations.push(`CAPTURE ${account.captureHealth.toUpperCase()}: ${account.parseErrors.join(", ") || "meter unavailable"}`);
+	const ageMs = account.fetchedAt > 0 ? Math.max(0, now - account.fetchedAt) : null;
+	const aged = ageMs != null && ageMs > QUOTA_FEED_AGED_MS;
+	if (ageMs == null) reasons.push("NO ACCEPTED SAMPLE");
+	else if (aged) degradations.push(`STALE TELEMETRY age ${quotaAge(ageMs)}`);
+	if (account.notBefore != null && now < account.notBefore * 1000) {
+		if (account.status429) reasons.push("RATE LIMITED");
+		reasons.push(`NOT BEFORE ${quotaIso(account.notBefore)}`);
+		recoveryGates.push(account.notBefore);
+	} else if (account.status429) {
+		reasons.push("RATE LIMITED");
+		degradations.push(
+			account.notBefore == null
+				? "RATE LIMIT OBSERVED WITHOUT ACTIVE COOLDOWN"
+				: `RATE LIMIT COOLDOWN ELAPSED ${quotaIso(account.notBefore)}`,
+		);
+	}
+	if (account.windows.length === 0) reasons.push("CAPACITY UNKNOWN");
+	if (!account.windows.some((window) => window.minutes === 300)) reasons.push("5H WINDOW MISSING");
+	if (!account.windows.some((window) => window.minutes === 10080)) reasons.push("WEEKLY WINDOW MISSING");
+	const effectiveWindows: CodexWindow[] = [];
+	for (const window of account.windows) {
+		if (window.resetAt * 1000 <= now) {
+			reasons.push(`WINDOW UNKNOWN AFTER RESET ${window.minutes}m`);
+			degradations.push(`WINDOW ${window.minutes}m snapshot expired at ${quotaIso(window.resetAt)}`);
+			continue;
+		}
+		const slope = aged && window.slopePctPerHour != null && window.slopePctPerHour > 0 ? window.slopePctPerHour : null;
+		const pctUsed = aged
+			? Math.min(100, slope == null ? Math.max(window.pctUsed, 90) : window.pctUsed + slope * (ageMs! / 3_600_000))
+			: window.pctUsed;
+		const projectedExhaustAt =
+			slope == null
+				? window.projectedExhaustAt
+				: (window.projectedExhaustAt ?? Math.ceil(now / 1000 + ((100 - pctUsed) / slope) * 3600));
+		const effective = { ...window, pctUsed, projectedExhaustAt };
+		effectiveWindows.push(effective);
+		if (aged && pctUsed !== window.pctUsed)
+			degradations.push(`WINDOW ${window.minutes}m degraded ${window.pctUsed}%→${pctUsed.toFixed(1)}%`);
+		if (pctUsed >= 100) {
+			reasons.push(`WINDOW EXHAUSTED ${window.minutes}m`);
+			recoveryGates.push(window.resetAt);
+			continue;
+		}
+		const boundary = horizon === undefined ? window.resetAt : Math.min(horizon, window.resetAt);
+		const safe = aged && slope == null ? true : projectedExhaustAt != null ? projectedExhaustAt >= boundary : pctUsed < 90;
+		if (!safe) {
+			reasons.push(`UNSAFE WINDOW ${window.minutes}m`);
+			recoveryGates.push(window.resetAt);
+		}
+	}
+	const onlyTimedReasons = reasons.every(
+		(reason) =>
+			reason === "RATE LIMITED" ||
+			reason.startsWith("NOT BEFORE") ||
+			reason.startsWith("WINDOW EXHAUSTED") ||
+			reason.startsWith("UNSAFE WINDOW"),
+	);
+	return {
+		routable: reasons.length === 0,
+		reasons,
+		ageMs,
+		freshness: ageMs == null ? "unknown" : aged ? "aged" : "fresh",
+		degradations,
+		effectiveWindows,
+		...(onlyTimedReasons && recoveryGates.length > 0 ? { recoveryAt: Math.max(...recoveryGates) } : {}),
+	};
+};
+
 export const quotaStatus = (
 	feed: CodexUsageState | undefined,
 	now: number = Date.now(),
-): QuotaStatus | undefined => {
-	if (!feed || feed.accounts.length === 0) return undefined;
-	const fresh = feed.accounts.filter(
-		(account) => account.fetchedAt > 0 && now - account.fetchedAt <= QUOTA_FEED_TTL_MS,
-	);
-	if (fresh.length === 0) return { routable: false, stale: true };
+): QuotaStatus => {
+	if (!feed || feed.accounts.length === 0) return { routable: false, stale: true };
+	const evaluations = feed.accounts.map((account) => evaluateQuotaAccount(account, now));
 	const remaining = (minutes: number): number | undefined => {
-		const values = fresh.flatMap((account) =>
-			account.windows
+		const values = evaluations.flatMap((evaluation) =>
+			evaluation.effectiveWindows
 				.filter((window) => window.minutes === minutes)
 				.map((window) => 100 - window.pctUsed),
 		);
 		return values.length > 0 ? Math.max(...values) : undefined;
 	};
-	const routable = fresh.some((account) => {
-		if (account.policyClass === "unknown" || account.captureHealth !== "healthy" || account.status429) return false;
-		if (account.notBefore != null && account.notBefore * 1000 > now) return false;
-		const windows = [300, 10080].map((minutes) =>
-			account.windows.find((window) => window.minutes === minutes),
-		);
-		return windows.every(
-			(window) =>
-				window !== undefined &&
-				window.resetAt * 1000 > now &&
-				window.pctUsed < 100 &&
-				(window.projectedExhaustAt != null
-					? window.projectedExhaustAt >= window.resetAt
-					: window.pctUsed < 90),
-		);
-	});
-	const recoveries = fresh
-		.map((account) => account.notBefore)
-		.filter((value): value is number => value != null && value * 1000 > now);
+	const routable = evaluations.some((evaluation) => evaluation.routable);
+	const recoveries = evaluations
+		.map((evaluation) => evaluation.recoveryAt)
+		.filter((value): value is number => value !== undefined);
+	const recoveryAt = recoveries.length > 0 ? Math.min(...recoveries) : undefined;
 	const h5 = remaining(300);
 	const week = remaining(10080);
 	return {
 		...(h5 === undefined ? {} : { h5 }),
 		...(week === undefined ? {} : { week }),
 		routable,
-		...(recoveries.length === 0 ? {} : { recoveryAt: Math.min(...recoveries) }),
-		stale: false,
+		...(recoveryAt === undefined ? {} : { recoveryAt }),
+		stale: !routable && recoveryAt === undefined,
+		...(evaluations.some((evaluation) => evaluation.freshness === "aged") ? { aged: true } : {}),
 	};
 };
 
