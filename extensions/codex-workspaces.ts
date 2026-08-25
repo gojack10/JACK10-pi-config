@@ -6,6 +6,7 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseRegistry, type RegistryAccount } from "./codex-quota-extension/store.ts";
 import { evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal/router.ts";
+import { scheduleLoginProbe, withFreshLoginProbe } from "./codex-workspace-login-probe.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const REGISTRY_PATH = join(AGENT_DIR, "codex-accounts.json");
@@ -60,7 +61,7 @@ function summarizeCredentials(credentials: OAuthCredential): Record<string, unkn
 
 function appendAuthObservation(
 	provider: string,
-	phase: "login" | "refresh",
+	phase: "login" | "refresh" | "probe",
 	outcome: "success" | "error",
 	details: Record<string, unknown>,
 ): void {
@@ -127,6 +128,14 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	for (const account of registry.accounts) {
 		if (account.credentialRef !== account.providerId)
 			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
+		const accountOauth = withFreshLoginProbe(
+			(interaction: Parameters<typeof oauth.login>[0]) => oauth.login(interaction),
+			(credentials: OAuthCredential, signal: AbortSignal) => oauth.refresh(credentials, signal),
+			() => queueMicrotask(() => scheduleLoginProbe(
+				account.providerId,
+				(outcome, details) => appendAuthObservation(account.providerId, "probe", outcome, details),
+			)),
+		);
 		pi.registerProvider({
 			...source,
 			id: account.providerId,
@@ -138,7 +147,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					name: `${account.label} (Codex account)`,
 					login: async (interaction) => {
 						try {
-							const credentials = await oauth.login(interaction);
+							const credentials = await accountOauth.login(interaction);
 							appendAuthObservation(account.providerId, "login", "success", summarizeCredentials(credentials));
 							return credentials;
 						} catch (error) {
@@ -150,7 +159,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					},
 					refresh: async (credentials, signal) => {
 						try {
-							const refreshed = await oauth.refresh(credentials, signal);
+							const refreshed = await accountOauth.refresh(credentials, signal);
 							appendAuthObservation(account.providerId, "refresh", "success", summarizeCredentials(refreshed));
 							return refreshed;
 						} catch (error) {
