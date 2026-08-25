@@ -1,0 +1,114 @@
+diff --git a/packages/ai/src/models.ts b/packages/ai/src/models.ts
+index f6f7c1c..988f18f 100644
+--- a/packages/ai/src/models.ts
++++ b/packages/ai/src/models.ts
+@@ -98,6 +98,7 @@ export interface Provider<TApi extends Api = Api> {
+ 	readonly id: string;
+ 	readonly name: string;
+ 	readonly selectable?: boolean;
++	readonly modelSelectionError?: (model: Model<TApi>) => string | undefined;
+ 
+ 	readonly baseUrl?: string;
+ 	readonly headers?: ProviderHeaders;
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index 167c23d..f41177c 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -1586,6 +1586,8 @@ export class AgentSession {
+ 	 * @throws Error if no auth is configured for the model
+ 	 */
+ 	async setModel(model: Model<any>): Promise<void> {
++		const selectionError = this._modelRuntime.getProvider(model.provider)?.modelSelectionError?.(model);
++		if (selectionError) throw new Error(selectionError);
+ 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+ 			throw new Error(`No API key for ${model.provider}/${model.id}`);
+ 		}
+diff --git a/packages/coding-agent/src/modes/interactive/components/model-selector.ts b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
+index ccd58e3..c3cb993 100644
+--- a/packages/coding-agent/src/modes/interactive/components/model-selector.ts
++++ b/packages/coding-agent/src/modes/interactive/components/model-selector.ts
+@@ -268,6 +268,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 		this.updateList();
+ 	}
+ 
++	private getModelSelectionError(model: Model<any>): string | undefined {
++		try {
++			return this.modelRuntime.getProvider(model.provider)?.modelSelectionError?.(model);
++		} catch (error) {
++			return `ERROR: ${model.provider}/${model.id} selection check failed: ${error instanceof Error ? error.message : String(error)}`;
++		}
++	}
++
+ 	private updateList(): void {
+ 		this.listContainer.clear();
+ 
+@@ -285,9 +293,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 
+ 			const isSelected = i === this.selectedIndex;
+ 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
++			const selectionError = this.getModelSelectionError(item.model);
+ 
+ 			let line = "";
+-			if (isSelected) {
++			if (selectionError) {
++				line = theme.fg(
++					"error",
++					`${isSelected ? "→ " : "  "}${item.id} [${item.provider}]${isCurrent ? " ✓" : ""} [BLOCKED]`,
++				);
++			} else if (isSelected) {
+ 				const prefix = theme.fg("accent", "→ ");
+ 				const modelText = `${item.id}`;
+ 				const providerBadge = theme.fg("muted", `[${item.provider}]`);
+@@ -375,6 +389,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
+ 	}
+ 
+ 	private handleSelect(model: Model<any>): void {
++		const selectionError = this.getModelSelectionError(model);
++		if (selectionError) {
++			this.errorMessage = selectionError;
++			this.updateList();
++			this.tui.requestRender();
++			return;
++		}
+ 		this.dispose();
+ 		// Save as new default
+ 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+diff --git a/packages/coding-agent/test/model-selector.test.ts b/packages/coding-agent/test/model-selector.test.ts
+index 060386e..55faefa 100644
+--- a/packages/coding-agent/test/model-selector.test.ts
++++ b/packages/coding-agent/test/model-selector.test.ts
+@@ -21,6 +21,34 @@ describe("model selector", () => {
+ 		harness = undefined;
+ 	});
+ 
++	it("renders and refuses dynamically blocked models", async () => {
++		harness = await createHarness();
++		const model = harness.getModel();
++		const provider = harness.session.modelRuntime.getProvider(model.provider) as
++			| { modelSelectionError?: () => string | undefined }
++			| undefined;
++		expect(provider).toBeDefined();
++		provider!.modelSelectionError = () => "ERROR: quota blocked";
++		let selected = false;
++		const selector = new ModelSelectorComponent(
++			createFakeTui(),
++			model,
++			harness.settingsManager,
++			harness.session.modelRuntime,
++			[],
++			() => {
++				selected = true;
++			},
++			() => {},
++		);
++
++		expect(stripAnsi(selector.render(120).join("\n"))).toContain(`${model.id} [${model.provider}] ✓ [BLOCKED]`);
++		(selector as unknown as { handleSelect(value: unknown): void }).handleSelect(model);
++		expect(selected).toBe(false);
++		expect(stripAnsi(selector.render(120).join("\n"))).toContain("ERROR: quota blocked");
++		await expect(harness.session.setModel(model)).rejects.toThrow("ERROR: quota blocked");
++	});
++
+ 	it("lists every catalog that failed to refresh", async () => {
+ 		harness = await createHarness();
+ 		vi.spyOn(harness.session.modelRuntime, "refresh").mockResolvedValue({
