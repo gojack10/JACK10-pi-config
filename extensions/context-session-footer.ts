@@ -7,10 +7,6 @@ import type {
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
-	appendQuotaBesideCache,
-	quotaPlacementForProvider,
-} from "./codex-quota-extension/placement.ts";
-import {
 	type CodexUsageState,
 	quotaStatus,
 	type QuotaStatus,
@@ -222,7 +218,7 @@ const appendQuotaLine = (
 	theme: Theme,
 ): void => {
 	flushFooterLine(state, width);
-	const line = renderQuotaLine(status, width, theme, Date.now(), false, visibleWidth, fitToWidth);
+	const line = renderQuotaLine(status, width, theme, Date.now(), visibleWidth, fitToWidth);
 	if (line) state.lines.push(line);
 };
 
@@ -402,22 +398,10 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					const quotaPlacement = quotaPlacementForProvider(ctx.model?.provider);
 					flushFooterLine(lineState, width);
 					const cacheStart = lineState.lines.length;
 					appendCacheTable(lineState, cacheTimers, width, theme);
 					const cacheEnd = lineState.lines.length;
-					if (quotaPlacement === "beside") {
-						appendQuotaBesideCache(
-							lineState.lines,
-							cacheStart,
-							cacheEnd,
-							width,
-							(available) => renderQuotaLine(quota, available, theme, Date.now(), true, visibleWidth, fitToWidth),
-							visibleWidth,
-							fitToWidth,
-						);
-					}
 					appendTrafficBesideCache(
 						lineState.lines,
 						cacheStart,
@@ -435,7 +419,7 @@ export default function (pi: ExtensionAPI) {
 						(text) => theme.fg("dim", text),
 					);
 					flushFooterLine(lineState, width);
-					if (quotaPlacement === "line") appendQuotaLine(lineState, quota, width, theme);
+					appendQuotaLine(lineState, quota, width, theme);
 
 					return lineState.lines;
 				},

@@ -1,33 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-	appendQuotaBesideCache,
+import * as placement from "./placement.ts";
+
+const {
 	QUOTA_TEXT_COLOR,
 	quotaBarColorForRemainingPercent,
 	quotaBarForRemainingPercent,
-	quotaPlacementForProvider,
-} from "./placement.ts";
+} = placement;
 
-test("places Codex quota on its own line and other quota beside cache", () => {
-	assert.equal(quotaPlacementForProvider("openai-codex-alt"), "line");
-	assert.equal(quotaPlacementForProvider("anthropic"), "beside");
-
-	const lines = ["MODEL", "CACHE----┐", "│ ROW    │", "└--------┘"];
-	assert.equal(
-		appendQuotaBesideCache(
-			lines,
-			1,
-			4,
-			80,
-			() => "Q 5H 60% · W 40%",
-			(text) => text.length,
-			(text, width) => text.slice(0, width),
-		),
-		true,
-	);
-	assert.match(lines[2], /│ ROW    │ Q 5H 60% · W 40%/);
-	assert.doesNotMatch(lines[1], /Q 5H/);
-	assert.doesNotMatch(lines[3], /Q 5H/);
+test("has no provider-specific or beside-cache quota variant", () => {
+	assert.equal("quotaPlacementForProvider" in placement, false);
+	assert.equal("appendQuotaBesideCache" in placement, false);
 });
 
 test("draws proportional ten-cell and narrow five-cell bars", () => {
