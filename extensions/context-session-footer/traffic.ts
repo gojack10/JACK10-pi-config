@@ -315,7 +315,7 @@ export const trafficRow = (
 };
 
 export const nettopArgs = (pid = process.pid): string[] => [
-	"-n", "-P", "-x", "-d", "-L", "0", "-s", "5",
+	"-n", "-P", "-x", "-d", "-L", "2", "-s", "5",
 	"-J", "bytes_in,bytes_out", "-p", String(pid),
 ];
 
@@ -465,12 +465,29 @@ export class TrafficMeter {
 	}
 
 	start(): void {
-		if (this.child) return;
+		if (this.startedAt !== undefined) return;
 		this.startedAt = Date.now();
 		this.lastSampleAt = undefined;
-		this.child = spawn("nettop", nettopArgs(), { stdio: ["ignore", "pipe", "ignore"] });
-		this.child.on("error", () => { this.child = undefined; });
-		this.child.stdout?.on("data", (chunk: Buffer) => this.consume(String(chunk)));
+		this.launch();
+	}
+
+	private launch(): void {
+		this.buffer = "";
+		this.headers = 0;
+		this.bytesInColumn = -1;
+		this.bytesOutColumn = -1;
+		const child = spawn("nettop", nettopArgs(), { stdio: ["ignore", "pipe", "ignore"] });
+		this.child = child;
+		let failed = false;
+		child.on("error", () => {
+			failed = true;
+			if (this.child === child) this.child = undefined;
+		});
+		child.on("close", () => {
+			if (this.child === child) this.child = undefined;
+			if (!failed && this.startedAt !== undefined) this.launch();
+		});
+		child.stdout?.on("data", (chunk: Buffer) => this.consume(String(chunk)));
 	}
 
 	stop(): void {
