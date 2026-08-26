@@ -5,7 +5,12 @@ import type { Model, OAuthCredential, Provider } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseRegistry, type RegistryAccount } from "./codex-quota-extension/store.ts";
-import { resolveCodexPersonalSelection, type RoutePin } from "./codex-personal/resolution.ts";
+import {
+	isTerminalCodexUsageLimit,
+	isZeroOutputFailure,
+	resolveCodexPersonalSelection,
+	type RoutePin,
+} from "./codex-personal/resolution.ts";
 import { evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal/router.ts";
 import { scheduleLoginProbe, withFreshLoginProbe } from "./codex-workspaces/probe.ts";
 
@@ -117,6 +122,8 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	let pin: RoutePin | undefined;
 	let pendingPin: RoutePin | undefined;
 	let sessionStarted = false;
+	const failedAccounts = new Set<string>();
+	const failoverAttempts = new Set<string>();
 	for (const account of registry.accounts) {
 		if (account.credentialRef !== account.providerId)
 			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
@@ -223,6 +230,9 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				evaluate: () =>
 					evaluateCodexRouteFromFiles({ model: model.id, work, registryPath: REGISTRY_PATH, feedPath: FEED_PATH }),
 				context,
+				excludedAccountKeys: failedAccounts,
+				consideredAccountKeys: failedAccounts.size ? failoverAttempts : undefined,
+				reevaluatePin: !!pin && failedAccounts.has(pin.accountKey),
 			});
 			if (resolved.pin) {
 				if (sessionStarted) {
@@ -279,6 +289,49 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			throw new Error("PIN VIOLATION: active model differs from the durable Codex route");
 		if (event.reason === "new" && ctx.hasUI)
 			ctx.ui.notify("NOT REBALANCED; RELAUNCH FOR ROUTING", "warning");
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		if (
+			event.message.role !== "assistant" ||
+			!ctx.model ||
+			!pin ||
+			event.message.provider !== pin.actualProviderId ||
+			!isTerminalCodexUsageLimit(event.message) ||
+			!isZeroOutputFailure(event.message)
+		)
+			return;
+
+		failedAccounts.add(pin.accountKey);
+		failoverAttempts.add(pin.accountKey);
+		const work = parseWorkInput(process.env.PI_CODEX_WORK);
+		try {
+			const resolved = await resolveCodexPersonalSelection({
+				model: ctx.model,
+				pin,
+				registry,
+				work,
+				evaluate: () =>
+					evaluateCodexRouteFromFiles({ model: event.message.model, work, registryPath: REGISTRY_PATH, feedPath: FEED_PATH }),
+				context: {
+					previousModel: ctx.model,
+					getModel: (provider, model) => ctx.modelRegistry.find(provider, model),
+					hasAuth: async (provider) => !!(await ctx.modelRegistry.getProviderAuth(provider)),
+				},
+				excludedAccountKeys: failedAccounts,
+				consideredAccountKeys: failoverAttempts,
+				reevaluatePin: true,
+			});
+			if (!resolved.pin || !(await pi.setModel(resolved.model)))
+				throw new Error(`AUTH UNAVAILABLE: ${resolved.pin?.actualProviderId ?? "next Codex account"}`);
+			pin = resolved.pin;
+			pi.appendEntry("codex-route/v1", pin);
+			if (ctx.hasUI) ctx.ui.notify(`Codex usage limit: rerouted to ${pin.actualProviderId}`, "warning");
+			return { retry: true };
+		} catch (error) {
+			const recovery = error instanceof Error ? error.message : String(error);
+			return { message: { ...event.message, errorMessage: `${event.message.errorMessage}\nFailover unavailable: ${recovery}` } };
+		}
 	});
 
 	pi.on("model_select", async (event, ctx) => {

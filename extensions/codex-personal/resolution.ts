@@ -1,9 +1,20 @@
-import type { Model, ModelResolutionContext } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, ModelResolutionContext } from "@earendil-works/pi-ai";
 import type {
 	CodexAccountRegistry,
 	RegistryAccount,
 } from "../codex-quota-extension/store.ts";
 import type { RouteEvaluation, WorkInput } from "./router.ts";
+
+export const isTerminalCodexUsageLimit = (message: AssistantMessage): boolean =>
+	message.stopReason === "error" &&
+	/ChatGPT usage limit|usage[_ ]limit(?:[_ ]has[_ ]been)?[_ ]reached|usage_not_included/i.test(message.errorMessage ?? "");
+
+export const isZeroOutputFailure = (message: AssistantMessage): boolean =>
+	message.content.every(
+		(block) =>
+			(block.type === "text" && block.text.length === 0) ||
+			(block.type === "thinking" && block.thinking.length === 0),
+	) && message.usage.output === 0;
 
 export type RoutePin = {
 	umbrella: string;
@@ -39,13 +50,18 @@ export async function resolveCodexPersonalSelection(options: {
 	work: WorkInput;
 	evaluate: () => RouteEvaluation;
 	context: ModelResolutionContext;
+	excludedAccountKeys?: ReadonlySet<string>;
+	consideredAccountKeys?: Set<string>;
+	reevaluatePin?: boolean;
 }): Promise<{ model: Model; pin?: RoutePin }> {
 	const { model, previousModel, registry, context, pin } = options;
-	const pinnedAccount = pin
-		? registry.accounts.find((account) => account.accountKey === pin.accountKey)
-		: registry.accounts.find(
-				(account) => account.providerId === previousModel?.provider,
-			);
+	const pinnedAccount = options.reevaluatePin
+		? undefined
+		: pin
+			? registry.accounts.find((account) => account.accountKey === pin.accountKey)
+			: registry.accounts.find(
+					(account) => account.providerId === previousModel?.provider,
+				);
 	if (pinnedAccount) {
 		const pinned = pin ? { ...pin, model: model.id } : undefined;
 		if (pinned) validatePin(pinned, pinnedAccount, registry.umbrellaProviderId);
@@ -59,6 +75,9 @@ export async function resolveCodexPersonalSelection(options: {
 	const evaluation = options.evaluate();
 	if (evaluation.allBlocked) throw new Error(evaluation.error);
 	for (const candidate of evaluation.candidates) {
+		if (options.excludedAccountKeys?.has(candidate.accountKey) || options.consideredAccountKeys?.has(candidate.accountKey))
+			continue;
+		options.consideredAccountKeys?.add(candidate.accountKey);
 		const account = registry.accounts.find(
 			(entry) => entry.accountKey === candidate.accountKey,
 		);
@@ -82,7 +101,8 @@ export async function resolveCodexPersonalSelection(options: {
 			},
 		};
 	}
+	const excluded = [...(options.excludedAccountKeys ?? [])];
 	throw new Error(
-		`ERROR: ${registry.umbrellaProviderId}/${model.id} unavailable — telemetry eligible but credentials unavailable.`,
+		`ERROR: ${registry.umbrellaProviderId}/${model.id} unavailable — eligible accounts exhausted or credentials unavailable.${excluded.length ? ` Excluded after usage limit: ${excluded.join(", ")}.` : ""}`,
 	);
 }
