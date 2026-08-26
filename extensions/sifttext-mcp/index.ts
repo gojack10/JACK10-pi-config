@@ -166,7 +166,7 @@ function registerSiftTextPullGate(pi: ExtensionAPI) {
 		const input = (event.input ?? {}) as Record<string, unknown>;
 
 		// Witness the PULL: any read tool that names a required node ID counts.
-		if (SIFTTEXT_IDEATION_READ_TOOLS.has(event.toolName) && event.toolName !== "ideation_sql") {
+		if (SIFTTEXT_IDEATION_READ_TOOLS.has(event.toolName) && event.toolName !== "sifttext_sql") {
 			const beforeSize = state.pullNodeIds.size;
 			const beforeDone = hasSiftTextPullDone(state);
 			const read = rememberSiftTextPullRead(state, siftTextToolTargetNodeId(input));
@@ -175,7 +175,7 @@ function registerSiftTextPullGate(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		if (event.toolName === "ideation_sql") {
+		if (event.toolName === "sifttext_sql") {
 			const query = String((input as { query?: unknown }).query ?? "").toLowerCase();
 			let changed = false;
 			for (const node of SIFTTEXT_COMMIT_PULL_NODES) {

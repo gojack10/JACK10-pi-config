@@ -28,36 +28,36 @@ const MIN_MS_BETWEEN_COMPACTIONS = 30_000;
 const UUID_GLOBAL = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 
 const MUTATING_IDEATION_TOOLS = new Set<string>([
-  "ideation_create_node",
-  "ideation_create_tree",
-  "ideation_delete_node",
-  "ideation_duplicate_node",
-  "ideation_link_by_name",
-  "ideation_move_node",
-  "ideation_move_cross_tree",
-  "ideation_promote_to_root",
-  "ideation_rename_node",
-  "ideation_reorder_children",
-  "ideation_resolve",
-  "ideation_mark_stuck",
-  "ideation_set_priority",
-  "ideation_set_scope",
-  "ideation_set_vitals",
-  "ideation_edit_crystallization",
-  "ideation_edit_scope",
-  "ideation_edit_section",
-  "ideation_crystallize_append",
-  "ideation_crystallize_replace",
-  "ideation_add_ruled_out",
-  "ideation_add_warning",
-  "ideation_defer",
-  "ideation_discard",
-  "ideation_activate",
+  "sifttext_create_node",
+  "sifttext_create_tree",
+  "sifttext_delete_node",
+  "sifttext_duplicate_node",
+  "sifttext_link_by_name",
+  "sifttext_move_node",
+  "sifttext_move_cross_tree",
+  "sifttext_promote_to_root",
+  "sifttext_rename_node",
+  "sifttext_reorder_children",
+  "sifttext_resolve",
+  "sifttext_mark_stuck",
+  "sifttext_set_priority",
+  "sifttext_set_scope",
+  "sifttext_set_vitals",
+  "sifttext_edit_crystallization",
+  "sifttext_edit_scope",
+  "sifttext_edit_section",
+  "sifttext_crystallize_append",
+  "sifttext_crystallize_replace",
+  "sifttext_add_ruled_out",
+  "sifttext_add_warning",
+  "sifttext_defer",
+  "sifttext_discard",
+  "sifttext_activate",
 ]);
 
 const BASE_COMPACT_RULES = [
   "Preserve the exact todo list state: every todo id, todo text, and todo status shown in the conversation.",
-  "Add a 'Tree State Mutations' section listing every ideation_* call that created, modified, or deleted state this session, in chronological order, one per line, with the tool name and key arguments.",
+  "Add a 'Tree State Mutations' section listing every sifttext_* call that created, modified, or deleted state this session, in chronological order, one per line, with the tool name and key arguments.",
 ].join(" ");
 
 const formatArgsBrief = (input: Record<string, unknown>): string => {
@@ -687,7 +687,7 @@ export default function todoLoop(pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event) => {
     const name = event.toolName;
-    if (!name.startsWith("ideation_")) return;
+    if (!name.startsWith("sifttext_")) return;
     const text = event.content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
       .map((c) => c.text)

@@ -1,7 +1,7 @@
 /**
  * /sifttext-commit — fetch a SiftText node via MCP and send it as a user message.
  *
- * Connects to app.sifttext.com/mcp, calls ideation_get_node with a
+ * Connects to app.sifttext.com/mcp, calls sifttext_get_node with a
  * hardcoded node ID, and injects the result as a user message so the LLM
  * can read and act on it immediately (no tool round-trip, no token waste).
  *
@@ -26,7 +26,7 @@ async function fetchNodeContent(): Promise<string> {
     MCP_URL,
     token,
     "sifttext-commit",
-    "ideation_get_node",
+    "sifttext_get_node",
     { node_id: NODE_ID },
   );
 
