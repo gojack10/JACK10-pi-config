@@ -18,7 +18,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
-const KEEP = new Set(["ideation_get_node", "ideation_get_outline"]);
+const KEEP = new Set(["sifttext_get_node", "sifttext_get_outline"]);
 const CLEARED_RESULT = "[tool result cleared by /tool-call-clean]";
 type Row = Record<string, any>;
 
@@ -107,7 +107,7 @@ function runSelfTest() {
 				content: [
 					{ type: "thinking", thinking: "valuable", thinkingSignature: "signed" },
 					{ type: "toolCall", id: "clear-call", name: "bash", arguments: {} },
-					{ type: "toolCall", id: "keep-call", name: "ideation_get_node", arguments: {} },
+					{ type: "toolCall", id: "keep-call", name: "sifttext_get_node", arguments: {} },
 				],
 				stopReason: "toolUse",
 				usage: { totalTokens: 999 },
@@ -132,7 +132,7 @@ function runSelfTest() {
 			message: {
 				role: "toolResult",
 				toolCallId: "keep-call",
-				toolName: "ideation_get_node",
+				toolName: "sifttext_get_node",
 				content: [{ type: "text", text: "keep output" }],
 			},
 		},
