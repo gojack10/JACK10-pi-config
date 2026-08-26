@@ -10,6 +10,7 @@ const model = (provider: string, id = "gpt-5.6-sol") =>
 const umbrella = model("openai-codex-personal");
 const personal = model("openai-codex");
 const sifttext = model("openai-codex-sifttext");
+const team = model("openai-codex-team");
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1,
 	umbrellaProviderId: umbrella.provider,
@@ -30,6 +31,14 @@ const registry: CodexAccountRegistry = {
 			policyClass: "perishable",
 			supportedModels: [umbrella.id],
 		},
+		{
+			accountKey: "team",
+			providerId: team.provider,
+			credentialRef: team.provider,
+			label: "Team",
+			policyClass: "stable-weekly",
+			supportedModels: [umbrella.id],
+		},
 	],
 };
 
@@ -39,7 +48,7 @@ const context = (
 ): ModelResolutionContext => ({
 	previousModel,
 	getModel: (provider, id) =>
-		[personal, sifttext].find(
+		[personal, sifttext, team].find(
 			(entry) => entry.provider === provider && entry.id === id,
 		),
 	hasAuth: async (provider) => authenticated.includes(provider),
@@ -63,6 +72,14 @@ const routable = (): RouteEvaluation => ({
 			actualProviderId: sifttext.provider,
 			model: umbrella.id,
 			reason: "second",
+			warnings: [],
+			feedGeneration: 7,
+		},
+		{
+			accountKey: "team",
+			actualProviderId: team.provider,
+			model: umbrella.id,
+			reason: "third",
 			warnings: [],
 			feedGeneration: 7,
 		},
@@ -108,6 +125,90 @@ test("transparent selection refuses an all-blocked route with recovery", async (
 		}),
 		/Earliest recovery: 2030-01-01/,
 	);
+});
+
+test("runtime failover excludes the pinned account and skips unauthenticated candidates", async () => {
+	const authChecks: string[] = [];
+	const considered = new Set(["personal"]);
+	const resolved = await resolveCodexPersonalSelection({
+		model: umbrella,
+		pin: {
+			umbrella: umbrella.provider,
+			accountKey: "personal",
+			model: umbrella.id,
+			actualProviderId: personal.provider,
+			feedGeneration: 7,
+			routedAt: 1,
+			workClass: "unpredictable",
+		},
+		registry,
+		work: { workClass: "unpredictable" },
+		evaluate: routable,
+		context: {
+			...context([]),
+			hasAuth: async (provider) => {
+				authChecks.push(provider);
+				return provider === team.provider;
+			},
+		},
+		excludedAccountKeys: new Set(["personal"]),
+		consideredAccountKeys: considered,
+		reevaluatePin: true,
+	});
+	assert.equal(resolved.model, team);
+	assert.equal(resolved.pin?.accountKey, "team");
+	assert.deepEqual(authChecks, [sifttext.provider, team.provider]);
+	assert.deepEqual([...considered], ["personal", "sifttext", "team"]);
+});
+
+test("manual umbrella reevaluation leaves a failed pin", async () => {
+	const resolved = await resolveCodexPersonalSelection({
+		model: umbrella,
+		pin: {
+			umbrella: umbrella.provider,
+			accountKey: "personal",
+			model: umbrella.id,
+			actualProviderId: personal.provider,
+			feedGeneration: 7,
+			routedAt: 1,
+			workClass: "unpredictable",
+		},
+		registry,
+		work: { workClass: "unpredictable" },
+		evaluate: routable,
+		context: context([sifttext.provider]),
+		excludedAccountKeys: new Set(["personal"]),
+		consideredAccountKeys: new Set(["personal"]),
+		reevaluatePin: true,
+	});
+	assert.equal(resolved.model, sifttext);
+	assert.equal(resolved.pin?.accountKey, "sifttext");
+});
+
+test("failover exhaustion considers each remaining candidate once", async () => {
+	const authChecks: string[] = [];
+	const considered = new Set(["personal"]);
+	await assert.rejects(
+		resolveCodexPersonalSelection({
+			model: umbrella,
+			registry,
+			work: { workClass: "unpredictable" },
+			evaluate: routable,
+			context: {
+				...context([]),
+				hasAuth: async (provider) => {
+					authChecks.push(provider);
+					return false;
+				},
+			},
+			excludedAccountKeys: new Set(["personal"]),
+			consideredAccountKeys: considered,
+			reevaluatePin: true,
+		}),
+		/eligible accounts exhausted or credentials unavailable.*personal/,
+	);
+	assert.deepEqual(authChecks, [sifttext.provider, team.provider]);
+	assert.deepEqual([...considered], ["personal", "sifttext", "team"]);
 });
 
 test("resuming a real routed provider keeps the pin without evaluating again", async () => {
