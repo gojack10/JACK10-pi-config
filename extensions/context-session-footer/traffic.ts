@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import {
 	chmodSync,
@@ -48,6 +48,10 @@ export type TrafficRow = {
 };
 
 type Exec = (command: string, args: string[]) => string;
+const runCommand: Exec = (command, args) => execFileSync(command, args, {
+	encoding: "utf8",
+	stdio: ["ignore", "pipe", "ignore"],
+});
 type CommandLevel = "info" | "warning" | "error";
 export type TrafficCommandResult = { level: CommandLevel; text: string };
 export type TrafficCommandOptions = {
@@ -143,13 +147,13 @@ export const readTrafficState = (path = DEFAULT_STATE_PATH, now = Date.now()): T
 	}
 };
 
-export const writeTrafficState = (path: string, state: TrafficState): void => {
+const writeJson = (path: string, value: unknown): void => {
 	mkdirSync(dirname(path), { recursive: true });
 	const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
 	let fd: number | undefined;
 	try {
 		fd = openSync(temporary, "wx", 0o600);
-		writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`);
+		writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
 		fsyncSync(fd);
 		closeSync(fd);
 		fd = undefined;
@@ -161,6 +165,8 @@ export const writeTrafficState = (path: string, state: TrafficState): void => {
 		throw error;
 	}
 };
+
+export const writeTrafficState = (path: string, state: TrafficState): void => writeJson(path, state);
 
 const sleep = (milliseconds: number) =>
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -228,10 +234,7 @@ const readOrCreateKey = (path: string): Buffer => {
 };
 
 export const getNetworkIdentity = (options: { keyPath?: string; exec?: Exec } = {}): NetworkIdentity => {
-	const run = options.exec ?? ((command, args) => execFileSync(command, args, {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "ignore"],
-	}));
+	const run = options.exec ?? runCommand;
 	let route: string;
 	try {
 		route = run("route", ["-n", "get", "default"]);
@@ -318,10 +321,30 @@ export const trafficRow = (
 	return { type: "UNKNOWN", data: `${formatBytes(current.cycle.unknown)}!`, time: "-" };
 };
 
-export const nettopArgs = (pid = process.pid): string[] => [
-	"-n", "-P", "-x", "-d", "-L", "2", "-s", "5",
-	"-J", "bytes_in,bytes_out", "-p", String(pid),
-];
+export type InterfaceCounters = WireBytes & { name: string };
+
+export const parseInterfaceCounters = (
+	output: string,
+	name: string,
+): InterfaceCounters | undefined => {
+	for (const line of output.split("\n")) {
+		const fields = line.trim().split(/\s+/);
+		if (fields[0] !== name || !fields[2]?.startsWith("<Link#")) continue;
+		const counters = fields.slice(-7).map(Number);
+		if (counters.length !== 7 || counters.some((value) => !Number.isFinite(value))) continue;
+		return { name, bytesIn: counters[2], bytesOut: counters[5] };
+	}
+};
+
+const readInterfaceCounters = (run: Exec = runCommand): InterfaceCounters | undefined => {
+	try {
+		const route = run("route", ["-n", "get", "default"]);
+		const name = route.match(/^\s*interface:\s*(\S+)/m)?.[1];
+		return name ? parseInterfaceCounters(run("netstat", ["-ibn"]), name) : undefined;
+	} catch {
+		return undefined;
+	}
+};
 
 export const renderTrafficTable = (row: TrafficRow): string[] => {
 	const headers = ["TYPE", "DATA", "TIME"];
@@ -434,25 +457,62 @@ export const registerTrafficCommand = (
 	});
 };
 
+export const claimTrafficCollector = (path: string, pid = process.pid): boolean => {
+	mkdirSync(dirname(path), { recursive: true });
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			const fd = openSync(path, "wx", 0o600);
+			writeFileSync(fd, String(pid));
+			closeSync(fd);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		let owner = 0;
+		try {
+			owner = Number(readFileSync(path, "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		if (Number.isInteger(owner) && owner > 0) {
+			try {
+				process.kill(owner, 0);
+				return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+			}
+		}
+		try { unlinkSync(path); } catch {}
+	}
+	return false;
+};
+
+export const releaseTrafficCollector = (path: string, pid = process.pid): void => {
+	try {
+		if (Number(readFileSync(path, "utf8")) === pid) unlinkSync(path);
+	} catch {}
+};
+
 export class TrafficMeter {
 	private state: TrafficState;
-	private child?: ReturnType<typeof spawn>;
-	private buffer = "";
-	private headers = 0;
-	private bytesInColumn = -1;
-	private bytesOutColumn = -1;
+	private timer?: ReturnType<typeof setInterval>;
 	private detected?: { at: number; identity: NetworkIdentity };
 	private startedAt?: number;
 	private lastSampleAt?: number;
+	private ownsCollector = false;
+	private previous?: InterfaceCounters;
 	readonly path: string;
+	readonly collectorPath: string;
 
 	constructor(
-		private readonly isLocal: () => boolean,
 		private readonly changed: () => void,
 		path = DEFAULT_STATE_PATH,
 		private readonly detect: () => NetworkIdentity = () => getNetworkIdentity(),
+		private readonly counters: () => InterfaceCounters | undefined = () => readInterfaceCounters(),
 	) {
 		this.path = path;
+		this.collectorPath = `${path}.collector.lock`;
 		this.state = readTrafficState(path);
 	}
 
@@ -472,32 +532,26 @@ export class TrafficMeter {
 		if (this.startedAt !== undefined) return;
 		this.startedAt = Date.now();
 		this.lastSampleAt = undefined;
-		this.launch();
+		this.tick();
+		this.timer = setInterval(() => this.tick(), 5000);
 	}
 
-	private launch(): void {
-		this.buffer = "";
-		this.headers = 0;
-		this.bytesInColumn = -1;
-		this.bytesOutColumn = -1;
-		const child = spawn("nettop", nettopArgs(), { stdio: ["ignore", "pipe", "ignore"] });
-		this.child = child;
-		let failed = false;
-		child.on("error", () => {
-			failed = true;
-			if (this.child === child) this.child = undefined;
-		});
-		child.on("close", () => {
-			if (this.child === child) this.child = undefined;
-			if (!failed && this.startedAt !== undefined) this.launch();
-		});
-		child.stdout?.on("data", (chunk: Buffer) => this.consume(String(chunk)));
+	private tick(): void {
+		if (!this.ownsCollector) {
+			this.ownsCollector = claimTrafficCollector(this.collectorPath);
+			if (!this.ownsCollector) return;
+			this.previous = undefined;
+		}
+		this.sample();
 	}
 
 	stop(): void {
-		this.child?.kill("SIGTERM");
-		this.child = undefined;
 		this.startedAt = undefined;
+		if (this.timer) clearInterval(this.timer);
+		this.timer = undefined;
+		if (this.ownsCollector) releaseTrafficCollector(this.collectorPath);
+		this.ownsCollector = false;
+		this.previous = undefined;
 		this.lastSampleAt = undefined;
 	}
 
@@ -505,36 +559,30 @@ export class TrafficMeter {
 		return this.startedAt !== undefined && now - (this.lastSampleAt ?? this.startedAt) >= 90_000;
 	}
 
-	private consume(chunk: string): void {
-		this.buffer += chunk;
-		const lines = this.buffer.split("\n");
-		this.buffer = lines.pop() ?? "";
-		for (const line of lines) {
-			const fields = line.trim().split(",");
-			if (fields.includes("bytes_in") && fields.includes("bytes_out")) {
-				this.headers++;
-				this.bytesInColumn = fields.indexOf("bytes_in");
-				this.bytesOutColumn = fields.indexOf("bytes_out");
-				continue;
-			}
-			if (this.headers < 2) continue;
-			const bytesIn = Number(fields[this.bytesInColumn]);
-			const bytesOut = Number(fields[this.bytesOutColumn]);
-			if (!Number.isFinite(bytesIn) || !Number.isFinite(bytesOut)) continue;
-			const now = Date.now();
-			this.lastSampleAt = now;
-			this.state = updateTrafficState(
-				this.path,
-				(state) => addTrafficSample(
-					state,
-					{ bytesIn, bytesOut },
-					this.isLocal(),
-					now,
-					this.currentIdentity(now),
-				),
+	private sample(): void {
+		const current = this.counters();
+		if (!current) return;
+		const previous = this.previous;
+		this.previous = current;
+		const now = Date.now();
+		this.lastSampleAt = now;
+		if (!previous || previous.name !== current.name) return;
+		const sample = {
+			bytesIn: Math.max(0, current.bytesIn - previous.bytesIn),
+			bytesOut: Math.max(0, current.bytesOut - previous.bytesOut),
+		};
+		if (sample.bytesIn === 0 && sample.bytesOut === 0) return;
+		this.state = updateTrafficState(
+			this.path,
+			(state) => addTrafficSample(
+				state,
+				sample,
+				false,
 				now,
-			);
-			this.changed();
-		}
+				this.currentIdentity(now),
+			),
+			now,
+		);
+		this.changed();
 	}
 }
