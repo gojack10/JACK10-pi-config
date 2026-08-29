@@ -1,59 +1,54 @@
 ---
 name: git-commit
-description: Turns a working tree diff into clean Conventional Commits. Use when you need to inspect, split, or commit repository changes.
+description: Turns a working tree diff into clean Scoped Commits. Use when you need to inspect, split, or commit repository changes.
 argument-hint: <optional focus or commit guidance>
 ---
 
 # Git Commit
 
-## Git Commit Conventions
+## Scoped Commit Conventions
 
-Use Conventional Commits format. Max 100 char title.
+Use Scoped Commits format. Max 100 char title.
 Do NOT add `Co-Authored-By` trailers to commits.
-
-### Commit Types
-
-| Type | Description |
-|------|-------------|
-| `feat` | New feature for the user |
-| `fix` | Bug fix for the user |
-| `docs` | Documentation changes |
-| `style` | Formatting, no code change |
-| `refactor` | Refactoring, no behavior change |
-| `test` | Adding/refactoring tests |
-| `chore` | Build tasks, no code change |
-| `perf` | Performance improvements |
-| `build` | Build system or dependencies |
-| `ci` | CI config changes |
-| `revert` | Reverts a previous commit |
-
-### Scope
-
-One token, kebab-case. Use domain/subsystem over file paths. Omit if cross-cutting.
-
-Common scopes: `auth`, `api`, `db`, `ui`, `tree`, `llm`, `chat`, `context`, `parser`
 
 ### Format
 
 ```
-type(scope): imperative description
+<scope>: <description>
 
-CHANGES:
+[optional body]
 
-- Bullet describing change (7-10 words each)
-- Another change
+[optional trailer(s)]
 ```
+
+- Choose the subsystem, area, or module as the scope; it is the most important part.
+- Write a short, clear description of the changes.
+- Do not use Conventional Commit type prefixes such as `feat`, `fix`, or `chore`.
+- For multiple scopes, prefer a more general scope, comma-separated scopes, or `treewide`, `all`, or `global` for whole-tree changes. If none is useful, use a good unscoped description.
+- Put ticket numbers in the scope (`auth (PROJ-123): fix login bug`) or a trailer (`Jira-Ticket: PROJ-123`).
+- Use the optional body for details contributors need to understand the project's evolution.
+- Reverts, merges, and other special commits may use any appropriate format.
+
+Examples:
+- `i2c: virtio: mark device ready before registering the adapter`
+- `linuxulator: Return EINVAL for invalid inotify flags`
+- `gitlab-ci: update macOS image`
+- `net/http/cookiejar: add godoc links`
+- `xwayland: 24.1.11 -> 24.1.12`
 
 ### Branch Naming
 
+Prefer a pragmatic scope and short slug, with an optional ticket:
+
 ```
-<type>[optional-scope]/<ticket>-<short-slug>
+<scope>/<ticket>-<short-slug>
+<scope>/<short-slug>
 ```
 
 Examples:
-- `feat/auth/123-add-login-form`
-- `fix/parser-handle-nested-blocks`
-- `refactor/llm-split-prompt-sections`
+- `auth/123-add-login-form`
+- `parser/handle-nested-blocks`
+- `llm/split-prompt-sections`
 
 ### Large Diffs
 
@@ -64,12 +59,9 @@ git add <files>
 ```
 
 ```
-type(scope): description
+<scope>: <description>
 
-CHANGES:
-
-- Change 1
-- Change 2
+Optional body explaining the change.
 ```
 
 ## Workflow
