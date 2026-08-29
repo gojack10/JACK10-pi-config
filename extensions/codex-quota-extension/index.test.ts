@@ -10,9 +10,13 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 	const home = await mkdtemp(join(tmpdir(), "codex-quota-home-"));
 	t.after(() => rm(home, { recursive: true, force: true }));
 	const oldHome = process.env.HOME;
+	const oldMaintenance = process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
 	process.env.HOME = home;
+	process.env.PI_CODEX_ACCOUNT_MAINTENANCE = "test";
 	t.after(() => {
 		process.env.HOME = oldHome;
+		if (oldMaintenance === undefined) delete process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
+		else process.env.PI_CODEX_ACCOUNT_MAINTENANCE = oldMaintenance;
 	});
 	const agentDir = join(home, ".pi", "agent");
 	await mkdir(agentDir, { recursive: true });
@@ -77,5 +81,13 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 	assert.match(state.accounts[0].parseErrors[0], /quota headers are missing/);
 	assert.equal(state.accounts[0].windows[0].pctUsed, 46);
 	assert.match(updates.at(-1).degraded, /quota headers are missing/);
+
+	state.generation++;
+	state.generatedAt++;
+	state.accounts[0].windows[0].pctUsed = 12;
+	await writeFile(join(agentDir, "codex-usage-state.json"), JSON.stringify(state));
+	for (let attempt = 0; attempt < 20 && updates.at(-1).state.accounts[0].windows[0].pctUsed !== 12; attempt++)
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 12);
 	await handlers.get("session_shutdown")?.({}, ctx);
 });

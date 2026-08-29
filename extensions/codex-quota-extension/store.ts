@@ -55,9 +55,14 @@ export type CodexUsageState = {
 	resetObserved?: string;
 };
 
+export type QuotaIncrease = { at: number; percent: number };
 export type QuotaStatus = {
 	h5?: number;
 	week?: number;
+	h5Increases: QuotaIncrease[];
+	weekIncreases: QuotaIncrease[];
+	h5Verifying: boolean;
+	weekVerifying: boolean;
 	routable: boolean;
 	recoveryAt?: number;
 	stale: boolean;
@@ -74,7 +79,7 @@ export type QuotaAccountEvaluation = {
 	recoveryAt?: number;
 };
 
-const QUOTA_FEED_AGED_MS = 15 * 60_000;
+export const QUOTA_FEED_AGED_MS = 15 * 60_000;
 
 type LegacyWindow = Omit<CodexWindow, "slopePctPerHour" | "projectedExhaustAt">;
 type LegacyAccount = {
@@ -311,30 +316,50 @@ export const evaluateQuotaAccount = (
 	};
 };
 
+const poolStatus = (feed: CodexUsageState, minutes: number, now: number) => {
+	const windows = feed.accounts.flatMap((account) => {
+		const window = account.windows.find((candidate) => candidate.minutes === minutes);
+		return window ? [window] : [];
+	});
+	if (windows.length === 0) return { increases: [] as QuotaIncrease[], verifying: false };
+	const gains = new Map<number, number>();
+	let verifying = false;
+	for (const window of windows) {
+		if (window.resetAt * 1000 <= now) verifying = true;
+		else if (window.pctUsed > 0)
+			gains.set(window.resetAt, (gains.get(window.resetAt) ?? 0) + window.pctUsed / windows.length);
+	}
+	return {
+		remaining: windows.reduce((sum, window) => sum + 100 - window.pctUsed, 0) / windows.length,
+		increases: [...gains].sort(([left], [right]) => left - right)
+			.map(([at, percent]) => ({ at, percent })),
+		verifying,
+	};
+};
+
 export const quotaStatus = (
 	feed: CodexUsageState | undefined,
 	now: number = Date.now(),
 ): QuotaStatus => {
-	if (!feed || feed.accounts.length === 0) return { routable: false, stale: true };
-	const evaluations = feed.accounts.map((account) => evaluateQuotaAccount(account, now));
-	const remaining = (minutes: number): number | undefined => {
-		const values = evaluations.flatMap((evaluation) =>
-			evaluation.effectiveWindows
-				.filter((window) => window.minutes === minutes)
-				.map((window) => 100 - window.pctUsed),
-		);
-		return values.length > 0 ? Math.max(...values) : undefined;
+	if (!feed || feed.accounts.length === 0) return {
+		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
+		routable: false, stale: true,
 	};
+	const evaluations = feed.accounts.map((account) => evaluateQuotaAccount(account, now));
 	const routable = evaluations.some((evaluation) => evaluation.routable);
 	const recoveries = evaluations
 		.map((evaluation) => evaluation.recoveryAt)
 		.filter((value): value is number => value !== undefined);
 	const recoveryAt = recoveries.length > 0 ? Math.min(...recoveries) : undefined;
-	const h5 = remaining(300);
-	const week = remaining(10080);
+	const h5 = poolStatus(feed, 300, now);
+	const week = poolStatus(feed, 10080, now);
 	return {
-		...(h5 === undefined ? {} : { h5 }),
-		...(week === undefined ? {} : { week }),
+		...(h5.remaining === undefined ? {} : { h5: h5.remaining }),
+		...(week.remaining === undefined ? {} : { week: week.remaining }),
+		h5Increases: h5.increases,
+		weekIncreases: week.increases,
+		h5Verifying: h5.verifying,
+		weekVerifying: week.verifying,
 		routable,
 		...(recoveryAt === undefined ? {} : { recoveryAt }),
 		stale: !routable && recoveryAt === undefined,
