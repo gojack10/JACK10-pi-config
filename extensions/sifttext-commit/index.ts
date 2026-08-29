@@ -59,7 +59,7 @@ export default function (pi: ExtensionAPI) {
           : "Focus: (model decides based on full context)";
 
         pi.sendUserMessage(
-          `please follow this skill\n\n${focusBlock}\n\n${content}`
+          `Run the regular in-chat SiftText Commit for this current conversation, using the current chat context.\n\n${focusBlock}\n\nDo not invoke Commit RLM. Do not snapshot or inspect session JSONL. Do not launch a retrospective synthesis agent. Still satisfy the regular SiftText Commit pre-write reads and human approval gates, and persist only after explicit human approval.\n\n${content}`,
         );
         ctx.ui.notify("Node content sent to agent", "success");
       } catch (err: unknown) {
