@@ -1,78 +1,133 @@
-/**
- * Model Recency Extension
- *
- * Tracks model switches to maintain MRU order.
- * Persists to ~/.pi/agent/model-recency.json (survives session restarts).
- * Also writes to session entries so the built-in /model reader picks it up.
- */
+import {
+	closeSync,
+	existsSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext, Model } from "@mariozechner/pi-coding-agent";
 
-import * as fs from "node:fs";
-import * as path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+interface RecencyEntry { provider: string; modelId: string }
+interface RecencyCache { order: RecencyEntry[] }
 
-interface RecencyEntry {
-	provider: string;
-	modelId: string;
-}
+const AGENT_DIR = join(homedir(), ".pi", "agent");
+const CACHE_PATH = join(AGENT_DIR, "model-recency.json");
+const REGISTRY_PATH = join(AGENT_DIR, "codex-accounts.json");
+const PERSONAL_PROVIDER = "openai-codex-personal";
+const MAX_ENTRIES = 50;
+const LOCK_STALE_MS = 30_000;
+const LOCK_WAIT_MS = 5_000;
 
-const CACHE_FILE = path.join(
-	process.env.HOME ?? "~",
-	".pi/agent/model-recency.json",
-);
+const key = (entry: RecencyEntry): string => `${entry.provider}\0${entry.modelId}`;
+const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-function readCache(): RecencyEntry[] {
+const accountProviders = (): Set<string> => {
 	try {
-		const raw = fs.readFileSync(CACHE_FILE, "utf-8");
-		const data = JSON.parse(raw);
-		if (data?.order && Array.isArray(data.order)) return data.order;
+		const raw = JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as { accounts?: Array<{ providerId?: unknown }> };
+		return new Set((raw.accounts ?? []).flatMap((account) =>
+			typeof account.providerId === "string" ? [account.providerId] : [],
+		));
 	} catch {
-		// File doesn't exist or is corrupt — start fresh
+		return new Set();
 	}
-	return [];
-}
+};
 
-function writeCache(order: RecencyEntry[]): void {
+const loadCache = (path = CACHE_PATH): RecencyEntry[] => {
 	try {
-		fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-		fs.writeFileSync(CACHE_FILE, JSON.stringify({ order }), "utf-8");
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RecencyCache>;
+		if (!Array.isArray(parsed.order)) return [];
+		return parsed.order.filter((entry): entry is RecencyEntry =>
+			typeof entry?.provider === "string" && typeof entry?.modelId === "string",
+		);
 	} catch {
-		// Best effort
+		return [];
 	}
-}
+};
 
-export default function (pi: ExtensionAPI) {
-	let recentOrder: RecencyEntry[] = readCache();
+export const bumpRecencyOrder = (
+	order: RecencyEntry[],
+	model: RecencyEntry,
+	providers: Set<string>,
+): RecencyEntry[] => {
+	const canonical = providers.has(model.provider)
+		? { provider: PERSONAL_PROVIDER, modelId: model.modelId }
+		: model;
+	return [canonical, ...order]
+		.filter((entry, index, entries) => !providers.has(entry.provider)
+			&& entries.findIndex((candidate) => key(candidate) === key(entry)) === index)
+		.slice(0, MAX_ENTRIES);
+};
 
-	function fullId(provider: string, modelId: string): string {
-		return `${provider}/${modelId}`;
+const acquireLock = async (path: string): Promise<number> => {
+	const startedAt = Date.now();
+	while (true) {
+		try {
+			return openSync(path, "wx", 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) unlinkSync(path);
+			} catch (statError) {
+				if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+			}
+			if (Date.now() - startedAt >= LOCK_WAIT_MS) throw new Error(`timed out waiting for ${path}`);
+			await sleep(10 + Math.floor(Math.random() * 20));
+		}
 	}
+};
 
-	function persist() {
-		writeCache(recentOrder);
-		// Also write to session so showModelSelector can read it
+export const updateRecencyFile = async (
+	path: string,
+	model: RecencyEntry,
+	providers: Set<string>,
+): Promise<RecencyEntry[]> => {
+	const lockPath = `${path}.lock`;
+	const handle = await acquireLock(lockPath);
+	try {
+		const order = bumpRecencyOrder(loadCache(path), model, providers);
+		const tempPath = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+		writeFileSync(tempPath, `${JSON.stringify({ order } satisfies RecencyCache, null, 2)}\n`, { mode: 0o600 });
+		try {
+			renameSync(tempPath, path);
+		} finally {
+			if (existsSync(tempPath)) unlinkSync(tempPath);
+		}
+		return order;
+	} finally {
+		closeSync(handle);
+		try { unlinkSync(lockPath); } catch {}
+	}
+};
+
+export default function modelRecencyExtension(pi: ExtensionAPI) {
+	const providers = accountProviders();
+	let recentOrder = loadCache().filter((entry) => !providers.has(entry.provider));
+	let pending = Promise.resolve();
+
+	const publish = () => {
+		pi.events.emit("model-recency:update", { order: recentOrder });
 		pi.appendEntry("model-recency", { order: recentOrder });
-	}
+	};
+	const bump = (model: Model<any> | undefined) => {
+		if (!model) return pending;
+		pending = pending.catch(() => undefined).then(async () => {
+			recentOrder = await updateRecencyFile(CACHE_PATH, {
+				provider: model.provider,
+				modelId: model.id,
+			}, providers);
+			publish();
+		});
+		return pending;
+	};
+	const bumpCurrent = (_event: unknown, ctx: ExtensionContext) => bump(ctx.model);
 
-	function bump(model: { provider: string; id: string }) {
-		const key = fullId(model.provider, model.id);
-		recentOrder = recentOrder.filter((e) => fullId(e.provider, e.modelId) !== key);
-		recentOrder.unshift({ provider: model.provider, modelId: model.id });
-		if (recentOrder.length > 50) recentOrder = recentOrder.slice(0, 50);
-		persist();
-	}
-
-	pi.on("model_select", (event) => {
-		bump(event.model);
-	});
-
-	pi.on("session_start", (_event, ctx) => {
-		// Reload from file (may have been modified by another session)
-		recentOrder = readCache();
-		if (ctx.model) bump(ctx.model);
-	});
-
-	pi.on("session_tree", (_event, ctx) => {
-		recentOrder = readCache();
-		if (ctx.model) bump(ctx.model);
-	});
+	pi.on("session_start", bumpCurrent);
+	pi.on("session_switch", bumpCurrent);
+	pi.on("session_tree", bumpCurrent);
+	pi.on("model_select", (event) => bump(event.model));
 }
