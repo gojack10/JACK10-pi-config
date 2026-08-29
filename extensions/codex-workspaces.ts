@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Model, OAuthCredential, Provider } from "@earendil-works/pi-ai";
@@ -17,7 +17,6 @@ import { scheduleLoginProbe, withFreshLoginProbe } from "./codex-workspaces/prob
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const REGISTRY_PATH = join(AGENT_DIR, "codex-accounts.json");
 const FEED_PATH = join(AGENT_DIR, "codex-usage-state.json");
-const CHOICE_PATH = join(AGENT_DIR, "codex-personal-choice.json");
 const AUTH_OBSERVABILITY_PATH = join(AGENT_DIR, "codex-workspace-auth-observability.jsonl");
 const ROUTE_ENV = "PI_CODEX_PERSONAL_ROUTE";
 const SOL_MODEL = /(^|-)sol($|-)/;
@@ -109,11 +108,6 @@ function validatePin(pin: RoutePin, account: RegistryAccount, umbrella: string):
 		throw new Error("ROUTE DENIED: Codex route pin does not match the private account registry");
 }
 
-function writeChoice(model: string): void {
-	writeFileSync(CHOICE_PATH, `${JSON.stringify({ model }, null, 2)}\n`, { mode: 0o600 });
-	chmodSync(CHOICE_PATH, 0o600);
-}
-
 export default function codexWorkspaces(pi: ExtensionAPI) {
 	const registry = parseRegistry(JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as unknown);
 	const source = builtinProviders().find((provider) => provider.id === "openai-codex");
@@ -177,7 +171,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					pin?.accountKey !== account.accountKey &&
 					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
 				)
-					throw new Error("ROUTE DENIED: launch real Codex accounts through pi-codex-personal");
+					throw new Error("ROUTE DENIED: Codex account has no matching session pin");
 				return source.stream(model, context, options);
 			},
 			streamSimple: (model, context, options) => {
@@ -185,7 +179,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					pin?.accountKey !== account.accountKey &&
 					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
 				)
-					throw new Error("ROUTE DENIED: launch real Codex accounts through pi-codex-personal");
+					throw new Error("ROUTE DENIED: Codex account has no matching session pin");
 				return source.streamSimple(model, context, options);
 			},
 		} as Provider);
@@ -198,9 +192,8 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			registryPath: REGISTRY_PATH,
 			feedPath: FEED_PATH,
 		}).error;
-	const failBeforeNetwork = (model: Model): never => {
-		const blocked = selectionError(model);
-		throw new Error(blocked ?? "launch through the Codex personal router");
+	const unresolved = (): never => {
+		throw new Error("Codex Personal provider resolution invariant failed");
 	};
 	const umbrella: SelectorProvider = {
 		...source,
@@ -244,13 +237,12 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			}
 			return resolved.model;
 		},
-		stream: (model) => failBeforeNetwork(model),
-		streamSimple: (model) => failBeforeNetwork(model),
+		stream: unresolved,
+		streamSimple: unresolved,
 	};
 	pi.registerProvider(umbrella as Provider);
 
-	let translating = false;
-	pi.on("session_start", (event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		sessionStarted = true;
 		const branch = ctx.sessionManager.getBranch();
 		pin = routeEntry(branch);
@@ -263,7 +255,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			pi.appendEntry("codex-route/v1", pin);
 		} else if (
 			!pin &&
-			branch.some((entry) => entry.type === "message") &&
 			ctx.model?.provider.startsWith("openai-codex") &&
 			ctx.model.provider !== registry.umbrellaProviderId
 		) {
@@ -281,6 +272,10 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			pi.appendEntry("codex-route/v1", pin);
 		}
 		pendingPin = undefined;
+		if (ctx.model?.provider === registry.umbrellaProviderId) {
+			if (!(await pi.setModel(ctx.model))) throw new Error("Codex Personal provider resolution failed");
+			return;
+		}
 		if (!pin) return;
 		const account = registry.accounts.find((entry) => entry.accountKey === pin!.accountKey);
 		if (!account) throw new Error("ROUTE DENIED: pinned Codex account is absent from the registry");
@@ -331,41 +326,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 		} catch (error) {
 			const recovery = error instanceof Error ? error.message : String(error);
 			return { message: { ...event.message, errorMessage: `${event.message.errorMessage}\nFailover unavailable: ${recovery}` } };
-		}
-	});
-
-	pi.on("model_select", async (event, ctx) => {
-		if (translating) return;
-		if (event.model.provider === registry.umbrellaProviderId) {
-			const blocked = selectionError(event.model);
-			if (blocked) {
-				if (ctx.hasUI) ctx.ui.notify(blocked, "error");
-				if (event.previousModel) {
-					translating = true;
-					try {
-						await pi.setModel(event.previousModel);
-					} finally {
-						translating = false;
-					}
-				}
-				return;
-			}
-			if (!pin) {
-				writeChoice(event.model.id);
-				if (ctx.hasUI) ctx.ui.notify("Codex model saved; launch through pi-codex-personal to route an account", "warning");
-				return;
-			}
-			const account = registry.accounts.find((entry) => entry.accountKey === pin!.accountKey)!;
-			const actual = ctx.modelRegistry.find(account.providerId, event.model.id);
-			if (!actual) throw new Error(`Pinned account does not support ${event.model.id}`);
-			translating = true;
-			try {
-				if (!(await pi.setModel(actual))) throw new Error(`AUTH UNAVAILABLE: ${account.label}`);
-			} finally {
-				translating = false;
-			}
-			pin = { ...pin, model: event.model.id };
-			pi.appendEntry("codex-route/v1", pin);
 		}
 	});
 }
