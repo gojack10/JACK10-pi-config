@@ -1,51 +1,42 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatQuotaCountdown, renderQuotaLine } from "./quota.ts";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { QuotaStatus } from "../codex-quota-extension/store.ts";
+import { renderQuotaLines } from "./quota.ts";
 
-const theme = { fg: (_color: string, text: string) => text };
-const now = 1_000_000;
-const render = (status: QuotaStatus | undefined, width = 120) =>
-	renderQuotaLine(status, width, theme, now);
+const theme = { fg: (_color: string, text: string) => text } as Theme;
+const visible = (text: string) => text.length;
+const fit = (text: string, width: number) => text.slice(0, width);
 
-test("renders the same dedicated two-bar row for every provider", () => {
-	const status = { h5: 100, week: 63, routable: true, stale: false } as const;
-	const lines = ["openai-codex-alt", "anthropic"].map(() => render(status)!);
-	assert.equal(lines[0], lines[1]);
-	assert.match(lines[0], /^CODEX   5H   ██████████ 100%   \|   WEEK ██████░░░░  63%$/);
-	assert.doesNotMatch(lines[0], /\[|TOTAL|AGE|account/i);
+const status: QuotaStatus = {
+	h5: 86,
+	week: 78,
+	h5Increases: [
+		{ at: 9_060, percent: 14 },
+		{ at: 11_520, percent: 8 },
+		{ at: 17_220, percent: 5 },
+	],
+	weekIncreases: [
+		{ at: 482_400, percent: 18 },
+		{ at: 507_600, percent: 3 },
+		{ at: 594_000, percent: 7 },
+	],
+	h5Verifying: false,
+	weekVerifying: false,
+	routable: true,
+	stale: false,
+};
+
+test("renders two aligned aggregate bars with every gain", () => {
+	assert.deepEqual(renderQuotaLines(status, 300, theme, 60_000, visible, fit), [
+		"CODEX 5H   █████████░   86%   +14% IN 02:30:00 / +8% IN 03:11:00 / +5% IN 04:46:00",
+		"CODEX WEEK ████████░░   78%   +18% IN 5D 13:59:00 / +3% IN 5D 20:59:00 / +7% IN 6D 20:59:00",
+	]);
 });
 
-test("renders exhausted and cross-account blocked recovery states", () => {
-	const recoveryAt = now / 1000 + 48 * 60 + 34;
-	const exhausted = render({ h5: 0, week: 63, routable: false, recoveryAt, stale: false })!;
-	assert.match(exhausted, /5H   ░{10}   0%/);
-	assert.match(exhausted, /BACK 48:34$/);
-	assert.doesNotMatch(exhausted, /OUT|BLOCKED/);
-
-	const split = render({ h5: 72, week: 63, routable: false, recoveryAt, stale: false })!;
-	assert.match(split, /BLOCKED · BACK 48:34$/);
-});
-
-test("degrades to five-cell bars and then a minimal blocked gate", () => {
-	const healthy = { h5: 72, week: 63, routable: true, stale: false } as const;
-	assert.match(render(healthy, 40)!, /5H ████░  72%  W ███░░  63%/);
-	assert.equal(render(healthy, 18), "5H 72%  W 63%");
-	assert.equal(
-		render({ h5: 0, week: 63, routable: false, recoveryAt: now / 1000 + 48 * 60 + 34, stale: false }, 20),
-		"5H 0%  BACK 48:34",
-	);
-});
-
-test("renders stale only for router refusal and keeps aged values", () => {
-	assert.equal(render({ routable: false, stale: true }), "CODEX   5H   --   |   WEEK --   |   STALE");
-	assert.equal(render(undefined), "CODEX   5H   --   |   WEEK --   |   STALE");
-	const aged = { h5: 10, week: 10, routable: true, stale: false, aged: true } as const;
-	assert.match(render(aged)!, /5H   █░{9}  10%.*WEEK █░{9}  10%/);
-});
-
-test("keeps countdowns to two useful units", () => {
-	assert.equal(formatQuotaCountdown((48 * 60 + 34) * 1000), "48:34");
-	assert.equal(formatQuotaCountdown((5 * 3600 + 7 * 60) * 1000), "05:07");
-	assert.equal(formatQuotaCountdown((52 * 3600) * 1000), "2d 4h");
+test("uses words for verification and respects width", () => {
+	const lines = renderQuotaLines({ ...status, h5Verifying: true }, 32, theme, 60_000, visible, fit);
+	assert.equal(lines.length, 2);
+	assert.ok(lines[0].startsWith("CODEX 5H"));
+	assert.ok(lines.every((line) => line.length <= 32));
 });

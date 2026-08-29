@@ -11,11 +11,13 @@ import test from "node:test";
 import {
 	addTrafficSample,
 	appendTrafficBesideCache,
+	claimTrafficCollector,
 	getNetworkIdentity,
 	newTrafficState,
-	nettopArgs,
+	parseInterfaceCounters,
 	readTrafficState,
 	registerTrafficCommand,
+	releaseTrafficCollector,
 	runTrafficCommand,
 	TrafficMeter,
 	trafficRow,
@@ -181,14 +183,21 @@ test("identity mismatch reports UNKNOWN and offline cannot classify", () => {
 	});
 });
 
-test("nettop includes loopback traffic and meter marks an empty stream degraded", () => {
-	const args = nettopArgs(123);
-	assert.deepEqual(args.slice(-2), ["-p", "123"]);
-	assert.deepEqual(args.slice(args.indexOf("-L"), args.indexOf("-L") + 2), ["-L", "2"]);
-	assert.equal(args.includes("external"), false);
-	assert.equal(args.includes("-t"), false);
+test("default-interface counters parse link rows with or without an address", () => {
+	const output = [
+		"Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll",
+		"en0 1500 <Link#19> aa:bb:cc:dd:ee:ff 100 0 200 300 0 400 0",
+		"utun0 1380 <Link#22> 10 0 20 30 0 40 0",
+	].join("\n");
+	assert.deepEqual(parseInterfaceCounters(output, "en0"), {
+		name: "en0", bytesIn: 200, bytesOut: 400,
+	});
+	assert.deepEqual(parseInterfaceCounters(output, "utun0"), {
+		name: "utun0", bytesIn: 20, bytesOut: 40,
+	});
+	assert.equal(parseInterfaceCounters(output, "en9"), undefined);
 
-	const meter = new TrafficMeter(() => false, () => {});
+	const meter = new TrafficMeter(() => {});
 	(meter as any).startedAt = 1_000;
 	assert.equal(meter.degraded(90_999), false);
 	assert.equal(meter.degraded(91_000), true);
@@ -198,18 +207,35 @@ test("nettop includes loopback traffic and meter marks an empty stream degraded"
 	);
 });
 
-test("nettop deltas and the shared classification persist across meter restarts", () => {
+test("shared interface deltas persist without double-counting after restart", () => {
 	const path = join(mkdtempSync(join(tmpdir(), "traffic-meter-")), "state.json");
 	runTrafficCommand("lan", { path, identity: () => networkA });
-	const meter = new TrafficMeter(() => false, () => {}, path, () => networkA);
-	(meter as any).consume(
-		",bytes_in,bytes_out,\npi.1,100,200,\n" +
-		",bytes_in,bytes_out,\npi.1,10,20,\n",
-	);
+	const readings = [
+		{ name: "en0", bytesIn: 100, bytesOut: 200 },
+		{ name: "en0", bytesIn: 110, bytesOut: 220 },
+	];
+	const meter = new TrafficMeter(() => {}, path, () => networkA, () => readings.shift());
+	(meter as any).sample();
+	(meter as any).sample();
 	assert.deepEqual(meter.snapshot().cycle.lan, { bytesIn: 10, bytesOut: 20 });
-	const restarted = new TrafficMeter(() => false, () => {}, path, () => networkA).snapshot();
-	assert.deepEqual(restarted.cycle.lan, { bytesIn: 10, bytesOut: 20 });
-	assert.equal(restarted.networkLabel?.class, "lan");
+	const restarted = new TrafficMeter(
+		() => {},
+		path,
+		() => networkA,
+		() => ({ name: "en0", bytesIn: 110, bytesOut: 220 }),
+	);
+	(restarted as any).sample();
+	assert.deepEqual(restarted.snapshot().cycle.lan, { bytesIn: 10, bytesOut: 20 });
+	assert.equal(restarted.snapshot().networkLabel?.class, "lan");
+});
+
+test("only one process can claim the shared collector", () => {
+	const path = join(mkdtempSync(join(tmpdir(), "traffic-collector-")), "collector.lock");
+	assert.equal(claimTrafficCollector(path), true);
+	assert.equal(claimTrafficCollector(path), false);
+	releaseTrafficCollector(path);
+	assert.equal(claimTrafficCollector(path), true);
+	releaseTrafficCollector(path);
 });
 
 test("atomic writer preserves 0600 mode", () => {
