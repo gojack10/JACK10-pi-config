@@ -155,7 +155,7 @@ function persistPullGateState(pi: ExtensionAPI, state: SiftTextPullGateState) {
 	});
 }
 
-function registerSiftTextPullGate(pi: ExtensionAPI) {
+export function registerSiftTextPullGate(pi: ExtensionAPI) {
 	const state = freshPullGateState();
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -191,7 +191,11 @@ function registerSiftTextPullGate(pi: ExtensionAPI) {
 
 		const directWrite = isSiftTextIdeationWriteTool(event.toolName);
 		const wrappedWrite = isKnownToolWrapper(event.toolName) && inputIncludesSiftTextIdeationWrite(input);
-		if ((directWrite || wrappedWrite) && !hasSiftTextPullDone(state)) {
+		if (
+			(directWrite || wrappedWrite) &&
+			pi.getFlag("rlm-writer") !== true &&
+			!hasSiftTextPullDone(state)
+		) {
 			return { block: true, reason: siftTextPullBlockReason(state, "sifttext") };
 		}
 	});
@@ -317,6 +321,12 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
+	pi.registerFlag("rlm-writer", {
+		description: "Only for an already-approved Commit RLM Persistence writer",
+		type: "boolean",
+		default: false,
+	});
+
 	const token = await getWorkingToken(process.env.SIFTTEXT_API_KEY);
 	if (!token) {
 		console.warn("[sifttext-mcp] SIFTTEXT_API_KEY not set — skipping SiftText tools");
