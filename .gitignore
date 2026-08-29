@@ -10,8 +10,10 @@ model-recency.json
 models-store.json
 tool-cache.json
 codex-usage-cache.json
+codex-usage-state.json*
+probe-schedule.json*
 codex-*observability.jsonl
-traffic-state.json
+traffic-state.json*
 .traffic-key
 *.log
 
