@@ -57,7 +57,7 @@ export const launchLoginProbe = (
 			"--no-tools",
 			"--no-session",
 			"--print",
-			"ok",
+			"test",
 		], {
 			stdio: "ignore",
 			env: { ...process.env, PI_CODEX_ACCOUNT_MAINTENANCE: provider },

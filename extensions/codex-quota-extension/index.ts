@@ -1,6 +1,7 @@
+import { type Stats, unwatchFile, watchFile } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ProbeScheduler } from "./probe-scheduler.ts";
-import { CodexUsageStore } from "./store.ts";
+import { CodexUsageStore, quotaStatus } from "./store.ts";
 
 const isCodex = (provider: unknown): provider is string =>
 	typeof provider === "string" && provider.startsWith("openai-codex") && provider !== "openai-codex-personal";
@@ -15,9 +16,13 @@ export default function (pi: ExtensionAPI) {
 	const probes = new ProbeScheduler();
 	let awaitingResponse = 0;
 	let pending = Promise.resolve();
+	let publishedGeneration = -1;
+	let watcher: ((current: Stats, previous: Stats) => void) | undefined;
 
 	const publish = async (ctx: CaptureContext, degraded?: string) => {
 		const state = store.snapshot();
+		if (!degraded && state.generation === publishedGeneration) return;
+		publishedGeneration = state.generation;
 		pi.events.emit("codex-usage:update", {
 			state,
 			...(degraded ? { degraded } : {}),
@@ -49,11 +54,22 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		const provider = isCodex(ctx.model?.provider) ? ctx.model.provider : undefined;
+		if (!watcher) {
+			watcher = (current, previous) => {
+				if (current.mtimeMs === previous.mtimeMs && current.size === previous.size) return;
+				void enqueue(ctx, undefined, async () => {
+					await store.load();
+					await publish(ctx);
+				});
+			};
+			watchFile(store.path, { persistent: false, interval: 250 }, watcher);
+		}
 		return enqueue(ctx, provider, async () => {
 			await store.load();
 			if (provider) store.setCurrent(provider);
 			await store.write();
 			await publish(ctx);
+			if (!quotaStatus(store.snapshot()).routable) await probes.runDue();
 		});
 	});
 
@@ -92,6 +108,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (watcher) unwatchFile(store.path, watcher);
+		watcher = undefined;
 		probes.close();
 		await pending;
 	});

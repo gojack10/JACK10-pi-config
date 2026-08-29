@@ -128,58 +128,68 @@ test("detects reset epochs and percentage drops", () => {
 	assert.deepEqual(resetNotes(before, next), ["openai-codex-alt 300m reset observed"]);
 });
 
-test("quota status takes max remaining capacity across accounts", () => {
+test("quota status mixes capacity and schedules every reset gain", () => {
 	const full = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
 	const used = normalizeObservation(team, 200, headers("100"), undefined, 1_000_000);
 	const status = quotaStatus(state([used, full]), 1_000_000);
-	assert.equal(status?.h5, 100);
-	assert.equal(status?.week, 24);
-	assert.equal(status?.routable, true);
+	assert.equal(status.h5, 50);
+	assert.equal(status.week, 24);
+	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }]);
+	assert.deepEqual(status.weekIncreases, [{ at: 7000, percent: 76 }]);
+	assert.equal(status.routable, true);
 });
 
-test("quota status follows router eligibility and keeps aged windows usable", () => {
+test("quota status verifies expired zero-use windows", () => {
+	const expired = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
+	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
+	const status = quotaStatus(state([expired]), 1_000_000);
+	assert.equal(status.h5, 100);
+	assert.equal(status.h5Verifying, true);
+	assert.equal(status.routable, false);
+});
+
+test("quota status keeps display capacity separate from router eligibility", () => {
 	const shortOnly = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
 	shortOnly.windows = shortOnly.windows.filter((window) => window.minutes === 300);
 	shortOnly.notBefore = 1900;
 	const weekOnly = normalizeObservation(team, 200, headers("30"), undefined, 1_000_000);
 	weekOnly.windows = weekOnly.windows.filter((window) => window.minutes === 10080);
 	weekOnly.notBefore = 1800;
-	assert.deepEqual(quotaStatus(state([shortOnly, weekOnly]), 1_000_000), {
-		h5: 80,
-		week: 24,
-		routable: false,
-		stale: true,
-	});
+	const blocked = quotaStatus(state([shortOnly, weekOnly]), 1_000_000);
+	assert.equal(blocked.h5, 80);
+	assert.equal(blocked.week, 24);
+	assert.equal(blocked.routable, false);
+	assert.equal(blocked.stale, true);
 
 	const aged = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
-	assert.deepEqual(quotaStatus(state([aged]), 1_000_000 + 15 * 60_000 + 1), {
-		h5: 10,
-		week: 10,
-		routable: true,
-		stale: false,
-		aged: true,
-	});
+	const agedStatus = quotaStatus(state([aged]), 1_000_000 + 15 * 60_000 + 1);
+	assert.equal(agedStatus.h5, 80);
+	assert.equal(agedStatus.week, 24);
+	assert.equal(agedStatus.routable, true);
+	assert.equal(agedStatus.stale, false);
+	assert.equal(agedStatus.aged, true);
 });
 
 test("quota status is stale only when the router has no route or recovery", () => {
-	assert.deepEqual(quotaStatus(undefined), { routable: false, stale: true });
+	assert.deepEqual(quotaStatus(undefined), {
+		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
+		routable: false, stale: true,
+	});
 	const blocked = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
 	blocked.notBefore = 2000;
-	assert.deepEqual(quotaStatus(state([blocked]), 1_000_000), {
-		h5: 80,
-		week: 24,
-		routable: false,
-		recoveryAt: 2000,
-		stale: false,
-	});
+	const recovering = quotaStatus(state([blocked]), 1_000_000);
+	assert.equal(recovering.h5, 80);
+	assert.equal(recovering.week, 24);
+	assert.equal(recovering.routable, false);
+	assert.equal(recovering.recoveryAt, 2000);
+	assert.equal(recovering.stale, false);
 
 	const elapsed429 = normalizeObservation(alt, 429, { "Retry-After": "10" }, blocked, 1_100_000);
-	assert.deepEqual(quotaStatus(state([elapsed429]), 1_200_000), {
-		h5: 80,
-		week: 24,
-		routable: false,
-		stale: true,
-	});
+	const stale = quotaStatus(state([elapsed429]), 1_200_000);
+	assert.equal(stale.h5, 80);
+	assert.equal(stale.week, 24);
+	assert.equal(stale.routable, false);
+	assert.equal(stale.stale, true);
 });
 
 test("migrates schema-1 state through immutable registry identity", async (t) => {
