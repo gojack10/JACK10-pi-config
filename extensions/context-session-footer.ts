@@ -17,7 +17,8 @@ import {
 	getSessionUsage,
 	type UsageTotals,
 } from "./context-session-footer/session-usage.ts";
-import { renderQuotaLine } from "./context-session-footer/quota.ts";
+import { formatFooterDuration } from "./context-session-footer/duration.ts";
+import { renderQuotaLines } from "./context-session-footer/quota.ts";
 import {
 	appendTrafficBesideCache,
 	registerTrafficCommand,
@@ -201,25 +202,16 @@ const appendCacheTable = (
 	state.lines.push(theme.fg("dim", border("└", "┴", "┘")));
 };
 
-const formatCacheTimerValue = (milliseconds: number): string => {
-	const total = Math.max(0, Math.ceil(milliseconds / 1000));
-	const hours = Math.floor(total / 3600);
-	const minutes = Math.floor((total % 3600) / 60);
-	const seconds = total % 60;
-	return [hours, minutes, seconds]
-		.map((part) => String(part).padStart(2, "0"))
-		.join(":");
-};
+const formatCacheTimerValue = formatFooterDuration;
 
-const appendQuotaLine = (
+const appendQuotaLines = (
 	state: FooterLineState,
 	status: QuotaStatus | undefined,
 	width: number,
 	theme: Theme,
 ): void => {
 	flushFooterLine(state, width);
-	const line = renderQuotaLine(status, width, theme, Date.now(), visibleWidth, fitToWidth);
-	if (line) state.lines.push(line);
+	state.lines.push(...renderQuotaLines(status, width, theme, Date.now(), visibleWidth, fitToWidth));
 };
 
 function usageTokens(
@@ -313,10 +305,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
-		const traffic = new TrafficMeter(
-			() => modelIsLocal(ctx.model),
-			() => requestRender?.(),
-		);
+		const traffic = new TrafficMeter(() => requestRender?.());
 		traffic.start();
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
@@ -409,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 						width,
 						trafficRow(
 							traffic.snapshot(),
-							isLocal,
+							false,
 							formatCacheTimerValue,
 							Date.now(),
 							traffic.currentIdentity(),
@@ -419,7 +408,7 @@ export default function (pi: ExtensionAPI) {
 						(text) => theme.fg("dim", text),
 					);
 					flushFooterLine(lineState, width);
-					appendQuotaLine(lineState, quota, width, theme);
+					appendQuotaLines(lineState, quota, width, theme);
 
 					return lineState.lines;
 				},
