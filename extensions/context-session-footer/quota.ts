@@ -2,7 +2,7 @@ import {
 	quotaBarColorForRemainingPercent,
 	quotaBarForRemainingPercent,
 } from "../codex-quota-extension/placement.ts";
-import type { QuotaIncrease, QuotaStatus } from "../codex-quota-extension/store.ts";
+import type { QuotaStatus } from "../codex-quota-extension/store.ts";
 import { formatFooterDuration } from "./duration.ts";
 
 type QuotaTheme = {
@@ -10,11 +10,6 @@ type QuotaTheme = {
 };
 
 const timer = (at: number, now: number) => formatFooterDuration(at * 1000 - now);
-
-const gain = (percentage: number) => {
-	const rounded = Math.round(percentage * 10) / 10;
-	return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-};
 
 export function renderQuotaLines(
 	status: QuotaStatus | undefined,
@@ -25,25 +20,15 @@ export function renderQuotaLines(
 	fitToWidth: (text: string, width: number) => string,
 ): string[] {
 	if (!status) return [];
-	const render = (
-		label: "5H" | "WEEK",
-		percentage: number | undefined,
-		increases: QuotaIncrease[],
-		verifying: boolean,
-	) => {
-		const prefix = `CODEX ${label.padEnd(4)} `;
-		if (percentage === undefined) return theme.fg("dim", `${prefix}NO DATA`);
-		const amount = `${String(Math.round(percentage)).padStart(3)}%`;
-		const schedule = [
-			...(verifying ? ["VERIFYING"] : []),
-			...increases.map((increase) => `+${gain(increase.percent)}% IN ${timer(increase.at, now)}`),
-		].join(" / ");
-		const warning = !status.routable ? "BLOCKED" : status.aged ? "STALE" : "";
-		const suffix = [schedule, warning].filter(Boolean).join(" / ");
-		return `${theme.fg("dim", prefix)}${theme.fg(quotaBarColorForRemainingPercent(percentage), quotaBarForRemainingPercent(percentage))}${theme.fg("dim", `  ${amount}${suffix ? `   ${suffix}` : ""}`)}`;
-	};
-	return [
-		render("5H", status.h5, status.h5Increases, status.h5Verifying),
-		render("WEEK", status.week, status.weekIncreases, status.weekVerifying),
-	].map((line) => visibleWidth(line) > width ? fitToWidth(line, width) : line);
+	const prefix = "CODEX GLOBAL ";
+	if (status.global === undefined) return [theme.fg("dim", `${prefix}NO DATA`)];
+	const percentage = status.global;
+	const amount = `${String(Math.round(percentage)).padStart(3)}%`;
+	const schedule = status.refillAt
+		? `${status.routable ? "REFILL" : "RECOVERY"} IN ${timer(status.refillAt, now)}`
+		: "";
+	const warning = !status.routable ? "BLOCKED" : status.aged ? "STALE" : "";
+	const suffix = [schedule, warning].filter(Boolean).join(" / ");
+	const line = `${theme.fg("dim", prefix)}${theme.fg(quotaBarColorForRemainingPercent(percentage), quotaBarForRemainingPercent(percentage))}${theme.fg("dim", `  ${amount}${suffix ? `   ${suffix}` : ""}`)}`;
+	return [visibleWidth(line) > width ? fitToWidth(line, width) : line];
 }

@@ -55,14 +55,9 @@ export type CodexUsageState = {
 	resetObserved?: string;
 };
 
-export type QuotaIncrease = { at: number; percent: number };
 export type QuotaStatus = {
-	h5?: number;
-	week?: number;
-	h5Increases: QuotaIncrease[];
-	weekIncreases: QuotaIncrease[];
-	h5Verifying: boolean;
-	weekVerifying: boolean;
+	global?: number;
+	refillAt?: number;
 	routable: boolean;
 	recoveryAt?: number;
 	stale: boolean;
@@ -316,50 +311,36 @@ export const evaluateQuotaAccount = (
 	};
 };
 
-const poolStatus = (feed: CodexUsageState, minutes: number, now: number) => {
-	const windows = feed.accounts.flatMap((account) => {
-		const window = account.windows.find((candidate) => candidate.minutes === minutes);
-		return window ? [window] : [];
-	});
-	if (windows.length === 0) return { increases: [] as QuotaIncrease[], verifying: false };
-	const gains = new Map<number, number>();
-	let verifying = false;
-	for (const window of windows) {
-		if (window.resetAt * 1000 <= now) verifying = true;
-		else if (window.pctUsed > 0)
-			gains.set(window.resetAt, (gains.get(window.resetAt) ?? 0) + window.pctUsed / windows.length);
-	}
-	return {
-		remaining: windows.reduce((sum, window) => sum + 100 - window.pctUsed, 0) / windows.length,
-		increases: [...gains].sort(([left], [right]) => left - right)
-			.map(([at, percent]) => ({ at, percent })),
-		verifying,
-	};
-};
-
 export const quotaStatus = (
 	feed: CodexUsageState | undefined,
 	now: number = Date.now(),
+	registeredAccounts: number = feed?.accounts.length ?? 0,
 ): QuotaStatus => {
-	if (!feed || feed.accounts.length === 0) return {
-		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
-		routable: false, stale: true,
-	};
+	if (!feed || feed.accounts.length === 0 || registeredAccounts <= 0)
+		return { routable: false, stale: true };
 	const evaluations = feed.accounts.map((account) => evaluateQuotaAccount(account, now));
 	const routable = evaluations.some((evaluation) => evaluation.routable);
 	const recoveries = evaluations
 		.map((evaluation) => evaluation.recoveryAt)
 		.filter((value): value is number => value !== undefined);
 	const recoveryAt = recoveries.length > 0 ? Math.min(...recoveries) : undefined;
-	const h5 = poolStatus(feed, 300, now);
-	const week = poolStatus(feed, 10080, now);
+	const bottleneckResets = evaluations.flatMap((evaluation) => {
+		if (!evaluation.routable) return [];
+		const used = Math.max(...evaluation.effectiveWindows.map((window) => window.pctUsed));
+		return evaluation.effectiveWindows
+			.filter((window) => window.pctUsed === used)
+			.map((window) => window.resetAt);
+	});
+	const refills = [...recoveries, ...bottleneckResets];
+	// ponytail: equal-weight normalized accounts; weight absolute limits if telemetry exposes them.
+	const denominator = Math.max(registeredAccounts, feed.accounts.length);
+	const global = evaluations.reduce((total, evaluation) => {
+		if (!evaluation.routable) return total;
+		return total + Math.min(...evaluation.effectiveWindows.map((window) => 100 - window.pctUsed));
+	}, 0) / denominator;
 	return {
-		...(h5.remaining === undefined ? {} : { h5: h5.remaining }),
-		...(week.remaining === undefined ? {} : { week: week.remaining }),
-		h5Increases: h5.increases,
-		weekIncreases: week.increases,
-		h5Verifying: h5.verifying,
-		weekVerifying: week.verifying,
+		global,
+		...(refills.length === 0 ? {} : { refillAt: Math.min(...refills) }),
 		routable,
 		...(recoveryAt === undefined ? {} : { recoveryAt }),
 		stale: !routable && recoveryAt === undefined,
@@ -564,6 +545,10 @@ export class CodexUsageStore {
 	async load(): Promise<CodexUsageState> {
 		this.state = await this.readDisk();
 		return this.snapshot();
+	}
+
+	async registeredAccountCount(): Promise<number> {
+		return (await this.getRegistry()).accounts.length;
 	}
 
 	snapshot(): CodexUsageState {
