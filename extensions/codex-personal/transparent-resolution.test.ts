@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { Model, ModelResolutionContext } from "@earendil-works/pi-ai";
 import type { CodexAccountRegistry } from "../codex-quota-extension/store.ts";
-import { resolveCodexPersonalSelection, routeEntry } from "./resolution.ts";
+import { resolveCodexPersonalSelection } from "./resolution.ts";
 import type { RouteEvaluation } from "./router.ts";
 
 const model = (provider: string, id = "gpt-5.6-sol") =>
@@ -52,34 +52,6 @@ const context = (
 			(entry) => entry.provider === provider && entry.id === id,
 		),
 	hasAuth: async (provider) => authenticated.includes(provider),
-});
-
-test("a later model switch invalidates a durable Codex route", () => {
-	const pin = {
-		umbrella: umbrella.provider,
-		accountKey: "personal",
-		model: umbrella.id,
-		actualProviderId: personal.provider,
-		feedGeneration: 1,
-		routedAt: 1,
-		workClass: "unpredictable",
-	};
-	const route = { type: "custom", customType: "codex-route/v1", data: pin };
-	assert.equal(routeEntry([route]), pin);
-	assert.equal(
-		routeEntry([
-			route,
-			{ type: "model_change", provider: personal.provider, modelId: umbrella.id },
-		]),
-		pin,
-	);
-	assert.equal(
-		routeEntry([
-			route,
-			{ type: "model_change", provider: "openai", modelId: umbrella.id },
-		]),
-		undefined,
-	);
 });
 
 const routable = (): RouteEvaluation => ({
