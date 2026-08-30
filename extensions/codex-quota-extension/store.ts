@@ -316,21 +316,36 @@ export const evaluateQuotaAccount = (
 	};
 };
 
-const poolStatus = (feed: CodexUsageState, minutes: number, now: number) => {
-	const windows = feed.accounts.flatMap((account) => {
-		const window = account.windows.find((candidate) => candidate.minutes === minutes);
-		return window ? [window] : [];
-	});
-	if (windows.length === 0) return { increases: [] as QuotaIncrease[], verifying: false };
+const poolStatus = (
+	accounts: Array<{ account: CodexAccount; evaluation: QuotaAccountEvaluation }>,
+	minutes: number,
+	now: number,
+	denominator: number,
+) => {
 	const gains = new Map<number, number>();
+	const addGain = (at: number, percent: number) => {
+		if (percent > 0 && at * 1000 > now)
+			gains.set(at, (gains.get(at) ?? 0) + percent / denominator);
+	};
+	let remaining = 0;
 	let verifying = false;
-	for (const window of windows) {
-		if (window.resetAt * 1000 <= now) verifying = true;
-		else if (window.pctUsed > 0)
-			gains.set(window.resetAt, (gains.get(window.resetAt) ?? 0) + window.pctUsed / windows.length);
+	for (const { account, evaluation } of accounts) {
+		const observed = account.windows.find((window) => window.minutes === minutes);
+		if (observed && observed.resetAt * 1000 <= now) verifying = true;
+		const window = evaluation.effectiveWindows.find((candidate) => candidate.minutes === minutes);
+		if (!window) continue;
+		if (evaluation.routable) {
+			remaining += 100 - window.pctUsed;
+			addGain(window.resetAt, window.pctUsed);
+			continue;
+		}
+		if (evaluation.recoveryAt === undefined) continue;
+		const afterRecovery = window.resetAt <= evaluation.recoveryAt ? 100 : 100 - window.pctUsed;
+		addGain(evaluation.recoveryAt, afterRecovery);
+		if (window.resetAt > evaluation.recoveryAt) addGain(window.resetAt, window.pctUsed);
 	}
 	return {
-		remaining: windows.reduce((sum, window) => sum + 100 - window.pctUsed, 0) / windows.length,
+		remaining: remaining / denominator,
 		increases: [...gains].sort(([left], [right]) => left - right)
 			.map(([at, percent]) => ({ at, percent })),
 		verifying,
@@ -340,22 +355,34 @@ const poolStatus = (feed: CodexUsageState, minutes: number, now: number) => {
 export const quotaStatus = (
 	feed: CodexUsageState | undefined,
 	now: number = Date.now(),
+	registeredAccounts?: number,
+	model?: string,
 ): QuotaStatus => {
-	if (!feed || feed.accounts.length === 0) return {
+	if (!feed) return {
 		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
 		routable: false, stale: true,
 	};
-	const evaluations = feed.accounts.map((account) => evaluateQuotaAccount(account, now));
+	const observed = model
+		? feed.accounts.filter((account) => account.supportedModels.includes(model))
+		: feed.accounts;
+	const denominator = Math.max(registeredAccounts ?? observed.length, observed.length);
+	if (denominator === 0) return {
+		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
+		routable: false, stale: true,
+	};
+	const accounts = observed.map((account) => ({ account, evaluation: evaluateQuotaAccount(account, now) }));
+	const evaluations = accounts.map(({ evaluation }) => evaluation);
 	const routable = evaluations.some((evaluation) => evaluation.routable);
 	const recoveries = evaluations
 		.map((evaluation) => evaluation.recoveryAt)
 		.filter((value): value is number => value !== undefined);
 	const recoveryAt = recoveries.length > 0 ? Math.min(...recoveries) : undefined;
-	const h5 = poolStatus(feed, 300, now);
-	const week = poolStatus(feed, 10080, now);
+	// ponytail: equal-weight normalized accounts; weight absolute limits if telemetry exposes them.
+	const h5 = poolStatus(accounts, 300, now, denominator);
+	const week = poolStatus(accounts, 10080, now, denominator);
 	return {
-		...(h5.remaining === undefined ? {} : { h5: h5.remaining }),
-		...(week.remaining === undefined ? {} : { week: week.remaining }),
+		h5: h5.remaining,
+		week: week.remaining,
 		h5Increases: h5.increases,
 		weekIncreases: week.increases,
 		h5Verifying: h5.verifying,
@@ -564,6 +591,11 @@ export class CodexUsageStore {
 	async load(): Promise<CodexUsageState> {
 		this.state = await this.readDisk();
 		return this.snapshot();
+	}
+
+	async registeredAccountCount(model?: string): Promise<number> {
+		const accounts = (await this.getRegistry()).accounts;
+		return model ? accounts.filter((account) => account.supportedModels.includes(model)).length : accounts.length;
 	}
 
 	snapshot(): CodexUsageState {
