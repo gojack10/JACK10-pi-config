@@ -27,6 +27,28 @@ export type RoutePin = {
 	horizonMinutes?: number;
 };
 
+export function routeEntry(entries: readonly unknown[]): RoutePin | undefined {
+	let pin: RoutePin | undefined;
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object") continue;
+		const value = entry as {
+			type?: string;
+			customType?: string;
+			data?: RoutePin;
+			provider?: string;
+			modelId?: string;
+		};
+		if (value.type === "custom" && value.customType === "codex-route/v1") pin = value.data;
+		else if (
+			value.type === "model_change" &&
+			pin &&
+			(value.provider !== pin.actualProviderId || value.modelId !== pin.model)
+		)
+			pin = undefined;
+	}
+	return pin;
+}
+
 function validatePin(
 	pin: RoutePin,
 	account: RegistryAccount,

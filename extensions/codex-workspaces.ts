@@ -9,6 +9,7 @@ import {
 	isTerminalCodexUsageLimit,
 	isZeroOutputFailure,
 	resolveCodexPersonalSelection,
+	routeEntry,
 	type RoutePin,
 } from "./codex-personal/resolution.ts";
 import { evaluateCodexRouteFromFiles, parseWorkInput } from "./codex-personal/router.ts";
@@ -84,19 +85,6 @@ function parseRoute(value: string | undefined): RoutePin | undefined {
 	)
 		throw new Error("Invalid Codex route environment");
 	return route as RoutePin;
-}
-
-function routeEntry(entries: readonly unknown[]): RoutePin | undefined {
-	const routes = entries
-		.filter(
-			(entry): entry is { type: "custom"; customType: "codex-route/v1"; data: RoutePin } =>
-				!!entry &&
-				typeof entry === "object" &&
-				(entry as { type?: string }).type === "custom" &&
-				(entry as { customType?: string }).customType === "codex-route/v1",
-		)
-		.map((entry) => entry.data);
-	return routes.at(-1);
 }
 
 function validatePin(pin: RoutePin, account: RegistryAccount, umbrella: string): void {
@@ -280,8 +268,10 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 		const account = registry.accounts.find((entry) => entry.accountKey === pin!.accountKey);
 		if (!account) throw new Error("ROUTE DENIED: pinned Codex account is absent from the registry");
 		validatePin(pin, account, registry.umbrellaProviderId);
-		if (ctx.model && (ctx.model.provider !== pin.actualProviderId || ctx.model.id !== pin.model))
-			throw new Error("PIN VIOLATION: active model differs from the durable Codex route");
+		if (!ctx.model || ctx.model.provider !== pin.actualProviderId || ctx.model.id !== pin.model) {
+			const restored = ctx.modelRegistry.find(pin.actualProviderId, pin.model);
+			if (!restored || !(await pi.setModel(restored))) throw new Error(`AUTH UNAVAILABLE: ${account.label}`);
+		}
 		if (event.reason === "new" && ctx.hasUI)
 			ctx.ui.notify("NOT REBALANCED; RELAUNCH FOR ROUTING", "warning");
 	});
