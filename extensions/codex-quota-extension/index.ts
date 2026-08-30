@@ -25,7 +25,6 @@ export default function (pi: ExtensionAPI) {
 		publishedGeneration = state.generation;
 		pi.events.emit("codex-usage:update", {
 			state,
-			registeredAccounts: await store.registeredAccountCount(),
 			...(degraded ? { degraded } : {}),
 		});
 		try { await probes.reconcile(state); }
