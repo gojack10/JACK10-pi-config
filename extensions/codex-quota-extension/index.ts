@@ -8,6 +8,7 @@ const isCodex = (provider: unknown): provider is string =>
 
 type CaptureContext = {
 	hasUI: boolean;
+	model?: { id?: string };
 	ui: { notify(message: string, level: "error"): void };
 };
 
@@ -22,9 +23,11 @@ export default function (pi: ExtensionAPI) {
 	const publish = async (ctx: CaptureContext, degraded?: string) => {
 		const state = store.snapshot();
 		if (!degraded && state.generation === publishedGeneration) return;
+		const registeredAccounts = await store.registeredAccountCount(ctx.model?.id);
 		publishedGeneration = state.generation;
 		pi.events.emit("codex-usage:update", {
 			state,
+			registeredAccounts,
 			...(degraded ? { degraded } : {}),
 		});
 		try { await probes.reconcile(state); }

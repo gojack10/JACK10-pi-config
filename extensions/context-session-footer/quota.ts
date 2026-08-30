@@ -11,10 +11,7 @@ type QuotaTheme = {
 
 const timer = (at: number, now: number) => formatFooterDuration(at * 1000 - now);
 
-const gain = (percentage: number) => {
-	const rounded = Math.round(percentage * 10) / 10;
-	return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-};
+const formatPercentage = (value: number) => value.toFixed(1);
 
 export function renderQuotaLines(
 	status: QuotaStatus | undefined,
@@ -33,10 +30,10 @@ export function renderQuotaLines(
 	) => {
 		const prefix = `CODEX ${label.padEnd(4)} `;
 		if (percentage === undefined) return theme.fg("dim", `${prefix}NO DATA`);
-		const amount = `${String(Math.round(percentage)).padStart(3)}%`;
+		const amount = `${percentage.toFixed(1).padStart(5)}%`;
 		const schedule = [
 			...(verifying ? ["VERIFYING"] : []),
-			...increases.map((increase) => `+${gain(increase.percent)}% IN ${timer(increase.at, now)}`),
+			...increases.map((increase) => `+${formatPercentage(increase.percent)}% IN ${timer(increase.at, now)}`),
 		].join(" / ");
 		const warning = !status.routable ? "BLOCKED" : status.aged ? "STALE" : "";
 		const suffix = [schedule, warning].filter(Boolean).join(" / ");

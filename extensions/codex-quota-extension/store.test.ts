@@ -128,43 +128,56 @@ test("detects reset epochs and percentage drops", () => {
 	assert.deepEqual(resetNotes(before, next), ["openai-codex-alt 300m reset observed"]);
 });
 
-test("quota status mixes capacity and schedules every reset gain", () => {
-	const full = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
-	const used = normalizeObservation(team, 200, headers("100"), undefined, 1_000_000);
-	const status = quotaStatus(state([used, full]), 1_000_000);
+test("quota status consolidates only usable account capacity", () => {
+	const available = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
+	const exhausted = normalizeObservation({ ...team, policyClass: "perishable" }, 200, headers("100"), undefined, 1_000_000);
+	const status = quotaStatus(state([exhausted, available]), 1_000_000);
 	assert.equal(status.h5, 50);
-	assert.equal(status.week, 24);
+	assert.equal(status.week, 12);
 	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }]);
-	assert.deepEqual(status.weekIncreases, [{ at: 7000, percent: 76 }]);
+	assert.deepEqual(status.weekIncreases, [{ at: 2000, percent: 12 }, { at: 7000, percent: 76 }]);
 	assert.equal(status.routable, true);
+	assert.equal(quotaStatus(state([available]), 1_000_000, 3).h5, 100 / 3);
+	assert.equal(quotaStatus(state([available]), 1_000_000, 3).week, 8);
 });
 
-test("quota status verifies expired zero-use windows", () => {
+test("quota status zeros complementary exhausted capacity", () => {
+	const shortExhausted = normalizeObservation(
+		alt,
+		200,
+		{ ...headers("100"), "X-Codex-Secondary-Used-Percent": "58" },
+		undefined,
+		1_000_000,
+	);
+	const weekExhausted = normalizeObservation(
+		{ ...team, policyClass: "perishable" },
+		200,
+		{ ...headers("0"), "X-Codex-Secondary-Used-Percent": "100" },
+		undefined,
+		1_000_000,
+	);
+	const status = quotaStatus(state([shortExhausted, weekExhausted]), 1_000_000);
+	assert.equal(status.h5, 0);
+	assert.equal(status.week, 0);
+	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }, { at: 7000, percent: 50 }]);
+	assert.deepEqual(status.weekIncreases, [{ at: 2000, percent: 21 }, { at: 7000, percent: 79 }]);
+	assert.equal(status.routable, false);
+	assert.equal(status.recoveryAt, 2000);
+});
+
+test("quota status verifies expired windows and degrades aged capacity", () => {
 	const expired = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
 	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
-	const status = quotaStatus(state([expired]), 1_000_000);
-	assert.equal(status.h5, 100);
-	assert.equal(status.h5Verifying, true);
-	assert.equal(status.routable, false);
-});
-
-test("quota status keeps display capacity separate from router eligibility", () => {
-	const shortOnly = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
-	shortOnly.windows = shortOnly.windows.filter((window) => window.minutes === 300);
-	shortOnly.notBefore = 1900;
-	const weekOnly = normalizeObservation(team, 200, headers("30"), undefined, 1_000_000);
-	weekOnly.windows = weekOnly.windows.filter((window) => window.minutes === 10080);
-	weekOnly.notBefore = 1800;
-	const blocked = quotaStatus(state([shortOnly, weekOnly]), 1_000_000);
-	assert.equal(blocked.h5, 80);
-	assert.equal(blocked.week, 24);
-	assert.equal(blocked.routable, false);
-	assert.equal(blocked.stale, true);
+	const expiredStatus = quotaStatus(state([expired]), 1_000_000);
+	assert.equal(expiredStatus.h5, 0);
+	assert.equal(expiredStatus.week, 0);
+	assert.equal(expiredStatus.h5Verifying, true);
+	assert.equal(expiredStatus.routable, false);
 
 	const aged = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
 	const agedStatus = quotaStatus(state([aged]), 1_000_000 + 15 * 60_000 + 1);
-	assert.equal(agedStatus.h5, 80);
-	assert.equal(agedStatus.week, 24);
+	assert.equal(agedStatus.h5, 10);
+	assert.equal(agedStatus.week, 10);
 	assert.equal(agedStatus.routable, true);
 	assert.equal(agedStatus.stale, false);
 	assert.equal(agedStatus.aged, true);
@@ -178,16 +191,16 @@ test("quota status is stale only when the router has no route or recovery", () =
 	const blocked = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
 	blocked.notBefore = 2000;
 	const recovering = quotaStatus(state([blocked]), 1_000_000);
-	assert.equal(recovering.h5, 80);
-	assert.equal(recovering.week, 24);
+	assert.equal(recovering.h5, 0);
+	assert.equal(recovering.week, 0);
 	assert.equal(recovering.routable, false);
 	assert.equal(recovering.recoveryAt, 2000);
 	assert.equal(recovering.stale, false);
 
 	const elapsed429 = normalizeObservation(alt, 429, { "Retry-After": "10" }, blocked, 1_100_000);
 	const stale = quotaStatus(state([elapsed429]), 1_200_000);
-	assert.equal(stale.h5, 80);
-	assert.equal(stale.week, 24);
+	assert.equal(stale.h5, 0);
+	assert.equal(stale.week, 0);
 	assert.equal(stale.routable, false);
 	assert.equal(stale.stale, true);
 });
