@@ -291,15 +291,22 @@ export default function (pi: ExtensionAPI) {
 	registerTrafficCommand(pi, { changed: () => requestRender?.() });
 	let cacheTimers: CacheStatusRow[] = [];
 	let quotaState: CodexUsageState | undefined;
+	let quotaAccountCount: number | undefined;
 	pi.events.on("cache-status:update", (data) => {
 		if (Array.isArray(data)) cacheTimers = data as CacheStatusRow[];
 		requestRender?.();
 	});
 	pi.events.on("codex-usage:update", (data) => {
 		if (!data || typeof data !== "object") return;
-		const update = data as CodexUsageState | { state?: CodexUsageState };
+		const update = data as CodexUsageState | { state?: CodexUsageState; registeredAccounts?: number };
 		const state = "accounts" in update ? update : update.state;
 		if (state) quotaState = state;
+		if (
+			!("accounts" in update) &&
+			typeof update.registeredAccounts === "number" &&
+			Number.isInteger(update.registeredAccounts)
+		)
+			quotaAccountCount = update.registeredAccounts;
 		requestRender?.();
 	});
 
@@ -354,7 +361,7 @@ export default function (pi: ExtensionAPI) {
 
 					const dim = theme.fg.bind(theme, "dim");
 					const lineState: FooterLineState = { lines: [], currentLine: "" };
-					const quota = quotaStatus(quotaState);
+					const quota = quotaStatus(quotaState, Date.now(), quotaAccountCount);
 
 					appendPipeSegment(lineState, `CWD: ${cwdPrompt}`, width, dim);
 					appendPipeSegment(

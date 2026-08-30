@@ -74,6 +74,7 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 	assert.equal(state.currentAccountKey, accountKey);
 	assert.equal(state.accounts[0].captureHealth, "healthy");
 	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 46);
+	assert.equal(updates.at(-1).registeredAccounts, 1);
 
 	await handlers.get("after_provider_response")?.({ status: 200, headers: {} }, ctx);
 	state = JSON.parse(await readFile(join(agentDir, "codex-usage-state.json"), "utf8"));
