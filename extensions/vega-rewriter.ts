@@ -158,7 +158,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 			signal.throwIfAborted();
 			const prompt = await readFile(PROMPT_PATH, "utf8");
 			const promptSha256 = createHash("sha256").update(prompt).digest("hex");
-			const input = `CURRENT OPERATOR MESSAGE:\n${operatorMessage}\n\nRAW AGENT RESPONSE:\n${rawResponse}`;
+			const input = `SOURCE RULE: Rewrite only RAW AGENT RESPONSE. CURRENT OPERATOR MESSAGE controls selection but is never output material; do not quote, echo, or paraphrase it.\n\nCURRENT OPERATOR MESSAGE:\n${operatorMessage}\n\nRAW AGENT RESPONSE:\n${rawResponse}`;
 
 			if (process.env.VEGA_REWRITER_FORCE_FAIL === "1") throw new Error("forced failure (VEGA_REWRITER_FORCE_FAIL=1)");
 
@@ -187,6 +187,9 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 				rewrite = await invoke("openrouter", prompt, input, signal);
 			}
 
+			if (operatorMessage.trim() && rewrite.includes(operatorMessage.trim())) {
+				throw new Error("unsafe rewrite rejected: output echoed operator message");
+			}
 			rewrites.set(rawResponse, rewrite);
 			deliveries.push({
 				content: rewrite,
