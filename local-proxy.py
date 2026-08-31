@@ -44,7 +44,8 @@ LISTEN_PORT = 8002
 QWEN_FLASH_MODEL_ID = "qwen36-35b-a3b-flash-moe"
 DS4_FLASH_MODEL_ID = "tunnel-model"
 DS4_PRO_MODEL_ID = "deepseek-v4-pro"
-DS4_MODEL_IDS = {DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID}
+GLM_FLASH_MODEL_ID = "glm-5.3-flash"
+DS4_MODEL_IDS = {DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID, GLM_FLASH_MODEL_ID}
 DS4_SERVICE_LABEL = "com.dsv4.server"
 DS4_DESIRED_FILE = Path.home() / ".dsv4" / "desired-model"
 DS4_SWITCH_TIMEOUT = 600
@@ -72,6 +73,11 @@ DS4_MODEL_METADATA = {
         "name": "DeepSeek V4 Pro",
         "context_length": 1048576,
         "max_completion_tokens": 1048576,
+    },
+    GLM_FLASH_MODEL_ID: {
+        "name": "GLM 5.3 Flash",
+        "context_length": 1048576,
+        "max_completion_tokens": 393216,
     },
 }
 DS4_LOADED_MODEL_ID = None
@@ -120,6 +126,7 @@ BACKENDS = {
 STATIC_MODEL_BACKENDS = {
     DS4_FLASH_MODEL_ID: "ds4",
     DS4_PRO_MODEL_ID: "ds4",
+    GLM_FLASH_MODEL_ID: "ds4",
     QWEN_FLASH_MODEL_ID: "flash_moe",
 }
 MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
@@ -644,12 +651,16 @@ def _model_id_from_mode(value):
         return DS4_FLASH_MODEL_ID
     if value in ("pro", DS4_PRO_MODEL_ID):
         return DS4_PRO_MODEL_ID
+    if value in ("glm", GLM_FLASH_MODEL_ID):
+        return GLM_FLASH_MODEL_ID
     return None
 
 
 def _mode_from_model_id(model_id):
     if model_id == DS4_PRO_MODEL_ID:
         return "pro"
+    if model_id == GLM_FLASH_MODEL_ID:
+        return "glm"
     return "flash"
 
 
@@ -675,6 +686,8 @@ def _detect_ds4_loaded_model_sync():
         return None
 
     cmd = ds4_lines[-1]
+    if "GLM-5.3-Flash-Q2.gguf" in cmd:
+        return GLM_FLASH_MODEL_ID
     if "DeepSeek-V4-Pro" in cmd:
         return DS4_PRO_MODEL_ID
     if "DeepSeek-V4-Flash" in cmd or "ds4flash.gguf" in cmd:
@@ -778,7 +791,7 @@ async def ensure_ds4_model(model_id):
             await stop_dsv4()
             await asyncio.sleep(3)
 
-        await asyncio.to_thread(_write_ds4_desired_model_sync, model_id)
+        await asyncio.to_thread(_write_ds4_desired_model_sync, mode)
         await start_dsv4()
 
         global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
@@ -845,10 +858,10 @@ async def handle_models(request):
     merged = []
     seen = set()
 
-    # DSV4 advertises both IDs regardless of which GGUF is actually loaded.
-    # The proxy owns the real Flash/Pro lifecycle, so expose accurate static
-    # metadata here and ignore DSV4's misleading duplicate model records below.
-    for model_id in (DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID):
+    # DSV4 advertises switchable IDs regardless of which GGUF is actually loaded.
+    # The proxy owns their lifecycle, so expose accurate static metadata here and
+    # ignore DSV4's misleading duplicate model records below.
+    for model_id in (DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID, GLM_FLASH_MODEL_ID):
         merged.append(ds4_static_model(model_id))
         seen.add(model_id)
 
