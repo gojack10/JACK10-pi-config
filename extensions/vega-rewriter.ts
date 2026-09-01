@@ -3,7 +3,7 @@ import { Markdown } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rmdir, stat } from "node:fs/promises";
 import { connect } from "node:net";
-import { replaceAssistantText, runStreamingPi, textOf } from "./vega-rewriter-process.ts";
+import { replaceAssistantText, runStreamingPi, textOf } from "./vega-rewriter-lib/vega-rewriter-process.ts";
 
 const PROMPT_PATH = "/Users/USER/.pi/agent/vega-presenter.md";
 const PROVIDER_EXTENSION = "/Users/USER/.pi/agent/extensions/tunnel-llm-proxy.ts";
