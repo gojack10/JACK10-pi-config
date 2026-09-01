@@ -13,6 +13,7 @@ PARSER = argparse.ArgumentParser(description='Build deterministic adaptive Commi
 PARSER.add_argument('--source', required=True, type=Path)
 PARSER.add_argument('--source-sha256', required=True)
 PARSER.add_argument('--snapshots', required=True, type=Path)
+PARSER.add_argument('--commit-protocol', required=True, type=Path, help='Frozen four-node SiftText Commit pull packet.')
 PARSER.add_argument('--run-dir', required=True, type=Path)
 PARSER.add_argument('--chunk-target-tokens', type=int, default=10_000)
 PARSER.add_argument('--full-threshold-tokens', type=int, default=80_000)
@@ -22,6 +23,7 @@ ARGS = PARSER.parse_args()
 ROOT = ARGS.run_dir
 SOURCE = ARGS.source
 SNAPSHOTS = ARGS.snapshots
+COMMIT_PROTOCOL = ARGS.commit_protocol
 EXPECTED_SOURCE_SHA = ARGS.source_sha256
 TARGET_TOKENS = ARGS.chunk_target_tokens
 ENC = tiktoken.get_encoding(ARGS.tokenizer)
@@ -44,6 +46,25 @@ if SOURCE.resolve() != (ROOT / 'source.jsonl').resolve():
     shutil.copy2(SOURCE, ROOT / 'source.jsonl')
 if SNAPSHOTS.resolve() != (ROOT / 'prewrite-snapshots.json').resolve():
     shutil.copy2(SNAPSHOTS, ROOT / 'prewrite-snapshots.json')
+protocol_target = ROOT / 'commit-protocol-pull.json'
+if COMMIT_PROTOCOL.resolve() != protocol_target.resolve():
+    shutil.copy2(COMMIT_PROTOCOL, protocol_target)
+protocol = json.loads(protocol_target.read_text())
+required_protocol_ids = [
+    'c72d552d-3499-445b-a8d5-05d0ff7824f2',
+    'd00ab6fd-b475-49ef-b37a-812807879308',
+    'da24ff95-9d07-4e15-9571-9313d6b90f94',
+    'af92e983-aa27-4dec-b628-2a4d0bbbd2b6',
+]
+if protocol.get('schema') != 'commit-rlm-protocol-pull/v1' or protocol.get('required_node_ids') != required_protocol_ids:
+    raise SystemExit('invalid SiftText Commit protocol packet')
+protocol_nodes = protocol.get('nodes', [])
+if [node.get('node_id') for node in protocol_nodes] != required_protocol_ids:
+    raise SystemExit('SiftText Commit protocol pull coverage mismatch')
+for node in protocol_nodes:
+    content = node.get('content', '')
+    if hashlib.sha256(content.encode()).hexdigest() != node.get('sha256'):
+        raise SystemExit(f"SiftText Commit protocol node hash mismatch: {node.get('node_id')}")
 
 raw = [json.loads(line) for line in SOURCE.read_text().splitlines()]
 line_order = {entry.get('id'): i for i, entry in enumerate(raw) if entry.get('id')}
@@ -233,6 +254,7 @@ if missing_effects:
 metadata = {
     'source': str(SOURCE), 'source_sha256': sha(SOURCE),
     'snapshots': str(SNAPSHOTS), 'snapshots_sha256': sha(SNAPSHOTS),
+    'commit_protocol': str(protocol_target), 'commit_protocol_sha256': sha(protocol_target),
     'message_count': len(messages), 'plain_bytes': len(plain.encode()), 'plain_tokens': tokens(plain),
     'evidence_calls': len(index), 'attention_cards': len(cards),
     'attention_card_tokens': tokens(inline_cards),
