@@ -3,22 +3,16 @@ import { Markdown } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rmdir, stat } from "node:fs/promises";
 import { connect } from "node:net";
+import { replaceAssistantText, runStreamingPi, textOf } from "./vega-rewriter-process.ts";
 
 const PROMPT_PATH = "/Users/jack/.pi/agent/vega-presenter.md";
 const PROVIDER_EXTENSION = "/Users/jack/.pi/agent/extensions/tunnel-llm-proxy.ts";
 const LOCAL_LOCK = "/tmp/vega-rewriter-local.lock";
+const NORMAL_TIMEOUT_MS = 30_000;
+const OPENROUTER_FIRST_TOKEN_MS = 15_000;
+const EMERGENCY_TIMEOUT_MS = 30_000;
 
-type Route = "local" | "openrouter";
-
-function textOf(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((block): block is { type: "text"; text: string } =>
-			typeof block === "object" && block !== null && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string")
-		.map((block) => block.text)
-		.join("");
-}
+type Route = "local" | "openrouter" | "luna";
 
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -59,7 +53,7 @@ async function acquireLocalLock(): Promise<boolean> {
 }
 
 async function healthIsFree(signal?: AbortSignal): Promise<boolean> {
-	const timeout = AbortSignal.timeout(2000);
+	const timeout = AbortSignal.timeout(2_000);
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	try {
 		const response = await fetch("http://127.0.0.1:8002/health", { signal: combined });
@@ -71,22 +65,37 @@ async function healthIsFree(signal?: AbortSignal): Promise<boolean> {
 	}
 }
 
+function routeArgs(route: Route, prompt: string, input: string): string[] {
+	const local = route === "local";
+	return [
+		"--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-tools",
+		"--thinking", "off", "--mode", "json",
+		...(local ? ["-e", PROVIDER_EXTENSION] : []),
+		"--provider", local ? "tunnel" : "openrouter",
+		"--model", route === "luna" ? "openai/gpt-5.6-luna" : route === "local" ? "glm-5.3-flash" : "z-ai/glm-5.3-flash",
+		"--system-prompt", prompt,
+		input,
+	];
+}
+
+async function invoke(route: Route, prompt: string, input: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+	return runStreamingPi("pi", routeArgs(route, prompt, input), {
+		cwd,
+		env: process.env,
+		timeoutMs,
+		firstTokenTimeoutMs: route === "openrouter" ? Math.min(OPENROUTER_FIRST_TOKEN_MS, timeoutMs) : undefined,
+		signal,
+	});
+}
+
 export default function vegaRewriter(pi: ExtensionAPI) {
 	let enabled = true;
 	let armed = false;
 	let tuiMode = false;
-	let queue = Promise.resolve();
 	let lifetime = new AbortController();
-	const live = new Set<string>();
-	const rewrites = new Map<string, string>();
-	const failed = new Set<string>();
-	const deliveries: Array<{ content: string; details: Record<string, unknown> }> = [];
 
-	pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) => {
-		if (!tuiMode || !enabled || messageType !== "assistant" || (!live.has(markdown) && !(armed && isStreaming))) return markdown;
-		if (failed.has(markdown)) return markdown;
-		return rewrites.get(markdown) ?? "";
-	});
+	pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) =>
+		tuiMode && enabled && armed && messageType === "assistant" && isStreaming ? "" : markdown);
 
 	pi.registerMessageRenderer("vega-rewrite", (message, { outputPad }) =>
 		new Markdown(String(message.content), outputPad, 0, getMarkdownTheme()));
@@ -105,11 +114,6 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 		armed = false;
 		tuiMode = ctx.mode === "tui";
 		lifetime = new AbortController();
-		live.clear();
-		rewrites.clear();
-		failed.clear();
-		deliveries.length = 0;
-
 		for (const entry of ctx.sessionManager.getEntries() as Array<any>) {
 			if (entry.type === "custom" && entry.customType === "vega-rewriter-state" && typeof entry.data?.enabled === "boolean") enabled = entry.data.enabled;
 		}
@@ -117,53 +121,41 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => lifetime.abort());
 
-	pi.on("agent_settled", () => {
-		if (!tuiMode) return;
-		for (const message of deliveries.splice(0)) {
-			pi.sendMessage({ customType: "vega-rewrite", display: false, ...message }, { deliverAs: "followUp", triggerTurn: false });
-		}
-	});
-
 	pi.on("message_end", async (event, ctx) => {
 		if (!tuiMode) return;
 		if (event.message.role === "user") {
 			armed = true;
 			return;
 		}
-		if (event.message.role !== "assistant" || !armed) return;
+		if (event.message.role !== "assistant" || !armed || !enabled) return;
 		const rawResponse = textOf(event.message.content);
 		if (!rawResponse.trim()) return;
-		const hasToolCall = event.message.content.some((block) => block.type === "toolCall");
-		// ponytail: sparse tool narrations stay raw; replace this threshold if substantive narrations are skipped.
-		if (hasToolCall && rawResponse.trim().split(/\s+/).length < 12) return;
 
-		live.add(rawResponse);
 		const operatorMessage = [...ctx.sessionManager.getBranch() as Array<any>]
 			.reverse()
 			.find((entry) => entry.type === "message" && entry.message?.role === "user");
 		const operatorText = operatorMessage ? textOf(operatorMessage.message.content) : "";
-		const turnSignal = ctx.signal;
-		queue = queue.then(() => runJob(ctx, operatorText, rawResponse, turnSignal)).catch(() => {});
-		await queue;
+		const signal = ctx.signal ? AbortSignal.any([ctx.signal, lifetime.signal]) : lifetime.signal;
+		const rewrite = await runJob(ctx, operatorText, rawResponse, signal);
+		if (!rewrite) return;
+		return { message: { ...event.message, content: replaceAssistantText(event.message.content, rewrite) } };
 	});
 
-	async function runJob(ctx: ExtensionContext, operatorMessage: string, rawResponse: string, turnSignal?: AbortSignal) {
+	async function runJob(ctx: ExtensionContext, operatorMessage: string, rawResponse: string, signal: AbortSignal): Promise<string | undefined> {
 		const started = Date.now();
-		const signal = turnSignal ? AbortSignal.any([turnSignal, lifetime.signal]) : lifetime.signal;
 		let route: Route = "openrouter";
-		let error = "";
+		let primaryError = "";
 		let lockHeld = false;
+		let promptSha256 = "";
 
 		try {
 			signal.throwIfAborted();
 			const prompt = await readFile(PROMPT_PATH, "utf8");
-			const promptSha256 = createHash("sha256").update(prompt).digest("hex");
+			promptSha256 = createHash("sha256").update(prompt).digest("hex");
 			const input = `SOURCE RULE: Rewrite only RAW AGENT RESPONSE. CURRENT OPERATOR MESSAGE controls selection but is never output material; do not quote, echo, or paraphrase it.\n\nCURRENT OPERATOR MESSAGE:\n${operatorMessage}\n\nRAW AGENT RESPONSE:\n${rawResponse}`;
-
-			if (process.env.VEGA_REWRITER_FORCE_FAIL === "1") throw new Error("forced failure (VEGA_REWRITER_FORCE_FAIL=1)");
+			const normalDeadline = started + NORMAL_TIMEOUT_MS;
 
 			lockHeld = await acquireLocalLock();
-
 			if (lockHeld && await tcpAvailable(signal) && await healthIsFree(signal)) route = "local";
 			if (lockHeld && route !== "local") {
 				await rmdir(LOCAL_LOCK).catch(() => {});
@@ -171,67 +163,48 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 			}
 
 			let rewrite: string;
-			if (route === "local") {
-				try {
-					rewrite = await invoke("local", prompt, input, signal);
-				} catch (localError) {
-					error = `local: ${errorText(localError)}`;
+			try {
+				const remaining = normalDeadline - Date.now();
+				if (remaining <= 0) throw new Error("normal rewrite deadline exceeded");
+				rewrite = await invoke(route, prompt, input, ctx.cwd, remaining, signal);
+			} catch (error) {
+				primaryError = errorText(error);
+				if (lockHeld) {
 					await rmdir(LOCAL_LOCK).catch(() => {});
 					lockHeld = false;
-					route = "openrouter";
-					rewrite = await invoke("openrouter", prompt, input, signal).catch((openrouterError) => {
-						throw new Error(`${error}; openrouter: ${errorText(openrouterError)}`);
-					});
 				}
-			} else {
-				rewrite = await invoke("openrouter", prompt, input, signal);
+				route = "luna";
+				rewrite = await invoke("luna", prompt, input, ctx.cwd, EMERGENCY_TIMEOUT_MS, signal);
 			}
 
 			if (operatorMessage.trim() && rewrite.includes(operatorMessage.trim())) {
 				throw new Error("unsafe rewrite rejected: output echoed operator message");
 			}
-			rewrites.set(rawResponse, rewrite);
-			deliveries.push({
-				content: rewrite,
-				details: {
-					operatorMessage,
-					rawResponse,
-					rewrite,
-					route,
-					model: route === "local" ? "glm-5.3-flash" : "z-ai/glm-5.3-flash",
-					durationMs: Date.now() - started,
-					promptSha256,
-					timestamp: new Date().toISOString(),
-				},
-			});
-		} catch (jobError) {
-			error = errorText(jobError);
-			failed.add(rawResponse);
-			pi.appendEntry("vega-rewrite-failed", {
-				rawText: rawResponse,
-				error,
+			pi.appendEntry("vega-rewrite", {
+				operatorMessage,
+				rawResponse,
+				rewrite,
 				route,
+				model: route === "local" ? "glm-5.3-flash" : route === "openrouter" ? "z-ai/glm-5.3-flash" : "openai/gpt-5.6-luna",
+				durationMs: Date.now() - started,
+				promptSha256,
+				primaryError,
 				timestamp: new Date().toISOString(),
 			});
+			return rewrite;
+		} catch (error) {
+			pi.appendEntry("vega-rewrite-failed", {
+				rawText: rawResponse,
+				error: errorText(error),
+				primaryError,
+				route,
+				durationMs: Date.now() - started,
+				promptSha256,
+				timestamp: new Date().toISOString(),
+			});
+			return undefined;
 		} finally {
 			if (lockHeld) await rmdir(LOCAL_LOCK).catch(() => {});
 		}
-	}
-
-	async function invoke(route: Route, prompt: string, input: string, signal: AbortSignal): Promise<string> {
-		const local = route === "local";
-		const args = [
-			"--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-tools",
-			"--thinking", "off", "-p",
-			...(local ? ["-e", PROVIDER_EXTENSION] : []),
-			"--provider", local ? "tunnel" : "openrouter",
-			"--model", local ? "glm-5.3-flash" : "z-ai/glm-5.3-flash",
-			"--system-prompt", prompt,
-			input,
-		];
-		const result = await pi.exec("pi", args, { signal, timeout: local ? 15_000 : 30_000 });
-		const output = result.stdout.trim();
-		if (result.code !== 0 || !output) throw new Error(result.stderr.trim() || `child exited ${result.code}`);
-		return output;
 	}
 }
