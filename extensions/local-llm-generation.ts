@@ -61,7 +61,7 @@ const PARTIAL_BLOCKS: Record<number, string> = {
 
 function buildBar(filled: number, total: number): string {
   const pct = total > 0 ? Math.min(filled / total, 1) : 0;
-  const eighths = Math.round(pct * BAR_WIDTH * 8);
+  const eighths = Math.floor(pct * BAR_WIDTH * 8);
   const full = Math.floor(eighths / 8);
   const rem = eighths % 8;
   const empty = BAR_WIDTH - full - (rem > 0 ? 1 : 0);
@@ -145,9 +145,7 @@ let barStart   = 0;     // when current motion segment began
 let apiSpeed   = 0;     // real API tok/s (what we display as speed)
 let dispSpeed  = 0;     // display speed: how fast barPos advances (tokens/s)
 
-let catchUpEnd    = 0;
-let catchUpTarget = 0;
-
+let gtProcessed = 0;
 let gtTotal   = 0;
 let gtEta: number | undefined;
 let gtCount: number | undefined;
@@ -156,23 +154,15 @@ let hasActivity = false;
 
 function reset() {
   barPos = 0; barStart = 0; apiSpeed = 0; dispSpeed = 0;
-  catchUpEnd = 0; catchUpTarget = 0;
-  gtTotal = 0; gtEta = undefined; gtCount = undefined;
+  gtProcessed = 0; gtTotal = 0; gtEta = undefined; gtCount = undefined;
   gtLastPollTime = 0; hasActivity = false;
 }
 
-function inCatchUp(now: number): boolean {
-  return catchUpEnd > 0 && now < catchUpEnd;
-}
-
 function getInterpolated(now: number): number {
-  if (inCatchUp(now)) {
-    const t = (now - barStart) / 100; // 0..1 over 100ms
-    return Math.min(catchUpTarget * t, gtTotal);
-  }
   if (dispSpeed <= 0) return barPos;
   const elapsed = (now - barStart) / 1000;
-  return Math.min(barPos + dispSpeed * elapsed, gtTotal);
+  const ceiling = gtProcessed < gtTotal ? gtTotal - 1 : gtTotal;
+  return Math.min(barPos + dispSpeed * elapsed, ceiling);
 }
 
 // ── Display Formatting ──────────────────────────────────────────────────────
@@ -184,7 +174,7 @@ function formatPrefill(data: ProgressData, interpolated: number): string {
   const clbl = (data.count != null && data.count > 1) ? ` (${data.count} PP)` : "";
   const eta = formatRemaining(data.eta ?? 0);
   const sp = speed ? `  (${speed})` : "";
-  return `Prefill${clbl} ${bar}  ${Math.round(clamped)}/${data.total} tokens${eta}${sp}`;
+  return `Prefill${clbl} ${bar}  ${Math.floor(clamped)}/${data.total} tokens${eta}${sp}`;
 }
 
 function formatDecode(data: ProgressData): string {
@@ -309,7 +299,7 @@ export default function (pi: ExtensionAPI) {
 
         if (pf.length > 0) {
           const totalProcessed = pf.reduce((s: number, p: any) => s + numeric(p.processed), 0);
-          const maxTotal = Math.max(...pf.map((p: any) => numeric(p.total)));
+          const total = pf.reduce((s: number, p: any) => s + numeric(p.total), 0);
           const first = pf[0];
           const firstSpeed = getItemSpeed(first);
 
@@ -320,26 +310,15 @@ export default function (pi: ExtensionAPI) {
             dispSpeed = 0;
           }
 
-          if (apiSpeed === 0 && firstSpeed > 0) {
-            apiSpeed = firstSpeed;
-            catchUpTarget = totalProcessed + apiSpeed * 0.1;
-            catchUpEnd = now + 100;
-            dispSpeed = catchUpTarget / 0.1;
-            barPos = 0;
-            barStart = now;
+          if (firstSpeed > 0) {
+            apiSpeed = apiSpeed === 0 ? firstSpeed : apiSpeed + (firstSpeed - apiSpeed) * 0.2;
           }
+          barPos = totalProcessed;
+          barStart = now;
+          dispSpeed = apiSpeed;
 
-          if (!inCatchUp(now) && apiSpeed > 0) {
-            const elapsed = (now - barStart) / 1000;
-            barPos = barPos + dispSpeed * elapsed;
-            barStart = now;
-
-            const target = firstSpeed || apiSpeed;
-            apiSpeed += (target - apiSpeed) * 0.2;
-            dispSpeed = apiSpeed;
-          }
-
-          gtTotal = maxTotal;
+          gtProcessed = totalProcessed;
+          gtTotal = total;
           gtEta = numeric(first.eta);
           gtCount = pf.length;
           gtLastPollTime = now;
