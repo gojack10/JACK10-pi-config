@@ -23,10 +23,20 @@ export function textOf(content: unknown): string {
 export class DisplayRewrites {
 	private rewrites = new Map<string, { blocks: string[]; rewrite: string }>();
 	private displays = new Map<string, string | null>();
+	private pending = new Set<string>();
 
 	clear(): void {
 		this.rewrites.clear();
 		this.displays.clear();
+		this.pending.clear();
+	}
+
+	setPending(content: unknown): void {
+		const blocks = this.blocks(content);
+		const key = JSON.stringify(blocks);
+		this.rewrites.set(key, { blocks, rewrite: "" });
+		this.pending.add(key);
+		this.rebuild();
 	}
 
 	set(content: unknown, rewrite: string): void {
@@ -35,9 +45,19 @@ export class DisplayRewrites {
 		this.rebuild();
 	}
 
+	finish(content: unknown): void {
+		this.pending.delete(JSON.stringify(this.blocks(content)));
+	}
+
 	delete(content: unknown): void {
-		this.rewrites.delete(JSON.stringify(this.blocks(content)));
+		const key = JSON.stringify(this.blocks(content));
+		this.rewrites.delete(key);
+		this.pending.delete(key);
 		this.rebuild();
+	}
+
+	isPending(markdown: string): boolean {
+		return [...this.pending].some((key) => this.rewrites.get(key)?.blocks.includes(markdown));
 	}
 
 	transform(markdown: string): string {
