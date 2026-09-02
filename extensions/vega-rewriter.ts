@@ -95,7 +95,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 	const rewrites = new DisplayRewrites();
 
 	pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) =>
-		tuiMode && enabled && messageType === "assistant" && !isStreaming ? rewrites.transform(markdown) : markdown);
+		tuiMode && enabled && messageType === "assistant" && (!isStreaming || rewrites.isPending(markdown)) ? rewrites.transform(markdown) : markdown);
 
 	pi.registerCommand("rewrite", {
 		description: "Toggle VEGA response rewriting for this session",
@@ -134,7 +134,14 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 			.find((entry) => entry.type === "message" && entry.message?.role === "user");
 		const operatorText = operatorMessage ? textOf(operatorMessage.message.content) : "";
 		const signal = ctx.signal ? AbortSignal.any([ctx.signal, lifetime.signal]) : lifetime.signal;
-		await runJob(ctx, operatorText, rawResponse, event.message.content, signal);
+		rewrites.setPending(event.message.content);
+		ctx.ui.setStatus("vega", "Translating...");
+		try {
+			await runJob(ctx, operatorText, rawResponse, event.message.content, signal);
+		} finally {
+			ctx.ui.setStatus("vega", undefined);
+			rewrites.finish(event.message.content);
+		}
 	});
 
 	async function runJob(ctx: ExtensionContext, operatorMessage: string, rawResponse: string, content: unknown, signal: AbortSignal): Promise<void> {
