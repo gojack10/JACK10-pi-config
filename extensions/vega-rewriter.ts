@@ -1,9 +1,8 @@
-import { getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Markdown } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rmdir, stat } from "node:fs/promises";
 import { connect } from "node:net";
-import { replaceAssistantText, runStreamingPi, textOf } from "./vega-rewriter-lib/vega-rewriter-process.ts";
+import { DisplayRewrites, runStreamingPi, textOf } from "./vega-rewriter-lib/vega-rewriter-process.ts";
 
 const PROMPT_PATH = "/Users/jack/.pi/agent/vega-presenter.md";
 const PROVIDER_EXTENSION = "/Users/jack/.pi/agent/extensions/tunnel-llm-proxy.ts";
@@ -93,12 +92,10 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 	let armed = false;
 	let tuiMode = false;
 	let lifetime = new AbortController();
+	const rewrites = new DisplayRewrites();
 
 	pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) =>
-		tuiMode && enabled && armed && messageType === "assistant" && isStreaming ? "" : markdown);
-
-	pi.registerMessageRenderer("vega-rewrite", (message, { outputPad }) =>
-		new Markdown(String(message.content), outputPad, 0, getMarkdownTheme()));
+		tuiMode && enabled && messageType === "assistant" && !isStreaming ? rewrites.transform(markdown) : markdown);
 
 	pi.registerCommand("rewrite", {
 		description: "Toggle VEGA response rewriting for this session",
@@ -114,6 +111,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 		armed = false;
 		tuiMode = ctx.mode === "tui";
 		lifetime = new AbortController();
+		rewrites.clear();
 		for (const entry of ctx.sessionManager.getEntries() as Array<any>) {
 			if (entry.type === "custom" && entry.customType === "vega-rewriter-state" && typeof entry.data?.enabled === "boolean") enabled = entry.data.enabled;
 		}
@@ -136,12 +134,10 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 			.find((entry) => entry.type === "message" && entry.message?.role === "user");
 		const operatorText = operatorMessage ? textOf(operatorMessage.message.content) : "";
 		const signal = ctx.signal ? AbortSignal.any([ctx.signal, lifetime.signal]) : lifetime.signal;
-		const rewrite = await runJob(ctx, operatorText, rawResponse, signal);
-		if (!rewrite) return;
-		return { message: { ...event.message, content: replaceAssistantText(event.message.content, rewrite) } };
+		await runJob(ctx, operatorText, rawResponse, event.message.content, signal);
 	});
 
-	async function runJob(ctx: ExtensionContext, operatorMessage: string, rawResponse: string, signal: AbortSignal): Promise<string | undefined> {
+	async function runJob(ctx: ExtensionContext, operatorMessage: string, rawResponse: string, content: unknown, signal: AbortSignal): Promise<void> {
 		const started = Date.now();
 		let route: Route = "openrouter";
 		let primaryError = "";
@@ -162,24 +158,33 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 				lockHeld = false;
 			}
 
-			let rewrite: string;
-			try {
-				const remaining = normalDeadline - Date.now();
-				if (remaining <= 0) throw new Error("normal rewrite deadline exceeded");
-				rewrite = await invoke(route, prompt, input, ctx.cwd, remaining, signal);
-			} catch (error) {
-				primaryError = errorText(error);
-				if (lockHeld) {
-					await rmdir(LOCAL_LOCK).catch(() => {});
-					lockHeld = false;
+			let rewrite: string | undefined;
+			for (const candidate of route === "local" ? ["local", "openrouter"] as const : ["openrouter"] as const) {
+				route = candidate;
+				try {
+					const remaining = normalDeadline - Date.now();
+					if (remaining <= 0) throw new Error("normal rewrite deadline exceeded");
+					rewrite = await invoke(route, prompt, input, ctx.cwd, remaining, signal);
+					break;
+				} catch (error) {
+					primaryError += `${primaryError ? "; " : ""}${route}: ${errorText(error)}`;
+					if (lockHeld) {
+						await rmdir(LOCAL_LOCK).catch(() => {});
+						lockHeld = false;
+					}
 				}
+			}
+			if (!rewrite) {
 				route = "luna";
-				rewrite = await invoke("luna", prompt, input, ctx.cwd, EMERGENCY_TIMEOUT_MS, signal);
+				const remaining = normalDeadline - Date.now();
+				if (remaining <= 0) throw new Error(`${primaryError}; normal rewrite deadline exceeded`);
+				rewrite = await invoke("luna", prompt, input, ctx.cwd, Math.min(EMERGENCY_TIMEOUT_MS, remaining), signal);
 			}
 
 			if (operatorMessage.trim() && rewrite.includes(operatorMessage.trim())) {
 				throw new Error("unsafe rewrite rejected: output echoed operator message");
 			}
+			rewrites.set(content, rewrite);
 			pi.appendEntry("vega-rewrite", {
 				operatorMessage,
 				rawResponse,
@@ -191,8 +196,8 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 				primaryError,
 				timestamp: new Date().toISOString(),
 			});
-			return rewrite;
 		} catch (error) {
+			rewrites.delete(content);
 			pi.appendEntry("vega-rewrite-failed", {
 				rawText: rawResponse,
 				error: errorText(error),
@@ -202,7 +207,6 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 				promptSha256,
 				timestamp: new Date().toISOString(),
 			});
-			return undefined;
 		} finally {
 			if (lockHeld) await rmdir(LOCAL_LOCK).catch(() => {});
 		}

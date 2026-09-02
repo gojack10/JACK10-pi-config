@@ -20,14 +20,45 @@ export function textOf(content: unknown): string {
 		.join("");
 }
 
-export function replaceAssistantText(content: Array<any>, rewrite: string): Array<any> {
-	let replaced = false;
-	return content.flatMap((block) => {
-		if (block.type !== "text") return [block];
-		if (replaced) return [];
-		replaced = true;
-		return [{ ...block, text: rewrite }];
-	});
+export class DisplayRewrites {
+	private rewrites = new Map<string, { blocks: string[]; rewrite: string }>();
+	private displays = new Map<string, string | null>();
+
+	clear(): void {
+		this.rewrites.clear();
+		this.displays.clear();
+	}
+
+	set(content: unknown, rewrite: string): void {
+		const blocks = this.blocks(content);
+		this.rewrites.set(JSON.stringify(blocks), { blocks, rewrite });
+		this.rebuild();
+	}
+
+	delete(content: unknown): void {
+		this.rewrites.delete(JSON.stringify(this.blocks(content)));
+		this.rebuild();
+	}
+
+	transform(markdown: string): string {
+		// ponytail: block-only transformer context cannot disambiguate duplicate narration; keep collisions raw until Pi exposes message IDs.
+		return this.displays.has(markdown) ? this.displays.get(markdown) ?? markdown : markdown;
+	}
+
+	private blocks(content: unknown): string[] {
+		return Array.isArray(content)
+			? content.filter((block): block is { type: "text"; text: string } => block?.type === "text" && typeof block.text === "string").map((block) => block.text.trim())
+			: [String(content).trim()];
+	}
+
+	private rebuild(): void {
+		this.displays.clear();
+		for (const value of this.rewrites.values()) value.blocks.forEach((block, index) => {
+			const display = index === 0 ? value.rewrite : "";
+			const current = this.displays.get(block);
+			this.displays.set(block, current === undefined || current === display ? display : null);
+		});
+	}
 }
 
 export function runStreamingPi(command: string, args: string[], options: StreamOptions): Promise<string> {
