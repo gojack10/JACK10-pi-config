@@ -21,6 +21,10 @@ const MODELS_JSON = `${process.env.HOME}/.pi/agent/models.json`;
 const POLL_MS = 250;
 const ANIM_MS = 33;
 const BAR_WIDTH = 20;
+const STOPPING_STATUS = "local-llm-stopping";
+const STOPPING_MESSAGE = "Stopping - finishing current chunk...";
+const STOPPING_APPEAR_MS = 2_000;
+const STOPPING_MAX_MS = 60_000;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -129,6 +133,11 @@ function findBestMatch(loaded: LoadedModel[], ids: string[]): LoadedModel | null
   return null;
 }
 
+function hasStoppingActivity(loaded: LoadedModel[]): boolean {
+  return loaded.some((m) => [...(m.prefilling || []), ...(m.generating || [])]
+    .some((activity) => activity?.stopping === true));
+}
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 let barPos     = 0;     // current bar position (tokens)
@@ -190,11 +199,14 @@ function formatDecode(data: ProgressData): string {
 export default function (pi: ExtensionAPI) {
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let animTimer: ReturnType<typeof setInterval> | null = null;
+  let stoppingTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionToken: {} | null = null;
+  let abortedToken: {} | null = null;
 
   function stopTimers() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (animTimer) { clearInterval(animTimer); animTimer = null; }
+    if (stoppingTimer) { clearTimeout(stoppingTimer); stoppingTimer = null; }
     reset();
   }
 
@@ -209,13 +221,55 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("agent_start", async (_event, ctx: ExtensionContext) => {
+    sessionToken = null;
+    abortedToken = null;
     stopTimers();
-    const myToken = {};
-    sessionToken = myToken;
+    ctx.ui.setStatus(STOPPING_STATUS, undefined);
     ctx.ui.setWorkingMessage(undefined);
 
     const monitor = loadMonitorConfig(ctx);
     if (!monitor) return;
+
+    const myToken = {};
+    sessionToken = myToken;
+    let stoppingSeen = false;
+    let stoppingWaitUntil = 0;
+    let stoppingDeadline = 0;
+
+    const showStopping = () => {
+      ctx.ui.setWorkingMessage(STOPPING_MESSAGE);
+      ctx.ui.setStatus(STOPPING_STATUS, STOPPING_MESSAGE);
+    };
+    const clearStopping = () => {
+      if (sessionToken !== myToken) return;
+      abortedToken = null;
+      stopTimers();
+      ctx.ui.setWorkingMessage(undefined);
+      ctx.ui.setStatus(STOPPING_STATUS, undefined);
+    };
+    const updateStopping = (models: LoadedModel[]) => {
+      if (abortedToken !== myToken) return false;
+      const now = Date.now();
+      const present = hasStoppingActivity(models);
+      if (present) stoppingSeen = true;
+      if (now < stoppingDeadline && (present || (!stoppingSeen && now < stoppingWaitUntil))) {
+        showStopping();
+      } else {
+        clearStopping();
+      }
+      return true;
+    };
+    const onAbort = () => {
+      if (sessionToken !== myToken) return;
+      abortedToken = myToken;
+      stoppingWaitUntil = Date.now() + STOPPING_APPEAR_MS;
+      stoppingDeadline = Date.now() + STOPPING_MAX_MS;
+      if (animTimer) { clearInterval(animTimer); animTimer = null; }
+      stoppingTimer = setTimeout(clearStopping, STOPPING_MAX_MS);
+      showStopping();
+    };
+    if (ctx.signal?.aborted) onAbort();
+    else ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
     let cookieValue: string | null = null;
     if (monitor.loginUrl && monitor.apiKey) {
@@ -228,6 +282,7 @@ export default function (pi: ExtensionAPI) {
         if (r.ok) cookieValue = r.headers.get("Set-Cookie") || null;
       } catch { /* login is optional for proxy/llama.cpp-backed local servers */ }
     }
+    if (sessionToken !== myToken) return;
 
     const authHeaders = cookieValue ? { Cookie: cookieValue } : {};
 
@@ -235,7 +290,9 @@ export default function (pi: ExtensionAPI) {
       if (sessionToken !== myToken) return;
       try {
         const stats = await fetchJSON(monitor.statsUrl, authHeaders);
+        if (sessionToken !== myToken) return;
         const models: LoadedModel[] = stats?.active_models?.models || [];
+        if (updateStopping(models)) return;
         if (!models.length) { ctx.ui.setWorkingMessage(undefined); reset(); return; }
 
         const model = findBestMatch(models, monitor.modelIds);
@@ -301,7 +358,9 @@ export default function (pi: ExtensionAPI) {
             tokens: totalTokens, tok_s: avg, count: gen.length,
           }));
         }
-      } catch { /* stats fetch failed */ }
+      } catch {
+        if (abortedToken === myToken && Date.now() >= stoppingDeadline) clearStopping();
+      }
     }, POLL_MS);
 
     animTimer = setInterval(() => {
@@ -325,12 +384,22 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    if (abortedToken === sessionToken) {
+      if (animTimer) { clearInterval(animTimer); animTimer = null; }
+      ctx.ui.setWorkingMessage(STOPPING_MESSAGE);
+      return;
+    }
+    sessionToken = null;
     stopTimers();
     ctx.ui.setWorkingMessage(undefined);
+    ctx.ui.setStatus(STOPPING_STATUS, undefined);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    sessionToken = null;
+    abortedToken = null;
     stopTimers();
     ctx.ui.setWorkingMessage(undefined);
+    ctx.ui.setStatus(STOPPING_STATUS, undefined);
   });
 }
