@@ -22,7 +22,7 @@ const POLL_MS = 250;
 const ANIM_MS = 33;
 const BAR_WIDTH = 20;
 const STOPPING_STATUS = "local-llm-stopping";
-const STOPPING_MESSAGE = "Stopping - finishing current chunk...";
+const STOPPING_MESSAGE = "Local LLM stopping...";
 const STOPPING_APPEAR_MS = 2_000;
 const STOPPING_MAX_MS = 60_000;
 
