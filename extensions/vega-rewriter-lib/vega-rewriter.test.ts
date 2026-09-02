@@ -12,6 +12,7 @@ const env = process.env;
 function harness() {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const entries: Array<{ type: string; data: any }> = [];
+	const statuses = new Map<string, string | undefined>();
 	let transformer: (markdown: string, context: any) => string = (markdown) => markdown;
 	vegaRewriter({
 		on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler),
@@ -23,8 +24,9 @@ function harness() {
 	const ctx = {
 		mode: "tui", cwd: "/tmp", signal: new AbortController().signal,
 		sessionManager: { getEntries: () => [], getBranch: () => [user] },
+		ui: { setStatus: (key: string, text: string | undefined) => statuses.set(key, text) },
 	};
-	return { ctx, entries, handlers, transformer, user };
+	return { ctx, entries, handlers, statuses, transformer, user };
 }
 
 async function arm(value: ReturnType<typeof harness>) {
@@ -32,7 +34,7 @@ async function arm(value: ReturnType<typeof harness>) {
 	await value.handlers.get("message_end")?.(value.user, value.ctx);
 }
 
-test("keeps assistant content canonical and rewrites finalized text blocks only", async () => {
+test("hides pending assistant text, then displays its rewrite without changing content", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "vega-rewriter-"));
 	const executable = join(dir, "pi");
 	const oldPath = env.PATH;
@@ -48,9 +50,19 @@ test("keeps assistant content canonical and rewrites finalized text blocks only"
 			{ type: "text", text: "after" },
 		];
 		const original = structuredClone(content);
-		const result = await value.handlers.get("message_end")?.({ message: { role: "assistant", content } }, value.ctx);
-		assert.equal(result, undefined);
+		assert.equal(value.transformer("before", { messageType: "assistant", isStreaming: true }), "before");
+		const result = value.handlers.get("message_end")?.({ message: { role: "assistant", content } }, value.ctx);
+		assert.deepEqual(content.map((block) => block.type === "text"
+			? { ...block, text: value.transformer(block.text, { messageType: "assistant", isStreaming: true }) }
+			: block), [
+			{ type: "text", text: "" },
+			original[1],
+			{ type: "text", text: "" },
+		]);
+		assert.equal(value.statuses.get("vega"), "Translating...");
+		assert.equal(await result, undefined);
 		assert.deepEqual(content, original);
+		assert.equal(value.statuses.get("vega"), undefined);
 		assert.equal(value.transformer("before", { messageType: "assistant", isStreaming: true }), "before");
 		assert.deepEqual(content.map((block) => block.type === "text"
 			? { ...block, text: value.transformer(block.text, { messageType: "assistant", isStreaming: false }) }
@@ -82,6 +94,7 @@ test("failed rewrites leave finalized display raw", async () => {
 	const result = await value.handlers.get("message_end")?.({ message: { role: "assistant", content: [{ type: "text", text: "raw" }] } }, value.ctx);
 	assert.equal(result, undefined);
 	assert.equal(value.transformer("raw", { messageType: "assistant", isStreaming: false }), "raw");
+	assert.equal(value.statuses.get("vega"), undefined);
 	assert.equal(value.entries.at(-1)?.type, "vega-rewrite-failed");
 });
 
