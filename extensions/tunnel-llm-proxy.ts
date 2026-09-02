@@ -6,6 +6,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { streamSimple as baseStreamSimple } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
@@ -113,7 +114,22 @@ async function proxyModels(): Promise<Model<Api>[]> {
 	return fallbackModels();
 }
 
+export function requestHeaders() {
+	return {
+		"X-Pi-Request-Id": randomUUID(),
+		"X-Pi-Origin": process.env.PI_REQUEST_ORIGIN || "user",
+	};
+}
+
 export default async function tunnelProxy(pi: ExtensionAPI) {
+	pi.registerProvider("local", {
+		api: "openai-completions",
+		streamSimple: (model, context, options) => baseStreamSimple(
+			{ ...model, api: "openai-completions" as const },
+			context,
+			{ ...options, headers: { ...options?.headers, ...requestHeaders() } },
+		),
+	});
 	pi.registerProvider(PROVIDER, {
 		name: "tunnel tunnel",
 		baseUrl: BASE_URL,
@@ -123,6 +139,7 @@ export default async function tunnelProxy(pi: ExtensionAPI) {
 		streamSimple: (model, context, options) => {
 			return baseStreamSimple({ ...model, api: "openai-completions" as Api }, context, {
 				...options,
+				headers: { ...options?.headers, ...requestHeaders() },
 				maxTokens: Math.min(options?.maxTokens ?? model.maxTokens ?? 8192, model.maxTokens ?? 8192),
 			});
 		},

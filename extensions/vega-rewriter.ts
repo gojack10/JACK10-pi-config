@@ -80,7 +80,7 @@ function routeArgs(route: Route, prompt: string, input: string): string[] {
 async function invoke(route: Route, prompt: string, input: string, cwd: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
 	return runStreamingPi("pi", routeArgs(route, prompt, input), {
 		cwd,
-		env: process.env,
+		env: { ...process.env, PI_REQUEST_ORIGIN: "vega-rewriter" },
 		timeoutMs,
 		firstTokenTimeoutMs: route === "openrouter" ? Math.min(OPENROUTER_FIRST_TOKEN_MS, timeoutMs) : undefined,
 		signal,

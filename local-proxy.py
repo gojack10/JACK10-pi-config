@@ -910,6 +910,10 @@ async def handle_chat(request):
             "Authorization": request.headers.get("Authorization", AUTH_HEADERS["Authorization"]),
             "Content-Type": "application/json",
         }
+        for name in ("X-Pi-Request-Id", "X-Pi-Origin"):
+            if value := request.headers.get(name):
+                headers[name] = value
+        log.debug("request provenance id=%s origin=%s", headers.get("X-Pi-Request-Id"), headers.get("X-Pi-Origin"))
 
         async with ClientSession(timeout=CHAT_TIMEOUT) as sess:
             async with sess.post(f"{backend}/chat/completions", data=body, headers=headers) as resp:
