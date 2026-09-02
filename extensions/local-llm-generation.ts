@@ -36,6 +36,7 @@ interface ProgressData {
   tok_s: number;
   eta?: number;
   count?: number;
+  origin?: string;
 }
 
 interface LoadedModel {
@@ -149,12 +150,13 @@ let gtProcessed = 0;
 let gtTotal   = 0;
 let gtEta: number | undefined;
 let gtCount: number | undefined;
+let gtOrigin: string | undefined;
 let gtLastPollTime = 0;
 let hasActivity = false;
 
 function reset() {
   barPos = 0; barStart = 0; apiSpeed = 0; dispSpeed = 0;
-  gtProcessed = 0; gtTotal = 0; gtEta = undefined; gtCount = undefined;
+  gtProcessed = 0; gtTotal = 0; gtEta = undefined; gtCount = undefined; gtOrigin = undefined;
   gtLastPollTime = 0; hasActivity = false;
 }
 
@@ -167,21 +169,26 @@ function getInterpolated(now: number): number {
 
 // ── Display Formatting ──────────────────────────────────────────────────────
 
-function formatPrefill(data: ProgressData, interpolated: number): string {
+export function originLabel(origin?: string): string {
+  const value = typeof origin === "string" ? origin.trim() : "";
+  return !value || value.toLowerCase() === "user" ? "" : ` (${value.toUpperCase()})`;
+}
+
+export function formatPrefill(data: ProgressData, interpolated: number): string {
   const clamped = Math.min(Math.max(interpolated, 0), data.total);
   const bar = buildBar(clamped, data.total);
   const speed = formatTokS(data.tok_s);
   const clbl = (data.count != null && data.count > 1) ? ` (${data.count} PP)` : "";
   const eta = formatRemaining(data.eta ?? 0);
   const sp = speed ? `  (${speed})` : "";
-  return `Prefill${clbl} ${bar}  ${Math.floor(clamped)}/${data.total} tokens${eta}${sp}`;
+  return `Prefill${originLabel(data.origin)}${clbl} ${bar}  ${Math.floor(clamped)}/${data.total} tokens${eta}${sp}`;
 }
 
-function formatDecode(data: ProgressData): string {
+export function formatDecode(data: ProgressData): string {
   const speed = formatTokS(data.tok_s);
   const clbl = (data.count != null && data.count > 1) ? ` (${data.count})` : "";
   const sp = speed ? `  (${speed})` : "";
-  return `Generating${clbl} - ${data.tokens} tokens${sp}`;
+  return `Generating${originLabel(data.origin)}${clbl} - ${data.tokens} tokens${sp}`;
 }
 
 // ── Extension ───────────────────────────────────────────────────────────────
@@ -298,12 +305,21 @@ export default function (pi: ExtensionAPI) {
         const now = nowMs();
 
         if (pf.length > 0) {
+          if (pf.length > 1) {
+            gtCount = pf.length;
+            gtLastPollTime = 0;
+            ctx.ui.setWorkingMessage(pf.map((p: any) => formatPrefill({
+              phase: "prefill", processed: numeric(p.processed), total: numeric(p.total),
+              tokens: 0, tok_s: getItemSpeed(p), eta: numeric(p.eta), origin: p.origin,
+            }, numeric(p.processed))).join(" | "));
+            return;
+          }
           const totalProcessed = pf.reduce((s: number, p: any) => s + numeric(p.processed), 0);
           const total = pf.reduce((s: number, p: any) => s + numeric(p.total), 0);
           const first = pf[0];
           const firstSpeed = getItemSpeed(first);
 
-          if (!wasActivity) {
+          if (!wasActivity || (gtCount != null && gtCount > 1)) {
             barPos = 0;
             barStart = now;
             apiSpeed = 0;
@@ -321,21 +337,14 @@ export default function (pi: ExtensionAPI) {
           gtTotal = total;
           gtEta = numeric(first.eta);
           gtCount = pf.length;
+          gtOrigin = first.origin;
           gtLastPollTime = now;
         } else if (gen.length > 0) {
           reset();
-          const totalTokens = gen.reduce((s: number, g: any) => s + numeric(g.generated_tokens ?? g.tokens), 0);
-          let wSpeed = 0, wTime = 0;
-          for (const g of gen) {
-            const e = numeric(g.elapsed_seconds) || 1;
-            wSpeed += getItemSpeed(g) * e;
-            wTime += e;
-          }
-          const avg = wTime > 0 ? wSpeed / wTime : 0;
-          ctx.ui.setWorkingMessage(formatDecode({
+          ctx.ui.setWorkingMessage(gen.map((g: any) => formatDecode({
             phase: "decode", processed: 0, total: 0,
-            tokens: totalTokens, tok_s: avg, count: gen.length,
-          }));
+            tokens: numeric(g.generated_tokens ?? g.tokens), tok_s: getItemSpeed(g), origin: g.origin,
+          })).join(" | "));
         }
       } catch {
         if (abortedToken === myToken && Date.now() >= stoppingDeadline) clearStopping();
@@ -358,6 +367,7 @@ export default function (pi: ExtensionAPI) {
         tok_s: apiSpeed,
         eta: gtEta,
         count: gtCount,
+        origin: gtOrigin,
       }, interpolated));
     }, ANIM_MS);
   });
