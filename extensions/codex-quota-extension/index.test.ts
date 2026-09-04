@@ -46,10 +46,11 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 		},
 		events: { emit: (name: string, data: unknown) => name === "codex-usage:update" && updates.push(data) },
 	};
+	const notifications: string[] = [];
 	const ctx = {
-		hasUI: false,
+		hasUI: true,
 		model: { provider: "openai-codex-alt", id: "gpt-5.6-sol" },
-		ui: { notify() {} },
+		ui: { notify(message: string) { notifications.push(message); } },
 	};
 	activate(pi as never);
 	await handlers.get("session_start")?.({}, ctx);
@@ -83,6 +84,15 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 	assert.equal(state.accounts[0].windows[0].pctUsed, 46);
 	assert.match(updates.at(-1).degraded, /quota headers are missing/);
 
+	await handlers.get("after_provider_response")?.({ status: 401, headers: {} }, ctx);
+	notifications.length = 0;
+	await handlers.get("session_start")?.({}, ctx);
+	assert.match(
+		notifications[0]!,
+		/Codex reauth required for Alt.*PI_CODEX_ACCOUNT_MAINTENANCE=openai-codex-alt.*\/login openai-codex-alt/,
+	);
+
+	state = JSON.parse(await readFile(join(agentDir, "codex-usage-state.json"), "utf8"));
 	state.generation++;
 	state.generatedAt++;
 	state.accounts[0].windows[0].pctUsed = 12;
