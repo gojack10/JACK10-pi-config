@@ -150,6 +150,13 @@ test("selector blocks when quota pools are split across accounts", () => {
 	assert.equal(result.candidates.length, 0);
 });
 
+test("routes Pro accounts with a weekly-only quota", () => {
+	const pro = telemetry(alt, [{ minutes: 10080, pctUsed: 3, resetIn: 4 * 24 * 3600 }], { plan: "prolite" });
+	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(pro), model, now });
+	assert.equal(result.allBlocked, false);
+	assert.equal(result.candidates[0]?.accountKey, alt.accountKey);
+});
+
 test("429 remains blocked until a valid sample and reports recovery", () => {
 	const blocked = perishable(20);
 	blocked.status429 = true;

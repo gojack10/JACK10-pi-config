@@ -265,7 +265,8 @@ export const evaluateQuotaAccount = (
 		);
 	}
 	if (account.windows.length === 0) reasons.push("CAPACITY UNKNOWN");
-	if (!account.windows.some((window) => window.minutes === 300)) reasons.push("5H WINDOW MISSING");
+	if (!account.plan.toLowerCase().startsWith("pro") && !account.windows.some((window) => window.minutes === 300))
+		reasons.push("5H WINDOW MISSING");
 	if (!account.windows.some((window) => window.minutes === 10080)) reasons.push("WEEKLY WINDOW MISSING");
 	const effectiveWindows: CodexWindow[] = [];
 	for (const window of account.windows) {
