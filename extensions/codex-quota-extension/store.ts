@@ -292,7 +292,7 @@ export const evaluateQuotaAccount = (
 			continue;
 		}
 		const boundary = horizon === undefined ? window.resetAt : Math.min(horizon, window.resetAt);
-		const safe = aged && slope == null ? true : projectedExhaustAt != null ? projectedExhaustAt >= boundary : pctUsed < 90;
+		const safe = aged && slope == null ? true : projectedExhaustAt == null || projectedExhaustAt >= boundary;
 		if (!safe) {
 			reasons.push(`UNSAFE WINDOW ${window.minutes}m`);
 			recoveryGates.push(window.resetAt);

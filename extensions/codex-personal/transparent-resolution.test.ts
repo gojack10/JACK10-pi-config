@@ -11,6 +11,7 @@ const umbrella = model("openai-codex-personal");
 const personal = model("openai-codex");
 const sifttext = model("openai-codex-sifttext");
 const team = model("openai-codex-team");
+const direct = model("openai");
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1,
 	umbrellaProviderId: umbrella.provider,
@@ -48,7 +49,7 @@ const context = (
 ): ModelResolutionContext => ({
 	previousModel,
 	getModel: (provider, id) =>
-		[personal, sifttext, team].find(
+		[personal, sifttext, team, direct].find(
 			(entry) => entry.provider === provider && entry.id === id,
 		),
 	hasAuth: async (provider) => authenticated.includes(provider),
@@ -125,6 +126,25 @@ test("transparent selection refuses an all-blocked route with recovery", async (
 		}),
 		/Earliest recovery: 2030-01-01/,
 	);
+});
+
+test("all-blocked startup can fall back to the same direct model", async () => {
+	const resolved = await resolveCodexPersonalSelection({
+		model: umbrella,
+		registry,
+		work: { workClass: "unpredictable" },
+		evaluate: () => ({
+			allBlocked: true,
+			accounts: [],
+			candidates: [],
+			feedSource: "state",
+			error: "ERROR: unavailable",
+		}),
+		context: context([direct.provider]),
+		fallbackProviderId: direct.provider,
+	});
+	assert.equal(resolved.model, direct);
+	assert.equal(resolved.warning, "ERROR: unavailable");
 });
 
 test("runtime failover excludes the pinned account and skips unauthenticated candidates", async () => {
