@@ -104,6 +104,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	let pin: RoutePin | undefined;
 	let pendingPin: RoutePin | undefined;
 	let sessionStarted = false;
+	let startupFallbackWarning: string | undefined;
 	const failedAccounts = new Set<string>();
 	const failoverAttempts = new Set<string>();
 	for (const account of registry.accounts) {
@@ -214,7 +215,9 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				excludedAccountKeys: failedAccounts,
 				consideredAccountKeys: failedAccounts.size ? failoverAttempts : undefined,
 				reevaluatePin: !!pin && failedAccounts.has(pin.accountKey),
+				fallbackProviderId: sessionStarted ? undefined : "openai",
 			});
+			startupFallbackWarning = resolved.warning;
 			if (resolved.pin) {
 				if (sessionStarted) {
 					pin = resolved.pin;
@@ -232,6 +235,9 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		sessionStarted = true;
+		if (startupFallbackWarning && ctx.hasUI)
+			ctx.ui.notify(`Codex accounts unavailable; using ${ctx.model?.provider}/${ctx.model?.id}`, "warning");
+		startupFallbackWarning = undefined;
 		const branch = ctx.sessionManager.getBranch();
 		pin = routeEntry(branch);
 		const envRoute = parseRoute(process.env[ROUTE_ENV]);

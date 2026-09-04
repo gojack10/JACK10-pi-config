@@ -75,7 +75,8 @@ export async function resolveCodexPersonalSelection(options: {
 	excludedAccountKeys?: ReadonlySet<string>;
 	consideredAccountKeys?: Set<string>;
 	reevaluatePin?: boolean;
-}): Promise<{ model: Model; pin?: RoutePin }> {
+	fallbackProviderId?: string;
+}): Promise<{ model: Model; pin?: RoutePin; warning?: string }> {
 	const { model, previousModel, registry, context, pin } = options;
 	const pinnedAccount = options.reevaluatePin
 		? undefined
@@ -95,7 +96,17 @@ export async function resolveCodexPersonalSelection(options: {
 	}
 
 	const evaluation = options.evaluate();
-	if (evaluation.allBlocked) throw new Error(evaluation.error);
+	if (evaluation.allBlocked) {
+		const fallback = options.fallbackProviderId
+			? context.getModel(options.fallbackProviderId, model.id)
+			: undefined;
+		if (fallback && (await context.hasAuth(fallback.provider)))
+			return {
+				model: fallback,
+				...(evaluation.error ? { warning: evaluation.error } : {}),
+			};
+		throw new Error(evaluation.error);
+	}
 	for (const candidate of evaluation.candidates) {
 		if (options.excludedAccountKeys?.has(candidate.accountKey) || options.consideredAccountKeys?.has(candidate.accountKey))
 			continue;
