@@ -8,9 +8,12 @@ const isCodex = (provider: unknown): provider is string =>
 
 type CaptureContext = {
 	hasUI: boolean;
-	model?: { id?: string };
+	model?: { id?: string; provider?: string };
 	ui: { notify(message: string, level: "error"): void };
 };
+
+const needsReauth = (errors: string[]): boolean =>
+	errors.some((error) => /\b401\b|unauthorized|authentication token is expired/i.test(error));
 
 export default function (pi: ExtensionAPI) {
 	const store = new CodexUsageStore();
@@ -68,7 +71,14 @@ export default function (pi: ExtensionAPI) {
 			watchFile(store.path, { persistent: false, interval: 250 }, watcher);
 		}
 		return enqueue(ctx, provider, async () => {
-			await store.load();
+			const state = await store.load();
+			if (provider && ctx.hasUI) {
+				for (const account of state.accounts.filter((entry) => needsReauth(entry.parseErrors)))
+					ctx.ui.notify(
+						`Codex reauth required for ${account.label}: restart with env PI_CODEX_ACCOUNT_MAINTENANCE=${account.id} pi, then run /login ${account.id}`,
+						"error",
+					);
+			}
 			if (provider) store.setCurrent(provider);
 			await store.write();
 			await publish(ctx);
