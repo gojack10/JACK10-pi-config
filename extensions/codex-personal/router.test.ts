@@ -96,7 +96,7 @@ test("short work burns perishable capacity while long work preserves it", () => 
 	assert.equal(long.candidates[0]?.accountKey, personal.accountKey);
 });
 
-test("known safe projection may route above the conservative 90 percent fallback", () => {
+test("known safe projection may route above 90 percent", () => {
 	const projected = telemetry(alt, [
 		{ minutes: 300, pctUsed: 95, resetIn: 7200, projectedIn: 8000 },
 		{ minutes: 10080, pctUsed: 30, resetIn: 4 * 24 * 3600 },
@@ -105,6 +105,14 @@ test("known safe projection may route above the conservative 90 percent fallback
 	assert.equal(result.allBlocked, false);
 	projected.windows[0]!.projectedExhaustAt = nowSeconds + 100;
 	assert.equal(evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(projected), model, now }).allBlocked, true);
+});
+
+test("uses reported quota through 99 percent when no projection exists", () => {
+	const almostExhausted = stable(99, 99);
+	const options = { registry: { ...registry, accounts: [personal] }, feed: feed(almostExhausted), model, now };
+	assert.equal(evaluateCodexRoute(options).allBlocked, false);
+	almostExhausted.windows[0]!.pctUsed = 100;
+	assert.equal(evaluateCodexRoute(options).allBlocked, true);
 });
 
 test("all exhausted short windows fail closed with earliest recovery", () => {
