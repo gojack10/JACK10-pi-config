@@ -11,11 +11,28 @@ function authHeader(): string {
   catch { return ""; }
 }
 
-function textOf(message: any): string {
-  const content = message?.content;
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content)) return "";
-  return content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("").trim();
+function lastAssistantText(messages: readonly any[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const content = messages[index]?.role === "assistant" ? messages[index].content : undefined;
+    const text = typeof content === "string"
+      ? content.trim()
+      : Array.isArray(content)
+        ? content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("").trim()
+        : "";
+    if (text) return text;
+  }
+  return "";
+}
+
+function preferredAssistantText(messages: readonly any[], entries: readonly any[]): string {
+  const original = lastAssistantText(messages);
+  for (const entry of [...entries].reverse()) {
+    if (entry?.type !== "custom" || entry.customType !== "vega-rewrite") continue;
+    const raw = typeof entry.data?.rawResponse === "string" ? entry.data.rawResponse.trim() : "";
+    const rewrite = typeof entry.data?.rewrite === "string" ? entry.data.rewrite.trim() : "";
+    if (rewrite && (original === raw || original === rewrite)) return rewrite;
+  }
+  return original;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -46,9 +63,9 @@ export default function (pi: ExtensionAPI) {
     } catch { /* retry next tick */ }
   }
 
-  pi.on("message_end", (event) => {
-    if (!token || event.message.role !== "assistant") return;
-    const text = textOf(event.message);
+  pi.on("agent_end", (event, ctx) => {
+    if (!token) return;
+    const text = preferredAssistantText(event.messages, ctx.sessionManager.getBranch());
     if (!text) return;
     void fetch(`${BASE_URL}/inject`, {
       method: "POST",
