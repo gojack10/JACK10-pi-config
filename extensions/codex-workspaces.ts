@@ -20,7 +20,6 @@ const REGISTRY_PATH = join(AGENT_DIR, "codex-accounts.json");
 const FEED_PATH = join(AGENT_DIR, "codex-usage-state.json");
 const AUTH_OBSERVABILITY_PATH = join(AGENT_DIR, "codex-workspace-auth-observability.jsonl");
 const ROUTE_ENV = "PI_CODEX_PERSONAL_ROUTE";
-const SOL_MODEL = /(^|-)sol($|-)/;
 
 type SelectorProvider = Provider & {
 	selectable?: boolean;
@@ -98,6 +97,7 @@ function validatePin(pin: RoutePin, account: RegistryAccount, umbrella: string):
 
 export default function codexWorkspaces(pi: ExtensionAPI) {
 	const registry = parseRegistry(JSON.parse(readFileSync(REGISTRY_PATH, "utf8")) as unknown);
+	const supportedModels = new Set(registry.accounts.flatMap((account) => account.supportedModels));
 	const source = builtinProviders().find((provider) => provider.id === "openai-codex");
 	const oauth = source?.auth.oauth;
 	if (!source || !oauth) throw new Error("Built-in Codex provider has no OAuth flow");
@@ -161,7 +161,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
 				)
 					throw new Error("ROUTE DENIED: Codex account has no matching session pin");
-				return source.stream(model, context, options);
+				return source.stream(model, context, { ...options, transport: "sse" });
 			},
 			streamSimple: (model, context, options) => {
 				if (
@@ -169,7 +169,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
 				)
 					throw new Error("ROUTE DENIED: Codex account has no matching session pin");
-				return source.streamSimple(model, context, options);
+				return source.streamSimple(model, context, { ...options, transport: "sse" });
 			},
 		} as Provider);
 	}
@@ -198,7 +198,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 		getModels: () =>
 			source
 				.getModels()
-				.filter((model) => SOL_MODEL.test(model.id))
+				.filter((model) => supportedModels.has(model.id))
 				.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
 		modelSelectionError: selectionError,
 		resolveModel: async (model, context) => {
