@@ -332,7 +332,7 @@ const poolStatus = (
 	for (const { account, evaluation } of accounts) {
 		const observed = account.windows.find((window) => window.minutes === minutes);
 		if (observed && observed.resetAt * 1000 <= now) verifying = true;
-		const window = evaluation.effectiveWindows.find((candidate) => candidate.minutes === minutes);
+		const window = observed?.resetAt && observed.resetAt * 1000 > now ? observed : undefined;
 		if (!window) continue;
 		if (evaluation.routable) {
 			remaining += 100 - window.pctUsed;

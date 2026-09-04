@@ -165,7 +165,7 @@ test("quota status zeros complementary exhausted capacity", () => {
 	assert.equal(status.recoveryAt, 2000);
 });
 
-test("quota status verifies expired windows and degrades aged capacity", () => {
+test("quota status verifies expired windows and labels aged observed capacity", () => {
 	const expired = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
 	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
 	const expiredStatus = quotaStatus(state([expired]), 1_000_000);
@@ -176,8 +176,8 @@ test("quota status verifies expired windows and degrades aged capacity", () => {
 
 	const aged = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
 	const agedStatus = quotaStatus(state([aged]), 1_000_000 + 15 * 60_000 + 1);
-	assert.equal(agedStatus.h5, 10);
-	assert.equal(agedStatus.week, 10);
+	assert.equal(agedStatus.h5, 80);
+	assert.equal(agedStatus.week, 24);
 	assert.equal(agedStatus.routable, true);
 	assert.equal(agedStatus.stale, false);
 	assert.equal(agedStatus.aged, true);
