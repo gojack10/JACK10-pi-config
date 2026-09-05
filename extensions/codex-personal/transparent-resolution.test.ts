@@ -8,6 +8,7 @@ import type { RouteEvaluation } from "./router.ts";
 const model = (provider: string, id = "gpt-5.6-sol") =>
 	({ provider, id }) as Model;
 const umbrella = model("openai-codex-personal");
+const gpt56Ids = ["gpt-5.6-luna", umbrella.id, "gpt-5.6-terra"];
 const astraUmbrella = model(umbrella.provider, "gpt-6-astra");
 const personal = model("openai-codex");
 const sifttext = model("openai-codex-sifttext");
@@ -24,7 +25,7 @@ const registry: CodexAccountRegistry = {
 			credentialRef: personal.provider,
 			label: "Personal",
 			policyClass: "stable-weekly",
-			supportedModels: [umbrella.id],
+			supportedModels: gpt56Ids,
 		},
 		{
 			accountKey: "sifttext",
@@ -32,7 +33,7 @@ const registry: CodexAccountRegistry = {
 			credentialRef: sifttext.provider,
 			label: "SiftText",
 			policyClass: "perishable",
-			supportedModels: [umbrella.id, astraUmbrella.id],
+			supportedModels: [...gpt56Ids, astraUmbrella.id],
 		},
 		{
 			accountKey: "team",
@@ -40,7 +41,7 @@ const registry: CodexAccountRegistry = {
 			credentialRef: team.provider,
 			label: "Team",
 			policyClass: "stable-weekly",
-			supportedModels: [umbrella.id],
+			supportedModels: gpt56Ids,
 		},
 	],
 };
@@ -53,7 +54,9 @@ const context = (
 	getModel: (provider, id) =>
 		[personal, sifttext, astraSifttext, team, direct].find(
 			(entry) => entry.provider === provider && entry.id === id,
-		),
+		) ?? (gpt56Ids.includes(id) && registry.accounts.some((account) => account.providerId === provider)
+			? model(provider, id)
+			: undefined),
 	hasAuth: async (provider) => authenticated.includes(provider),
 });
 
@@ -144,25 +147,40 @@ test("switching models reroutes an incompatible pin to a compatible account", as
 	assert.equal(resolved.pin?.model, astraUmbrella.id);
 });
 
-test("switching to Sol leaves an Astra-capable pin when another account is available", async () => {
-	const resolved = await resolveCodexPersonalSelection({
-		model: umbrella,
-		pin: {
-			umbrella: umbrella.provider,
-			accountKey: "sifttext",
-			model: astraUmbrella.id,
-			actualProviderId: sifttext.provider,
-			feedGeneration: 7,
-			routedAt: 1,
-			workClass: "unpredictable",
-		},
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: routable,
-		context: context([personal.provider, sifttext.provider]),
-	});
-	assert.equal(resolved.model, personal);
-	assert.equal(resolved.pin?.accountKey, "personal");
+test("switching to any GPT-5.6 model leaves an Astra-capable pin when another account is available", async () => {
+	for (const id of gpt56Ids) {
+		const resolved = await resolveCodexPersonalSelection({
+			model: model(umbrella.provider, id),
+			pin: {
+				umbrella: umbrella.provider,
+				accountKey: "sifttext",
+				model: astraUmbrella.id,
+				actualProviderId: sifttext.provider,
+				feedGeneration: 7,
+				routedAt: 1,
+				workClass: "unpredictable",
+			},
+			registry,
+			work: { workClass: "unpredictable" },
+			evaluate: () => ({
+				allBlocked: false,
+				accounts: [],
+				feedSource: "state",
+				candidates: [{
+					accountKey: "personal",
+					actualProviderId: personal.provider,
+					model: id,
+					reason: "preserve Astra",
+					warnings: [],
+					feedGeneration: 7,
+				}],
+			}),
+			context: context([personal.provider, sifttext.provider]),
+		});
+		assert.equal(resolved.model.provider, personal.provider);
+		assert.equal(resolved.model.id, id);
+		assert.equal(resolved.pin?.accountKey, "personal");
+	}
 });
 
 test("missing model support produces an obvious error", async () => {
