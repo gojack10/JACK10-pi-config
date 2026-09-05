@@ -78,6 +78,9 @@ export async function resolveCodexPersonalSelection(options: {
 	fallbackProviderId?: string;
 }): Promise<{ model: Model; pin?: RoutePin; warning?: string }> {
 	const { model, previousModel, registry, context, pin } = options;
+	const compatibleAccounts = registry.accounts.filter((account) => account.supportedModels.includes(model.id));
+	if (compatibleAccounts.length === 0)
+		throw new Error(`MODEL UNAVAILABLE: no Codex Personal account supports ${model.id}`);
 	const pinnedAccount = options.reevaluatePin
 		? undefined
 		: pin
@@ -85,9 +88,11 @@ export async function resolveCodexPersonalSelection(options: {
 			: registry.accounts.find(
 					(account) => account.providerId === previousModel?.provider,
 				);
-	if (pinnedAccount) {
+	if (pin && pinnedAccount) validatePin(pin, pinnedAccount, registry.umbrellaProviderId);
+	const shouldPreserveAstra =
+		!!pin && model.id === "gpt-5.6-sol" && !!pinnedAccount?.supportedModels.includes("gpt-6-astra");
+	if (pinnedAccount?.supportedModels.includes(model.id) && !shouldPreserveAstra) {
 		const pinned = pin ? { ...pin, model: model.id } : undefined;
-		if (pinned) validatePin(pinned, pinnedAccount, registry.umbrellaProviderId);
 		const target = context.getModel(pinnedAccount.providerId, model.id);
 		if (!target) throw new Error(`Pinned account does not support ${model.id}`);
 		if (!(await context.hasAuth(pinnedAccount.credentialRef)))
@@ -105,7 +110,7 @@ export async function resolveCodexPersonalSelection(options: {
 				model: fallback,
 				...(evaluation.error ? { warning: evaluation.error } : {}),
 			};
-		throw new Error(evaluation.error);
+		throw new Error(`MODEL UNAVAILABLE: no Codex Personal account supporting ${model.id} is currently routable.${evaluation.error ? `\n${evaluation.error}` : ""}`);
 	}
 	for (const candidate of evaluation.candidates) {
 		if (options.excludedAccountKeys?.has(candidate.accountKey) || options.consideredAccountKeys?.has(candidate.accountKey))
@@ -136,6 +141,6 @@ export async function resolveCodexPersonalSelection(options: {
 	}
 	const excluded = [...(options.excludedAccountKeys ?? [])];
 	throw new Error(
-		`ERROR: ${registry.umbrellaProviderId}/${model.id} unavailable — eligible accounts exhausted or credentials unavailable.${excluded.length ? ` Excluded after usage limit: ${excluded.join(", ")}.` : ""}`,
+		`MODEL UNAVAILABLE: ${registry.umbrellaProviderId}/${model.id} has no routable compatible account with usable credentials.${excluded.length ? ` Excluded after usage limit: ${excluded.join(", ")}.` : ""}`,
 	);
 }

@@ -8,8 +8,10 @@ import type { RouteEvaluation } from "./router.ts";
 const model = (provider: string, id = "gpt-5.6-sol") =>
 	({ provider, id }) as Model;
 const umbrella = model("openai-codex-personal");
+const astraUmbrella = model(umbrella.provider, "gpt-6-astra");
 const personal = model("openai-codex");
 const sifttext = model("openai-codex-sifttext");
+const astraSifttext = model(sifttext.provider, astraUmbrella.id);
 const team = model("openai-codex-team");
 const direct = model("openai");
 const registry: CodexAccountRegistry = {
@@ -30,7 +32,7 @@ const registry: CodexAccountRegistry = {
 			credentialRef: sifttext.provider,
 			label: "SiftText",
 			policyClass: "perishable",
-			supportedModels: [umbrella.id],
+			supportedModels: [umbrella.id, astraUmbrella.id],
 		},
 		{
 			accountKey: "team",
@@ -49,7 +51,7 @@ const context = (
 ): ModelResolutionContext => ({
 	previousModel,
 	getModel: (provider, id) =>
-		[personal, sifttext, team, direct].find(
+		[personal, sifttext, astraSifttext, team, direct].find(
 			(entry) => entry.provider === provider && entry.id === id,
 		),
 	hasAuth: async (provider) => authenticated.includes(provider),
@@ -106,6 +108,74 @@ test("transparent selection substitutes the first authenticated routed account",
 		routedAt: resolved.pin.routedAt,
 		workClass: "unpredictable",
 	});
+});
+
+test("switching models reroutes an incompatible pin to a compatible account", async () => {
+	const resolved = await resolveCodexPersonalSelection({
+		model: astraUmbrella,
+		pin: {
+			umbrella: umbrella.provider,
+			accountKey: "personal",
+			model: umbrella.id,
+			actualProviderId: personal.provider,
+			feedGeneration: 7,
+			routedAt: 1,
+			workClass: "unpredictable",
+		},
+		registry,
+		work: { workClass: "unpredictable" },
+		evaluate: () => ({
+			allBlocked: false,
+			accounts: [],
+			feedSource: "state",
+			candidates: [{
+				accountKey: "sifttext",
+				actualProviderId: sifttext.provider,
+				model: astraUmbrella.id,
+				reason: "Astra compatible",
+				warnings: [],
+				feedGeneration: 8,
+			}],
+		}),
+		context: context([sifttext.provider]),
+	});
+	assert.equal(resolved.model, astraSifttext);
+	assert.equal(resolved.pin?.accountKey, "sifttext");
+	assert.equal(resolved.pin?.model, astraUmbrella.id);
+});
+
+test("switching to Sol leaves an Astra-capable pin when another account is available", async () => {
+	const resolved = await resolveCodexPersonalSelection({
+		model: umbrella,
+		pin: {
+			umbrella: umbrella.provider,
+			accountKey: "sifttext",
+			model: astraUmbrella.id,
+			actualProviderId: sifttext.provider,
+			feedGeneration: 7,
+			routedAt: 1,
+			workClass: "unpredictable",
+		},
+		registry,
+		work: { workClass: "unpredictable" },
+		evaluate: routable,
+		context: context([personal.provider, sifttext.provider]),
+	});
+	assert.equal(resolved.model, personal);
+	assert.equal(resolved.pin?.accountKey, "personal");
+});
+
+test("missing model support produces an obvious error", async () => {
+	await assert.rejects(
+		resolveCodexPersonalSelection({
+			model: model(umbrella.provider, "gpt-9-missing"),
+			registry,
+			work: { workClass: "unpredictable" },
+			evaluate: routable,
+			context: context([]),
+		}),
+		/MODEL UNAVAILABLE: no Codex Personal account supports gpt-9-missing/,
+	);
 });
 
 test("transparent selection refuses an all-blocked route with recovery", async () => {
@@ -225,7 +295,7 @@ test("failover exhaustion considers each remaining candidate once", async () => 
 			consideredAccountKeys: considered,
 			reevaluatePin: true,
 		}),
-		/eligible accounts exhausted or credentials unavailable.*personal/,
+		/no routable compatible account with usable credentials.*personal/,
 	);
 	assert.deepEqual(authChecks, [sifttext.provider, team.provider]);
 	assert.deepEqual([...considered], ["personal", "sifttext", "team"]);
