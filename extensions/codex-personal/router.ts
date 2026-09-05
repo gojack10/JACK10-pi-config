@@ -116,7 +116,10 @@ const formatBlockedError = (
 					.map(({ account, reasons }) => `${account.label}(${account.accountKey}): ${reasons.join(", ") || "eligible"}`)
 					.join("; ")
 			: "registry unavailable";
-	return `ERROR: openai-codex-personal/${model} unavailable — no routable Codex account.\nEarliest recovery: ${earliestRecovery} / earliest notBefore: ${notBeforeText}.\nFeed: ${feedPath}; ${feedSummary}.\nAccounts: ${accountText}.`;
+	const headline = accounts.some(({ account }) => account.supportedModels.includes(model))
+		? `MODEL UNAVAILABLE: openai-codex-personal/${model} — no routable Codex account supports this model.`
+		: `MODEL UNAVAILABLE: openai-codex-personal/${model} — no configured Codex account supports this model.`;
+	return `${headline}\nEarliest recovery: ${earliestRecovery} / earliest notBefore: ${notBeforeText}.\nFeed: ${feedPath}; ${feedSummary}.\nAccounts: ${accountText}.`;
 };
 
 const rank = (
@@ -167,6 +170,11 @@ const rank = (
 				.sort((a, b) => b.bottleneckRemaining - a.bottleneckRemaining || b.earliestReset - a.earliestReset || lexical(a, b)),
 		];
 	}
+	if (model === "gpt-5.6-sol")
+		ordered = [
+			...ordered.filter((entry) => !entry.account.supportedModels.includes("gpt-6-astra")),
+			...ordered.filter((entry) => entry.account.supportedModels.includes("gpt-6-astra")),
+		];
 	return ordered.map((entry) => {
 		const stableCount = ranked.filter((candidate) => candidate.account.policyClass === "stable-weekly").length;
 		const warning =
