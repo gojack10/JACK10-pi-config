@@ -170,7 +170,7 @@ const rank = (
 				.sort((a, b) => b.bottleneckRemaining - a.bottleneckRemaining || b.earliestReset - a.earliestReset || lexical(a, b)),
 		];
 	}
-	if (model === "gpt-5.6-sol")
+	if (model.startsWith("gpt-5.6-"))
 		ordered = [
 			...ordered.filter((entry) => !entry.account.supportedModels.includes("gpt-6-astra")),
 			...ordered.filter((entry) => entry.account.supportedModels.includes("gpt-6-astra")),
@@ -228,11 +228,7 @@ export const evaluateCodexRoute = (options: {
 				degradations,
 				effectiveWindows: [],
 			};
-		if (
-			telemetry.id !== account.providerId ||
-			telemetry.policyClass !== account.policyClass ||
-			!telemetry.supportedModels.includes(model)
-		)
+		if (telemetry.id !== account.providerId || telemetry.policyClass !== account.policyClass)
 			reasons.push("REGISTRY/FEED MISMATCH");
 		const quota = evaluateQuotaAccount(telemetry, now, horizon);
 		reasons.push(...quota.reasons);

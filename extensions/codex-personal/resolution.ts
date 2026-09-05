@@ -90,7 +90,7 @@ export async function resolveCodexPersonalSelection(options: {
 				);
 	if (pin && pinnedAccount) validatePin(pin, pinnedAccount, registry.umbrellaProviderId);
 	const shouldPreserveAstra =
-		!!pin && model.id === "gpt-5.6-sol" && !!pinnedAccount?.supportedModels.includes("gpt-6-astra");
+		!!pin && model.id.startsWith("gpt-5.6-") && !!pinnedAccount?.supportedModels.includes("gpt-6-astra");
 	if (pinnedAccount?.supportedModels.includes(model.id) && !shouldPreserveAstra) {
 		const pinned = pin ? { ...pin, model: model.id } : undefined;
 		const target = context.getModel(pinnedAccount.providerId, model.id);

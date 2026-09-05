@@ -14,13 +14,14 @@ import { evaluateCodexRoute, evaluateCodexRouteFromFiles, parseWorkInput } from 
 const now = 2_000_000_000_000;
 const nowSeconds = now / 1000;
 const model = "gpt-5.6-sol";
+const gpt56Models = ["gpt-5.6-luna", model, "gpt-5.6-terra"];
 const personal: RegistryAccount = {
 	accountKey: "personal-key",
 	providerId: "openai-codex",
 	credentialRef: "openai-codex",
 	label: "Personal",
 	policyClass: "stable-weekly",
-	supportedModels: [model],
+	supportedModels: gpt56Models,
 };
 const alt: RegistryAccount = {
 	accountKey: "alt-key",
@@ -28,7 +29,7 @@ const alt: RegistryAccount = {
 	credentialRef: "openai-codex-alt",
 	label: "Alt",
 	policyClass: "perishable",
-	supportedModels: [model],
+	supportedModels: gpt56Models,
 };
 const astra: RegistryAccount = {
 	accountKey: "astra-key",
@@ -36,7 +37,7 @@ const astra: RegistryAccount = {
 	credentialRef: "openai-codex-astra",
 	label: "Astra",
 	policyClass: "perishable",
-	supportedModels: [model, "gpt-6-astra"],
+	supportedModels: [...gpt56Models, "gpt-6-astra"],
 };
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1,
@@ -104,24 +105,38 @@ test("short work burns perishable capacity while long work preserves it", () => 
 	assert.equal(long.candidates[0]?.accountKey, personal.accountKey);
 });
 
-test("Sol preserves Astra capacity until every Sol-only account is blocked", () => {
+test("GPT-5.6 models preserve Astra capacity until every other account is blocked", () => {
 	const astraUsage = telemetry(astra, [{ minutes: 10080, pctUsed: 5, resetIn: 6 * 24 * 3600 }], { plan: "prolite" });
-	const available = evaluateCodexRoute({
-		registry: { ...registry, accounts: [...registry.accounts, astra] },
-		feed: feed(stable(), perishable(), astraUsage),
-		model,
-		work: parseWorkInput("short"),
-		now,
-	});
-	assert.deepEqual(available.candidates.map((candidate) => candidate.accountKey), [alt.accountKey, personal.accountKey, astra.accountKey]);
+	for (const routedModel of gpt56Models) {
+		const available = evaluateCodexRoute({
+			registry: { ...registry, accounts: [...registry.accounts, astra] },
+			feed: feed(stable(), perishable(), astraUsage),
+			model: routedModel,
+			work: parseWorkInput("short"),
+			now,
+		});
+		assert.deepEqual(available.candidates.map((candidate) => candidate.accountKey), [alt.accountKey, personal.accountKey, astra.accountKey]);
 
-	const lastDitch = evaluateCodexRoute({
-		registry: { ...registry, accounts: [...registry.accounts, astra] },
-		feed: feed(stable(100, 20), perishable(100), astraUsage),
-		model,
+		const lastDitch = evaluateCodexRoute({
+			registry: { ...registry, accounts: [...registry.accounts, astra] },
+			feed: feed(stable(100, 20), perishable(100), astraUsage),
+			model: routedModel,
+			now,
+		});
+		assert.deepEqual(lastDitch.candidates.map((candidate) => candidate.accountKey), [astra.accountKey]);
+	}
+});
+
+test("registry model additions do not wait for quota telemetry refresh", () => {
+	const legacyTelemetry = perishable();
+	legacyTelemetry.supportedModels = [model];
+	const result = evaluateCodexRoute({
+		registry: { ...registry, accounts: [alt] },
+		feed: feed(legacyTelemetry),
+		model: "gpt-5.6-luna",
 		now,
 	});
-	assert.deepEqual(lastDitch.candidates.map((candidate) => candidate.accountKey), [astra.accountKey]);
+	assert.equal(result.candidates[0]?.accountKey, alt.accountKey);
 });
 
 test("unsupported models name the missing compatible account", () => {
