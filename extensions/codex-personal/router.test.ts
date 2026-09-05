@@ -30,6 +30,14 @@ const alt: RegistryAccount = {
 	policyClass: "perishable",
 	supportedModels: [model],
 };
+const astra: RegistryAccount = {
+	accountKey: "astra-key",
+	providerId: "openai-codex-astra",
+	credentialRef: "openai-codex-astra",
+	label: "Astra",
+	policyClass: "perishable",
+	supportedModels: [model, "gpt-6-astra"],
+};
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1,
 	umbrellaProviderId: "openai-codex-personal",
@@ -94,6 +102,32 @@ test("short work burns perishable capacity while long work preserves it", () => 
 	assert.equal(short.candidates[0]?.accountKey, alt.accountKey);
 	const long = evaluateCodexRoute({ registry, feed: feed(stable(), perishable()), model, work: parseWorkInput("long"), now });
 	assert.equal(long.candidates[0]?.accountKey, personal.accountKey);
+});
+
+test("Sol preserves Astra capacity until every Sol-only account is blocked", () => {
+	const astraUsage = telemetry(astra, [{ minutes: 10080, pctUsed: 5, resetIn: 6 * 24 * 3600 }], { plan: "prolite" });
+	const available = evaluateCodexRoute({
+		registry: { ...registry, accounts: [...registry.accounts, astra] },
+		feed: feed(stable(), perishable(), astraUsage),
+		model,
+		work: parseWorkInput("short"),
+		now,
+	});
+	assert.deepEqual(available.candidates.map((candidate) => candidate.accountKey), [alt.accountKey, personal.accountKey, astra.accountKey]);
+
+	const lastDitch = evaluateCodexRoute({
+		registry: { ...registry, accounts: [...registry.accounts, astra] },
+		feed: feed(stable(100, 20), perishable(100), astraUsage),
+		model,
+		now,
+	});
+	assert.deepEqual(lastDitch.candidates.map((candidate) => candidate.accountKey), [astra.accountKey]);
+});
+
+test("unsupported models name the missing compatible account", () => {
+	const result = evaluateCodexRoute({ registry, feed: feed(stable(), perishable()), model: "gpt-9-missing", now });
+	assert.equal(result.allBlocked, true);
+	assert.match(result.error!, /MODEL UNAVAILABLE:.*no configured Codex account supports this model/);
 });
 
 test("known safe projection may route above 90 percent", () => {
