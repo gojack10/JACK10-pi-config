@@ -6,12 +6,11 @@ import { DisplayRewrites, runStreamingPi, textOf } from "./vega-rewriter-lib/veg
 
 const PROMPT_PATH = "/Users/jack/.pi/agent/vega-presenter.md";
 const PROVIDER_EXTENSION = "/Users/jack/.pi/agent/extensions/tunnel-llm-proxy.ts";
+const CODEX_EXTENSION = "/Users/jack/.pi/agent/extensions/codex-workspaces.ts";
 const LOCAL_LOCK = "/tmp/vega-rewriter-local.lock";
 const NORMAL_TIMEOUT_MS = 30_000;
-const OPENROUTER_FIRST_TOKEN_MS = 15_000;
-const EMERGENCY_TIMEOUT_MS = 30_000;
 
-type Route = "local" | "openrouter" | "luna";
+type Route = "local" | "luna";
 
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -69,9 +68,9 @@ function routeArgs(route: Route, prompt: string, input: string): string[] {
 	return [
 		"--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-tools",
 		"--thinking", "off", "--mode", "json",
-		...(local ? ["-e", PROVIDER_EXTENSION] : []),
-		"--provider", local ? "tunnel" : "openrouter",
-		"--model", route === "luna" ? "openai/gpt-5.6-luna" : route === "local" ? "glm-5.3-flash" : "z-ai/glm-5.3-flash",
+		"-e", local ? PROVIDER_EXTENSION : CODEX_EXTENSION,
+		"--provider", local ? "tunnel" : "openai-codex-personal",
+		"--model", local ? "glm-5.3-flash" : "gpt-5.6-luna",
 		"--system-prompt", prompt,
 		input,
 	];
@@ -82,7 +81,6 @@ async function invoke(route: Route, prompt: string, input: string, cwd: string, 
 		cwd,
 		env: { ...process.env, PI_REQUEST_ORIGIN: "vega-rewriter" },
 		timeoutMs,
-		firstTokenTimeoutMs: route === "openrouter" ? Math.min(OPENROUTER_FIRST_TOKEN_MS, timeoutMs) : undefined,
 		signal,
 	});
 }
@@ -146,7 +144,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 
 	async function runJob(ctx: ExtensionContext, operatorMessage: string, rawResponse: string, content: unknown, signal: AbortSignal): Promise<void> {
 		const started = Date.now();
-		let route: Route = "openrouter";
+		let route: Route = "luna";
 		let primaryError = "";
 		let lockHeld = false;
 		let promptSha256 = "";
@@ -166,7 +164,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 			}
 
 			let rewrite: string | undefined;
-			for (const candidate of route === "local" ? ["local", "openrouter"] as const : ["openrouter"] as const) {
+			for (const candidate of route === "local" ? ["local", "luna"] as const : ["luna"] as const) {
 				route = candidate;
 				try {
 					const remaining = normalDeadline - Date.now();
@@ -181,12 +179,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 					}
 				}
 			}
-			if (!rewrite) {
-				route = "luna";
-				const remaining = normalDeadline - Date.now();
-				if (remaining <= 0) throw new Error(`${primaryError}; normal rewrite deadline exceeded`);
-				rewrite = await invoke("luna", prompt, input, ctx.cwd, Math.min(EMERGENCY_TIMEOUT_MS, remaining), signal);
-			}
+			if (!rewrite) throw new Error(`${primaryError}; normal rewrite deadline exceeded`);
 
 			if (operatorMessage.trim() && rewrite.includes(operatorMessage.trim())) {
 				throw new Error("unsafe rewrite rejected: output echoed operator message");
@@ -197,7 +190,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 				rawResponse,
 				rewrite,
 				route,
-				model: route === "local" ? "glm-5.3-flash" : route === "openrouter" ? "z-ai/glm-5.3-flash" : "openai/gpt-5.6-luna",
+				model: route === "local" ? "glm-5.3-flash" : "gpt-5.6-luna",
 				durationMs: Date.now() - started,
 				promptSha256,
 				primaryError,
