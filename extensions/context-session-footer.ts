@@ -8,8 +8,8 @@ import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
 	type CodexUsageState,
-	quotaStatus,
-	type QuotaStatus,
+	quotaBuckets,
+	type QuotaBucketRow,
 } from "./codex-quota-extension/store.ts";
 import {
 	getCacheTimerColor,
@@ -206,12 +206,12 @@ const formatCacheTimerValue = formatFooterDuration;
 
 const appendQuotaLines = (
 	state: FooterLineState,
-	status: QuotaStatus | undefined,
+	rows: QuotaBucketRow[] | undefined,
 	width: number,
 	theme: Theme,
 ): void => {
 	flushFooterLine(state, width);
-	state.lines.push(...renderQuotaLines(status, width, theme, Date.now(), visibleWidth, fitToWidth));
+	state.lines.push(...renderQuotaLines(rows, width, theme, Date.now(), visibleWidth, fitToWidth));
 };
 
 function usageTokens(
@@ -291,7 +291,6 @@ export default function (pi: ExtensionAPI) {
 	registerTrafficCommand(pi, { changed: () => requestRender?.() });
 	let cacheTimers: CacheStatusRow[] = [];
 	let quotaState: CodexUsageState | undefined;
-	let quotaAccountCount: number | undefined;
 	pi.events.on("cache-status:update", (data) => {
 		if (Array.isArray(data)) cacheTimers = data as CacheStatusRow[];
 		requestRender?.();
@@ -301,12 +300,6 @@ export default function (pi: ExtensionAPI) {
 		const update = data as CodexUsageState | { state?: CodexUsageState; registeredAccounts?: number };
 		const state = "accounts" in update ? update : update.state;
 		if (state) quotaState = state;
-		if (
-			!("accounts" in update) &&
-			typeof update.registeredAccounts === "number" &&
-			Number.isInteger(update.registeredAccounts)
-		)
-			quotaAccountCount = update.registeredAccounts;
 		requestRender?.();
 	});
 
@@ -361,7 +354,7 @@ export default function (pi: ExtensionAPI) {
 
 					const dim = theme.fg.bind(theme, "dim");
 					const lineState: FooterLineState = { lines: [], currentLine: "" };
-					const quota = quotaStatus(quotaState, Date.now(), quotaAccountCount, ctx.model?.id);
+					const quota = quotaBuckets(quotaState, Date.now());
 
 					appendPipeSegment(lineState, `CWD: ${cwdPrompt}`, width, dim);
 					appendPipeSegment(

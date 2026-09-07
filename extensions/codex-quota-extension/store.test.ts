@@ -9,6 +9,7 @@ import {
 	CodexUsageStore,
 	normalizeObservation,
 	parseRegistry,
+	quotaBuckets,
 	quotaStatus,
 	resetNotes,
 	type RegistryAccount,
@@ -288,4 +289,164 @@ test("writes state atomically with mode 0600", async (t) => {
 	assert.equal(blocked.currentAccountKey, alt.accountKey);
 	assert.equal(blocked.accounts[0].notBefore, 2000);
 	assert.deepEqual((await readdir(directory)).sort(), ["state.json"]);
+});
+
+test("buckets quota by plan with live per-window denominators", () => {
+	const eduPlus = normalizeObservation(
+		alt,
+		200,
+		{
+			"X-Codex-Plan-Type": "edu_plus",
+			"X-Codex-Primary-Used-Percent": "37",
+			"X-Codex-Primary-Window-Minutes": "300",
+			"X-Codex-Primary-Reset-At": "2000",
+			"X-Codex-Secondary-Used-Percent": "88",
+			"X-Codex-Secondary-Window-Minutes": "10080",
+			"X-Codex-Secondary-Reset-At": "7000",
+		},
+		undefined,
+		1_000_000,
+	);
+	const plusAcc = normalizeObservation(
+		team,
+		200,
+		{
+			"X-Codex-Plan-Type": "plus",
+			"X-Codex-Primary-Used-Percent": "100",
+			"X-Codex-Primary-Window-Minutes": "300",
+			"X-Codex-Primary-Reset-At": "2600",
+			"X-Codex-Secondary-Used-Percent": "23",
+			"X-Codex-Secondary-Window-Minutes": "10080",
+			"X-Codex-Secondary-Reset-At": "9000",
+		},
+		undefined,
+		1_000_000,
+	);
+	const proAcc = normalizeObservation(
+		{ ...team, policyClass: "perishable" },
+		200,
+		{
+			"X-Codex-Plan-Type": "pro",
+			"X-Codex-Secondary-Used-Percent": "76",
+			"X-Codex-Secondary-Window-Minutes": "10080",
+			"X-Codex-Secondary-Reset-At": "7100",
+		},
+		undefined,
+		1_000_000,
+	);
+	const rows = quotaBuckets(state([eduPlus, plusAcc, proAcc]), 1_000_000);
+	assert.deepEqual(rows, [
+		{
+			bucket: "PLUS",
+			window: "5H",
+			remaining: 31.5,
+			increases: [{ at: 2000, percent: 18.5 }, { at: 2600, percent: 50 }],
+			verifying: false,
+			blocked: false,
+			stale: false,
+		},
+		{
+			bucket: "PLUS",
+			window: "WEEK",
+			remaining: 44.5,
+			increases: [{ at: 7000, percent: 44 }, { at: 9000, percent: 11.5 }],
+			verifying: false,
+			blocked: false,
+			stale: false,
+		},
+		{
+			bucket: "PRO",
+			window: "WEEK",
+			remaining: 24,
+			increases: [{ at: 7100, percent: 76 }],
+			verifying: false,
+			blocked: false,
+			stale: false,
+		},
+	]);
+});
+
+test("bucket rows verify expired windows and badge blocked rows", () => {
+	const healthy = normalizeObservation(alt, 200, { ...headers(), "X-Codex-Plan-Type": "plus" }, undefined, 1_000_000);
+	const rateLimited = normalizeObservation(alt, 429, { "Retry-After": "10" }, healthy, 1_100_000);
+	const rows = quotaBuckets(state([rateLimited]), 1_200_000);
+	assert.deepEqual(rows, [
+		{
+			bucket: "PLUS",
+			window: "5H",
+			remaining: 54,
+			increases: [{ at: 2000, percent: 46 }],
+			verifying: false,
+			blocked: true,
+			stale: false,
+		},
+		{
+			bucket: "PLUS",
+			window: "WEEK",
+			remaining: 24,
+			increases: [{ at: 7000, percent: 76 }],
+			verifying: false,
+			blocked: true,
+			stale: false,
+		},
+	]);
+	const expired = normalizeObservation(alt, 200, { ...headers(), "X-Codex-Plan-Type": "pro" }, undefined, 1_000_000);
+	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
+	const expiredRows = quotaBuckets(state([expired]), 1_200_000);
+	assert.deepEqual(expiredRows, [
+		{
+			bucket: "PRO",
+			window: "5H",
+			remaining: 0,
+			increases: [],
+			verifying: true,
+			blocked: false,
+			stale: false,
+		},
+		{
+			bucket: "PRO",
+			window: "WEEK",
+			remaining: 24,
+			increases: [{ at: 7000, percent: 76 }],
+			verifying: false,
+			blocked: true,
+			stale: false,
+		},
+	]);
+});
+
+test("bucket rows badge stale when live telemetry has aged", () => {
+	const aged = normalizeObservation(
+		alt,
+		200,
+		{ ...headers("20"), "X-Codex-Plan-Type": "pro" },
+		undefined,
+		1_000_000,
+	);
+	const rows = quotaBuckets(state([aged]), 1_000_000 + 15 * 60_000 + 1);
+	assert.deepEqual(rows, [
+		{
+			bucket: "PRO",
+			window: "5H",
+			remaining: 10,
+			increases: [{ at: 2000, percent: 90 }],
+			verifying: false,
+			blocked: false,
+			stale: true,
+		},
+		{
+			bucket: "PRO",
+			window: "WEEK",
+			remaining: 10,
+			increases: [{ at: 7000, percent: 90 }],
+			verifying: false,
+			blocked: false,
+			stale: true,
+		},
+	]);
+});
+
+test("bucket rows vanish when no account remains", () => {
+	assert.deepEqual(quotaBuckets(undefined), []);
+	assert.deepEqual(quotaBuckets(state([])), []);
 });
