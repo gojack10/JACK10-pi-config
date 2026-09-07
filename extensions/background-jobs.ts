@@ -1,13 +1,15 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, truncateTail, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { type ChildProcess, spawn } from "node:child_process";
-import { createWriteStream, existsSync, readFileSync } from "node:fs";
+import { createWriteStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 interface BgJob {
   id: number;
   command: string;
+  label: string;
   cwd: string;
   child: ChildProcess;
   pid: number | undefined;
@@ -25,7 +27,7 @@ const killJobTree = (job: BgJob): void => {
     process.kill(-job.pid, "SIGTERM");
   } catch {}
   setTimeout(() => {
-    if (job.exitCode !== undefined) return;
+    if (job.exitedAt !== undefined) return;
     try {
       process.kill(-job.pid!, "SIGKILL");
     } catch {}
@@ -35,13 +37,26 @@ const killJobTree = (job: BgJob): void => {
 export default function backgroundJobs(pi: ExtensionAPI) {
   const jobs = new Map<number, BgJob>();
   let nextJobId = 1;
+  const pending: BgJob[] = [];
+  let shuttingDown = false;
+
+  const runningCount = () => [...jobs.values()].filter(j => j.exitedAt === undefined).length;
+  const flushCompletions = () => {
+    // ponytail: one session-wide batch; use explicit groups if long-lived jobs need isolation.
+    if (shuttingDown || !pending.length || runningCount()) return;
+    const batch = pending.splice(0);
+    pi.sendUserMessage(
+      `SYSTEM (background-jobs): All ${batch.length} background job(s) in this batch finished.\n${batch.map(renderCompletionSummary).join("\n")}`,
+      { deliverAs: "steer" },
+    );
+  };
 
   const renderCompletionSummary = (job: BgJob): string => {
     const elapsed = Math.round(((job.exitedAt ?? Date.now()) - job.startedAt) / 1000);
     const status = job.exitCode === -1
       ? `failed${job.errorMessage ? ` (${job.errorMessage})` : ""}`
       : `exit ${job.exitCode}${job.killed ? " (killed)" : ""}`;
-    return `SYSTEM (background-jobs): job_${job.id} finished: [${status}] ${job.command.slice(0, 100)} (${elapsed}s)`;
+    return `job_${job.id} (${job.label}): [${status}] (${elapsed}s). Log: ${job.logPath}`;
   };
 
   const renderJobsList = (): string => {
@@ -50,8 +65,8 @@ export default function backgroundJobs(pi: ExtensionAPI) {
       .map((j) => {
         const elapsed = Math.round(((j.exitedAt ?? Date.now()) - j.startedAt) / 1000);
         const status =
-          j.exitCode === undefined ? "running" : `exit ${j.exitCode}${j.killed ? " (killed)" : ""}`;
-        return `  job_${j.id}: [${status}] ${j.command.slice(0, 100)} (${elapsed}s)`;
+          j.exitedAt === undefined ? "running (collecting output)" : `exit ${j.exitCode}${j.killed ? " (killed)" : ""}`;
+        return `  job_${j.id}: [${status}] ${j.label} (${elapsed}s)`;
       })
       .join("\n");
   };
@@ -64,12 +79,13 @@ export default function backgroundJobs(pi: ExtensionAPI) {
     name: "bash_bg",
     label: "bash_bg",
     description:
-      "Spawn a long-running command in the background. Returns {job_id, log_path}. Do not poll/wait after starting a job; the agent will receive a follow-up message when this job finishes. Use bash_tail(job_id) only for occasional progress checks while doing other work, and bash_kill(job_id) to stop it.",
+      "Spawn a background command. Returns {job_id, log_path}. Give it a short task label. All overlapping jobs form one batch: one automatic steering notification when ALL jobs finish, at the next tool-call boundary if busy, or waking the agent if idle. New overlapping jobs extend the wait. Do independent work or end your turn; NEVER poll or wait for completion. Inspect running jobs only if the user explicitly asks for progress/ETA. Read completed logs to consume results; use bash_kill to stop a job.",
     parameters: Type.Object({
       command: Type.String({ description: "Bash command (runs through `sh -c`)." }),
+      label: Type.Optional(Type.String({ description: "Short task name, e.g. 'Run tests' or 'Queue probe', not shell code.", minLength: 1, maxLength: 80 })),
       cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to session cwd." })),
     }),
-    async execute(_id, { command, cwd }, _signal, _onUpdate, ctx) {
+    async execute(_id, { command, cwd, label }, _signal, _onUpdate, ctx) {
       const id = nextJobId++;
       const logPath = join(tmpdir(), `pi-bg-${Date.now()}-${id}.log`);
       const logStream = createWriteStream(logPath);
@@ -80,11 +96,13 @@ export default function backgroundJobs(pi: ExtensionAPI) {
         stdio: ["ignore", "pipe", "pipe"],
       });
       const startedAt = Date.now();
-      child.stdout?.on("data", (d) => logStream.write(d));
-      child.stderr?.on("data", (d) => logStream.write(d));
+      child.stdout?.pipe(logStream, { end: false });
+      child.stderr?.pipe(logStream, { end: false });
       const job: BgJob = {
         id,
         command,
+        label: (label?.trim() || command.split("\n").find(line => line.trim()) || "background job")
+          .replace(/[\s\x00-\x1f\x7f-\x9f]+/g, " ").trim().slice(0, 80),
         cwd: workingDir,
         child,
         pid: child.pid,
@@ -94,31 +112,38 @@ export default function backgroundJobs(pi: ExtensionAPI) {
         exitedAt: undefined,
         killed: false,
       };
-      child.on("exit", (code) => {
+      const finish = () => {
         if (job.exitedAt !== undefined) return;
-        job.exitCode = code;
         job.exitedAt = Date.now();
-        logStream.end();
-        pi.sendUserMessage(renderCompletionSummary(job), { deliverAs: "followUp" });
+        if (!shuttingDown) { pending.push(job); flushCompletions(); }
+      };
+      let closed = false;
+      logStream.on("error", err => {
+        job.exitCode = -1;
+        job.errorMessage = `log write failed: ${err.message}`;
+        if (closed) finish(); else killJobTree(job);
       });
-      child.on("error", (err) => {
-        if (job.exitedAt !== undefined) return;
-        logStream.write(`\n[spawn error: ${err.message}]\n`);
+      child.on("exit", code => { job.exitCode ??= code; });
+      child.on("error", err => {
         job.exitCode = -1;
         job.errorMessage = err.message;
-        job.exitedAt = Date.now();
-        logStream.end();
-        pi.sendUserMessage(renderCompletionSummary(job), { deliverAs: "followUp" });
+        if (!logStream.destroyed) logStream.write(`\n[spawn error: ${err.message}]\n`);
+      });
+      child.on("close", () => {
+        closed = true;
+        // exit can precede descendant stdout. Notify only after stdio closes and the log flushes.
+        if (logStream.destroyed) finish(); else logStream.end(finish);
       });
       jobs.set(id, job);
+      const running = runningCount();
       return {
         content: [
           {
             type: "text",
-            text: `Started job_${id} (pid ${child.pid ?? "?"}).\nLog: ${logPath}\nCommand: ${command}\n\nIMPORTANT NEXT STEP: If you are only waiting for this command, stop now and send the user a brief response. Do NOT call bash_tail(), bash_jobs(), sleep, or any polling/wait command. This extension will send you a follow-up message when this job finishes. Only use bash_tail() for occasional progress checks while doing other independent work.`,
+            text: `Started job_${id} (${job.label}, pid ${child.pid ?? "?"}).\nLog: ${logPath}\nCommand: ${command}\n\n${running === 1 ? "1 job running; it will notify automatically when done." : `${running} jobs running; completed results are held until ALL finish, then sent in ONE steering notification.`} New overlapping jobs extend the wait.\nDo independent work if available; otherwise end your turn now. Do NOT poll with bash_tail, bash_jobs, bash, sleep, or wait just to check completion. Automatic notification will resume you. Only inspect running jobs if the user explicitly asks for progress/ETA; never repeatedly poll. Reading completed logs to consume results is allowed.`,
           },
         ],
-        details: { job_id: id, log_path: logPath, pid: child.pid },
+        details: { job_id: id, log_path: logPath, pid: child.pid, label: job.label, running_jobs: running },
       };
     },
   });
@@ -127,7 +152,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
     name: "bash_tail",
     label: "bash_tail",
     description:
-      "Peek the last N lines of a background job's stdout+stderr. Non-blocking. Returns alive=true while running, exit_code when finished.",
+      "Read the last N lines of a job's log, capped at 50 KiB. Use to consume completed results, or inspect running progress/ETA ONLY when the user explicitly asks. Never poll for completion: an automatic batch notification will resume you. Returns alive=true while output is still being collected.",
     parameters: Type.Object({
       job_id: Type.Integer(),
       lines: Type.Optional(
@@ -148,12 +173,25 @@ export default function backgroundJobs(pi: ExtensionAPI) {
       }
       const n = Math.min(Math.max(lines ?? 50, 1), 500);
       let tail = "";
-      if (existsSync(job.logPath)) {
-        const contents = readFileSync(job.logPath, "utf-8");
-        const all = contents.split("\n");
-        tail = all.slice(-n).join("\n");
+      try {
+        const file = await open(job.logPath, "r");
+        try {
+          const { size } = await file.stat();
+          const offset = Math.max(0, size - DEFAULT_MAX_BYTES - 4);
+          const buffer = Buffer.alloc(Math.min(size, DEFAULT_MAX_BYTES + 4));
+          const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
+          let start = 0;
+          while (start < bytesRead && (buffer[start] & 0xc0) === 0x80) start++;
+          const result = truncateTail(buffer.subarray(start, bytesRead).toString("utf8"), { maxLines: n });
+          tail = result.content;
+          if (offset > 0 || result.truncated) {
+            tail += `\n[Truncated tail: ${n} lines / 50 KiB limit; may begin mid-line. Full log: ${job.logPath}]`;
+          }
+        } finally { await file.close(); }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
-      const alive = job.exitCode === undefined;
+      const alive = job.exitedAt === undefined;
       const elapsedMs = (job.exitedAt ?? Date.now()) - job.startedAt;
       const elapsed = Math.round(elapsedMs / 1000);
       const status = alive
@@ -186,7 +224,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
           isError: true,
         };
       }
-      if (job.exitCode !== undefined) {
+      if (job.exitedAt !== undefined) {
         return { content: [{ type: "text", text: `job_${job_id} already exited (code ${job.exitCode}).` }] };
       }
       job.killed = true;
@@ -198,7 +236,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   pi.registerTool({
     name: "bash_jobs",
     label: "bash_jobs",
-    description: "List background jobs (live and recently exited).",
+    description: "List background jobs when the user explicitly asks for progress/ETA, or to find completed results. Never poll for completion; all overlapping jobs produce one automatic notification when done.",
     parameters: Type.Object({}),
     async execute() {
       if (jobs.size === 0) return { content: [{ type: "text", text: "No background jobs." }] };
@@ -219,8 +257,10 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   // ============================================================
 
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
+    pending.length = 0;
     for (const job of jobs.values()) {
-      if (job.exitCode === undefined) killJobTree(job);
+      if (job.exitedAt === undefined) killJobTree(job);
     }
   });
 }
