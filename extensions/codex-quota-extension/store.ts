@@ -395,6 +395,78 @@ export const quotaStatus = (
 	};
 };
 
+export type QuotaBucket = "PLUS" | "PRO";
+
+export type QuotaBucketRow = {
+	bucket: QuotaBucket;
+	window: "5H" | "WEEK";
+	remaining: number;
+	increases: QuotaIncrease[];
+	verifying: boolean;
+	blocked: boolean;
+	stale: boolean;
+};
+
+const bucketFor = (plan: string): QuotaBucket | undefined => {
+	const normalized = plan.toLowerCase();
+	if (normalized.includes("plus")) return "PLUS";
+	if (normalized.startsWith("pro")) return "PRO";
+	return undefined;
+};
+
+// Bucket rows are model-independent gauges: remaining is summed across every live
+// account that has the window (429'd included, aged degradation included) and
+// divided by the count of those live accounts, never by registered accounts.
+export const quotaBuckets = (
+	feed: CodexUsageState | undefined,
+	now: number = Date.now(),
+): QuotaBucketRow[] => {
+	if (!feed || feed.accounts.length === 0) return [];
+	const evaluated = feed.accounts.map((account) => ({ account, evaluation: evaluateQuotaAccount(account, now) }));
+	const rows: QuotaBucketRow[] = [];
+	for (const bucket of ["PLUS", "PRO"] as const) {
+		const members = evaluated.filter(({ account }) => bucketFor(account.plan) === bucket);
+		for (const minutes of [300, 10080] as const) {
+			if (!members.some(({ account }) => account.windows.some((window) => window.minutes === minutes))) continue;
+			const live = members.filter(({ evaluation }) =>
+				evaluation.effectiveWindows.some((window) => window.minutes === minutes)
+			);
+			const blocked = live.length > 0 && live.every(({ evaluation }) => !evaluation.routable);
+			const stale = !blocked && live.some(({ evaluation }) => evaluation.freshness === "aged");
+			const refillByReset = new Map<number, number>();
+			for (const { evaluation } of live) {
+				for (const window of evaluation.effectiveWindows) {
+					if (window.minutes !== minutes || window.resetAt * 1000 <= now || window.pctUsed <= 0) continue;
+					refillByReset.set(window.resetAt, (refillByReset.get(window.resetAt) ?? 0) + window.pctUsed);
+				}
+			}
+			const events: QuotaIncrease[] = [...refillByReset]
+				.sort(([left], [right]) => left - right)
+				.map(([at, percent]) => ({ at, percent: percent / live.length }));
+			const remaining =
+				live.length === 0
+					? 0
+					: live.reduce((sum, { evaluation }) => {
+							const window = evaluation.effectiveWindows.find((candidate) => candidate.minutes === minutes)!;
+							return sum + (100 - window.pctUsed);
+						}, 0) / live.length;
+			const verifying = members.some(({ account }) =>
+				account.windows.some((window) => window.minutes === minutes && window.resetAt * 1000 <= now)
+			);
+			rows.push({
+				bucket,
+				window: minutes === 300 ? "5H" : "WEEK",
+				remaining,
+				increases: events,
+				verifying,
+				blocked,
+				stale,
+			});
+		}
+	}
+	return rows;
+};
+
 const isPolicyClass = (value: unknown): value is PolicyClass =>
 	value === "stable-weekly" || value === "perishable" || value === "unknown";
 
