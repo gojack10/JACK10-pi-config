@@ -409,9 +409,6 @@ export default function (pi: ExtensionAPI) {
 					);
 					flushFooterLine(lineState, width);
 					appendQuotaLines(lineState, quota, width, theme);
-					for (const status of footerData.getExtensionStatuses().values()) {
-						appendPipeSegment(lineState, status, width, dim);
-					}
 					flushFooterLine(lineState, width);
 
 					return lineState.lines;
