@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -340,4 +341,173 @@ test("session loss is transport evidence, not semantic success", { timeout: 1000
   assert.equal(record.outcome, "transport_lost");
   assert.equal(record.source, "transport");
   assert.equal(record.final, false);
+});
+
+test("sidecar replay requires the exact active-branch event, not its inherited token", { timeout: 10000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "task-outcome-branch-diverge-"));
+  const sm = SessionManager.create(dir);
+  const h = await harness(t, sm);
+  const report = join(dir, "branch-diverge.md");
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "branch-job", attempt_id: "a1", mode: "task", report_path: report,
+  });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "batch" });
+  await writeFile(report, "branch report");
+  await h.settle({ outcome: "completed", summary: "abandoned branch outcome" });
+  const contractEntry = sm.getEntries().find(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "contract");
+  assert.ok(contractEntry);
+  sm.branch(contractEntry.id);
+  sm.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as any);
+  await h.emit("session_tree");
+  const snapshot = await h.snapshot();
+  assert.equal(snapshot.outcomes.length, 0);
+  assert.equal(snapshot.contracts.length, 1);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("failed activation does not persist a contract or partial batch membership", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  await h.call("task_outcomes_consumer", { action: "batch_open", batch_id: "overflow", expected: 1 });
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "overflow-job", attempt_id: "o1", mode: "dialogue", batch_id: "overflow",
+      children: ["overflow-child"],
+    }),
+    /Unknown|batch|members|already has/i,
+  );
+  const overflow = await h.call("task_outcomes_consumer", { action: "batch_stats", batch_id: "overflow" });
+  assert.equal(overflow.details.members, 0);
+  assert.equal(overflow.details.open, true);
+
+  await h.call("task_outcomes_consumer", { action: "activate", job_id: "seed", attempt_id: "s1", mode: "dialogue", batch_id: "closed-batch" });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "closed-batch" });
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "closed-job", attempt_id: "c1", mode: "dialogue", batch_id: "closed-batch",
+    }),
+    /closed|complete/i,
+  );
+  assert.equal((await h.snapshot()).contracts.some((item: any) => /overflow-job|closed-job/.test(item.jobId)), false);
+  assert.equal(h.sm.getBranch().some(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" &&
+    /overflow-job|closed-job/.test((entry.data as any).contract?.jobId ?? "")), false);
+  assert.doesNotMatch(await readFile(`${h.sm.getSessionFile()}.task-outcomes.jsonl`, "utf8"), /overflow-job|closed-job/);
+});
+
+test("a final append that throws after mutation is idempotent on retry", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "partial", "p1", "partial-batch") });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "partial-batch" });
+  await writeFile(join(h.dir, "partial-p1.md"), "partial report");
+  const append = h.runtime.appendEntry;
+  let fail = true;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    append(type, data);
+    if (fail && data?.kind === "outcome" && data?.outcome === "completed") {
+      fail = false;
+      throw new Error("storage unavailable after final append");
+    }
+  };
+  await assert.rejects(h.settle({ outcome: "completed", summary: "retry me" }), /storage unavailable/);
+  h.runtime.appendEntry = append;
+  await h.settle();
+  const outcomeEntries = h.sm.getEntries().filter(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "outcome");
+  assert.equal(outcomeEntries.length, 1);
+  assert.equal((await h.snapshot()).outcomes.filter((item: any) => item.final).length, 1);
+
+  await h.emit("session_shutdown", { reason: "reload" });
+  const restarted = await harness(t, h.sm);
+  assert.equal((await restarted.snapshot()).outcomes.filter((item: any) => item.final).length, 1);
+});
+
+test("replay preserves child evidence and the generation boundary", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "parent", attempt_id: "p1", mode: "task",
+    report_path: join(h.dir, "parent-p1.md"), children: ["early"],
+  });
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "parent", child_job_id: "early", status: "completed", summary: "early done",
+  });
+  await h.call("task_outcomes_consumer", { action: "child", job_id: "parent", child_job_id: "late" });
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "parent", child_job_id: "late", status: "completed", summary: "late done",
+  });
+  await writeFile(join(h.dir, "parent-p1.md"), "parent report");
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  await h.call("report_outcome", { outcome: "completed", summary: "all children done" });
+  await h.emit("session_tree");
+  const replayed = await h.snapshot();
+  assert.deepEqual(replayed.active.pendingWork, []);
+  assert.deepEqual(replayed.active.childJobIds, ["early", "late"]);
+  assert.equal(replayed.active.declaration.outcome, "completed");
+  const membership = h.sm.getBranch().filter(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "contract").at(-1);
+  assert.equal((membership?.data as any).contract.childGeneration, 1);
+  await h.emit("turn_end", { turnIndex: 0, message: { role: "assistant", content: [] } });
+  await h.emit("agent_end", { messages: [{ role: "assistant", content: [] }] });
+  await h.emit("agent_settled");
+  assert.equal((await h.snapshot()).outcomes.at(-1).outcome, "completed");
+});
+
+test("dangling report symlinks are not fresh report paths", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const report = join(h.dir, "dangling-report.md");
+  await symlink(join(h.dir, "missing-target"), report);
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "dangling", attempt_id: "d1", mode: "task", report_path: report,
+    }),
+    /fresh|unused|report/i,
+  );
+});
+
+test("child work after completion declaration wakes the fresh settlement boundary", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "child-wake", attempt_id: "cw1", mode: "task",
+    report_path: join(h.dir, "child-wake-cw1.md"),
+  });
+  await writeFile(join(h.dir, "child-wake-cw1.md"), "child wake report");
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  await h.call("report_outcome", { outcome: "completed", summary: "declared too early" });
+  await h.call("task_outcomes_consumer", { action: "child", job_id: "child-wake", child_job_id: "new-child" });
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "child-wake", child_job_id: "new-child", status: "completed", summary: "child done",
+  });
+  await h.emit("turn_end", { turnIndex: 0, message: { role: "assistant", content: [] } });
+  await h.emit("agent_end", { messages: [{ role: "assistant", content: [] }] });
+  await h.emit("agent_settled");
+  assert.equal((await h.snapshot()).active.declaration, undefined);
+  assert.equal(h.messages.filter(message => /task-outcomes/.test(message.text)).length, 1);
+});
+
+test("replayed work_ready is an intentional deduplicated wake, not a second delivery", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "wake", attempt_id: "w1", mode: "dialogue",
+  });
+  const contractEntry = h.sm.getEntries().find(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "contract");
+  assert.ok(contractEntry);
+  const data = contractEntry.data as any;
+  h.sm.appendCustomEntry("task-outcome/v1", {
+    version: 1,
+    eventId: randomUUID(),
+    branchId: data.branchId,
+    kind: "work_ready",
+    at: new Date().toISOString(),
+    jobId: "wake",
+    attemptId: "w1",
+    summary: "previous wake was durably recorded",
+  });
+  await h.emit("session_tree");
+  await h.call("task_outcomes_consumer", { action: "background", batch_id: "unrelated", command: "true" });
+  await until(() => h.messages.length > 0);
+  await delay(50);
+  assert.equal(h.messages.filter(message => /task-outcomes/.test(message.text)).length, 0);
 });
