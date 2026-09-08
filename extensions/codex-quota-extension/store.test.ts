@@ -129,20 +129,20 @@ test("detects reset epochs and percentage drops", () => {
 	assert.deepEqual(resetNotes(before, next), ["openai-codex-alt 300m reset observed"]);
 });
 
-test("quota status consolidates only usable account capacity", () => {
+test("quota status preserves weekly balance when short capacity is blocked", () => {
 	const available = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
 	const exhausted = normalizeObservation({ ...team, policyClass: "perishable" }, 200, headers("100"), undefined, 1_000_000);
 	const status = quotaStatus(state([exhausted, available]), 1_000_000);
 	assert.equal(status.h5, 50);
-	assert.equal(status.week, 12);
+	assert.equal(status.week, 24);
 	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }]);
-	assert.deepEqual(status.weekIncreases, [{ at: 2000, percent: 12 }, { at: 7000, percent: 76 }]);
+	assert.deepEqual(status.weekIncreases, [{ at: 7000, percent: 76 }]);
 	assert.equal(status.routable, true);
 	assert.equal(quotaStatus(state([available]), 1_000_000, 3).h5, 100 / 3);
 	assert.equal(quotaStatus(state([available]), 1_000_000, 3).week, 8);
 });
 
-test("quota status zeros complementary exhausted capacity", () => {
+test("weekly exhaustion blocks short capacity, not vice versa", () => {
 	const shortExhausted = normalizeObservation(
 		alt,
 		200,
@@ -159,9 +159,9 @@ test("quota status zeros complementary exhausted capacity", () => {
 	);
 	const status = quotaStatus(state([shortExhausted, weekExhausted]), 1_000_000);
 	assert.equal(status.h5, 0);
-	assert.equal(status.week, 0);
+	assert.equal(status.week, 21);
 	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }, { at: 7000, percent: 50 }]);
-	assert.deepEqual(status.weekIncreases, [{ at: 2000, percent: 21 }, { at: 7000, percent: 79 }]);
+	assert.deepEqual(status.weekIncreases, [{ at: 7000, percent: 79 }]);
 	assert.equal(status.routable, false);
 	assert.equal(status.recoveryAt, 2000);
 });
@@ -171,7 +171,7 @@ test("quota status verifies expired windows and labels aged observed capacity", 
 	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
 	const expiredStatus = quotaStatus(state([expired]), 1_000_000);
 	assert.equal(expiredStatus.h5, 0);
-	assert.equal(expiredStatus.week, 0);
+	assert.equal(expiredStatus.week, 24);
 	assert.equal(expiredStatus.h5Verifying, true);
 	assert.equal(expiredStatus.routable, false);
 
@@ -193,7 +193,7 @@ test("quota status is stale only when the router has no route or recovery", () =
 	blocked.notBefore = 2000;
 	const recovering = quotaStatus(state([blocked]), 1_000_000);
 	assert.equal(recovering.h5, 0);
-	assert.equal(recovering.week, 0);
+	assert.equal(recovering.week, 24);
 	assert.equal(recovering.routable, false);
 	assert.equal(recovering.recoveryAt, 2000);
 	assert.equal(recovering.stale, false);
@@ -201,7 +201,7 @@ test("quota status is stale only when the router has no route or recovery", () =
 	const elapsed429 = normalizeObservation(alt, 429, { "Retry-After": "10" }, blocked, 1_100_000);
 	const stale = quotaStatus(state([elapsed429]), 1_200_000);
 	assert.equal(stale.h5, 0);
-	assert.equal(stale.week, 0);
+	assert.equal(stale.week, 24);
 	assert.equal(stale.routable, false);
 	assert.equal(stale.stale, true);
 });
@@ -366,7 +366,7 @@ test("buckets quota by plan with live per-window denominators", () => {
 	]);
 });
 
-test("bucket rows verify expired windows and badge blocked rows", () => {
+test("bucket rows do not infer exhaustion from 429s or expired sibling windows", () => {
 	const healthy = normalizeObservation(alt, 200, { ...headers(), "X-Codex-Plan-Type": "plus" }, undefined, 1_000_000);
 	const rateLimited = normalizeObservation(alt, 429, { "Retry-After": "10" }, healthy, 1_100_000);
 	const rows = quotaBuckets(state([rateLimited]), 1_200_000);
@@ -377,7 +377,7 @@ test("bucket rows verify expired windows and badge blocked rows", () => {
 			remaining: 54,
 			increases: [{ at: 2000, percent: 46 }],
 			verifying: false,
-			blocked: true,
+			blocked: false,
 			stale: false,
 		},
 		{
@@ -386,7 +386,7 @@ test("bucket rows verify expired windows and badge blocked rows", () => {
 			remaining: 24,
 			increases: [{ at: 7000, percent: 76 }],
 			verifying: false,
-			blocked: true,
+			blocked: false,
 			stale: false,
 		},
 	]);
@@ -409,7 +409,7 @@ test("bucket rows verify expired windows and badge blocked rows", () => {
 			remaining: 24,
 			increases: [{ at: 7000, percent: 76 }],
 			verifying: false,
-			blocked: true,
+			blocked: false,
 			stale: false,
 		},
 	]);
