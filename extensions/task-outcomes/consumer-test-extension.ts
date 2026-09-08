@@ -27,6 +27,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
       summary: Type.Optional(Type.String()),
       command: Type.Optional(Type.String()),
       children: Type.Optional(Type.Array(Type.String())),
+      expected: Type.Optional(Type.Integer({ minimum: 1 })),
     }),
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const manager = getTaskManager(pi, ctx);
@@ -63,6 +64,12 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
         }
         case "close":
           manager.closeBatch(args.batch_id ?? args.job_id ?? "batch");
+          break;
+        case "batch_open":
+          getBackgroundJobManager(pi, ctx).openBatch(args.batch_id ?? args.job_id ?? "batch", args.expected);
+          break;
+        case "batch_stats":
+          result = getBackgroundJobManager(pi, ctx).getBatchStatus(args.batch_id ?? args.job_id ?? "batch");
           break;
         case "snapshot":
           result = { ...manager.snapshot(), events: [...events] };

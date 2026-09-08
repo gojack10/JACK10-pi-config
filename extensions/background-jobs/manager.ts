@@ -245,14 +245,45 @@ export class BackgroundJobManager {
   }
 
   registerOutcome(batchId: string, id: string): void {
+    this.registerOutcomes(batchId, [id]);
+  }
+
+  registerOutcomes(batchId: string, ids: readonly string[]): void {
     this.assertOpen();
-    const batch = this.batches.get(batchId);
-    if (!batch) throw new Error(`Unknown background batch ${batchId}`);
-    const memberId = `outcome:${id}`;
-    if (batch.membershipClosed && !batch.members.has(memberId)) {
+    const uniqueIds = [...new Set(ids)];
+    if (uniqueIds.length === 0) return;
+    let batch = this.batches.get(batchId);
+    if (!batch) {
+      if (this.closedBatchIds.has(batchId)) throw new Error(`Batch ${batchId} is closed`);
+      batch = this.createBatch(batchId);
+      batch.open = true;
+    }
+    const memberIds = uniqueIds.map(id => `outcome:${id}`);
+    const newMembers = memberIds.filter(memberId => !batch!.members.has(memberId));
+    if (batch.membershipClosed && newMembers.length > 0) {
       throw new Error(`Batch ${batchId} is closed`);
     }
-    this.addMember(batch, memberId);
+    if (batch.expectedMembers !== undefined && batch.members.size + newMembers.length > batch.expectedMembers) {
+      throw new Error(`Batch ${batchId} already has ${batch.expectedMembers} members`);
+    }
+    for (const memberId of newMembers) batch.members.add(memberId);
+  }
+
+  assertCanRegisterOutcomes(batchId: string, ids: readonly string[]): void {
+    this.assertOpen();
+    const batch = this.batches.get(batchId);
+    if (!batch) {
+      if (this.closedBatchIds.has(batchId)) throw new Error(`Batch ${batchId} is closed`);
+      return;
+    }
+    const newMembers = [...new Set(ids.map(id => `outcome:${id}`))]
+      .filter(memberId => !batch!.members.has(memberId));
+    if (batch.membershipClosed && newMembers.length > 0) {
+      throw new Error(`Batch ${batchId} is closed`);
+    }
+    if (batch.expectedMembers !== undefined && batch.members.size + newMembers.length > batch.expectedMembers) {
+      throw new Error(`Batch ${batchId} already has ${batch.expectedMembers} members`);
+    }
   }
 
   recordOutcome(batchId: string, outcome: BackgroundJobOutcome): void {
