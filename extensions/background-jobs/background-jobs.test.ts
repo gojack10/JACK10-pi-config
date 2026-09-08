@@ -9,29 +9,39 @@ import test from 'node:test';
 // Use Pi's real loader so package aliases and TypeBox resolve as they do at startup.
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
   '.local/share/pi-mono/packages/coding-agent/dist/core/extensions/loader.js')).href);
+const { SessionManager } = await import(pathToFileURL(join(homedir(),
+  '.local/share/pi-mono/packages/coding-agent/dist/index.js')).href);
 const extensionPath = fileURLToPath(new URL('../background-jobs.ts', import.meta.url));
+const consumerExtensionPath = fileURLToPath(new URL('./consumer-test-extension.ts', import.meta.url));
 async function until(check: () => boolean | Promise<boolean>) {
   for (let i = 0; i < 200; i++) { if (await check()) return; await delay(20); }
   assert.fail('Timed out waiting for test event');
 }
-async function harness(t: any) {
+async function harness(t: any, withConsumer = false) {
   const dir = await mkdtemp(join(tmpdir(), 'bg-test-'));
-  const { extensions, errors, runtime } = await loadExtensions([extensionPath], dir);
+  const { extensions, errors, runtime } = await loadExtensions(
+    withConsumer ? [extensionPath, consumerExtensionPath] : [extensionPath],
+    dir,
+  );
   assert.deepEqual(errors, []);
-  const extension = extensions[0];
   const messages: Array<{ text: string; options: any }> = [];
   runtime.sendUserMessage = (text: string, options: any) => messages.push({ text, options });
-  const ctx = { cwd: dir };
-  const emit = async (name: string) => {
-    for (const handler of extension.handlers.get(name) ?? []) await handler({}, ctx);
+  const ctx = { cwd: dir, sessionManager: SessionManager.inMemory(dir) };
+  const emit = async (name: string, event: any = {}) => {
+    for (const ext of extensions) {
+      for (const handler of ext.handlers.get(name) ?? []) await handler(event, ctx);
+    }
   };
-  const call = (name: string, args: any = {}) =>
-    extension.tools.get(name).definition.execute('test', args, undefined, undefined, ctx);
+  const call = (name: string, args: any = {}, callCtx: any = ctx) => {
+    const owner = extensions.find(ext => ext.tools.has(name));
+    assert.ok(owner, `missing tool ${name}`);
+    return owner.tools.get(name)!.definition.execute('test', args, undefined, undefined, callCtx);
+  };
   const gates: string[] = [];
-  const gated = async (label: string) => {
+  const gated = async (label: string, command = `printf '${label}'`) => {
     const gate = join(dir, label); gates.push(gate);
     const job = await call('bash_bg', { label,
-      command: `i=0; while [ ! -f '${gate}' ] && [ "$i" -lt 250 ]; do i=$((i+1)); sleep .02; done; printf '${label}'` });
+      command: `i=0; while [ ! -f '${gate}' ] && [ "$i" -lt 250 ]; do i=$((i+1)); sleep .02; done; ${command}` });
     return { ...job, release: () => writeFile(gate, '') };
   };
   t.after(async () => {
@@ -40,8 +50,124 @@ async function harness(t: any) {
     await delay(100);
     await rm(dir, { recursive: true, force: true });
   });
-  return { call, emit, messages, gated, dir };
+  return { call, emit, messages, gated, dir, ctx };
 }
+
+const gatedCommand = (gate: string, output: string, exitCode = 0) =>
+  `i=0; while [ ! -f '${gate}' ] && [ "$i" -lt 250 ]; do i=$((i+1)); sleep .02; done; printf '${output}'; exit ${exitCode}`;
+
+test('default batch holds a nonzero exit until its peer finishes', { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const gateA = join(h.dir, 'failed-a'), gateB = join(h.dir, 'success-b');
+  const a = await h.call('bash_bg', { label: 'failed-a', command: gatedCommand(gateA, 'failed-a', 7) });
+  const b = await h.call('bash_bg', { label: 'success-b', command: gatedCommand(gateB, 'success-b') });
+  await writeFile(gateA, '');
+  await delay(150);
+  assert.equal(h.messages.length, 0);
+  await writeFile(gateB, '');
+  await until(() => h.messages.length === 1);
+  assert.match(h.messages[0].text, /failed-a/);
+  assert.match(h.messages[0].text, /success-b/);
+  assert.match(h.messages[0].text, new RegExp(`job_${a.details.job_id} .*exit 7`));
+  assert.match(h.messages[0].text, new RegExp(`job_${b.details.job_id} .*exit 0`));
+});
+
+test('explicit batches are isolated and emit once', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  const xA = join(h.dir, 'x-a'), xB = join(h.dir, 'x-b');
+  const yC = join(h.dir, 'y-c');
+  const unrelated = await h.gated('unrelated');
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'X', expected: 2 });
+  const a = await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'X', label: 'x-a', command: gatedCommand(xA, 'x-a', 3),
+  });
+  const b = await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'X', label: 'x-b', command: gatedCommand(xB, 'x-b'),
+  });
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'X' });
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'Y', expected: 1 });
+  await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'Y', label: 'y-c', command: gatedCommand(yC, 'y-c'),
+  });
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'Y' });
+  await writeFile(xA, '');
+  await delay(150);
+  assert.equal(h.messages.length, 0);
+  await writeFile(xB, '');
+  await until(() => h.messages.length === 1);
+  assert.match(h.messages[0].text, /x-a/);
+  assert.match(h.messages[0].text, /x-b/);
+  assert.doesNotMatch(h.messages[0].text, /y-c|unrelated/);
+  assert.equal(h.messages.filter(message => /x-a|x-b/.test(message.text)).length, 1);
+  assert.equal(a.details.running, 2);
+  assert.equal(b.details.running, 3);
+  await unrelated.release();
+  await writeFile(yC, '');
+  await until(() => h.messages.length === 3);
+});
+
+test('needs_input notifies without consuming or cancelling an explicit batch', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  const gateA = join(h.dir, 'input-a'), gateB = join(h.dir, 'input-b');
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'input', expected: 2 });
+  const a = await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'input', label: 'input-a', command: gatedCommand(gateA, 'input-a'),
+  });
+  await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'input', label: 'input-b', command: gatedCommand(gateB, 'input-b'),
+  });
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'input' });
+  await writeFile(gateA, '');
+  await until(async () => (await h.call('background_jobs_consumer', { action: 'stats' })).details.pending === 1);
+  await h.call('background_jobs_consumer', {
+    action: 'needs_input', batch_id: 'input', message: 'Question: choose a continuation',
+  });
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].text, /choose a continuation/);
+  const stats = await h.call('background_jobs_consumer', { action: 'stats' });
+  assert.equal(stats.details.running, 1);
+  assert.equal(stats.details.pending, 1);
+  await writeFile(gateB, '');
+  await until(() => h.messages.length === 2);
+  assert.match(h.messages[1].text, /input-a/);
+  assert.match(h.messages[1].text, /input-b/);
+  assert.ok(a.details.job_id);
+});
+
+test('completed, failed, and blocked outcomes collect until batch close', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'outcomes', expected: 3 });
+  for (const [outcome_id, status] of [['done', 'completed'], ['bad', 'failed'], ['blocked', 'blocked']]) {
+    await h.call('background_jobs_consumer', {
+      action: 'outcome', batch_id: 'outcomes', outcome_id, status, message: `${status} ${outcome_id}`,
+    });
+  }
+  assert.equal(h.messages.length, 0);
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'outcomes' });
+  await until(() => h.messages.length === 1);
+  for (const text of ['completed done', 'failed bad', 'blocked blocked']) assert.match(h.messages[0].text, new RegExp(text));
+});
+
+test('shared manager is session-owned and is cleaned up on replacement', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  const oldJob = await h.gated('old-owner');
+  const shared = await h.call('background_jobs_consumer', {
+    action: 'start', label: 'shared-owner', command: 'sleep 10',
+  });
+  const stats = await h.call('background_jobs_consumer', { action: 'stats' });
+  assert.equal(stats.details.jobs, 2);
+  assert.equal(stats.details.running, 2);
+  await oldJob.release();
+  await until(async () => (await h.call('background_jobs_consumer', { action: 'stats' })).details.pending === 1);
+  await h.emit('session_shutdown');
+  await until(async () => !(await h.call('bash_tail', { job_id: oldJob.details.job_id })).details.alive);
+  const replacementCtx = { cwd: h.dir, sessionManager: SessionManager.inMemory(h.dir) };
+  const replacementStats = await h.call('background_jobs_consumer', { action: 'stats' }, replacementCtx);
+  assert.deepEqual(replacementStats.details, { jobs: 0, running: 0, pending: 0, batches: 0 });
+  const replacementJobs = await h.call('bash_jobs', {}, replacementCtx);
+  assert.match(replacementJobs.content[0].text, /No background jobs/);
+  assert.ok(shared.details.job_id);
+});
 
 test('overlapping jobs share one steering wake, including jobs added mid-batch', { timeout: 10000 }, async t => {
   const h = await harness(t);
