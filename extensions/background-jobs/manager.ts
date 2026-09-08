@@ -130,6 +130,7 @@ export class BackgroundJobManager {
   private shuttingDown = false;
   private sendUserMessage: SendUserMessage;
   private readonly workListeners = new Set<() => void>();
+  private workGenerationValue = 0;
 
   constructor(sendUserMessage: SendUserMessage) {
     this.sendUserMessage = sendUserMessage;
@@ -181,6 +182,7 @@ export class BackgroundJobManager {
       killed: false,
     };
     this.jobs.set(id, job);
+    this.workGenerationValue += 1;
 
     let closed = false;
     const finish = () => {
@@ -352,6 +354,10 @@ export class BackgroundJobManager {
   onJobsSettled(listener: () => void): () => void {
     this.workListeners.add(listener);
     return () => this.workListeners.delete(listener);
+  }
+
+  workGeneration(): number {
+    return this.workGenerationValue;
   }
 
   stats(): { jobs: number; running: number; pending: number; batches: number } {

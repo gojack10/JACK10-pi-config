@@ -8,6 +8,9 @@ import type { TaskMode } from "./manager.ts";
 import { getTaskOutcomeManager as getTaskManager } from "./manager.ts";
 
 export default function consumerTestExtension(pi: ExtensionAPI) {
+  const events: unknown[] = [];
+  pi.events.on("task-outcome", event => events.push(event));
+
   pi.registerTool({
     name: "task_outcomes_consumer",
     label: "task_outcomes_consumer",
@@ -62,7 +65,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
           manager.closeBatch(args.batch_id ?? args.job_id ?? "batch");
           break;
         case "snapshot":
-          result = manager.snapshot();
+          result = { ...manager.snapshot(), events: [...events] };
           break;
         default:
           throw new Error(`Unknown task outcome test action: ${args.action}`);

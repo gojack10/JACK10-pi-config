@@ -22,6 +22,8 @@ const OUTCOME_GENERATION_OPTION = "@pi_outcome_generation";
 // command ACKs command-specific until a real completion hook exists.
 export default function (pi: ExtensionAPI) {
 	let ownerSessionId: string | undefined;
+	const pendingOutcomes: unknown[] = [];
+	let outcomeQueue = Promise.resolve();
 	const readOption = async (pane: string, optionName: string) =>
 		(await pi.exec("tmux", ["show-options", "-qv", "-t", pane, optionName])).stdout.trim();
 
@@ -48,13 +50,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const signalOutcome = async (payload: unknown) => {
-		if (!taskOutcomeEventStatus(payload) || payload.sessionId !== ownerSessionId) return;
+	const publishOutcome = async (payload: TaskOutcomeEvent) => {
 		const pane = process.env.TMUX_PANE;
 		if (!pane) return;
-		const channel = (await readOption(pane, OUTCOME_CHANNEL_OPTION)) ||
+		const existingChannel = await readOption(pane, OUTCOME_CHANNEL_OPTION);
+		const channel = existingChannel ||
 			`pi-outcome-${pane.replace("%", "pane-")}-${process.pid}-${Date.now()}`;
-		if (!(await readOption(pane, OUTCOME_CHANNEL_OPTION))) {
+		if (!existingChannel) {
 			await pi.exec("tmux", ["set-option", "-q", "-t", pane, OUTCOME_CHANNEL_OPTION, channel]);
 		}
 		const generation = Number.parseInt(await readOption(pane, OUTCOME_GENERATION_OPTION), 10);
@@ -76,9 +78,34 @@ export default function (pi: ExtensionAPI) {
 		await pi.exec("tmux", ["wait-for", "-S", channel]);
 	};
 
+	const deliverOutcome = (payload: TaskOutcomeEvent) => {
+		outcomeQueue = outcomeQueue.then(() => publishOutcome(payload)).catch(() => {});
+		return outcomeQueue;
+	};
+
+	const signalOutcome = async (payload: unknown) => {
+		if (!taskOutcomeEventStatus(payload)) return;
+		if (!ownerSessionId) {
+			pendingOutcomes.push(payload);
+			return;
+		}
+		if (payload.sessionId === ownerSessionId) await deliverOutcome(payload);
+	};
+
+	const flushPendingOutcomes = async () => {
+		const queued = pendingOutcomes.splice(0);
+		for (const payload of queued) {
+			if (taskOutcomeEventStatus(payload) && payload.sessionId === ownerSessionId) {
+				await deliverOutcome(payload);
+			}
+		}
+		await outcomeQueue;
+	};
+
 	pi.events.on("task-outcome", signalOutcome);
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		ownerSessionId = ctx.sessionManager.getSessionId();
+		await flushPendingOutcomes();
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
