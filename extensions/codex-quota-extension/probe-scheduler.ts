@@ -19,7 +19,7 @@ const HOURLY_PROBE_MS = 60 * 60_000;
 const BACKOFF_MS = [5, 15, 30, 60].map((minutes) => minutes * 60_000);
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 
-export type ProbeStatus = "scheduled" | "fired" | "200" | "429" | "timeout";
+export type ProbeStatus = "scheduled" | "fired" | "200" | "429" | "timeout" | "error";
 export type ProbeScheduleEntry = {
 	accountKey: string;
 	providerId: string;
@@ -168,7 +168,7 @@ export class ProbeScheduler {
 		return this.registry ?? parseRegistry(JSON.parse(await readFile(this.registryPath, "utf8")) as unknown);
 	}
 
-	private arm(entries: ProbeScheduleEntry[]): void {
+	private arm(entries: ProbeScheduleEntry[], retryAt = 0): void {
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = undefined;
 		if (this.closed || entries.length === 0) return;
@@ -177,11 +177,18 @@ export class ProbeScheduler {
 			const rightDue = right.leaseUntil && right.leaseUntil > this.now() ? right.leaseUntil : right.scheduledAt;
 			return leftDue - rightDue;
 		})[0]!;
-		const due = entry.leaseUntil && entry.leaseUntil > this.now() ? entry.leaseUntil : entry.scheduledAt;
+		const due = Math.max(retryAt, entry.leaseUntil && entry.leaseUntil > this.now() ? entry.leaseUntil : entry.scheduledAt);
 		this.timer = setTimeout(() => {
 			this.timer = undefined;
-			if (due > this.now()) this.arm(entries);
-			else void this.fire(entry.accountKey);
+			if (due > this.now()) this.arm(entries, retryAt);
+			else void this.fire(entry.accountKey).catch(async (error) => {
+				// Keep background failures out of Pi's unhandled-rejection handler.
+				// Retry through the shared lock/lease rather than bypassing another Pi.
+				this.arm(entries, this.now() + GRACE_MS);
+				try {
+					await this.observe(entry.providerId, "error", { error: String(error) });
+				} catch { /* Diagnostics must not crash Pi either. */ }
+			});
 		}, Math.min(2_147_483_647, Math.max(0, due - this.now())));
 		this.timer.unref();
 	}
