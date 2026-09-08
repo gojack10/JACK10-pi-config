@@ -1,0 +1,54 @@
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import {
+  getTaskOutcomeManager,
+  releaseTaskOutcomeManager,
+  type DeclaredOutcome,
+} from "./task-outcomes/manager.ts";
+
+const outcomes = ["completed", "blocked", "needs_input", "failed"] as const;
+
+export default function taskOutcomes(pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "report_outcome",
+    label: "report_outcome",
+    description:
+      "Declare the explicit outcome of the active task attempt. The active launch contract supplies the job, attempt, and report path; do not invent or select another job. In task mode, completed requires a readable nonempty report and no registered child/background work still running. A declaration is provisional until the declaring turn settles cleanly.",
+    parameters: Type.Object({
+      outcome: StringEnum(outcomes, { description: "completed, blocked, needs_input, or failed" }),
+      summary: Type.String({ description: "Short structured outcome summary", minLength: 1, maxLength: 20_000 }),
+    }, { additionalProperties: false }),
+    async execute(_id, { outcome, summary }, _signal, _onUpdate, ctx) {
+      const result = await getTaskOutcomeManager(pi, ctx).declare(outcome as DeclaredOutcome, summary);
+      return {
+        content: [{ type: "text", text: `${result.outcome} declared for ${result.jobId}/${result.attemptId}; settlement will finalize it.` }],
+        details: result,
+        terminate: result.terminate,
+      };
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).restore();
+  });
+  pi.on("agent_start", (_event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).onAgentStart();
+  });
+  pi.on("turn_start", (event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).onTurnStart(event.turnIndex);
+  });
+  pi.on("turn_end", (event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).onTurnEnd(event.message);
+  });
+  pi.on("agent_end", (event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).onAgentEnd(event.messages);
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    await getTaskOutcomeManager(pi, ctx).onAgentSettled(ctx.hasPendingMessages?.() ?? false);
+  });
+  pi.on("session_shutdown", (event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).shutdown(`session ${event.reason}`);
+    releaseTaskOutcomeManager(ctx);
+  });
+}
