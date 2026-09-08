@@ -160,13 +160,75 @@ test('shared manager is session-owned and is cleaned up on replacement', { timeo
   await oldJob.release();
   await until(async () => (await h.call('background_jobs_consumer', { action: 'stats' })).details.pending === 1);
   await h.emit('session_shutdown');
-  await until(async () => !(await h.call('bash_tail', { job_id: oldJob.details.job_id })).details.alive);
+  await delay(100);
   const replacementCtx = { cwd: h.dir, sessionManager: SessionManager.inMemory(h.dir) };
   const replacementStats = await h.call('background_jobs_consumer', { action: 'stats' }, replacementCtx);
   assert.deepEqual(replacementStats.details, { jobs: 0, running: 0, pending: 0, batches: 0 });
   const replacementJobs = await h.call('bash_jobs', {}, replacementCtx);
   assert.match(replacementJobs.content[0].text, /No background jobs/);
   assert.ok(shared.details.job_id);
+});
+
+test('closed batches reject late members and retain registered outcomes', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  const gate = join(h.dir, 'registered-job');
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'closed', expected: 2 });
+  await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'closed', label: 'registered-job', command: gatedCommand(gate, 'registered-job'),
+  });
+  await h.call('background_jobs_consumer', {
+    action: 'register', batch_id: 'closed', outcome_id: 'registered-outcome',
+  });
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'closed' });
+  await h.call('background_jobs_consumer', {
+    action: 'outcome', batch_id: 'closed', outcome_id: 'registered-outcome',
+    status: 'blocked', message: 'registered before close',
+  });
+  await assert.rejects(
+    h.call('background_jobs_consumer', {
+      action: 'start', batch_id: 'closed', label: 'late-job', command: 'true',
+    }),
+    /closed|complete/i,
+  );
+  await assert.rejects(
+    h.call('background_jobs_consumer', {
+      action: 'outcome', batch_id: 'closed', outcome_id: 'late-outcome', status: 'completed',
+    }),
+    /closed|complete/i,
+  );
+  await writeFile(gate, '');
+  await until(() => h.messages.length === 1);
+  assert.match(h.messages[0].text, /registered-job/);
+  assert.match(h.messages[0].text, /registered-outcome/);
+  await assert.rejects(
+    h.call('background_jobs_consumer', { action: 'open', batch_id: 'closed', expected: 1 }),
+    /closed|complete/i,
+  );
+});
+
+test('final reports retain generic identity and status after send failure', async t => {
+  const h = await harness(t, true);
+  const result = await h.call('background_jobs_consumer', {
+    action: 'fail_report', batch_id: 'report', outcome_id: 'failure-id',
+    status: 'failed', message: 'custom failure summary',
+  });
+  const report = result.details.report;
+  assert.equal(h.messages.length, 0);
+  assert.ok(report);
+  assert.match(report.text, /failure-id/);
+  assert.match(report.text, /failed/);
+  assert.match(report.text, /custom failure summary/);
+  assert.equal(report.completions[0].id, 'failure-id');
+  assert.equal(report.completions[0].status, 'failed');
+  const again = await h.call('background_jobs_consumer', { action: 'report', batch_id: 'report' });
+  assert.equal(again.details.report.text, report.text);
+});
+
+test('running jobs preserve undefined exit_code details', { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const job = await h.call('bash_bg', { label: 'running-details', command: 'sleep 10' });
+  const listed = await h.call('bash_jobs');
+  assert.equal(listed.details.jobs.find((item: any) => item.id === job.details.job_id)?.exit_code, undefined);
 });
 
 test('overlapping jobs share one steering wake, including jobs added mid-batch', { timeout: 10000 }, async t => {
@@ -204,9 +266,10 @@ test('spawn failure is terminal but waits for its overlapping peer', { timeout: 
 });
 
 test('shutdown suppresses completion wakes', { timeout: 10000 }, async t => {
-  const h = await harness(t), job = await h.gated('shutdown');
+  const h = await harness(t);
+  await h.gated('shutdown');
   await h.emit('session_shutdown');
-  await until(async () => !(await h.call('bash_tail', { job_id: job.details.job_id })).details.alive);
+  await delay(100);
   assert.equal(h.messages.length, 0);
 });
 

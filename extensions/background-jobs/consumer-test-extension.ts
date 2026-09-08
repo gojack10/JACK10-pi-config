@@ -45,6 +45,22 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
         case "needs_input":
           manager.notifyNeedsInput(batchId, args.message ?? "Input required");
           break;
+        case "register":
+          manager.registerOutcome(batchId, args.outcome_id ?? args.label ?? "outcome");
+          break;
+        case "fail_report": {
+          const batch = manager.openBatch(batchId, 1);
+          manager.attach(() => Promise.reject(new Error("delivery failed")));
+          batch.recordOutcome({
+            id: args.outcome_id ?? "outcome",
+            status: (args.status ?? "failed") as BackgroundJobOutcomeStatus,
+            summary: args.message,
+          });
+          batch.close();
+          break;
+        }
+        case "report":
+          break;
         case "outcome":
           manager.recordOutcome(batchId, {
             id: args.outcome_id ?? args.label ?? "outcome",
@@ -57,7 +73,13 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
         default:
           throw new Error(`Unknown test action: ${args.action}`);
       }
-      const details = { ...manager.stats(), ...(started ? { job_id: started.job.id } : {}) };
+      const details = {
+        ...manager.stats(),
+        ...(started ? { job_id: started.job.id } : {}),
+        ...(args.action === "report" || args.action === "fail_report"
+          ? { report: manager.getReport(batchId) }
+          : {}),
+      };
       return {
         content: [{ type: "text", text: JSON.stringify(details) }],
         details,
