@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 type UserMessageOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
-type SendUserMessage = (content: string, options?: UserMessageOptions) => void;
+type SendUserMessage = (content: string, options?: UserMessageOptions) => void | PromiseLike<void>;
 
 export interface BackgroundJobStartOptions {
   command: string;
@@ -40,11 +40,25 @@ export interface BackgroundJobOutcome {
   summary?: string;
 }
 
+export interface BackgroundJobCompletion {
+  id: string;
+  status?: BackgroundJobOutcomeStatus;
+  summary: string;
+}
+
+export interface BackgroundJobReport {
+  batchId: string;
+  text: string;
+  completions: readonly BackgroundJobCompletion[];
+}
+
 export interface BackgroundJobBatch {
   readonly id: string;
   start(options: BackgroundJobStartOptions): BackgroundJobStartResult;
+  registerOutcome(id: string): void;
   recordOutcome(outcome: BackgroundJobOutcome): void;
   notifyNeedsInput(message: string): void;
+  getReport(): BackgroundJobReport | undefined;
   close(): void;
 }
 
@@ -57,7 +71,7 @@ export interface BackgroundTailResult {
 
 export interface BackgroundJobsList {
   text: string;
-  details: Array<{ id: number; command: string; pid: number | undefined; exit_code: number | null; killed: boolean }>;
+  details: Array<{ id: number; command: string; pid: number | undefined; exit_code: number | null | undefined; killed: boolean }>;
 }
 
 export type BackgroundJobKillResult =
@@ -70,18 +84,15 @@ interface BgJob extends BackgroundJobInfo {
   errorMessage?: string;
 }
 
-interface PendingCompletion {
-  summary: string;
-}
-
 interface BatchState {
   id: string;
   open: boolean;
+  membershipClosed: boolean;
   expectedMembers?: number;
   jobs: Set<number>;
   members: Set<string>;
   finalized: Set<string>;
-  pending: PendingCompletion[];
+  pending: BackgroundJobCompletion[];
 }
 
 const killJobTree = (job: BgJob): void => {
@@ -100,6 +111,8 @@ const killJobTree = (job: BgJob): void => {
 export class BackgroundJobManager {
   private readonly jobs = new Map<number, BgJob>();
   private readonly batches = new Map<string, BatchState>();
+  private readonly closedBatchIds = new Set<string>();
+  private readonly reports = new Map<string, BackgroundJobReport>();
   private nextJobId = 1;
   private nextBatchId = 1;
   private implicitBatchId: string | undefined;
@@ -154,7 +167,10 @@ export class BackgroundJobManager {
       if (job.exitedAt !== undefined) return;
       job.exitedAt = Date.now();
       if (!this.shuttingDown) {
-        this.finishMember(batch, `job:${id}`, this.renderCompletionSummary(job));
+        this.finishMember(batch, `job:${id}`, {
+          id: `job_${id}`,
+          summary: this.renderCompletionSummary(job),
+        });
       }
     };
     logStream.on("error", err => {
@@ -183,8 +199,8 @@ export class BackgroundJobManager {
       throw new Error("expectedMembers must be at least 1");
     }
     const existing = this.batches.get(batchId);
-    if (existing && existing.finalized.size > 0 && !existing.open) {
-      throw new Error(`Batch ${batchId} is already complete`);
+    if (this.closedBatchIds.has(batchId) || existing?.membershipClosed) {
+      throw new Error(`Batch ${batchId} is closed`);
     }
     const batch = existing ?? this.createBatch(batchId);
     batch.open = true;
@@ -196,18 +212,38 @@ export class BackgroundJobManager {
     const batch = this.batches.get(batchId);
     if (!batch) return;
     batch.open = false;
+    batch.membershipClosed = true;
+    this.closedBatchIds.add(batchId);
     this.maybeFlush(batch);
+  }
+
+  registerOutcome(batchId: string, id: string): void {
+    this.assertOpen();
+    const batch = this.batches.get(batchId);
+    if (!batch) throw new Error(`Unknown background batch ${batchId}`);
+    const memberId = `outcome:${id}`;
+    if (batch.membershipClosed && !batch.members.has(memberId)) {
+      throw new Error(`Batch ${batchId} is closed`);
+    }
+    this.addMember(batch, memberId);
   }
 
   recordOutcome(batchId: string, outcome: BackgroundJobOutcome): void {
     this.assertOpen();
-    const batch = this.batches.get(batchId) ?? this.createBatch(batchId);
+    const existing = this.batches.get(batchId);
+    if (!existing && this.closedBatchIds.has(batchId)) {
+      throw new Error(`Batch ${batchId} is closed`);
+    }
+    const batch = existing ?? this.createBatch(batchId);
     const memberId = `outcome:${outcome.id}`;
-    this.addMember(batch, memberId);
+    if (!batch.members.has(memberId)) {
+      if (batch.membershipClosed) throw new Error(`Batch ${batchId} is closed`);
+      this.addMember(batch, memberId);
+    }
     this.finishMember(
       batch,
       memberId,
-      outcome.summary ?? `${outcome.status} ${outcome.id}`,
+      { id: outcome.id, status: outcome.status, summary: outcome.summary ?? `${outcome.status} ${outcome.id}` },
     );
   }
 
@@ -282,7 +318,7 @@ export class BackgroundJobManager {
         id: job.id,
         command: job.command,
         pid: job.pid,
-        exit_code: job.exitCode ?? null,
+        exit_code: job.exitCode,
         killed: job.killed,
       })),
     };
@@ -301,25 +337,40 @@ export class BackgroundJobManager {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.batches.clear();
+    this.closedBatchIds.clear();
+    this.reports.clear();
     this.implicitBatchId = undefined;
     for (const job of this.jobs.values()) {
       if (job.exitedAt === undefined) killJobTree(job);
     }
   }
 
+  getReport(batchId: string): BackgroundJobReport | undefined {
+    const report = this.reports.get(batchId);
+    return report
+      ? { ...report, completions: report.completions.map(completion => ({ ...completion })) }
+      : undefined;
+  }
+
   private batchHandle(batch: BatchState): BackgroundJobBatch {
     return {
       id: batch.id,
       start: options => this.start(options, { batchId: batch.id }),
+      registerOutcome: id => this.registerOutcome(batch.id, id),
       recordOutcome: outcome => this.recordOutcome(batch.id, outcome),
       notifyNeedsInput: message => this.notifyNeedsInput(batch.id, message),
+      getReport: () => this.getReport(batch.id),
       close: () => this.closeBatch(batch.id),
     };
   }
 
   private batchForStart(batchId?: string): BatchState {
     if (batchId !== undefined) {
-      return this.batches.get(batchId) ?? this.createBatch(batchId);
+      const batch = this.batches.get(batchId);
+      if (this.closedBatchIds.has(batchId) || batch?.membershipClosed) {
+        throw new Error(`Batch ${batchId} is closed`);
+      }
+      return batch ?? this.createBatch(batchId);
     }
     const implicit = this.implicitBatchId ? this.batches.get(this.implicitBatchId) : undefined;
     if (implicit && [...implicit.jobs].some(id => this.jobs.get(id)?.exitedAt === undefined)) return implicit;
@@ -332,6 +383,7 @@ export class BackgroundJobManager {
     const batch: BatchState = {
       id,
       open: false,
+      membershipClosed: false,
       jobs: new Set(),
       members: new Set(),
       finalized: new Set(),
@@ -342,16 +394,17 @@ export class BackgroundJobManager {
   }
 
   private addMember(batch: BatchState, memberId: string): void {
+    if (batch.members.has(memberId)) return;
     if (batch.expectedMembers !== undefined && batch.members.size >= batch.expectedMembers) {
       throw new Error(`Batch ${batch.id} already has ${batch.expectedMembers} members`);
     }
     batch.members.add(memberId);
   }
 
-  private finishMember(batch: BatchState, memberId: string, summary: string): void {
+  private finishMember(batch: BatchState, memberId: string, completion: BackgroundJobCompletion): void {
     if (batch.finalized.has(memberId)) return;
     batch.finalized.add(memberId);
-    batch.pending.push({ summary });
+    batch.pending.push(completion);
     this.maybeFlush(batch);
   }
 
@@ -360,13 +413,35 @@ export class BackgroundJobManager {
     if (batch.expectedMembers !== undefined && batch.finalized.size < batch.expectedMembers) return;
     if (batch.expectedMembers === undefined && batch.finalized.size < batch.members.size) return;
     if ([...batch.jobs].some(id => this.jobs.get(id)?.exitedAt === undefined)) return;
-    const pending = batch.pending.splice(0);
-    this.sendUserMessage(
-      `SYSTEM (background-jobs): All ${pending.length} background job(s) in this batch finished.\n${pending.map(item => item.summary).join("\n")}`,
-      { deliverAs: "steer" },
-    );
+    const completions = batch.pending.splice(0);
+    const report = this.createReport(batch.id, completions);
+    this.reports.set(batch.id, report);
+    this.closedBatchIds.add(batch.id);
     this.batches.delete(batch.id);
     if (this.implicitBatchId === batch.id) this.implicitBatchId = undefined;
+    this.sendReport(report);
+  }
+
+  private createReport(batchId: string, completions: BackgroundJobCompletion[]): BackgroundJobReport {
+    const retained = completions.map(completion => ({ ...completion }));
+    return {
+      batchId,
+      completions: retained,
+      text: `SYSTEM (background-jobs): All ${retained.length} background job(s) in this batch finished.\n${retained.map(completion => this.renderCompletion(completion)).join("\n")}`,
+    };
+  }
+
+  private sendReport(report: BackgroundJobReport): void {
+    try {
+      const result = this.sendUserMessage(report.text, { deliverAs: "steer" });
+      if (result !== undefined) void Promise.resolve(result).catch(() => {});
+    } catch {}
+  }
+
+  private renderCompletion(completion: BackgroundJobCompletion): string {
+    return completion.status
+      ? `outcome ${completion.id}: [${completion.status}] ${completion.summary}`
+      : completion.summary;
   }
 
   private renderCompletionSummary(job: BgJob): string {
