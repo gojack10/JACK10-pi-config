@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   getBackgroundJobManager,
@@ -6,15 +6,6 @@ import {
 } from "./background-jobs/manager.ts";
 
 export default function backgroundJobs(pi: ExtensionAPI) {
-  let ownedSessionManager: object | undefined;
-  let ownedManager: ReturnType<typeof getBackgroundJobManager> | undefined;
-  const managerFor = (ctx: Pick<ExtensionContext, "sessionManager">) => {
-    if (ownedSessionManager === ctx.sessionManager && ownedManager) return ownedManager;
-    ownedSessionManager = ctx.sessionManager;
-    ownedManager = getBackgroundJobManager(pi, ctx);
-    return ownedManager;
-  };
-
   // ============================================================
   // Tools
   // ============================================================
@@ -30,7 +21,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
       cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to session cwd." })),
     }),
     async execute(_id, { command, cwd, label }, _signal, _onUpdate, ctx) {
-      const result = managerFor(ctx).start({ command, cwd: cwd ?? ctx.cwd, label });
+      const result = getBackgroundJobManager(pi, ctx).start({ command, cwd: cwd ?? ctx.cwd, label });
       const { job, runningJobs } = result;
       return {
         content: [
@@ -60,7 +51,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
       ),
     }),
     async execute(_id, { job_id, lines }, _signal, _onUpdate, ctx) {
-      const result = await managerFor(ctx).tail(job_id, lines);
+      const result = await getBackgroundJobManager(pi, ctx).tail(job_id, lines);
       if (!result) {
         return {
           content: [{ type: "text", text: `ERROR: no job with id ${job_id}. Call bash_jobs() to list.` }],
@@ -82,7 +73,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
       job_id: Type.Integer(),
     }),
     async execute(_id, { job_id }, _signal, _onUpdate, ctx) {
-      const result = managerFor(ctx).kill(job_id);
+      const result = getBackgroundJobManager(pi, ctx).kill(job_id);
       if (result.kind === "missing") {
         return {
           content: [{ type: "text", text: `ERROR: no job with id ${job_id}.` }],
@@ -102,7 +93,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
     description: "List background jobs when the user explicitly asks for progress/ETA, or to find completed results. Never poll for completion; all overlapping jobs produce one automatic notification when done.",
     parameters: Type.Object({}),
     async execute(_id, _args, _signal, _onUpdate, ctx) {
-      const result = managerFor(ctx).list();
+      const result = getBackgroundJobManager(pi, ctx).list();
       if (result.details.length === 0) return { content: [{ type: "text", text: result.text }] };
       return {
         content: [{ type: "text", text: result.text }],
