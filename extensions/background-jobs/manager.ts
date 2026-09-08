@@ -52,6 +52,17 @@ export interface BackgroundJobReport {
   completions: readonly BackgroundJobCompletion[];
 }
 
+export interface BackgroundJobBatchStatus {
+  batchId: string;
+  open: boolean;
+  membershipClosed: boolean;
+  members: number;
+  finalized: number;
+  pending: number;
+  running: number;
+  complete: boolean;
+}
+
 export interface BackgroundJobBatch {
   readonly id: string;
   start(options: BackgroundJobStartOptions): BackgroundJobStartResult;
@@ -118,6 +129,7 @@ export class BackgroundJobManager {
   private implicitBatchId: string | undefined;
   private shuttingDown = false;
   private sendUserMessage: SendUserMessage;
+  private readonly workListeners = new Set<() => void>();
 
   constructor(sendUserMessage: SendUserMessage) {
     this.sendUserMessage = sendUserMessage;
@@ -136,11 +148,21 @@ export class BackgroundJobManager {
     const id = this.nextJobId++;
     const logPath = join(tmpdir(), `pi-bg-${Date.now()}-${id}.log`);
     const logStream = createWriteStream(logPath);
-    const child = spawn("sh", ["-c", options.command], {
-      cwd: options.cwd,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // Close membership before submission so a fast child cannot finish before its monitor exists.
+    batch.jobs.add(id);
+    this.addMember(batch, `job:${id}`);
+    let child: ChildProcess;
+    try {
+      child = spawn("sh", ["-c", options.command], {
+        cwd: options.cwd,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      batch.jobs.delete(id);
+      batch.members.delete(`job:${id}`);
+      throw error;
+    }
     const startedAt = Date.now();
     child.stdout?.pipe(logStream, { end: false });
     child.stderr?.pipe(logStream, { end: false });
@@ -159,8 +181,6 @@ export class BackgroundJobManager {
       killed: false,
     };
     this.jobs.set(id, job);
-    batch.jobs.add(id);
-    this.addMember(batch, `job:${id}`);
 
     let closed = false;
     const finish = () => {
@@ -171,6 +191,11 @@ export class BackgroundJobManager {
           id: `job_${id}`,
           summary: this.renderCompletionSummary(job),
         });
+        if (this.runningCount() === 0) {
+          for (const listener of this.workListeners) {
+            try { listener(); } catch {}
+          }
+        }
       }
     };
     logStream.on("error", err => {
@@ -324,6 +349,11 @@ export class BackgroundJobManager {
     };
   }
 
+  onJobsSettled(listener: () => void): () => void {
+    this.workListeners.add(listener);
+    return () => this.workListeners.delete(listener);
+  }
+
   stats(): { jobs: number; running: number; pending: number; batches: number } {
     return {
       jobs: this.jobs.size,
@@ -340,6 +370,7 @@ export class BackgroundJobManager {
     this.closedBatchIds.clear();
     this.reports.clear();
     this.implicitBatchId = undefined;
+    this.workListeners.clear();
     for (const job of this.jobs.values()) {
       if (job.exitedAt === undefined) killJobTree(job);
     }
@@ -350,6 +381,28 @@ export class BackgroundJobManager {
     return report
       ? { ...report, completions: report.completions.map(completion => ({ ...completion })) }
       : undefined;
+  }
+
+  getBatchStatus(batchId: string): BackgroundJobBatchStatus | undefined {
+    const batch = this.batches.get(batchId);
+    if (!batch) {
+      return this.reports.has(batchId)
+        ? { batchId, open: false, membershipClosed: true, members: 0, finalized: 0, pending: 0, running: 0, complete: true }
+        : undefined;
+    }
+    const running = [...batch.jobs].filter(id => this.jobs.get(id)?.exitedAt === undefined).length;
+    const members = batch.members.size;
+    const finalized = batch.finalized.size;
+    return {
+      batchId,
+      open: batch.open,
+      membershipClosed: batch.membershipClosed,
+      members,
+      finalized,
+      pending: batch.pending.length,
+      running,
+      complete: !batch.open && running === 0 && finalized >= members,
+    };
   }
 
   private batchHandle(batch: BatchState): BackgroundJobBatch {
