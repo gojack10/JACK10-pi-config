@@ -22,14 +22,14 @@ async function until(check: () => boolean | Promise<boolean>) {
   assert.fail("Timed out waiting for task outcome state");
 }
 
-async function harness(t: any, sessionManager?: any) {
+async function harness(t: any, sessionManager?: any, persistent = false) {
   const dir = await mkdtemp(join(tmpdir(), "task-outcome-test-"));
   const { extensions, errors, runtime } = await loadExtensions(
     [backgroundPath, taskPath, consumerPath],
     dir,
   );
   assert.deepEqual(errors, []);
-  const sm = sessionManager ?? SessionManager.inMemory(dir);
+  const sm = sessionManager ?? (persistent ? SessionManager.create(dir) : SessionManager.inMemory(dir));
   const messages: Array<{ text: string; options: any }> = [];
   const persisted: any[] = [];
   runtime.sendUserMessage = (text: string, options: any) => messages.push({ text, options });
@@ -70,7 +70,7 @@ async function harness(t: any, sessionManager?: any) {
     await delay(50);
     await rm(dir, { recursive: true, force: true });
   });
-  return { dir, sm, call, emit, settle, snapshot, messages, persisted };
+  return { dir, sm, call, emit, settle, snapshot, messages, persisted, runtime };
 }
 
 const contract = (dir: string, jobId: string, attemptId: string, batchId = "batch") => ({
@@ -215,6 +215,7 @@ test("dialogue mode saves a settled assistant response without a report or comma
   assert.equal(outcome.outcome, "dialogue_settled");
   assert.match(outcome.summary, /saved dialogue response/);
   assert.equal(h.messages.length, 0);
+  assert.deepEqual((await h.snapshot()).events.map((event: any) => event.outcome), ["dialogue_settled"]);
 });
 
 test("durable records precede notification and restart does not claim stale ownership", { timeout: 10000 }, async t => {
@@ -238,6 +239,94 @@ test("durable records precede notification and restart does not claim stale owne
   assert.ok(restored.outcomes.some((item: any) => item.outcome === "completed" && item.attemptId === "d1"));
   assert.equal(restored.active, undefined);
   await rm(dir, { recursive: true, force: true });
+});
+
+test("sidecar replay stays on the active session branch", { timeout: 10000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "task-outcome-branch-"));
+  const sm = SessionManager.create(dir);
+  const h = await harness(t, sm);
+  const report = join(dir, "branch-a1.md");
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "branch-job", attempt_id: "a1", mode: "task", report_path: report,
+  });
+  await writeFile(report, "branch report");
+  await h.settle({ outcome: "completed", summary: "abandoned branch outcome" });
+  // Make the session file authoritative, then move the real manager to an empty branch.
+  sm.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as any);
+  sm.resetLeaf();
+  const reopened = SessionManager.open(sm.getSessionFile()!);
+  reopened.resetLeaf();
+  const fresh = await harness(t, reopened);
+  const snapshot = await fresh.snapshot();
+  assert.equal(snapshot.outcomes.length, 0);
+  assert.equal(snapshot.contracts.length, 0);
+  await fresh.call("task_outcomes_consumer", {
+    action: "activate", job_id: "branch-job", attempt_id: "a2", mode: "task",
+    report_path: join(dir, "branch-a2.md"),
+  });
+});
+
+test("a fresh attempt rejects a reused report path", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const report = join(h.dir, "reused.md");
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "reuse", attempt_id: "a1", mode: "task", report_path: report,
+  });
+  await writeFile(report, "old attempt report");
+  await h.settle({ outcome: "needs_input", summary: "choose a continuation" });
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "reuse", attempt_id: "a2", mode: "task", report_path: report,
+    }),
+    /fresh|reuse|exist|report/i,
+  );
+});
+
+test("work that starts and finishes after declaration invalidates completion", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const report = join(h.dir, "same-run.md");
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "same-run", attempt_id: "a1", mode: "task", report_path: report,
+  });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "batch" });
+  await writeFile(report, "same run report");
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  await h.call("report_outcome", { outcome: "completed", summary: "declared before work" });
+  const job = await h.call("bash_bg", { command: "true", label: "after declaration" });
+  await until(async () => (await h.call("bash_tail", { job_id: job.details.job_id })).details.alive === false);
+  const assistant = { role: "assistant", stopReason: "toolUse", content: [] };
+  await h.emit("turn_end", { turnIndex: 0, message: assistant, toolResults: [] });
+  await h.emit("agent_end", { messages: [assistant] });
+  await h.emit("agent_settled");
+  const snapshot = await h.snapshot();
+  assert.equal(snapshot.outcomes.filter((item: any) => item.attemptId === "a1" && item.final).length, 0);
+  assert.equal(snapshot.active.declaration, undefined);
+});
+
+test("failed durable child persistence remains retryable", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "mut", attempt_id: "a1", mode: "dialogue", children: ["child"],
+  });
+  const append = h.runtime.appendEntry;
+  h.runtime.appendEntry = (type: string, data: unknown) => {
+    append(type, data);
+    throw new Error("append unavailable");
+  };
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "child_outcome", job_id: "mut", child_job_id: "child", status: "completed", summary: "child done",
+    }),
+    /append unavailable/,
+  );
+  assert.match(await readFile(`${h.sm.getSessionFile()}.task-outcomes.jsonl`, "utf8"), /child done/);
+  assert.deepEqual((await h.snapshot()).active.pendingWork, ["child:child"]);
+  h.runtime.appendEntry = append;
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "mut", child_job_id: "child", status: "completed", summary: "child done",
+  });
+  assert.deepEqual((await h.snapshot()).active.pendingWork, []);
 });
 
 test("session loss is transport evidence, not semantic success", { timeout: 10000 }, async t => {

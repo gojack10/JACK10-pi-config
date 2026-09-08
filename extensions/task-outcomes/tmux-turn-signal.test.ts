@@ -1,4 +1,10 @@
 import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL, fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import activate from "../../extensions/tmux-turn-signal.ts";
 
@@ -86,4 +92,91 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
   pi.events.emit("task-outcome", { sessionId: "other", jobId: "wrong", attemptId: "wrong", outcome: "completed" });
   await wait();
   assert.equal(options.get(key("@pi_outcome_generation")), "1");
+});
+
+test("restart transport loss waits for tmux owner initialization", { timeout: 10000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "task-outcome-tmux-restart-"));
+  const stateDir = join(dir, "tmux-state");
+  const binDir = join(dir, "bin");
+  const tmux = join(binDir, "tmux");
+  await mkdir(binDir);
+  await writeFile(tmux, `#!/bin/sh
+state_dir="$PI_FAKE_TMUX_STATE"
+mkdir -p "$state_dir"
+last=""
+key=""
+for arg in "$@"; do
+  last="$arg"
+  case "$arg" in @pi_*) key="$arg"; break ;; esac
+done
+file="$state_dir/$(printf '%s' "\${TMUX_PANE:-pane}|$key" | tr -c 'A-Za-z0-9._-' '_')"
+case "$1" in
+  show-options) test -f "$file" && cat "$file" ;;
+  set-option)
+    if [ "$2" = "-qu" ]; then rm -f "$file"; exit 0; fi
+    value=""
+    take=0
+    for arg in "$@"; do
+      if [ "$take" = 1 ]; then value="$arg"; break; fi
+      [ "$arg" = "$key" ] && take=1
+    done
+    printf '%s' "$value" > "$file"
+    ;;
+  wait-for) printf '%s\\n' "$last" >> "$state_dir/signals" ;;
+esac
+`, "utf8");
+  await chmod(tmux, 0o755);
+  const oldPath = process.env.PATH;
+  const oldPane = process.env.TMUX_PANE;
+  const oldState = process.env.PI_FAKE_TMUX_STATE;
+  process.env.PATH = `${binDir}:${oldPath ?? ""}`;
+  process.env.TMUX_PANE = "%restart-outcome";
+  process.env.PI_FAKE_TMUX_STATE = stateDir;
+  t.after(async () => {
+    process.env.PATH = oldPath;
+    process.env.TMUX_PANE = oldPane;
+    process.env.PI_FAKE_TMUX_STATE = oldState;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const { loadExtensions } = await import(pathToFileURL(join(homedir(),
+    ".local/share/pi-mono/packages/coding-agent/dist/core/extensions/loader.js")).href);
+  const { SessionManager } = await import(pathToFileURL(join(homedir(),
+    ".local/share/pi-mono/packages/coding-agent/dist/index.js")).href);
+  const taskPath = fileURLToPath(new URL("../task-outcomes.ts", import.meta.url));
+  const tmuxPath = fileURLToPath(new URL("../tmux-turn-signal.ts", import.meta.url));
+  await mkdir(stateDir);
+  const sm = SessionManager.create(dir);
+  const event = {
+    version: 1,
+    eventId: randomUUID(),
+    kind: "contract",
+    at: new Date().toISOString(),
+    branchId: "restart-branch",
+    contract: {
+      jobId: "restart-job",
+      attemptId: "restart-attempt",
+      mode: "task",
+      reportPath: join(dir, "restart-report.md"),
+      ownerSessionId: sm.getSessionId(),
+      childJobIds: [],
+    },
+  };
+  sm.appendCustomEntry("task-outcome/v1", event);
+  sm.appendMessage({ role: "assistant", content: [], stopReason: "stop" } as any);
+  await writeFile(`${sm.getSessionFile()}.task-outcomes.jsonl`, `${JSON.stringify(event)}\\n`);
+
+  const loaded = await loadExtensions([taskPath, tmuxPath], dir);
+  assert.deepEqual(loaded.errors, []);
+  loaded.runtime.appendEntry = (type: string, data: unknown) => { sm.appendCustomEntry(type, data); };
+  loaded.runtime.sendUserMessage = () => {};
+  const ctx: any = { cwd: dir, mode: "tui", sessionManager: sm, hasPendingMessages: () => false };
+  for (const extension of loaded.extensions) {
+    for (const handler of extension.handlers.get("session_start") ?? []) await handler({ reason: "startup" }, ctx);
+  }
+  await delay(100);
+  const files = await readdir(stateDir);
+  const values = await Promise.all(files.filter(file => file !== "signals").map(file => readFile(join(stateDir, file), "utf8")));
+  assert.ok(values.some(value => value.includes("transport_lost")));
+  assert.match(await readFile(join(stateDir, "signals"), "utf8"), /pi-outcome/);
 });
