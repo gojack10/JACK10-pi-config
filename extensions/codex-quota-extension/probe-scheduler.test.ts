@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,6 +57,35 @@ const scheduled = (overrides: Partial<ProbeScheduleEntry> = {}): ProbeScheduleEn
 	attempts: 0,
 	reason: "test",
 	...overrides,
+});
+
+test("background lock timeout is contained, rearmed, and recovers after release", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-probe-lock-"));
+	t.after(() => rm(directory, { recursive: true, force: true }));
+	const path = join(directory, "schedule.json");
+	const feedPath = join(directory, "feed.json");
+	let launches = 0;
+	const failed = Promise.withResolvers<string>();
+	const scheduler = new ProbeScheduler({
+		path, feedPath, registry, now: () => now,
+		launch: async () => { launches++; return { timedOut: false, details: {} }; },
+		observe: (_provider, status, details) => {
+			if (status === "error") {
+				failed.resolve(String(details.error));
+				throw new Error("diagnostics unavailable");
+			}
+		},
+	});
+	t.after(() => scheduler.close());
+	await scheduler.reconcile(feed(account({ fetchedAt: 0 })));
+	await writeFile(`${path}.lock`, "");
+	assert.match(await failed.promise, /Timed out waiting for Codex probe schedule lock/);
+	assert.equal(launches, 0);
+	await unlink(`${path}.lock`);
+	await writeFile(feedPath, JSON.stringify(feed(account({ status429: false, fetchedAt: now }))));
+	await scheduler.runDue();
+	assert.equal(launches, 1);
+	assert.deepEqual(JSON.parse(await readFile(path, "utf8")).entries, []);
 });
 
 test("schedules a 429 probe at notBefore plus grace", () => {
