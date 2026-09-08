@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 import {
   getBackgroundJobManager,
@@ -75,8 +75,17 @@ interface Runtime {
 interface ContractState extends TaskLaunchContract {
   ownerSessionId: string;
   childJobIds: string[];
+  activatedAt: number;
+  childGeneration: number;
   state: TaskContractSnapshot["state"];
-  declaration?: { outcome: DeclaredOutcome; summary: string; run: number; turn: number };
+  declaration?: {
+    outcome: DeclaredOutcome;
+    summary: string;
+    run: number;
+    turn: number;
+    workGeneration: number;
+    childGeneration: number;
+  };
   childOutcomes: Map<string, { outcome: BackgroundJobOutcomeStatus; summary: string }>;
   questionNotified: boolean;
 }
@@ -84,9 +93,15 @@ interface ContractState extends TaskLaunchContract {
 interface PersistedEvent {
   version: 1;
   eventId: string;
+  branchId?: string;
   kind: "contract" | "declaration" | "declaration_invalidated" | "child_outcome" | "work_ready" | "outcome" | "transport_lost";
   at: string;
-  contract?: TaskLaunchContract & { ownerSessionId: string; childJobIds: string[] };
+  contract?: TaskLaunchContract & {
+    ownerSessionId: string;
+    childJobIds: string[];
+    activatedAt: number;
+    childGeneration?: number;
+  };
   jobId?: string;
   attemptId?: string;
   outcome?: DeclaredOutcome | MonitorOutcome;
@@ -121,7 +136,9 @@ const cloneRecord = (record: TaskOutcomeRecord): TaskOutcomeRecord => ({ ...reco
 export class TaskOutcomeManager {
   private readonly contracts = new Map<string, ContractState>();
   private readonly records: TaskOutcomeRecord[] = [];
+  private readonly usedReportPaths = new Set<string>();
   private activeKey: string | undefined;
+  private branchId = randomUUID();
   private restored = false;
   private run = 0;
   private turn = -1;
@@ -152,6 +169,22 @@ export class TaskOutcomeManager {
     this.activeKey = undefined;
   }
 
+  onSessionTree(): void {
+    this.stopWatchingWork();
+    this.contracts.clear();
+    this.records.length = 0;
+    this.usedReportPaths.clear();
+    this.activeKey = undefined;
+    this.branchId = randomUUID();
+    this.replay();
+    for (const contract of this.contracts.values()) {
+      if (contract.state === "active" && contract.ownerSessionId === this.runtime.sessionId) {
+        this.activeKey = this.key(contract.jobId, contract.attemptId);
+        this.watchWork(contract);
+      }
+    }
+  }
+
   activateContract(input: TaskLaunchContract): TaskContractSnapshot {
     assertId("jobId", input.jobId);
     assertId("attemptId", input.attemptId);
@@ -160,9 +193,14 @@ export class TaskOutcomeManager {
     const childJobIds = [...new Set(input.childJobIds ?? [])];
     for (const childJobId of childJobIds) assertId("childJobId", childJobId);
     if (childJobIds.includes(input.jobId)) throw new Error("a task cannot be its own child");
+    let reportPath = input.reportPath;
     if (input.mode === "task") {
-      if (!input.reportPath || !input.reportPath.startsWith("/") || input.reportPath.includes("\0")) {
+      if (!reportPath || !isAbsolute(reportPath) || reportPath.includes("\0")) {
         throw new Error("task mode requires an absolute reportPath");
+      }
+      reportPath = resolve(reportPath);
+      if (this.usedReportPaths.has(reportPath) || existsSync(reportPath)) {
+        throw new Error("task reportPath must be a fresh, unused path for this attempt");
       }
     }
     if (input.ownerSessionId && input.ownerSessionId !== this.runtime.sessionId) {
@@ -178,22 +216,24 @@ export class TaskOutcomeManager {
       throw new Error(`job ${input.jobId} already has an active or final attempt`);
     }
 
-    const batchId = input.batchId;
-    if (batchId) {
-      this.registerBatchMember(batchId, input.jobId);
-      for (const childJobId of childJobIds) this.registerBatchMember(batchId, childJobId);
-    }
-
     const contract: ContractState = {
       ...input,
+      reportPath,
       ownerSessionId: this.runtime.sessionId,
       childJobIds,
+      activatedAt: Date.now(),
+      childGeneration: 0,
       state: "active",
       childOutcomes: new Map(),
       questionNotified: false,
     };
-    this.contracts.set(key, contract);
     this.persist({ kind: "contract", contract: this.serializedContract(contract) });
+    if (contract.batchId) {
+      this.registerBatchMember(contract.batchId, contract.jobId);
+      for (const childJobId of childJobIds) this.registerBatchMember(contract.batchId, childJobId);
+    }
+    if (reportPath) this.usedReportPaths.add(reportPath);
+    this.contracts.set(key, contract);
     this.activeKey = key;
     this.watchWork(contract);
     return this.contractSnapshot(contract);
@@ -205,9 +245,11 @@ export class TaskOutcomeManager {
     const parent = this.requireActive(parentJobId);
     if (parent.childJobIds.includes(childJobId)) return;
     if (childJobId === parent.jobId) throw new Error("a task cannot be its own child");
-    parent.childJobIds.push(childJobId);
+    const next = { ...parent, childJobIds: [...parent.childJobIds, childJobId] };
+    this.persist({ kind: "contract", contract: this.serializedContract(next) });
     if (parent.batchId) this.registerBatchMember(parent.batchId, childJobId);
-    this.persist({ kind: "contract", contract: this.serializedContract(parent) });
+    parent.childJobIds.push(childJobId);
+    parent.childGeneration += 1;
   }
 
   recordChildOutcome(parentJobId: string, childJobId: string, outcome: BackgroundJobOutcomeStatus, summary: string): void {
@@ -218,9 +260,11 @@ export class TaskOutcomeManager {
     if (!parent.childJobIds.includes(childJobId)) throw new Error(`child ${childJobId} is not registered`);
     const text = assertSummary(summary);
     if (parent.childOutcomes.has(childJobId)) return;
-    parent.childOutcomes.set(childJobId, { outcome, summary: text });
     this.persist({ kind: "child_outcome", jobId: parent.jobId, attemptId: parent.attemptId, childJobId, outcome, summary: text });
-    if (parent.batchId) this.background().recordOutcome(parent.batchId, { id: childJobId, status: outcome, summary: text });
+    parent.childOutcomes.set(childJobId, { outcome, summary: text });
+    if (parent.batchId) {
+      try { this.background().recordOutcome(parent.batchId, { id: childJobId, status: outcome, summary: text }); } catch {}
+    }
     this.wakeIfReady(parent);
   }
 
@@ -235,6 +279,8 @@ export class TaskOutcomeManager {
     const contract = this.requireActive();
     if (contract.state !== "active") throw new Error(`attempt ${contract.attemptId} is not active`);
     if (contract.declaration) throw new Error(`attempt ${contract.attemptId} already declared an outcome`);
+    const declarationWorkGeneration = this.background().workGeneration();
+    const declarationChildGeneration = contract.childGeneration;
 
     if (outcome === "completed") {
       await this.verifyReport(contract);
@@ -242,7 +288,14 @@ export class TaskOutcomeManager {
       if (pending.length > 0) throw new Error(`completed is premature; pending work: ${pending.join(", ")}`);
     }
 
-    contract.declaration = { outcome, summary: text, run: this.run, turn: this.turn };
+    const declaration = {
+      outcome,
+      summary: text,
+      run: this.run,
+      turn: this.turn,
+      workGeneration: declarationWorkGeneration,
+      childGeneration: declarationChildGeneration,
+    };
     this.persist({
       kind: "declaration",
       jobId: contract.jobId,
@@ -253,7 +306,6 @@ export class TaskOutcomeManager {
     });
 
     if (outcome === "needs_input") {
-      contract.state = "awaiting_input";
       const question = `Task ${contract.jobId} (attempt ${contract.attemptId}) needs human input:\n${text}`;
       this.persist({
         kind: "outcome",
@@ -265,6 +317,8 @@ export class TaskOutcomeManager {
         reportPath: contract.reportPath,
         notified: true,
       });
+      contract.declaration = declaration;
+      contract.state = "awaiting_input";
       contract.questionNotified = true;
       this.records.push({
         jobId: contract.jobId,
@@ -278,6 +332,8 @@ export class TaskOutcomeManager {
       });
       this.notifyQuestion(contract, question);
       this.emitOutcome({ contract, outcome, source: "model", summary: text, final: false });
+    } else {
+      contract.declaration = declaration;
     }
 
     return {
@@ -330,14 +386,19 @@ export class TaskOutcomeManager {
     const declaration = contract.declaration;
     if (declaration) {
       const pending = this.pendingWork(contract);
-      if (declaration.outcome === "completed" && pending.length > 0) {
-        contract.declaration = undefined;
+      const workStartedAfterDeclaration = this.background().workGeneration() > declaration.workGeneration;
+      const childWorkStartedAfterDeclaration = contract.childGeneration > declaration.childGeneration;
+      if (declaration.outcome === "completed" &&
+          (pending.length > 0 || workStartedAfterDeclaration || childWorkStartedAfterDeclaration)) {
         this.persist({
           kind: "declaration_invalidated",
           jobId: contract.jobId,
           attemptId: contract.attemptId,
-          summary: `work remained at settlement: ${pending.join(", ")}`,
+          summary: pending.length > 0
+            ? `work remained at settlement: ${pending.join(", ")}`
+            : "work started after the completed declaration",
         });
+        contract.declaration = undefined;
         return;
       }
       if (declaration.outcome === "completed") {
@@ -356,7 +417,7 @@ export class TaskOutcomeManager {
     if (pending.length > 0) return;
     if (contract.mode === "dialogue") {
       const response = assistantText(this.lastAssistant);
-      this.finalize(contract, "dialogue_settled", "model", response || "Assistant settled; read the saved session response.", false);
+      this.finalize(contract, "dialogue_settled", "model", response || "Assistant settled; read the saved session response.");
       return;
     }
     this.finalize(contract, "failed", "protocol", "protocol-incomplete: task settled without a structured outcome declaration");
@@ -421,6 +482,9 @@ export class TaskOutcomeManager {
     try {
       const stat = await file.stat();
       if (!stat.isFile() || stat.size < 1) throw new Error("report must be a readable nonempty file");
+      if (Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs + 1 < contract.activatedAt) {
+        throw new Error("report must be created after this attempt was activated");
+      }
       const buffer = Buffer.alloc(1);
       const result = await file.read(buffer, 0, 1, 0);
       if (result.bytesRead !== 1) throw new Error("report must be a readable nonempty file");
@@ -501,11 +565,16 @@ export class TaskOutcomeManager {
   private wakeIfReady(contract: ContractState): void {
     if (this.activeKey !== this.key(contract.jobId, contract.attemptId) || contract.state !== "active") return;
     if (contract.declaration || this.pendingWork(contract).length > 0 || this.workReadyNotified) return;
-    this.workReadyNotified = true;
     const summary = `background/child work finished for ${contract.jobId}; inspect the retained evidence, synthesize the report, then declare an outcome`;
-    this.persist({ kind: "work_ready", jobId: contract.jobId, attemptId: contract.attemptId, summary });
     try {
-      this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${summary}.`, { deliverAs: "steer" });
+      this.persist({ kind: "work_ready", jobId: contract.jobId, attemptId: contract.attemptId, summary });
+    } catch {
+      return;
+    }
+    this.workReadyNotified = true;
+    try {
+      const result = this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${summary}.`, { deliverAs: "steer" });
+      if (result !== undefined) void Promise.resolve(result).catch(() => {});
     } catch {}
   }
 
@@ -526,7 +595,6 @@ export class TaskOutcomeManager {
 
   private markTransportLost(contract: ContractState, summary: string): void {
     if (contract.state === "final" || contract.state === "transport_lost") return;
-    contract.state = "transport_lost";
     this.persist({
       kind: "transport_lost",
       jobId: contract.jobId,
@@ -535,6 +603,7 @@ export class TaskOutcomeManager {
       source: "transport",
       summary,
     });
+    contract.state = "transport_lost";
     this.records.push({
       jobId: contract.jobId,
       attemptId: contract.attemptId,
@@ -573,6 +642,8 @@ export class TaskOutcomeManager {
       parentJobId: contract.parentJobId,
       childJobIds: [...contract.childJobIds],
       ownerSessionId: contract.ownerSessionId,
+      activatedAt: contract.activatedAt,
+      childGeneration: contract.childGeneration,
     };
   }
 
@@ -580,8 +651,14 @@ export class TaskOutcomeManager {
     return `${jobId}@${attemptId}`;
   }
 
-  private persist(event: Omit<PersistedEvent, "version" | "eventId" | "at">): void {
-    const data: PersistedEvent = { version: 1, eventId: randomUUID(), at: new Date().toISOString(), ...event };
+  private persist(event: Omit<PersistedEvent, "version" | "eventId" | "at" | "branchId">): void {
+    const data: PersistedEvent = {
+      version: 1,
+      eventId: randomUUID(),
+      branchId: this.branchId,
+      at: new Date().toISOString(),
+      ...event,
+    };
     const sidecar = this.runtime.sessionFile ? `${this.runtime.sessionFile}.task-outcomes.jsonl` : undefined;
     if (sidecar) {
       mkdirSync(dirname(sidecar), { recursive: true });
@@ -592,16 +669,33 @@ export class TaskOutcomeManager {
 
   private replay(): void {
     const events: PersistedEvent[] = [];
-    const sidecar = this.runtime.sessionFile ? `${this.runtime.sessionFile}.task-outcomes.jsonl` : undefined;
-    if (sidecar && existsSync(sidecar)) {
-      for (const line of readFileSync(sidecar, "utf8").split("\n")) {
-        try { const event = JSON.parse(line); if (event?.version === 1 && event?.eventId) events.push(event); } catch {}
-      }
-    }
+    const branchEvents: PersistedEvent[] = [];
+    const branchIds = new Set<string>();
     for (const entry of this.runtime.branchEntries()) {
       if (entry?.type !== "custom" || entry.customType !== TASK_OUTCOME_ENTRY) continue;
       const event = entry.data as PersistedEvent;
-      if (event?.version === 1 && event.eventId) events.push(event);
+      if (event?.version !== 1 || !event.eventId) continue;
+      branchEvents.push(event);
+      if (event.branchId) branchIds.add(event.branchId);
+      if (event.kind === "contract" && event.contract?.reportPath) this.usedReportPaths.add(resolve(event.contract.reportPath));
+    }
+    events.push(...branchEvents);
+
+    const sidecar = this.runtime.sessionFile ? `${this.runtime.sessionFile}.task-outcomes.jsonl` : undefined;
+    if (sidecar && existsSync(sidecar)) {
+      for (const line of readFileSync(sidecar, "utf8").split("\n")) {
+        try {
+          const event = JSON.parse(line) as PersistedEvent;
+          if (event?.version !== 1 || !event.eventId) continue;
+          if (event.kind === "contract" && event.contract?.reportPath) {
+            this.usedReportPaths.add(resolve(event.contract.reportPath));
+          }
+          // Sidecar records are only usable when their branch token is also
+          // represented by a custom entry on the active branch. Legacy records
+          // without a token cannot establish branch ownership safely.
+          if (event.branchId && branchIds.has(event.branchId)) events.push(event);
+        } catch {}
+      }
     }
     const seen = new Set<string>();
     for (const event of events) {
@@ -616,6 +710,8 @@ export class TaskOutcomeManager {
       const contract: ContractState = {
         ...event.contract,
         childJobIds: [...event.contract.childJobIds],
+        activatedAt: Number.isFinite(event.contract.activatedAt) ? event.contract.activatedAt : Date.parse(event.at),
+        childGeneration: event.contract.childGeneration ?? 0,
         state: "active",
         childOutcomes: new Map(),
         questionNotified: false,
@@ -628,7 +724,14 @@ export class TaskOutcomeManager {
     if (!contract) return;
     if (event.kind === "declaration") {
       if (isOutcome(event.outcome) && event.summary) {
-        contract.declaration = { outcome: event.outcome, summary: event.summary, run: 0, turn: -1 };
+        contract.declaration = {
+          outcome: event.outcome,
+          summary: event.summary,
+          run: 0,
+          turn: -1,
+          workGeneration: 0,
+          childGeneration: contract.childGeneration,
+        };
       }
     } else if (event.kind === "declaration_invalidated") {
       contract.declaration = undefined;
