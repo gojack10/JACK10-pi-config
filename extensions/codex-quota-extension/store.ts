@@ -335,7 +335,8 @@ const poolStatus = (
 		if (observed && observed.resetAt * 1000 <= now) verifying = true;
 		const window = observed?.resetAt && observed.resetAt * 1000 > now ? observed : undefined;
 		if (!window) continue;
-		if (evaluation.routable) {
+		// Weekly balance is independent of short-window exhaustion and routing blocks.
+		if (minutes === 10080 || evaluation.routable) {
 			remaining += 100 - window.pctUsed;
 			addGain(window.resetAt, window.pctUsed);
 			continue;
@@ -431,7 +432,13 @@ export const quotaBuckets = (
 			const live = members.filter(({ evaluation }) =>
 				evaluation.effectiveWindows.some((window) => window.minutes === minutes)
 			);
-			const blocked = live.length > 0 && live.every(({ evaluation }) => !evaluation.routable);
+			// A routing failure/429 does not identify which quota window is empty.
+			// Weekly exhaustion can block 5H use, but never the reverse.
+			const blocked = live.length > 0 && live.every(({ evaluation }) =>
+				evaluation.effectiveWindows.some((window) =>
+					(window.minutes === minutes || window.minutes === 10080) && window.pctUsed >= 100
+				)
+			);
 			const stale = !blocked && live.some(({ evaluation }) => evaluation.freshness === "aged");
 			const refillByReset = new Map<number, number>();
 			for (const { evaluation } of live) {
