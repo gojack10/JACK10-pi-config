@@ -82,6 +82,7 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
     mode: "task",
     outcome: "completed",
     source: "model",
+    final: true,
     report: "/tmp/report.md",
     session_file: "/tmp/session.jsonl",
   });

@@ -24,6 +24,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
       batch_id: Type.Optional(Type.String()),
       child_job_id: Type.Optional(Type.String()),
       status: Type.Optional(Type.String()),
+      source: Type.Optional(Type.String()),
       summary: Type.Optional(Type.String()),
       command: Type.Optional(Type.String()),
       children: Type.Optional(Type.Array(Type.String())),
@@ -52,6 +53,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
             args.child_job_id ?? "child",
             (args.status ?? "completed") as BackgroundJobOutcomeStatus,
             args.summary ?? "child finished",
+            args.source as any,
           );
           break;
         case "background": {

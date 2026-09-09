@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, constants, existsSync, lstatSync, readFileSync } from "node:fs";
+import { appendFileSync, constants, existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -20,8 +21,14 @@ export type OutcomeSource = "model" | "technical" | "protocol" | "transport";
 
 export const TASK_LAUNCH_MANIFEST_OPTION = "@pi_subagent_manifest";
 
+export interface ReportIdentity {
+  dev: string;
+  ino: string;
+}
+
 export interface TaskLaunchManifest extends TaskLaunchContract {
   version: 1;
+  activatedAt?: number;
   startChannel?: string;
   startGeneration?: number;
   outcomeGeneration?: number;
@@ -32,6 +39,7 @@ export interface TaskLaunchContract {
   attemptId: string;
   mode: TaskMode;
   reportPath?: string;
+  reportIdentity?: ReportIdentity;
   batchId?: string;
   parentJobId?: string;
   childJobIds?: readonly string[];
@@ -103,7 +111,7 @@ interface ContractState extends TaskLaunchContract {
   workReadySequence: number;
   workReadyNotified: boolean;
   workReadyPendingSequence: number | undefined;
-  childOutcomes: Map<string, { outcome: BackgroundJobOutcomeStatus; summary: string }>;
+  childOutcomes: Map<string, { outcome: BackgroundJobOutcomeStatus; summary: string; source: OutcomeSource }>;
   questionNotified: boolean;
 }
 
@@ -159,6 +167,34 @@ const isOutcome = (value: unknown): value is DeclaredOutcome =>
 
 const isStatus = (value: unknown): value is BackgroundJobOutcomeStatus =>
   value === "completed" || value === "failed" || value === "blocked";
+
+const isSource = (value: unknown): value is OutcomeSource =>
+  value === "model" || value === "technical" || value === "protocol" || value === "transport";
+
+const validReportIdentity = (value: unknown): value is ReportIdentity =>
+  !!value && typeof value === "object" &&
+  /^\d+$/.test((value as any).dev ?? "") && /^\d+$/.test((value as any).ino ?? "");
+
+const reportIdentityMatches = (path: string, identity: ReportIdentity): boolean => {
+  try {
+    const info = lstatSync(path);
+    return info.isFile() && String(info.dev) === identity.dev && String(info.ino) === identity.ino;
+  } catch {
+    return false;
+  }
+};
+
+const createReportReservation = (path: string): { activatedAt: number; reportIdentity: ReportIdentity } => {
+  const activatedAt = Date.now();
+  try {
+    writeFileSync(path, "", { flag: "wx", mode: 0o600 });
+    const info = lstatSync(path);
+    if (!info.isFile()) throw new Error("reservation is not a regular file");
+    return { activatedAt, reportIdentity: { dev: String(info.dev), ino: String(info.ino) } };
+  } catch (error) {
+    throw new Error(`cannot reserve reportPath ${path}: ${errorMessage(error)}`);
+  }
+};
 
 const cloneRecord = (record: TaskOutcomeRecord): TaskOutcomeRecord => ({ ...record });
 
@@ -303,6 +339,7 @@ export class TaskOutcomeManager {
       attemptId: manifest.attemptId,
       mode: manifest.mode,
       reportPath: manifest.reportPath,
+      reportIdentity: manifest.reportIdentity,
       batchId: manifest.batchId,
       parentJobId: manifest.parentJobId,
       childJobIds: manifest.childJobIds,
@@ -323,10 +360,10 @@ export class TaskOutcomeManager {
       }
       return this.contractSnapshot(existing);
     }
-    return this.activateContract(contract);
+    return this.activateContract({ ...contract, activatedAt: manifest.activatedAt });
   }
 
-  activateContract(input: TaskLaunchContract): TaskContractSnapshot {
+  activateContract(input: TaskLaunchContract & { activatedAt?: number }): TaskContractSnapshot {
     assertId("jobId", input.jobId);
     assertId("attemptId", input.attemptId);
     if (input.mode !== "task" && input.mode !== "dialogue") throw new Error("mode must be task or dialogue");
@@ -343,17 +380,37 @@ export class TaskOutcomeManager {
     const reservation = durableReservation ?? pendingReservation;
     const reservedContract = reservation?.kind === "contract" ? reservation.contract : undefined;
     let reportPath = input.reportPath;
+    let reportIdentity = input.reportIdentity ?? reservedContract?.reportIdentity;
+    let activatedAt = Number.isFinite(reservedContract?.activatedAt)
+      ? reservedContract!.activatedAt
+      : Number.isFinite(input.activatedAt) ? input.activatedAt! : Date.now();
     if (input.mode === "task") {
       if (!reportPath || !isAbsolute(reportPath) || reportPath.includes("\0")) {
         throw new Error("task mode requires an absolute reportPath");
       }
       reportPath = resolve(reportPath);
+      if (reportIdentity !== undefined && !validReportIdentity(reportIdentity)) {
+        throw new Error("task reportIdentity is invalid");
+      }
       const reservedReportPath = reservedContract?.reportPath
         ? resolve(reservedContract.reportPath)
         : undefined;
-      if ((this.usedReportPaths.has(reportPath) || pathEntryExists(reportPath)) && reservedReportPath !== reportPath) {
+      let launcherReservationMatches = reportIdentity !== undefined && reportIdentityMatches(reportPath, reportIdentity);
+      if (reportIdentity === undefined && !pathEntryExists(reportPath)) {
+        const created = createReportReservation(reportPath);
+        activatedAt = created.activatedAt;
+        reportIdentity = created.reportIdentity;
+        launcherReservationMatches = true;
+      }
+      if (reportIdentity !== undefined && !launcherReservationMatches) {
+        throw new Error("task reportPath no longer matches its launch reservation");
+      }
+      if ((this.usedReportPaths.has(reportPath) || pathEntryExists(reportPath)) &&
+          reservedReportPath !== reportPath && !launcherReservationMatches) {
         throw new Error("task reportPath must be a fresh, unused path for this attempt");
       }
+    } else if (reportIdentity !== undefined) {
+      throw new Error("dialogue mode must not include reportIdentity");
     }
     if (input.ownerSessionId && input.ownerSessionId !== this.runtime.sessionId) {
       throw new Error("launch contract belongs to another session");
@@ -371,11 +428,10 @@ export class TaskOutcomeManager {
     const contract: ContractState = {
       ...input,
       reportPath,
+      reportIdentity,
       ownerSessionId: this.runtime.sessionId,
       childJobIds,
-      activatedAt: Number.isFinite(reservedContract?.activatedAt)
-        ? reservedContract!.activatedAt
-        : Date.now(),
+      activatedAt,
       childGeneration: reservedContract?.childGeneration ?? 0,
       state: "active",
       declarationSequence: 0,
@@ -435,28 +491,48 @@ export class TaskOutcomeManager {
     parent.childGeneration = durable.contract.childGeneration ?? next.childGeneration;
   }
 
-  recordChildOutcome(parentJobId: string, childJobId: string, outcome: BackgroundJobOutcomeStatus, summary: string): void {
+  recordChildOutcome(
+    parentJobId: string,
+    childJobId: string,
+    outcome: BackgroundJobOutcomeStatus,
+    summary: string,
+    source: OutcomeSource = "model",
+  ): void {
     assertId("parentJobId", parentJobId);
     assertId("childJobId", childJobId);
     if (!isStatus(outcome)) throw new Error("child outcome must be completed, failed, or blocked");
+    if (!isSource(source)) throw new Error("child outcome source is invalid");
     const parent = this.requireActive(parentJobId);
     if (!parent.childJobIds.includes(childJobId)) throw new Error(`child ${childJobId} is not registered`);
     const text = assertSummary(summary);
     const wasRecorded = parent.childOutcomes.has(childJobId);
     const durable = this.persist(
-      { kind: "child_outcome", jobId: parent.jobId, attemptId: parent.attemptId, childJobId, outcome, summary: text },
+      {
+        kind: "child_outcome",
+        jobId: parent.jobId,
+        attemptId: parent.attemptId,
+        childJobId,
+        outcome,
+        source,
+        summary: text,
+      },
       this.operationEventId("child_outcome", parent, childJobId),
     );
-    if (!durable.childJobId || !isStatus(durable.outcome) || !durable.summary) {
+    if (!durable.childJobId || !isStatus(durable.outcome) || !durable.summary || !isSource(durable.source)) {
       throw new Error("invalid durable child outcome");
     }
-    parent.childOutcomes.set(durable.childJobId, { outcome: durable.outcome, summary: durable.summary });
+    parent.childOutcomes.set(durable.childJobId, {
+      outcome: durable.outcome,
+      summary: durable.summary,
+      source: durable.source,
+    });
     if (parent.batchId) {
       try {
         this.background().recordOutcome(parent.batchId, {
           id: durable.childJobId,
           status: durable.outcome,
           summary: durable.summary,
+          source: durable.source,
         });
       } catch {}
     }
@@ -707,13 +783,18 @@ export class TaskOutcomeManager {
 
   private async verifyReport(contract: ContractState): Promise<void> {
     if (!contract.reportPath) throw new Error("task has no expected report path");
-    const { open } = await import("node:fs/promises");
-    if (typeof constants.O_NOFOLLOW !== "number") throw new Error("report validation cannot reject symlinks on this platform");
-    const file = await open(contract.reportPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    if (!contract.reportIdentity) throw new Error("report reservation identity is missing");
+    if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") {
+      throw new Error("report validation cannot safely reject links or blocking special files on this platform");
+    }
+    const file = await open(contract.reportPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
-      const stat = await file.stat();
-      if (!stat.isFile() || stat.size < 1) throw new Error("report must be a readable nonempty file");
-      if (Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs + 1 < contract.activatedAt) {
+      const info = await file.stat();
+      if (!info.isFile() || info.size < 1) throw new Error("report must be a readable nonempty file");
+      if (String(info.dev) !== contract.reportIdentity.dev || String(info.ino) !== contract.reportIdentity.ino) {
+        throw new Error("report no longer matches its launch reservation");
+      }
+      if (Number.isFinite(info.birthtimeMs) && info.birthtimeMs + 1 < contract.activatedAt) {
         throw new Error("report must be created after this attempt was activated");
       }
       const buffer = Buffer.alloc(1);
@@ -763,6 +844,7 @@ export class TaskOutcomeManager {
           id: contract.jobId,
           status: record.outcome,
           summary: `${record.summary} (attempt ${contract.attemptId})`,
+          source: record.source,
         });
       } catch {
         // The durable record and monitor event remain authoritative if a manager was replaced.
@@ -980,6 +1062,7 @@ export class TaskOutcomeManager {
       attemptId: contract.attemptId,
       mode: contract.mode,
       reportPath: contract.reportPath,
+      reportIdentity: contract.reportIdentity,
       batchId: contract.batchId,
       parentJobId: contract.parentJobId,
       childJobIds: [...contract.childJobIds],
@@ -1173,7 +1256,11 @@ export class TaskOutcomeManager {
     } else if (event.kind === "declaration_invalidated") {
       contract.declaration = undefined;
     } else if (event.kind === "child_outcome" && event.childJobId && isStatus(event.outcome) && event.summary) {
-      contract.childOutcomes.set(event.childJobId, { outcome: event.outcome, summary: event.summary });
+      contract.childOutcomes.set(event.childJobId, {
+        outcome: event.outcome,
+        summary: event.summary,
+        source: isSource(event.source) ? event.source : "model",
+      });
     } else if (event.kind === "work_ready") {
       const sequence = event.workReadySequence ?? 0;
       if (sequence + 1 >= contract.workReadySequence) {
