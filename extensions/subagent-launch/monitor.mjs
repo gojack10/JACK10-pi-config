@@ -79,7 +79,12 @@ const transportFailure = (summary, manifest) => {
     outcome: "transport_lost", source: "transport", technical: true, final: true,
     summary, report: manifest?.reportPath });
 };
+const protocolFailure = summary => {
+  emit({ kind: "final", jobId: config.jobId, attemptId: config.attemptId,
+    outcome: "failed", source: "protocol", technical: true, final: true, summary });
+};
 
+const manifestDeadline = Date.now() + config.startTimeoutMs;
 let lastGeneration;
 let activeKey;
 let startedKey;
@@ -92,8 +97,16 @@ while (true) {
       transportFailure("transport_lost: child pane disappeared before a durable outcome", { jobId: config.jobId, attemptId: config.attemptId });
       process.exit(0);
     }
+    if (Date.now() >= manifestDeadline) {
+      protocolFailure("protocol_incomplete: launcher manifest was missing or invalid");
+      process.exit(0);
+    }
     await sleep(config.pollMs);
     continue;
+  }
+  if (activeKey === undefined && Date.now() >= manifestDeadline) {
+    protocolFailure("protocol_incomplete: launcher manifest arrived after the start deadline");
+    process.exit(0);
   }
   const key = `${manifest.jobId}@${manifest.attemptId}`;
   if (activeKey !== key) {

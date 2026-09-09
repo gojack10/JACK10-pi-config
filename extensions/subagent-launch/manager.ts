@@ -280,9 +280,10 @@ export class SubagentLauncher {
         batch.recordOutcome({
           id: item.jobId,
           status: "failed",
+          source: "transport",
           summary: `setup_failed: ${item.error}; no child was released (session evidence is retained)`,
         });
-        if (parent) this.recordParent(parent.jobId, item.jobId, `setup_failed: ${item.error}`);
+        if (parent) this.recordParent(parent.jobId, item.jobId, `setup_failed: ${item.error}`, "failed", "transport");
       }
     }
 
@@ -298,8 +299,8 @@ export class SubagentLauncher {
         // A monitor that was already submitted remains authoritative; do not add a
         // second batch member or invent a second parent outcome.
         if (item.state?.monitorJobId === undefined) {
-          batch.recordOutcome({ id: item.jobId, status: "failed", summary: `monitor_setup_failed: ${item.error}; no child was released` });
-          if (parent) this.recordParent(parent.jobId, item.jobId, `monitor_setup_failed: ${item.error}`);
+          batch.recordOutcome({ id: item.jobId, status: "failed", source: "transport", summary: `monitor_setup_failed: ${item.error}; no child was released` });
+          if (parent) this.recordParent(parent.jobId, item.jobId, `monitor_setup_failed: ${item.error}`, "failed", "transport");
         }
       }
     }
@@ -322,8 +323,8 @@ export class SubagentLauncher {
         failed.add(item.jobId);
         // The monitor remains authoritative if a partial tmux paste was accepted.
         if (state.monitorJobId === undefined) {
-          batch.recordOutcome({ id: item.jobId, status: "failed", summary: `release_failed: ${item.error}; pane was preserved` });
-          if (parent) this.recordParent(parent.jobId, item.jobId, `release_failed: ${item.error}`);
+          batch.recordOutcome({ id: item.jobId, status: "failed", source: "transport", summary: `release_failed: ${item.error}; pane was preserved` });
+          if (parent) this.recordParent(parent.jobId, item.jobId, `release_failed: ${item.error}`, "failed", "transport");
         }
       }
     }
@@ -386,7 +387,6 @@ export class SubagentLauncher {
     await requireDirectory(cwd, "cwd");
     await requireMission(missionFile);
     const reportPath = input.mode === "task" ? asPath(input.report_file, "report_file") : undefined;
-    const reservation = input.mode === "task" ? await requireFreshReport(reportPath!, new Set()) : undefined;
     if (input.mode !== "task" && input.report_file !== undefined) throw new Error("dialogue mode must not include report_file");
 
     const knownState = this.states.get(jobId);
@@ -396,6 +396,7 @@ export class SubagentLauncher {
     if (!knownState?.finished && await this.paneIsBusy(paneId)) {
       throw new Error(`subagent ${jobId} is still handling its current turn; follow-up was not pasted`);
     }
+    const reservation = input.mode === "task" ? await requireFreshReport(reportPath!, new Set()) : undefined;
     const reuseMonitor = knownState?.monitorJobId !== undefined && !knownState.finished;
     const currentStartGeneration = Number.parseInt(await this.show(paneId, START_GENERATION_OPTION) ?? "0", 10);
     const currentOutcomeGeneration = Number.parseInt(await this.show(paneId, OUTCOME_GENERATION_OPTION) ?? "0", 10);
