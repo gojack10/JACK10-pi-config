@@ -51,7 +51,7 @@ async function harness(t: any, sessionManager?: any, persistent = false) {
     return owner.tools.get(name)!.definition.execute("test", args, undefined, undefined, ctx);
   };
   const snapshot = async () => (await call("task_outcomes_consumer", { action: "snapshot" })).details;
-  const settle = async (options: { outcome?: string; summary?: string; stopReason?: string; text?: string } = {}) => {
+  const settle = async (options: { outcome?: string; summary?: string; stopReason?: string; text?: string; saveAssistant?: boolean } = {}) => {
     await emit("agent_start");
     await emit("turn_start", { turnIndex: 0 });
     if (options.outcome) {
@@ -63,6 +63,7 @@ async function harness(t: any, sessionManager?: any, persistent = false) {
       content: options.text ? [{ type: "text", text: options.text }] : [],
     };
     await emit("turn_end", { turnIndex: 0, message: assistant, toolResults: [] });
+    if (options.saveAssistant !== false) sm.appendMessage(assistant);
     await emit("agent_end", { messages: [assistant] });
     await emit("agent_settled");
   };
@@ -448,8 +449,10 @@ test("replay preserves child evidence and the generation boundary", { timeout: 1
   const membership = h.sm.getBranch().filter(entry =>
     entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "contract").at(-1);
   assert.equal((membership?.data as any).contract.childGeneration, 1);
-  await h.emit("turn_end", { turnIndex: 0, message: { role: "assistant", content: [] } });
-  await h.emit("agent_end", { messages: [{ role: "assistant", content: [] }] });
+  const assistant = { role: "assistant", stopReason: "stop", content: [] };
+  await h.emit("turn_end", { turnIndex: 0, message: assistant });
+  h.sm.appendMessage(assistant as any);
+  await h.emit("agent_end", { messages: [assistant] });
   await h.emit("agent_settled");
   assert.equal((await h.snapshot()).outcomes.at(-1).outcome, "completed");
 });
@@ -640,7 +643,7 @@ test("real session-file append failure is retried only after disk recovery", { t
     action: "activate", job_id: "disk-retry", attempt_id: "d1", mode: "dialogue",
   });
   await chmod(sessionFile, 0o444);
-  await assert.rejects(h.settle({ text: "old final" }), /EACCES|permission denied/);
+  await assert.rejects(h.settle({ text: "old final", saveAssistant: false }), /EACCES|permission denied/);
   const failedDisk = await readFile(sessionFile, "utf8");
   assert.doesNotMatch(failedDisk, /dialogue_settled/);
   assert.match(await readFile(`${sessionFile}.task-outcomes.jsonl`, "utf8"), /dialogue_settled/);
@@ -675,6 +678,155 @@ test("a durable but unattempted work_ready wake is retried after replay", { time
   await h.emit("session_tree");
   await h.call("task_outcomes_consumer", { action: "background", batch_id: "wake-unrelated", command: "true" });
   await until(() => h.messages.filter(message => /task-outcomes/.test(message.text)).length === 1);
+});
+
+test("persistent settlement before assistant materialization stays provisional", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  const sessionFile = h.sm.getSessionFile();
+  assert.ok(sessionFile);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "lazy", attempt_id: "a1", mode: "dialogue",
+  });
+  await h.settle({ text: "not actually saved", saveAssistant: false });
+  assert.equal((await h.snapshot()).outcomes.length, 0);
+  await assert.rejects(readFile(sessionFile), /ENOENT|no such file/);
+});
+
+test("dialogue settlement after an assistant is saved survives reload", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  const sessionFile = h.sm.getSessionFile();
+  assert.ok(sessionFile);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "saved-dialogue", attempt_id: "a1", mode: "dialogue",
+  });
+  await h.settle({ text: "saved dialogue" });
+  assert.match(await readFile(sessionFile, "utf8"), /saved dialogue/);
+  const restarted = await harness(t, SessionManager.open(sessionFile));
+  const outcome = (await restarted.snapshot()).outcomes.at(-1);
+  assert.equal(outcome.outcome, "dialogue_settled");
+  assert.match(outcome.summary, /saved dialogue/);
+});
+
+test("activation retry reuses its reserved timestamp but rejects changed input", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  const sessionFile = h.sm.getSessionFile();
+  assert.ok(sessionFile);
+  const original = h.runtime.appendEntry;
+  h.runtime.appendEntry = () => { throw new Error("activation failed before mutation"); };
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "retry-activation", attempt_id: "a1", mode: "dialogue",
+    }),
+    /before mutation/,
+  );
+  const sidecar = `${sessionFile}.task-outcomes.jsonl`;
+  const first = JSON.parse((await readFile(sidecar, "utf8")).trim());
+  h.runtime.appendEntry = original;
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "retry-activation", attempt_id: "a1", mode: "task",
+      report_path: join(h.dir, "changed.md"),
+    }),
+    /different payload/,
+  );
+  const result = await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "retry-activation", attempt_id: "a1", mode: "dialogue",
+  });
+  assert.equal(result.details.jobId, "retry-activation");
+  const entries = (await readFile(sidecar, "utf8")).trim().split("\\n").map(line => JSON.parse(line));
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].contract.activatedAt, first.contract.activatedAt);
+});
+
+test("failed append reload restores the selected branch before retry", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "user", content: "seed", timestamp: Date.now() } as any);
+  h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() } as any);
+  const sessionFile = h.sm.getSessionFile();
+  assert.ok(sessionFile);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "branch-retry", attempt_id: "a1", mode: "dialogue",
+  });
+  const contractEntry = h.sm.getEntries().find(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "contract");
+  assert.ok(contractEntry);
+  h.sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "abandoned" }], stopReason: "stop" } as any);
+  h.sm.branch(contractEntry.id);
+  await h.emit("session_tree");
+
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  const assistant = { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "selected" }] };
+  await h.emit("turn_end", { turnIndex: 0, message: assistant, toolResults: [] });
+  h.sm.appendMessage(assistant as any);
+  const intendedLeaf = h.sm.getLeafId();
+  const original = h.runtime.appendEntry;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    original(type, data);
+    if (data?.kind === "outcome") throw new Error("final append failed after mutation");
+  };
+  await chmod(sessionFile, 0o444);
+  await assert.rejects(
+    h.emit("agent_end", { messages: [assistant] }).then(() => h.emit("agent_settled")),
+    /final append failed after mutation|EACCES|permission denied/,
+  );
+  await chmod(sessionFile, 0o644);
+  h.runtime.appendEntry = original;
+  await h.emit("agent_settled");
+
+  const outcome = h.sm.getEntries().find(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "outcome");
+  assert.ok(outcome);
+  assert.equal(outcome.parentId, intendedLeaf);
+  assert.equal(h.sm.getLeafId(), outcome.id);
+});
+
+test("rejected work-ready notification remains retryable without duplicate sends", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "user", content: "seed", timestamp: Date.now() } as any);
+  h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() } as any);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "wake-retry", attempt_id: "a1", mode: "dialogue", children: ["child"],
+  });
+  h.runtime.sendUserMessage = () => { throw new Error("notifier unavailable"); };
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "wake-retry", child_job_id: "child", status: "completed", summary: "child done",
+  });
+  await delay(30);
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.persisted.filter(entry => entry.data?.kind === "work_ready" && entry.data.notified === true).length, 0);
+
+  h.runtime.sendUserMessage = (text: string, options: any) => {
+    h.messages.push({ text, options });
+    return Promise.resolve();
+  };
+  await h.emit("session_tree");
+  await until(() => h.messages.filter(message => /task-outcomes/.test(message.text)).length === 1);
+  assert.equal(h.persisted.filter(entry => entry.data?.kind === "work_ready" && entry.data.notified === false).length, 1);
+  assert.equal(h.persisted.filter(entry => entry.data?.kind === "work_ready" && entry.data.notified === true).length, 1);
+});
+
+test("rejected needs-input notification replays the question", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "user", content: "seed", timestamp: Date.now() } as any);
+  h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() } as any);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "question-retry", attempt_id: "a1", mode: "dialogue",
+  });
+  h.runtime.sendUserMessage = () => { throw new Error("question notifier unavailable"); };
+  await h.call("report_outcome", { outcome: "needs_input", summary: "choose a continuation" });
+  const outcome = h.sm.getBranch().find(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "outcome");
+  assert.equal((outcome?.data as any).notified, false);
+  assert.equal((await h.snapshot()).active.state, "awaiting_input");
+
+  h.runtime.sendUserMessage = (text: string, options: any) => {
+    h.messages.push({ text, options });
+    return Promise.resolve();
+  };
+  await h.emit("session_tree");
+  await until(() => h.messages.filter(message => /choose a continuation/.test(message.text)).length === 1);
+  assert.equal(h.persisted.filter(entry => entry.data?.kind === "outcome" && entry.data.notified === true).length, 1);
 });
 
 test("every direct transition helper call has a declared method", async () => {

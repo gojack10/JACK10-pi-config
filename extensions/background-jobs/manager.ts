@@ -68,7 +68,7 @@ export interface BackgroundJobBatch {
   start(options: BackgroundJobStartOptions): BackgroundJobStartResult;
   registerOutcome(id: string): void;
   recordOutcome(outcome: BackgroundJobOutcome): void;
-  notifyNeedsInput(message: string): void;
+  notifyNeedsInput(message: string): void | PromiseLike<void>;
   getReport(): BackgroundJobReport | undefined;
   close(): void;
 }
@@ -305,10 +305,10 @@ export class BackgroundJobManager {
     );
   }
 
-  notifyNeedsInput(batchId: string, message: string): void {
+  notifyNeedsInput(batchId: string, message: string): void | PromiseLike<void> {
     this.assertOpen();
     if (!this.batches.has(batchId)) throw new Error(`Unknown background batch ${batchId}`);
-    this.sendUserMessage(
+    return this.sendUserMessage(
       `SYSTEM (background-jobs): Batch ${batchId} needs human input.\n${message}`,
       { deliverAs: "steer" },
     );
