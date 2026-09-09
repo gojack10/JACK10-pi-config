@@ -470,6 +470,21 @@ test("dangling report symlinks are not fresh report paths", { timeout: 10000 }, 
   );
 });
 
+test("a nonempty report symlink cannot satisfy completion", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const report = join(h.dir, "symlink-report.md");
+  const target = join(h.dir, "unrelated.md");
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "symlink", attempt_id: "s1", mode: "task", report_path: report,
+  });
+  await writeFile(target, "unrelated nonempty target");
+  await symlink(target, report);
+  await assert.rejects(
+    h.call("report_outcome", { outcome: "completed", summary: "symlink must fail" }),
+    /report|symlink|ELOOP/i,
+  );
+});
+
 test("child work after completion declaration wakes the fresh settlement boundary", { timeout: 10000 }, async t => {
   const h = await harness(t);
   await h.call("task_outcomes_consumer", {

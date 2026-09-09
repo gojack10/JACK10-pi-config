@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, existsSync, lstatSync, readFileSync } from "node:fs";
+import { appendFileSync, constants, existsSync, lstatSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -708,7 +708,8 @@ export class TaskOutcomeManager {
   private async verifyReport(contract: ContractState): Promise<void> {
     if (!contract.reportPath) throw new Error("task has no expected report path");
     const { open } = await import("node:fs/promises");
-    const file = await open(contract.reportPath, "r");
+    if (typeof constants.O_NOFOLLOW !== "number") throw new Error("report validation cannot reject symlinks on this platform");
+    const file = await open(contract.reportPath, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const stat = await file.stat();
       if (!stat.isFile() || stat.size < 1) throw new Error("report must be a readable nonempty file");
