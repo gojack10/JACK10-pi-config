@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-type TaskOutcomeEvent = { sessionId: string; outcome: string; jobId: string; attemptId: string };
+type TaskOutcomeEvent = { sessionId: string; outcome: string; jobId: string; attemptId: string; final?: boolean; summary?: string };
 const taskOutcomeEventStatus = (value: unknown): value is TaskOutcomeEvent =>
 	!!value && typeof value === "object" &&
 	typeof (value as any).sessionId === "string" &&
@@ -13,6 +13,7 @@ const DONE_CHANNEL_OPTION = "@pi_done_channel";
 const SESSION_FILE_OPTION = "@pi_session_file";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
 const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
+const START_GENERATION_OPTION = "@pi_start_generation";
 const OUTCOME_CHANNEL_OPTION = "@pi_outcome_channel";
 const OUTCOME_OPTION = "@pi_outcome";
 const OUTCOME_GENERATION_OPTION = "@pi_outcome_generation";
@@ -114,6 +115,11 @@ export default function (pi: ExtensionAPI) {
 		if (!pane || ctx.mode !== "tui") return;
 
 		await saveSessionFile(pane, ctx.sessionManager.getSessionFile());
+		const startGeneration = Number.parseInt(await readOption(pane, START_GENERATION_OPTION), 10);
+		await pi.exec("tmux", [
+			"set-option", "-q", "-t", pane, START_GENERATION_OPTION,
+			String(Number.isSafeInteger(startGeneration) ? startGeneration + 1 : 1),
+		]);
 		await settledChannel(pane);
 		await signal(pane, START_CHANNEL_OPTION);
 	});
