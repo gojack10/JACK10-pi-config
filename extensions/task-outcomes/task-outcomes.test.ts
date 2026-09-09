@@ -830,6 +830,33 @@ test("rejected needs-input notification replays the question", { timeout: 10000 
   assert.equal(h.persisted.filter(entry => entry.data?.kind === "outcome" && entry.data.notified === true).length, 1);
 });
 
+test("replacement owners do not replay another owner's pending question", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const oldOwnerSessionId = h.sm.getSessionId();
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "replacement-question", attempt_id: "a1", mode: "dialogue",
+  });
+  h.runtime.sendUserMessage = () => { throw new Error("question notifier unavailable"); };
+  await h.call("report_outcome", { outcome: "needs_input", summary: "old owner's question" });
+  await delay(20);
+
+  const replacementSm = SessionManager.inMemory(h.dir, { id: "replacement-owner" }, h.sm.getEntries());
+  const replacement = await harness(t, replacementSm);
+  await delay(20);
+
+  assert.equal(replacement.messages.length, 0);
+  assert.equal(replacement.sm.getEntries().filter(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" &&
+    (entry.data as any).kind === "outcome" && (entry.data as any).notified === true,
+  ).length, 0);
+  const snapshot = await replacement.snapshot();
+  assert.equal(snapshot.active, undefined);
+  const restored = snapshot.contracts.find((item: any) => item.jobId === "replacement-question");
+  assert.equal(restored.ownerSessionId, oldOwnerSessionId);
+  assert.equal(restored.state, "awaiting_input");
+  assert.ok(snapshot.outcomes.some((item: any) => item.attemptId === "a1" && item.outcome === "needs_input"));
+});
+
 test("in-memory activation reserves identity without activating or leaking batch membership", { timeout: 10000 }, async t => {
   const h = await harness(t);
   await h.call("task_outcomes_consumer", { action: "batch_open", batch_id: "memory-batch" });
