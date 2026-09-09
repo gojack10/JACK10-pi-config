@@ -117,6 +117,7 @@ interface BgJob extends BackgroundJobInfo {
   errorMessage?: string;
   completionId?: string;
   completion?: BackgroundJobCompletionOverride;
+  retired?: boolean;
   onStdout?: (chunk: string) => void;
 }
 
@@ -241,7 +242,7 @@ export class BackgroundJobManager {
     const finish = () => {
       if (job.exitedAt !== undefined) return;
       job.exitedAt = Date.now();
-      if (!this.shuttingDown) {
+      if (!this.shuttingDown && !job.retired) {
         const completion = job.completion ?? (job.completionId
           ? { id: job.completionId, status: "failed" as const, summary: this.renderCompletionSummary(job) }
           : { id: `job_${id}`, summary: this.renderCompletionSummary(job) });
@@ -299,6 +300,32 @@ export class BackgroundJobManager {
     batch.membershipClosed = true;
     this.closedBatchIds.add(batchId);
     this.maybeFlush(batch);
+  }
+
+  reopenBatch(batchId: string): BackgroundJobBatch {
+    this.assertOpen();
+    const batch = this.batches.get(batchId);
+    if (!batch || !this.closedBatchIds.has(batchId) || batch.jobs.size > 0 || batch.members.size > 0 || batch.pending.length > 0) {
+      throw new Error(`Batch ${batchId} cannot be reopened`);
+    }
+    this.closedBatchIds.delete(batchId);
+    batch.open = true;
+    batch.membershipClosed = false;
+    return this.batchHandle(batch);
+  }
+
+  retireExternal(jobId: number): void {
+    const job = this.jobs.get(jobId);
+    if (!job || job.exitedAt !== undefined) return;
+    job.retired = true;
+    this.jobListeners.delete(jobId);
+    for (const batch of this.batches.values()) {
+      if (!batch.jobs.delete(jobId)) continue;
+      batch.members.delete(`job:${jobId}`);
+      batch.finalized.delete(`job:${jobId}`);
+    }
+    this.jobs.delete(jobId);
+    killJobTree(job);
   }
 
   registerOutcome(batchId: string, id: string): void {
