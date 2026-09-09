@@ -20,7 +20,7 @@ async function until(check: () => boolean | Promise<boolean>): Promise<void> {
   assert.fail("timed out");
 }
 
-const monitorConfig = (pane: string, jobId: string, attemptId: string) => JSON.stringify({
+const monitorConfig = (pane: string, jobId: string, attemptId: string, startTimeoutMs = 1000) => JSON.stringify({
   paneId: pane,
   manifestOption: "@pi_subagent_manifest",
   outcomeOption: "@pi_outcome",
@@ -28,9 +28,93 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string) => JSON.s
   startGenerationOption: "@pi_start_generation",
   sessionFileOption: "@pi_session_file",
   pollMs: 10,
-  startTimeoutMs: 1000,
+  startTimeoutMs,
   jobId,
   attemptId,
+});
+
+ test("monitor fails a live malformed manifest at the bounded start deadline", { timeout: 5000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-manifest-test-"));
+  const session = `pi-subagent-manifest-${process.pid}-${Date.now()}`;
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    await tmux(["new-session", "-d", "-s", session, "-c", dir]);
+    const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
+    const manifest = join(dir, "manifest.json");
+    await writeFile(manifest, JSON.stringify({ version: 999 }));
+    await tmux(["set-option", "-q", "-t", pane, "@pi_subagent_job_id", "manifest-job"]);
+    await tmux(["set-option", "-q", "-t", pane, "@pi_subagent_manifest", manifest]);
+    const markers: any[] = [];
+    child = spawn(process.execPath, [monitorPath, monitorConfig(pane, "manifest-job", "manifest-attempt", 100)], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout!.setEncoding("utf8").on("data", chunk => {
+      for (const line of String(chunk).split(/\r?\n/).filter(Boolean)) markers.push(JSON.parse(line));
+    });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("monitor did not bound malformed manifest")), 1000);
+      child!.once("close", () => { clearTimeout(timer); resolve(); });
+    });
+    const finals = markers.filter(marker => marker.kind === "final");
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].outcome, "failed");
+    assert.equal(finals[0].source, "protocol");
+    assert.equal(finals[0].technical, true);
+    assert.equal(finals[0].final, true);
+  } finally {
+    child?.kill("SIGTERM");
+    await tmux(["kill-session", "-t", session]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+ test("monitor accepts a valid manifest that arrives before the deadline", { timeout: 5000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-manifest-arrival-test-"));
+  const session = `pi-subagent-manifest-arrival-${process.pid}-${Date.now()}`;
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    await tmux(["new-session", "-d", "-s", session, "-c", dir]);
+    const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
+    const badManifest = join(dir, "bad-manifest.json");
+    const manifest = join(dir, "manifest.json");
+    const sessionFile = join(dir, "session.jsonl");
+    await writeFile(badManifest, JSON.stringify({ version: 999 }));
+    await writeFile(manifest, JSON.stringify({ version: 1, jobId: "arrival-job", attemptId: "arrival-attempt",
+      sessionId: "arrival-session", mode: "dialogue", startChannel: "unused-start",
+      startGeneration: 0, outcomeGeneration: 0 }));
+    await writeFile(sessionFile, "session\n");
+    const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
+    await set("@pi_subagent_job_id", "arrival-job");
+    await set("@pi_subagent_manifest", badManifest);
+    const markers: any[] = [];
+    child = spawn(process.execPath, [monitorPath, monitorConfig(pane, "arrival-job", "arrival-attempt", 500)], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout!.setEncoding("utf8").on("data", chunk => {
+      for (const line of String(chunk).split(/\r?\n/).filter(Boolean)) markers.push(JSON.parse(line));
+    });
+    await delay(60);
+    await set("@pi_subagent_manifest", manifest);
+    await set("@pi_start_generation", "1");
+    await set("@pi_session_file", sessionFile);
+    await until(() => markers.some(marker => marker.kind === "start"));
+    assert.equal(markers.filter(marker => marker.kind === "final").length, 0);
+    await set("@pi_outcome", JSON.stringify({ session_id: "arrival-session", job_id: "arrival-job",
+      attempt_id: "arrival-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true }));
+    await set("@pi_outcome_generation", "1");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("monitor did not settle valid manifest")), 1000);
+      child!.once("close", () => { clearTimeout(timer); resolve(); });
+    });
+    const finals = markers.filter(marker => marker.kind === "final");
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].outcome, "completed");
+    assert.equal(finals[0].source, "model");
+  } finally {
+    child?.kill("SIGTERM");
+    await tmux(["kill-session", "-t", session]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
  test("monitor rejects a replaced regular report and a FIFO without blocking", { timeout: 10000 }, async t => {
