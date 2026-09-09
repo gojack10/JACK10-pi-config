@@ -219,7 +219,7 @@ export class TaskOutcomeManager {
     this.restored = true;
     for (const contract of this.contracts.values()) {
       if (contract.ownerSessionId !== this.runtime.sessionId) continue;
-      if (contract.state === "active" && contract.ownerSessionId === this.runtime.sessionId) {
+      if (contract.state === "active") {
         this.markTransportLost(contract, "monitor restarted before a final outcome");
       }
     }
@@ -736,7 +736,8 @@ export class TaskOutcomeManager {
 
   private retryPendingNotifications(): void {
     for (const contract of this.contracts.values()) {
-      if (contract.state !== "awaiting_input" || contract.questionNotified) continue;
+      if (contract.ownerSessionId !== this.runtime.sessionId ||
+          contract.state !== "awaiting_input" || contract.questionNotified) continue;
       const summary = contract.declaration?.summary;
       if (!summary) continue;
       void this.notifyQuestion(contract, `Task ${contract.jobId} (attempt ${contract.attemptId}) needs human input:\n${summary}`);
@@ -755,7 +756,8 @@ export class TaskOutcomeManager {
   }
 
   private async wakeIfReady(contract: ContractState): Promise<void> {
-    if (this.activeKey !== this.key(contract.jobId, contract.attemptId) || contract.state !== "active") return;
+    if (contract.ownerSessionId !== this.runtime.sessionId ||
+        this.activeKey !== this.key(contract.jobId, contract.attemptId) || contract.state !== "active") return;
     if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified) return;
     const summary = `background/child work finished for ${contract.jobId}; inspect the retained evidence, synthesize the report, then declare an outcome`;
     const sequence = contract.workReadyPendingSequence ?? contract.workReadySequence;
@@ -820,6 +822,7 @@ export class TaskOutcomeManager {
   }
 
   private beginNotification(contract: ContractState, eventId: string): NotificationFlight | undefined {
+    if (contract.ownerSessionId !== this.runtime.sessionId) return undefined;
     const ownerSessionId = this.runtime.sessionId;
     const branchId = this.notificationBranchId;
     const contractKey = this.key(contract.jobId, contract.attemptId);
@@ -835,7 +838,8 @@ export class TaskOutcomeManager {
         this.runtime.sessionId !== flight.ownerSessionId ||
         this.notificationBranchId !== flight.branchId ||
         this.runtime.leafId() !== flight.leafId) return undefined;
-    return this.contracts.get(flight.contractKey);
+    const contract = this.contracts.get(flight.contractKey);
+    return contract?.ownerSessionId === flight.ownerSessionId ? contract : undefined;
   }
 
   private endNotification(flight: NotificationFlight): void {
