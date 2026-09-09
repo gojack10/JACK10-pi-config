@@ -106,7 +106,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	let sessionStarted = false;
 	let startupFallbackWarning: string | undefined;
 	const failedAccounts = new Set<string>();
-	const failoverAttempts = new Set<string>();
 	for (const account of registry.accounts) {
 		if (account.credentialRef !== account.providerId)
 			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
@@ -213,7 +212,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					evaluateCodexRouteFromFiles({ model: model.id, work, registryPath: REGISTRY_PATH, feedPath: FEED_PATH }),
 				context,
 				excludedAccountKeys: failedAccounts,
-				consideredAccountKeys: failedAccounts.size ? failoverAttempts : undefined,
 				reevaluatePin: !!pin && failedAccounts.has(pin.accountKey),
 				fallbackProviderId: sessionStarted ? undefined : "openai",
 			});
@@ -294,7 +292,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			return;
 
 		failedAccounts.add(pin.accountKey);
-		failoverAttempts.add(pin.accountKey);
 		const work = parseWorkInput(process.env.PI_CODEX_WORK);
 		try {
 			const resolved = await resolveCodexPersonalSelection({
@@ -310,7 +307,6 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					hasAuth: async (provider) => !!(await ctx.modelRegistry.getProviderAuth(provider)),
 				},
 				excludedAccountKeys: failedAccounts,
-				consideredAccountKeys: failoverAttempts,
 				reevaluatePin: true,
 			});
 			if (!resolved.pin || !(await pi.setModel(resolved.model)))
