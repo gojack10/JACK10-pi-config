@@ -67,6 +67,8 @@ interface StoredState {
   monitorJobId?: number;
   monitorLogPath?: string;
   monitorUnsubscribe?: () => void;
+  releaseFailure?: string;
+  releaseBuffered?: boolean;
   startWaiters: Map<string, Array<(started: boolean) => void>>;
   startResults: Map<string, boolean>;
   outputBuffer: string;
@@ -321,10 +323,20 @@ export class SubagentLauncher {
         item.error = errorMessage(error);
         item.failureStatus = "release_failed";
         failed.add(item.jobId);
-        // The monitor remains authoritative if a partial tmux paste was accepted.
-        if (state.monitorJobId === undefined) {
-          batch.recordOutcome({ id: item.jobId, status: "failed", source: "transport", summary: `release_failed: ${item.error}; pane was preserved` });
-          if (parent) this.recordParent(parent.jobId, item.jobId, `release_failed: ${item.error}`, "failed", "transport");
+        const summary = `release_failed: ${item.error}; pane was preserved`;
+        // Before load-buffer succeeds nothing was accepted, so transport is the
+        // fallback. Once buffering succeeds, the monitor owns the race.
+        if (state.monitorJobId !== undefined) {
+          state.releaseFailure = summary;
+          this.background.setCompletion(state.monitorJobId, {
+            id: item.jobId,
+            status: "failed",
+            source: "transport",
+            summary,
+          });
+        } else {
+          batch.recordOutcome({ id: item.jobId, status: "failed", source: "transport", summary });
+          if (parent) this.recordParent(parent.jobId, item.jobId, summary, "failed", "transport");
         }
       }
     }
@@ -397,11 +409,18 @@ export class SubagentLauncher {
       throw new Error(`subagent ${jobId} is still handling its current turn; follow-up was not pasted`);
     }
     const reservation = input.mode === "task" ? await requireFreshReport(reportPath!, new Set()) : undefined;
-    const reuseMonitor = knownState?.monitorJobId !== undefined && !knownState.finished;
+    const replaceMonitor = knownState?.monitorJobId !== undefined && !knownState.finished;
     const currentStartGeneration = Number.parseInt(await this.show(paneId, START_GENERATION_OPTION) ?? "0", 10);
     const currentOutcomeGeneration = Number.parseInt(await this.show(paneId, OUTCOME_GENERATION_OPTION) ?? "0", 10);
     const attemptId = unique("subagent-attempt");
-    const batchId = reuseMonitor ? knownState!.batchId : unique("subagent-followup-batch");
+    const batchId = replaceMonitor ? knownState!.batchId : unique("subagent-followup-batch");
+    const batch = replaceMonitor
+      ? (() => {
+        knownState!.monitorUnsubscribe?.();
+        this.background.retireExternal(knownState!.monitorJobId!);
+        return this.background.reopenBatch(batchId);
+      })()
+      : this.background.openBatch(batchId, 1);
     const manifestPath = await this.writeManifest({
       version: 1,
       jobId,
@@ -430,42 +449,32 @@ export class SubagentLauncher {
     await this.set(paneId, "@pi_subagent_attempt_id", attemptId);
     await this.set(paneId, "@pi_subagent_mode", input.mode);
 
-    let state = knownState;
-    const batch = reuseMonitor ? undefined : this.background.openBatch(batchId, 1);
-    if (!state || state.monitorJobId === undefined || state.finished) {
-      state = {
-        jobId,
-        sessionId,
-        attemptId,
-        batchId,
-        paneId,
-        sessionLabel: await this.show(paneId, "@pi_subagent_session_label") ?? sessionId,
-        cwd,
-        provider: input.provider,
-        model: input.model,
-        thinking: input.thinking,
-        mode: input.mode,
-        manifestPath,
-        reportPath,
-        startWaiters: new Map(),
-        startResults: new Map(),
-        outputBuffer: "",
-        finished: false,
-        parentJobId: old.parentJobId,
-      };
-      await this.armMonitor(state, batch!);
-      this.states.set(jobId, state);
-    } else {
-      state.attemptId = attemptId;
-      state.batchId = batchId;
-      state.manifestPath = manifestPath;
-      state.reportPath = reportPath;
-      state.finished = false;
-    }
+    const state: StoredState = {
+      jobId,
+      sessionId,
+      attemptId,
+      batchId,
+      paneId,
+      sessionLabel: await this.show(paneId, "@pi_subagent_session_label") ?? sessionId,
+      cwd,
+      provider: input.provider,
+      model: input.model,
+      thinking: input.thinking,
+      mode: input.mode,
+      manifestPath,
+      reportPath,
+      startWaiters: new Map(),
+      startResults: new Map(),
+      outputBuffer: "",
+      finished: false,
+      parentJobId: old.parentJobId,
+    };
+    await this.armMonitor(state, batch);
+    this.states.set(jobId, state);
     const startPromise = this.waitForStart(state, attemptId);
-    await this.paste(paneId, missionFile);
+    await this.paste(paneId, missionFile, state);
     const started = await Promise.race([startPromise, this.timeout(START_WAIT_MS)]);
-    batch?.close();
+    batch.close();
     return {
       job: jobId,
       status: started ? "running" : "start_timeout",
@@ -609,6 +618,8 @@ export class SubagentLauncher {
       startTimeoutMs: MONITOR_START_MS,
       jobId: state.jobId,
       attemptId: state.attemptId,
+      sessionId: state.sessionId,
+      mode: state.mode,
     });
     const monitorJob = batch.startExternal(
       {
@@ -655,9 +666,12 @@ export class SubagentLauncher {
         } catch {}
       } else if (marker.kind === "final" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         const status = marker.outcome === "completed" ? "completed" : marker.outcome === "blocked" ? "blocked" : "failed";
-        const source = marker.source as OutcomeSource | undefined;
+        const source = ["model", "technical", "protocol", "transport"].includes(marker.source)
+          ? marker.source as OutcomeSource
+          : "protocol" as const;
         const summary = `${marker.summary || marker.outcome} (attempt ${marker.attemptId}; session ${state.sessionId}; report ${marker.report || "none"}; monitor ${state.monitorLogPath || "pending"})`;
-        if (state.monitorJobId !== undefined) {
+        if (state.monitorJobId !== undefined &&
+            !(state.releaseFailure && !state.releaseBuffered && source === "protocol")) {
           this.background.setCompletion(state.monitorJobId, { id: state.jobId, status, summary, source });
         }
         this.resolveStart(state, marker.attemptId, false);
@@ -669,11 +683,12 @@ export class SubagentLauncher {
     const state = item.state!;
     const bootPath = await this.show(state.paneId, "@pi_subagent_boot_file");
     if (!bootPath) throw new Error("boot barrier file is missing");
-    await this.paste(state.paneId, bootPath);
+    await this.paste(state.paneId, bootPath, state);
   }
 
-  private async paste(paneId: string, filePath: string): Promise<void> {
+  private async paste(paneId: string, filePath: string, state?: StoredState): Promise<void> {
     await this.tmux(["load-buffer", filePath]);
+    if (state) state.releaseBuffered = true;
     await this.tmux(["paste-buffer", "-pr", "-t", paneId]);
     await this.tmux(["send-keys", "-t", paneId, "Enter"]);
   }

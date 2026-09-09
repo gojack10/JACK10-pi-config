@@ -83,6 +83,20 @@ const protocolFailure = summary => {
   emit({ kind: "final", jobId: config.jobId, attemptId: config.attemptId,
     outcome: "failed", source: "protocol", technical: true, final: true, summary });
 };
+const expected = {
+  jobId: config.jobId,
+  attemptId: config.attemptId,
+  sessionId: typeof config.sessionId === "string" ? config.sessionId : undefined,
+  mode: config.mode === "task" || config.mode === "dialogue" ? config.mode : undefined,
+};
+const matchesExpected = manifest => manifest.jobId === expected.jobId &&
+  manifest.attemptId === expected.attemptId &&
+  manifest.sessionId === expected.sessionId && manifest.mode === expected.mode;
+const bindManifest = manifest => {
+  if (expected.sessionId === undefined) expected.sessionId = manifest.sessionId;
+  if (expected.mode === undefined) expected.mode = manifest.mode;
+  return matchesExpected(manifest);
+};
 
 const manifestDeadline = Date.now() + config.startTimeoutMs;
 let lastGeneration;
@@ -104,6 +118,10 @@ while (true) {
     await sleep(config.pollMs);
     continue;
   }
+  if (!bindManifest(manifest)) {
+    protocolFailure("protocol_incomplete: launcher manifest identity changed");
+    process.exit(0);
+  }
   if (activeKey === undefined && Date.now() >= manifestDeadline) {
     protocolFailure("protocol_incomplete: launcher manifest arrived after the start deadline");
     process.exit(0);
@@ -122,6 +140,12 @@ while (true) {
         sleep(config.pollMs).then(() => ({ kind: "poll", value: false })),
       ]);
       if (result.kind === "signal" && result.value) observedChannel = true;
+      const liveManifest = await readManifest();
+      if (liveManifest && !bindManifest(liveManifest)) {
+        startWait.cancel();
+        protocolFailure("protocol_incomplete: launcher manifest identity changed");
+        process.exit(0);
+      }
       const startGeneration = Number.parseInt(await show(config.startGenerationOption) ?? "", 10);
       const file = await sessionFile();
       if (Number.isSafeInteger(startGeneration) && startGeneration > manifest.startGeneration && file) {
@@ -149,12 +173,17 @@ while (true) {
   const currentGeneration = await generation();
   if (currentGeneration > lastGeneration) {
     lastGeneration = currentGeneration;
+    const currentManifest = await readManifest();
+    if (!currentManifest || !bindManifest(currentManifest)) {
+      protocolFailure("protocol_incomplete: launcher manifest identity changed");
+      process.exit(0);
+    }
     const raw = await show(config.outcomeOption);
     let receipt;
     try { receipt = raw ? JSON.parse(raw) : undefined; } catch { receipt = undefined; }
     const source = receipt && receipt.source === undefined ? "model" : receipt?.source;
-    if (!receipt || receipt.job_id !== manifest.jobId || receipt.attempt_id !== manifest.attemptId ||
-        receipt.mode !== manifest.mode || receipt.session_id !== manifest.sessionId ||
+    if (!receipt || receipt.job_id !== expected.jobId || receipt.attempt_id !== expected.attemptId ||
+        receipt.mode !== expected.mode || receipt.session_id !== expected.sessionId ||
         typeof receipt.outcome !== "string" ||
         (receipt.source !== undefined && !["model", "technical", "protocol", "transport"].includes(receipt.source))) {
       emit({ kind: "evidence", jobId: manifest.jobId, attemptId: manifest.attemptId,

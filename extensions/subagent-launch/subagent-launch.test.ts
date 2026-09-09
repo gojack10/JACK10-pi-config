@@ -161,7 +161,7 @@ test("subagent_launch rejects an explicitly unsupported thinking level before tm
   }
 });
 
-test("subagent_followup reuses the initial monitor and batch after a settled input request", { timeout: 20000 }, async t => {
+test("subagent_followup replaces the monitor while preserving the batch after settled input", { timeout: 20000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), "subagent-followup-test-"));
   const parentSession = `pi-subagent-followup-${process.pid}-${Date.now()}`;
   const oldPath = process.env.PATH;
@@ -475,6 +475,86 @@ exit 1
     process.env.PATH = oldPath;
     if (oldPane === undefined) delete process.env.TMUX_PANE;
     else process.env.TMUX_PANE = oldPane;
+    await tmux(["kill-session", "-t", parentSession]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("load-buffer release failure keeps transport source through monitor and parent", { timeout: 40000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-launch-release-failure-test-"));
+  const parentSession = `pi-subagent-release-failure-${process.pid}-${Date.now()}`;
+  const oldPath = process.env.PATH;
+  const oldPane = process.env.TMUX_PANE;
+  const realTmux = (await execFileAsync("which", ["tmux"], { encoding: "utf8" })).stdout.trim();
+  const fakeTmux = join(dir, "tmux");
+  const parentSessionManager = SessionManager.inMemory(dir);
+  await writeFile(fakeTmux, `#!/bin/sh
+if [ "\${1:-}" = load-buffer ]; then
+  printf 'release-denied\\n' >&2
+  exit 1
+fi
+exec ${realTmux} "$@"
+`, { mode: 0o700 });
+  await chmod(fakeTmux, 0o700);
+  await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
+  const parentPane = await tmux(["list-panes", "-t", parentSession, "-F", "#{pane_id}"]);
+  process.env.PATH = `${dir}:${oldPath ?? ""}`;
+  process.env.TMUX_PANE = parentPane;
+  let childSession: string | undefined;
+  try {
+    const { extensions, errors, runtime } = await loadExtensions([extensionPath, taskOutcomeExtensionPath], dir);
+    assert.deepEqual(errors, []);
+    const messages: Array<{ text: string; options: any }> = [];
+    runtime.sendUserMessage = (text: string, options: any) => messages.push({ text, options });
+    runtime.appendEntry = (customType: string, data: unknown) => parentSessionManager.appendCustomEntry(customType, data);
+    const ctx: any = {
+      cwd: dir,
+      mode: "tui",
+      sessionManager: parentSessionManager,
+      modelRegistry: {
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
+        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh" } }],
+      },
+    };
+    const taskExtension = extensions.find(extension => extension.tools.has("report_outcome"));
+    assert.ok(taskExtension);
+    await taskExtension.handlers.get("session_start")?.[0]({ reason: "startup" }, ctx);
+    const parentManager = (globalThis[Symbol.for("pi.task-outcomes.manager-registry")] as WeakMap<object, any>).get(parentSessionManager);
+    assert.ok(parentManager);
+    parentManager.activateContract({ jobId: "parent-release-job", attemptId: "parent-release-attempt", mode: "dialogue" });
+    const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
+    assert.ok(owner);
+    const mission = join(dir, "mission.md");
+    const report = join(dir, "report.md");
+    await writeFile(mission, "The release must fail before paste.\\n");
+    const result: any = await owner.tools.get("subagent_launch")!.definition.execute("test", {
+      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+        cwd: dir, session_label: "release-failure", mode: "task", report_file: report }],
+    }, undefined, undefined, ctx);
+    const job = result.details.jobs[0];
+    assert.equal(job.status, "release_failed");
+    childSession = job.session_label;
+    const background = (globalThis[Symbol.for("pi.background-jobs.manager-registry")] as WeakMap<object, any>).get(parentSessionManager);
+    assert.ok(background);
+    let batchReport: any;
+    for (let i = 0; i < 1800 && !batchReport; i++) {
+      batchReport = background.getReport(result.details.batch_id);
+      if (!batchReport) await delay(20);
+    }
+    assert.ok(batchReport, "release failure batch did not settle");
+    assert.equal(batchReport.completions[0].source, "transport");
+    assert.match(batchReport.completions[0].summary, /release_failed: release-denied/);
+    const event = parentSessionManager.getBranch().find((entry: any) => entry.customType === "task-outcome/v1" && entry.data?.kind === "child_outcome");
+    assert.equal(event?.data.source, "transport");
+    assert.match(event?.data.summary, /release_failed: release-denied/);
+    assert.ok(messages.some(message => /\[transport\].*release_failed: release-denied/.test(message.text)));
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+    if (childSession) await tmux(["kill-session", "-t", childSession]).catch(() => {});
     await tmux(["kill-session", "-t", parentSession]).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   }

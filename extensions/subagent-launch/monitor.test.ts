@@ -20,7 +20,8 @@ async function until(check: () => boolean | Promise<boolean>): Promise<void> {
   assert.fail("timed out");
 }
 
-const monitorConfig = (pane: string, jobId: string, attemptId: string, startTimeoutMs = 1000) => JSON.stringify({
+const monitorConfig = (pane: string, jobId: string, attemptId: string, startTimeoutMs = 1000,
+  sessionId?: string, mode?: "task" | "dialogue") => JSON.stringify({
   paneId: pane,
   manifestOption: "@pi_subagent_manifest",
   outcomeOption: "@pi_outcome",
@@ -31,6 +32,8 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
   startTimeoutMs,
   jobId,
   attemptId,
+  sessionId,
+  mode,
 });
 
  test("monitor fails a live malformed manifest at the bounded start deadline", { timeout: 5000 }, async t => {
@@ -287,5 +290,72 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
   } finally {
     await tmux(["kill-session", "-t", session]).catch(() => {});
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("monitor binds manifest identity and allows same-identity replacement", { timeout: 15000 }, async () => {
+  const cases = [
+    { name: "foreign session", replacement: { sessionId: "foreign-session" }, receipt: {
+      session_id: "foreign-session", job_id: "bound-job", attempt_id: "bound-attempt",
+    } },
+    { name: "foreign job and attempt", replacement: { jobId: "foreign-job", attemptId: "foreign-attempt" }, receipt: {
+      session_id: "bound-session", job_id: "foreign-job", attempt_id: "foreign-attempt",
+    } },
+    { name: "same identity", replacement: { startChannel: "replacement-start" }, receipt: {
+      session_id: "bound-session", job_id: "bound-job", attempt_id: "bound-attempt",
+    } },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const dir = await mkdtemp(join(tmpdir(), `subagent-monitor-binding-${index}-`));
+    const session = `pi-subagent-binding-${process.pid}-${Date.now()}-${index}`;
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      await tmux(["new-session", "-d", "-s", session, "-c", dir]);
+      const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
+      const sessionFile = join(dir, "session.jsonl");
+      const manifest = join(dir, "manifest.json");
+      const replacement = join(dir, "replacement.json");
+      await writeFile(sessionFile, "session\n");
+      const base = { version: 1, jobId: "bound-job", attemptId: "bound-attempt", sessionId: "bound-session",
+        mode: "dialogue", startChannel: "initial-start", startGeneration: 0, outcomeGeneration: 0 };
+      await writeFile(manifest, JSON.stringify(base));
+      const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
+      await set("@pi_subagent_job_id", "bound-job");
+      await set("@pi_subagent_manifest", manifest);
+      await set("@pi_start_generation", "1");
+      await set("@pi_session_file", sessionFile);
+      const markers: any[] = [];
+      child = spawn(process.execPath, [monitorPath,
+        monitorConfig(pane, "bound-job", "bound-attempt", 500, "bound-session", "dialogue")], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.stdout!.setEncoding("utf8").on("data", chunk => {
+        for (const line of String(chunk).split(/\r?\n/).filter(Boolean)) markers.push(JSON.parse(line));
+      });
+      await until(() => markers.some(marker => marker.kind === "start"));
+      await writeFile(replacement, JSON.stringify({ ...base, ...scenario.replacement }));
+      await set("@pi_subagent_manifest", replacement);
+      await set("@pi_outcome", JSON.stringify({ ...scenario.receipt, mode: "dialogue",
+        outcome: scenario.name === "same identity" ? "dialogue_settled" : "completed", source: "model", final: true }));
+      await set("@pi_outcome_generation", "1");
+      await until(() => markers.some(marker => marker.kind === "final"));
+      await delay(30);
+      const finals = markers.filter(marker => marker.kind === "final");
+      assert.equal(finals.length, 1);
+      if (scenario.name === "same identity") {
+        assert.equal(finals[0].outcome, "completed");
+        assert.equal(finals[0].source, "model");
+      } else {
+        assert.equal(finals[0].jobId, "bound-job");
+        assert.equal(finals[0].attemptId, "bound-attempt");
+        assert.equal(finals[0].outcome, "failed");
+        assert.equal(finals[0].source, "protocol");
+        assert.equal(finals[0].technical, true);
+      }
+    } finally {
+      child?.kill("SIGTERM");
+      await tmux(["kill-session", "-t", session]).catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
