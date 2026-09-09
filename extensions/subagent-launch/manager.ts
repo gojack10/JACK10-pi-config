@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -30,6 +30,7 @@ const OUTCOME_CHANNEL_OPTION = "@pi_outcome_channel";
 const START_CHANNEL_OPTION = "@pi_start_channel";
 const DONE_CHANNEL_OPTION = "@pi_done_channel";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
+const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
 
 export interface SubagentJobInput {
   provider: string;
@@ -260,12 +261,17 @@ export class SubagentLauncher {
     for (const item of viable) {
       try {
         await this.armMonitor(item.state!, batch);
+        if (item.state?.monitorJobId !== undefined) this.states.set(item.jobId, item.state);
       } catch (error) {
         item.error = errorMessage(error);
         item.failureStatus = "monitor_setup_failed";
         failed.add(item.jobId);
-        batch.recordOutcome({ id: item.jobId, status: "failed", summary: `monitor_setup_failed: ${item.error}; no child was released` });
-        if (parent) this.recordParent(parent.jobId, item.jobId, `monitor_setup_failed: ${item.error}`);
+        // A monitor that was already submitted remains authoritative; do not add a
+        // second batch member or invent a second parent outcome.
+        if (item.state?.monitorJobId === undefined) {
+          batch.recordOutcome({ id: item.jobId, status: "failed", summary: `monitor_setup_failed: ${item.error}; no child was released` });
+          if (parent) this.recordParent(parent.jobId, item.jobId, `monitor_setup_failed: ${item.error}`);
+        }
       }
     }
 
@@ -358,6 +364,9 @@ export class SubagentLauncher {
     if (knownState?.finished && old.mode !== "dialogue") {
       throw new Error(`subagent ${jobId} already has a final monitored outcome`);
     }
+    if (!knownState?.finished && await this.paneIsBusy(paneId)) {
+      throw new Error(`subagent ${jobId} is still handling its current turn; follow-up was not pasted`);
+    }
     const reuseMonitor = knownState?.monitorJobId !== undefined && !knownState.finished;
     const currentStartGeneration = Number.parseInt(await this.show(paneId, START_GENERATION_OPTION) ?? "0", 10);
     const currentOutcomeGeneration = Number.parseInt(await this.show(paneId, OUTCOME_GENERATION_OPTION) ?? "0", 10);
@@ -412,8 +421,8 @@ export class SubagentLauncher {
         finished: false,
         parentJobId: old.parentJobId,
       };
-      this.states.set(jobId, state);
       await this.armMonitor(state, batch!);
+      this.states.set(jobId, state);
     } else {
       state.attemptId = attemptId;
       state.batchId = batchId;
@@ -452,7 +461,9 @@ export class SubagentLauncher {
       const model = this.ctx.modelRegistry.find(provider, modelId);
       const available = this.ctx.modelRegistry.getAvailable().some(candidate => candidate.provider === provider && candidate.id === modelId);
       if (!model || !available) throw new Error(`exact provider/model is unavailable: ${provider}/${modelId}`);
-      if (input.thinking !== "off" && !model.reasoning) throw new Error(`model ${provider}/${modelId} does not support thinking level ${input.thinking}`);
+      if (!getSupportedThinkingLevels(model).includes(input.thinking)) {
+        throw new Error(`model ${provider}/${modelId} does not support thinking level ${input.thinking}`);
+      }
     }
   }
 
@@ -509,6 +520,7 @@ export class SubagentLauncher {
       [OUTCOME_GENERATION_OPTION, "0"],
       [DONE_CHANNEL_OPTION, unique("pi-subagent-done")],
       [SETTLED_CHANNEL_OPTION, unique("pi-subagent-settled")],
+      [SETTLED_GENERATION_OPTION, "0"],
     ];
     for (const [option, value] of values) await this.set(paneId, option, value);
     await this.tmux(["pipe-pane", "-t", paneId, `cat >> ${shellQuote(logPath)}`]);
@@ -633,6 +645,13 @@ export class SubagentLauncher {
       state.startWaiters.set(key, waiters);
       setTimeout(() => this.resolveStart(state, attemptId, false), START_WAIT_MS);
     });
+  }
+
+  private async paneIsBusy(paneId: string): Promise<boolean> {
+    const started = Number.parseInt(await this.show(paneId, START_GENERATION_OPTION) ?? "", 10);
+    const settled = Number.parseInt(await this.show(paneId, SETTLED_GENERATION_OPTION) ?? "", 10);
+    if (!Number.isSafeInteger(started) || !Number.isSafeInteger(settled)) return true;
+    return started > settled;
   }
 
   private async startWasSeen(state: StoredState, attemptId: string): Promise<boolean> {
