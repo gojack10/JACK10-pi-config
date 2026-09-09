@@ -30,7 +30,12 @@ export default function taskOutcomes(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    getTaskOutcomeManager(pi, ctx).restore();
+    const manager = getTaskOutcomeManager(pi, ctx);
+    manager.restore();
+    manager.ingestLauncherContract();
+  });
+  pi.on("before_agent_start", (_event, ctx) => {
+    getTaskOutcomeManager(pi, ctx).ingestLauncherContract();
   });
   pi.on("session_tree", (_event, ctx) => {
     getTaskOutcomeManager(pi, ctx).onSessionTree();

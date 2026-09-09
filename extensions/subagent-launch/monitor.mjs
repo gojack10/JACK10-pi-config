@@ -1,0 +1,152 @@
+import { execFile, spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+
+const config = JSON.parse(process.argv[2] ?? "{}");
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const emit = value => process.stdout.write(`${JSON.stringify(value)}\n`);
+
+const tmux = args => new Promise((resolve, reject) => {
+  execFile("tmux", args, { encoding: "utf8" }, (error, stdout, stderr) => {
+    if (error) reject(new Error((stderr || stdout || error.message).trim()));
+    else resolve(stdout.trim());
+  });
+});
+const show = async option => {
+  try { return await tmux(["show-options", "-qv", "-t", config.paneId, option]); }
+  catch { return undefined; }
+};
+const paneExists = async () => (await show("@pi_subagent_job_id")) !== undefined;
+const readManifest = async () => {
+  const path = await show(config.manifestOption);
+  if (!path) return undefined;
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    if (value?.version !== 1 || typeof value.jobId !== "string" || typeof value.attemptId !== "string" ||
+        (value.mode !== "task" && value.mode !== "dialogue") || typeof value.startChannel !== "string" ||
+        !Number.isSafeInteger(value.startGeneration) || !Number.isSafeInteger(value.outcomeGeneration)) return undefined;
+    return value;
+  } catch { return undefined; }
+};
+const waitForChannel = (channel, timeoutMs) => {
+  if (!channel) return { promise: Promise.resolve(false), cancel: () => {} };
+  const child = spawn("tmux", ["wait-for", channel], { stdio: "ignore" });
+  let settled = false;
+  let timer;
+  let resolvePromise;
+  const promise = new Promise(resolve => { resolvePromise = resolve; });
+  const finish = value => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolvePromise(value);
+  };
+  child.once("error", () => finish(false));
+  child.once("close", code => finish(code === 0));
+  timer = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} finish(false); }, timeoutMs);
+  return { promise, cancel: () => { try { child.kill("SIGTERM"); } catch {} finish(false); } };
+};
+const generation = async () => {
+  const value = Number.parseInt(await show(config.outcomeGenerationOption) ?? "", 10);
+  return Number.isSafeInteger(value) ? value : 0;
+};
+const sessionFile = async () => await show(config.sessionFileOption);
+const transportFailure = (summary, manifest) => {
+  emit({ kind: "final", jobId: manifest?.jobId, attemptId: manifest?.attemptId,
+    outcome: "failed", summary, report: manifest?.reportPath });
+};
+
+let lastGeneration;
+let activeKey;
+let startedKey;
+let signal = waitForChannel(config.outcomeChannel, config.pollMs * 4);
+
+while (true) {
+  const manifest = await readManifest();
+  if (!manifest) {
+    if (!(await paneExists())) {
+      transportFailure("transport_lost: child pane disappeared before a durable outcome", { jobId: config.jobId, attemptId: config.attemptId });
+      process.exit(0);
+    }
+    await sleep(config.pollMs);
+    continue;
+  }
+  const key = `${manifest.jobId}@${manifest.attemptId}`;
+  if (activeKey !== key) {
+    activeKey = key;
+    if (lastGeneration === undefined) lastGeneration = manifest.outcomeGeneration;
+    else lastGeneration = Math.max(lastGeneration, manifest.outcomeGeneration);
+    const deadline = Date.now() + config.startTimeoutMs;
+    let observedChannel = false;
+    const startWait = waitForChannel(manifest.startChannel, config.pollMs * 4);
+    while (Date.now() < deadline) {
+      const result = await Promise.race([
+        startWait.promise.then(value => ({ kind: "signal", value })),
+        sleep(config.pollMs).then(() => ({ kind: "poll", value: false })),
+      ]);
+      if (result.kind === "signal" && result.value) observedChannel = true;
+      const startGeneration = Number.parseInt(await show(config.startGenerationOption) ?? "", 10);
+      const file = await sessionFile();
+      if (Number.isSafeInteger(startGeneration) && startGeneration > manifest.startGeneration && file) {
+        startWait.cancel();
+        startedKey = key;
+        emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
+          sessionFile: file, channel: observedChannel });
+        break;
+      }
+      if (!(await paneExists())) {
+        startWait.cancel();
+        transportFailure("transport_lost: child pane disappeared before START", manifest);
+        process.exit(0);
+      }
+    }
+    if (startedKey !== key) {
+      startWait.cancel();
+      emit({ kind: "final", jobId: manifest.jobId, attemptId: manifest.attemptId,
+        outcome: "failed", summary: "protocol_incomplete: START/session-file receipt timed out", report: manifest.reportPath });
+      process.exit(0);
+    }
+  }
+
+  const currentGeneration = await generation();
+  if (currentGeneration > lastGeneration) {
+    lastGeneration = currentGeneration;
+    const raw = await show(config.outcomeOption);
+    let receipt;
+    try { receipt = raw ? JSON.parse(raw) : undefined; } catch { receipt = undefined; }
+    if (!receipt || receipt.job_id !== manifest.jobId || receipt.attempt_id !== manifest.attemptId ||
+        receipt.mode !== manifest.mode || typeof receipt.outcome !== "string") {
+      emit({ kind: "evidence", jobId: manifest.jobId, attemptId: manifest.attemptId,
+        summary: `ignored malformed or mismatched outcome generation ${currentGeneration}` });
+    } else if (receipt.outcome === "needs_input" || receipt.final === false) {
+      emit({ kind: "needs_input", jobId: receipt.job_id, attemptId: receipt.attempt_id,
+        summary: receipt.summary || "child requested human input", report: receipt.report });
+    } else {
+      let outcome = receipt.outcome;
+      let summary = receipt.summary || `${outcome} ${manifest.jobId}`;
+      if (manifest.mode === "dialogue" && outcome === "dialogue_settled") outcome = "completed";
+      if (!["completed", "blocked", "failed"].includes(outcome)) {
+        outcome = "failed";
+        summary = `protocol_incomplete: unsupported child outcome ${receipt.outcome}`;
+      }
+      if (manifest.mode === "task" && receipt.outcome === "completed") {
+        let validReport = receipt.report === manifest.reportPath;
+        if (validReport) {
+          try { validReport = (await readFile(manifest.reportPath)).length > 0; } catch { validReport = false; }
+        }
+        if (!validReport) {
+          outcome = "failed";
+          summary = `protocol_incomplete: missing or mismatched report ${manifest.reportPath}`;
+        }
+      }
+      emit({ kind: "final", jobId: receipt.job_id, attemptId: receipt.attempt_id,
+        outcome, summary, report: manifest.reportPath, sessionFile: receipt.session_file });
+      process.exit(0);
+    }
+  }
+
+  const event = await Promise.race([
+    signal.promise.then(value => ({ kind: "signal", value })),
+    sleep(config.pollMs).then(() => ({ kind: "poll", value: false })),
+  ]);
+  if (event.kind === "signal") signal = waitForChannel(config.outcomeChannel, config.pollMs * 4);
+}

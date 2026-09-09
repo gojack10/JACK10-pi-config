@@ -12,6 +12,18 @@ export interface BackgroundJobStartOptions {
   command: string;
   label?: string;
   cwd: string;
+  /** Identity/status used by extensions that supervise a structured child. */
+  completionId?: string;
+}
+
+export interface BackgroundJobCompletionOverride {
+  id: string;
+  status: BackgroundJobOutcomeStatus;
+  summary: string;
+}
+
+export interface BackgroundJobStartHooks {
+  onStdout?: (chunk: string) => void;
 }
 
 export interface BackgroundJobInfo {
@@ -66,6 +78,11 @@ export interface BackgroundJobBatchStatus {
 export interface BackgroundJobBatch {
   readonly id: string;
   start(options: BackgroundJobStartOptions): BackgroundJobStartResult;
+  startExternal(
+    options: BackgroundJobStartOptions,
+    createChild: () => ChildProcess,
+    hooks?: BackgroundJobStartHooks,
+  ): BackgroundJobStartResult;
   registerOutcome(id: string): void;
   recordOutcome(outcome: BackgroundJobOutcome): void;
   notifyNeedsInput(message: string): void | PromiseLike<void>;
@@ -93,6 +110,9 @@ export type BackgroundJobKillResult =
 interface BgJob extends BackgroundJobInfo {
   child: ChildProcess;
   errorMessage?: string;
+  completionId?: string;
+  completion?: BackgroundJobCompletionOverride;
+  onStdout?: (chunk: string) => void;
 }
 
 interface BatchState {
@@ -130,6 +150,7 @@ export class BackgroundJobManager {
   private shuttingDown = false;
   private sendUserMessage: SendUserMessage;
   private readonly workListeners = new Set<() => void>();
+  private readonly jobListeners = new Map<number, Set<(job: BackgroundJobInfo, completion: BackgroundJobCompletion) => void>>();
   private workGenerationValue = 0;
 
   constructor(sendUserMessage: SendUserMessage) {
@@ -141,6 +162,32 @@ export class BackgroundJobManager {
   }
 
   start(options: BackgroundJobStartOptions, batchOptions: { batchId?: string } = {}): BackgroundJobStartResult {
+    return this.startProcess(
+      options,
+      () => spawn("sh", ["-c", options.command], {
+        cwd: options.cwd,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+      batchOptions,
+    );
+  }
+
+  startExternal(
+    options: BackgroundJobStartOptions,
+    createChild: () => ChildProcess,
+    hooks: BackgroundJobStartHooks = {},
+    batchOptions: { batchId?: string } = {},
+  ): BackgroundJobStartResult {
+    return this.startProcess(options, createChild, batchOptions, hooks);
+  }
+
+  private startProcess(
+    options: BackgroundJobStartOptions,
+    createChild: () => ChildProcess,
+    batchOptions: { batchId?: string } = {},
+    hooks: BackgroundJobStartHooks = {},
+  ): BackgroundJobStartResult {
     this.assertOpen();
     const batch = this.batchForStart(batchOptions.batchId);
     if (batch.expectedMembers !== undefined && batch.members.size >= batch.expectedMembers) {
@@ -154,19 +201,13 @@ export class BackgroundJobManager {
     this.addMember(batch, `job:${id}`);
     let child: ChildProcess;
     try {
-      child = spawn("sh", ["-c", options.command], {
-        cwd: options.cwd,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      child = createChild();
     } catch (error) {
       batch.jobs.delete(id);
       batch.members.delete(`job:${id}`);
       throw error;
     }
     const startedAt = Date.now();
-    child.stdout?.pipe(logStream, { end: false });
-    child.stderr?.pipe(logStream, { end: false });
     const job: BgJob = {
       id,
       command: options.command,
@@ -180,8 +221,15 @@ export class BackgroundJobManager {
       exitCode: undefined,
       exitedAt: undefined,
       killed: false,
+      completionId: options.completionId,
+      onStdout: hooks.onStdout,
     };
     this.jobs.set(id, job);
+    child.stdout?.on("data", chunk => {
+      logStream.write(chunk);
+      try { job.onStdout?.(chunk.toString()); } catch {}
+    });
+    child.stderr?.pipe(logStream, { end: false });
     this.workGenerationValue += 1;
 
     let closed = false;
@@ -189,10 +237,14 @@ export class BackgroundJobManager {
       if (job.exitedAt !== undefined) return;
       job.exitedAt = Date.now();
       if (!this.shuttingDown) {
-        this.finishMember(batch, `job:${id}`, {
-          id: `job_${id}`,
-          summary: this.renderCompletionSummary(job),
-        });
+        const completion = job.completion ?? (job.completionId
+          ? { id: job.completionId, status: "failed" as const, summary: this.renderCompletionSummary(job) }
+          : { id: `job_${id}`, summary: this.renderCompletionSummary(job) });
+        this.finishMember(batch, `job:${id}`, completion);
+        for (const listener of this.jobListeners.get(id) ?? []) {
+          try { listener(this.info(job), completion); } catch {}
+        }
+        this.jobListeners.delete(id);
         if (this.runningCount() === 0) {
           for (const listener of this.workListeners) {
             try { listener(); } catch {}
@@ -387,6 +439,34 @@ export class BackgroundJobManager {
     return () => this.workListeners.delete(listener);
   }
 
+  onJobSettled(
+    jobId: number,
+    listener: (job: BackgroundJobInfo, completion: BackgroundJobCompletion) => void,
+  ): () => void {
+    const job = this.jobs.get(jobId);
+    if (!job) return () => {};
+    if (job.exitedAt !== undefined) {
+      queueMicrotask(() => listener(this.info(job), job.completion ?? (job.completionId
+        ? { id: job.completionId, status: "failed" as const, summary: this.renderCompletionSummary(job) }
+        : { id: `job_${job.id}`, summary: this.renderCompletionSummary(job) })));
+      return () => {};
+    }
+    const listeners = this.jobListeners.get(jobId) ?? new Set();
+    listeners.add(listener);
+    this.jobListeners.set(jobId, listeners);
+    return () => {
+      const current = this.jobListeners.get(jobId);
+      current?.delete(listener);
+      if (current?.size === 0) this.jobListeners.delete(jobId);
+    };
+  }
+
+  setCompletion(jobId: number, completion: BackgroundJobCompletionOverride): void {
+    const job = this.jobs.get(jobId);
+    if (!job || job.exitedAt !== undefined) return;
+    job.completion = { ...completion };
+  }
+
   workGeneration(): number {
     return this.workGenerationValue;
   }
@@ -408,6 +488,7 @@ export class BackgroundJobManager {
     this.reports.clear();
     this.implicitBatchId = undefined;
     this.workListeners.clear();
+    this.jobListeners.clear();
     for (const job of this.jobs.values()) {
       if (job.exitedAt === undefined) killJobTree(job);
     }
@@ -446,6 +527,8 @@ export class BackgroundJobManager {
     return {
       id: batch.id,
       start: options => this.start(options, { batchId: batch.id }),
+      startExternal: (options, createChild, hooks) =>
+        this.startExternal(options, createChild, hooks, { batchId: batch.id }),
       registerOutcome: id => this.registerOutcome(batch.id, id),
       recordOutcome: outcome => this.recordOutcome(batch.id, outcome),
       notifyNeedsInput: message => this.notifyNeedsInput(batch.id, message),
