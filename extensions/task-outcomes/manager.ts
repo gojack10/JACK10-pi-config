@@ -92,10 +92,17 @@ interface ContractState extends TaskLaunchContract {
   declarationSequence: number;
   workReadySequence: number;
   workReadyNotified: boolean;
-  workReadySending: boolean;
   workReadyPendingSequence: number | undefined;
   childOutcomes: Map<string, { outcome: BackgroundJobOutcomeStatus; summary: string }>;
   questionNotified: boolean;
+}
+
+interface NotificationFlight {
+  key: string;
+  ownerSessionId: string;
+  branchId: string;
+  contractKey: string;
+  leafId: string | null;
 }
 
 interface PersistedEvent {
@@ -175,23 +182,36 @@ export class TaskOutcomeManager {
   private readonly contracts = new Map<string, ContractState>();
   private readonly records: TaskOutcomeRecord[] = [];
   private readonly usedReportPaths = new Set<string>();
+  private readonly pendingActivations = new Map<string, PersistedEvent>();
+  private readonly notificationFlights = new Map<string, NotificationFlight>();
   private activeKey: string | undefined;
   private branchId = randomUUID();
+  private notificationBranchId = randomUUID();
   private restored = false;
   private run = 0;
   private turn = -1;
   private lastAssistant: any;
   private lastRunFailure: string | undefined;
   private workUnsubscribe: (() => void) | undefined;
+  private observedLeafId: string | null;
   private runtime: Runtime;
 
   constructor(runtime: Runtime) {
     this.runtime = runtime;
+    this.observedLeafId = runtime.leafId();
     this.replay();
   }
 
   attach(runtime: Runtime): void {
+    const ownerChanged = this.runtime.sessionOwner !== runtime.sessionOwner || this.runtime.sessionId !== runtime.sessionId;
+    if (ownerChanged) {
+      this.pendingActivations.clear();
+      this.notificationFlights.clear();
+      this.branchId = randomUUID();
+      this.notificationBranchId = randomUUID();
+    }
     this.runtime = runtime;
+    if (ownerChanged) this.observedLeafId = runtime.leafId();
   }
 
   restore(): void {
@@ -208,12 +228,20 @@ export class TaskOutcomeManager {
   }
 
   onSessionTree(): void {
+    const nextLeafId = this.runtime.leafId();
+    const branchChanged = this.observedLeafId !== nextLeafId;
     this.stopWatchingWork();
     this.contracts.clear();
     this.records.length = 0;
     this.usedReportPaths.clear();
     this.activeKey = undefined;
     this.branchId = randomUUID();
+    if (branchChanged) {
+      this.notificationBranchId = randomUUID();
+      this.pendingActivations.clear();
+      this.notificationFlights.clear();
+    }
+    this.observedLeafId = nextLeafId;
     this.replay();
     for (const contract of this.contracts.values()) {
       if (contract.state === "active" && contract.ownerSessionId === this.runtime.sessionId) {
@@ -225,6 +253,7 @@ export class TaskOutcomeManager {
       }
     }
     this.retryPendingNotifications();
+    this.observedLeafId = this.runtime.leafId();
   }
 
   activateContract(input: TaskLaunchContract): TaskContractSnapshot {
@@ -237,8 +266,11 @@ export class TaskOutcomeManager {
     if (childJobIds.includes(input.jobId)) throw new Error("a task cannot be its own child");
     const key = this.key(input.jobId, input.attemptId);
     const contractEventId = `task-outcome:contract:${key}:0`;
-    const reservation = this.sidecarEvent(contractEventId) ??
+    const pendingReservation = this.pendingActivations.get(contractEventId);
+    const durableReservation = this.sidecarEvent(contractEventId) ??
       (this.activeBranchEntry(contractEventId)?.data as PersistedEvent | undefined);
+    if (pendingReservation && durableReservation) this.assertEventPayload(pendingReservation, durableReservation);
+    const reservation = durableReservation ?? pendingReservation;
     const reservedContract = reservation?.kind === "contract" ? reservation.contract : undefined;
     let reportPath = input.reportPath;
     if (input.mode === "task") {
@@ -278,7 +310,6 @@ export class TaskOutcomeManager {
       declarationSequence: 0,
       workReadySequence: 0,
       workReadyNotified: false,
-      workReadySending: false,
       workReadyPendingSequence: undefined,
       childOutcomes: new Map(),
       questionNotified: false,
@@ -286,12 +317,23 @@ export class TaskOutcomeManager {
     const members = contract.batchId ? [contract.jobId, ...childJobIds] : [];
     if (contract.batchId) this.background().assertCanRegisterOutcomes(contract.batchId, members);
     const contractEvent = { kind: "contract" as const, contract: this.serializedContract(contract) };
+    const pending = this.pendingActivations.get(contractEventId);
+    if (pending) this.assertEventPayload(pending, contractEvent);
+    else this.pendingActivations.set(contractEventId, {
+      version: 1,
+      eventId: contractEventId,
+      branchId: this.branchId,
+      at: new Date().toISOString(),
+      ...contractEvent,
+    });
     try {
       this.persist(contractEvent, contractEventId);
+      this.pendingActivations.delete(contractEventId);
     } catch (error) {
       const existing = this.durableActiveBranchEvent(contractEventId);
       if (!existing) throw error;
       this.assertEventPayload(existing, contractEvent);
+      this.pendingActivations.delete(contractEventId);
     }
     if (contract.batchId) this.registerBatchMembers(contract.batchId, members);
     if (reportPath) this.usedReportPaths.add(reportPath);
@@ -543,6 +585,8 @@ export class TaskOutcomeManager {
     if (contract && contract.state === "active") this.markTransportLost(contract, reason);
     this.stopWatchingWork();
     this.activeKey = undefined;
+    this.pendingActivations.clear();
+    this.notificationFlights.clear();
   }
 
   snapshot(): TaskOutcomeSnapshot {
@@ -656,29 +700,37 @@ export class TaskOutcomeManager {
   }
 
   private async notifyQuestion(contract: ContractState, question: string): Promise<void> {
+    const flight = this.beginNotification(contract, this.operationEventId("outcome", contract, "needs_input:attempted"));
+    if (!flight) return;
     try {
-      const result = contract.batchId && this.background().getBatchStatus(contract.batchId)
-        ? this.background().notifyNeedsInput(contract.batchId, question)
-        : this.runtime.sendUserMessage(question, { deliverAs: "steer" });
-      if (result !== undefined) await Promise.resolve(result);
-    } catch {
-      // A rejected invocation remains unaccepted and is retried by a later monitor.
-      return;
-    }
-    contract.questionNotified = true;
-    try {
-      this.persist({
-        kind: "outcome",
-        jobId: contract.jobId,
-        attemptId: contract.attemptId,
-        outcome: "needs_input",
-        source: "model",
-        summary: contract.declaration?.summary ?? question,
-        reportPath: contract.reportPath,
-        notified: true,
-      }, this.operationEventId("outcome", contract, "needs_input:attempted"));
-    } catch {
-      // The invocation was accepted, but the durable attempted marker remains retryable.
+      try {
+        const result = contract.batchId && this.background().getBatchStatus(contract.batchId)
+          ? this.background().notifyNeedsInput(contract.batchId, question)
+          : this.runtime.sendUserMessage(question, { deliverAs: "steer" });
+        if (result !== undefined) await Promise.resolve(result);
+      } catch {
+        // A rejected invocation remains unaccepted and is retried by a later monitor.
+        return;
+      }
+      const current = this.currentNotificationContract(flight);
+      if (!current || current.state !== "awaiting_input" || current.questionNotified) return;
+      current.questionNotified = true;
+      try {
+        this.persist({
+          kind: "outcome",
+          jobId: current.jobId,
+          attemptId: current.attemptId,
+          outcome: "needs_input",
+          source: "model",
+          summary: current.declaration?.summary ?? question,
+          reportPath: current.reportPath,
+          notified: true,
+        }, this.operationEventId("outcome", current, "needs_input:attempted"));
+      } catch {
+        // The invocation was accepted, but the durable attempted marker remains retryable.
+      }
+    } finally {
+      this.endNotification(flight);
     }
   }
 
@@ -704,7 +756,7 @@ export class TaskOutcomeManager {
 
   private async wakeIfReady(contract: ContractState): Promise<void> {
     if (this.activeKey !== this.key(contract.jobId, contract.attemptId) || contract.state !== "active") return;
-    if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified || contract.workReadySending) return;
+    if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified) return;
     const summary = `background/child work finished for ${contract.jobId}; inspect the retained evidence, synthesize the report, then declare an outcome`;
     const sequence = contract.workReadyPendingSequence ?? contract.workReadySequence;
     let ready: PersistedEvent;
@@ -730,35 +782,64 @@ export class TaskOutcomeManager {
       return;
     }
     contract.workReadyPendingSequence = ready.workReadySequence ?? sequence;
-    contract.workReadySending = true;
+    const flight = this.beginNotification(
+      contract,
+      this.operationEventId("work_ready", contract, `${ready.workReadySequence ?? sequence}:attempted`),
+    );
+    if (!flight) return;
     try {
-      const result = this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${ready.summary ?? summary}.`, { deliverAs: "steer" });
-      if (result !== undefined) await Promise.resolve(result);
-    } catch {
-      contract.workReadySending = false;
-      return;
+      try {
+        const result = this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${ready.summary ?? summary}.`, { deliverAs: "steer" });
+        if (result !== undefined) await Promise.resolve(result);
+      } catch {
+        return;
+      }
+      const current = this.currentNotificationContract(flight);
+      if (!current || current.state !== "active" || current.declaration || this.pendingWork(current).length > 0) return;
+      try {
+        this.persist(
+          {
+            kind: "work_ready",
+            jobId: current.jobId,
+            attemptId: current.attemptId,
+            summary: ready.summary ?? summary,
+            workReadySequence: ready.workReadySequence ?? sequence,
+            notified: true,
+          },
+          this.operationEventId("work_ready", current, `${ready.workReadySequence ?? sequence}:attempted`),
+        );
+      } catch {
+        // Invocation acceptance is retained in memory; a later replay may retry
+        // because Pi exposes no durable reception acknowledgement.
+      }
+      current.workReadyNotified = true;
+      current.workReadyPendingSequence = undefined;
+    } finally {
+      this.endNotification(flight);
     }
-    contract.workReadySending = false;
-    try {
-      this.persist(
-        {
-          kind: "work_ready",
-          jobId: contract.jobId,
-          attemptId: contract.attemptId,
-          summary: ready.summary ?? summary,
-          workReadySequence: ready.workReadySequence ?? sequence,
-          notified: true,
-        },
-        this.operationEventId("work_ready", contract, `${ready.workReadySequence ?? sequence}:attempted`),
-      );
-      contract.workReadyNotified = true;
-      contract.workReadyPendingSequence = undefined;
-    } catch {
-      // Invocation acceptance is retained in memory; a later replay may retry
-      // because Pi exposes no durable reception acknowledgement.
-      contract.workReadyNotified = true;
-      contract.workReadyPendingSequence = undefined;
-    }
+  }
+
+  private beginNotification(contract: ContractState, eventId: string): NotificationFlight | undefined {
+    const ownerSessionId = this.runtime.sessionId;
+    const branchId = this.notificationBranchId;
+    const contractKey = this.key(contract.jobId, contract.attemptId);
+    const key = `${ownerSessionId}:${branchId}:${contractKey}:${eventId}`;
+    if (this.notificationFlights.has(key)) return undefined;
+    const flight = { key, ownerSessionId, branchId, contractKey, leafId: this.runtime.leafId() };
+    this.notificationFlights.set(key, flight);
+    return flight;
+  }
+
+  private currentNotificationContract(flight: NotificationFlight): ContractState | undefined {
+    if (this.notificationFlights.get(flight.key) !== flight ||
+        this.runtime.sessionId !== flight.ownerSessionId ||
+        this.notificationBranchId !== flight.branchId ||
+        this.runtime.leafId() !== flight.leafId) return undefined;
+    return this.contracts.get(flight.contractKey);
+  }
+
+  private endNotification(flight: NotificationFlight): void {
+    if (this.notificationFlights.get(flight.key) === flight) this.notificationFlights.delete(flight.key);
   }
 
   private emitOutcome(input: { contract: ContractState; outcome: MonitorOutcome; source: OutcomeSource; summary: string; final: boolean }): void {
@@ -929,8 +1010,10 @@ export class TaskOutcomeManager {
       // through the supported API, selecting the exact appended event when it
       // reached disk or the exact prior leaf when it did not.
       try { this.runtime.reloadSession?.(priorLeafId, eventId); } catch {}
+      this.observedLeafId = this.runtime.leafId();
       throw error;
     }
+    this.observedLeafId = this.runtime.leafId();
     return data;
   }
 
@@ -987,7 +1070,6 @@ export class TaskOutcomeManager {
         declarationSequence: previous?.declarationSequence ?? 0,
         workReadySequence: previous?.workReadySequence ?? 0,
         workReadyNotified: previous?.workReadyNotified ?? false,
-        workReadySending: false,
         workReadyPendingSequence: undefined,
         childOutcomes: previous?.childOutcomes ?? new Map(),
         questionNotified: previous?.questionNotified ?? false,
