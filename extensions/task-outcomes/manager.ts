@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, lstatSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -16,6 +17,15 @@ export type TaskMode = "task" | "dialogue";
 export type DeclaredOutcome = "completed" | "blocked" | "needs_input" | "failed";
 export type MonitorOutcome = DeclaredOutcome | "protocol_incomplete" | "dialogue_settled" | "transport_lost";
 export type OutcomeSource = "model" | "technical" | "protocol" | "transport";
+
+export const TASK_LAUNCH_MANIFEST_OPTION = "@pi_subagent_manifest";
+
+export interface TaskLaunchManifest extends TaskLaunchContract {
+  version: 1;
+  startChannel?: string;
+  startGeneration?: number;
+  outcomeGeneration?: number;
+}
 
 export interface TaskLaunchContract {
   jobId: string;
@@ -256,6 +266,66 @@ export class TaskOutcomeManager {
     this.observedLeafId = this.runtime.leafId();
   }
 
+  /**
+   * Consume the launcher-written manifest before the next model request.
+   * This is deliberately an extension lifecycle action, not a model/tool action.
+   */
+  ingestLauncherContract(): TaskContractSnapshot | undefined {
+    const pane = process.env.TMUX_PANE;
+    let manifestPath = process.env.PI_SUBAGENT_MANIFEST;
+    if (pane) {
+      try {
+        const value = execFileSync("tmux", ["show-options", "-qv", "-t", pane, TASK_LAUNCH_MANIFEST_OPTION], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        if (value) manifestPath = value;
+      } catch {
+        // A normal non-tmux session, or a pane that is shutting down, has no manifest.
+      }
+    }
+    if (!manifestPath) return undefined;
+    if (!isAbsolute(manifestPath) || manifestPath.includes("\0")) {
+      throw new Error("launcher manifest path must be absolute and NUL-free");
+    }
+
+    let manifest: TaskLaunchManifest;
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as TaskLaunchManifest;
+    } catch (error) {
+      throw new Error(`cannot read launcher manifest ${manifestPath}: ${errorMessage(error)}`);
+    }
+    if (!manifest || typeof manifest !== "object" || manifest.version !== 1) {
+      throw new Error(`invalid launcher manifest ${manifestPath}`);
+    }
+    const contract: TaskLaunchContract = {
+      jobId: manifest.jobId,
+      attemptId: manifest.attemptId,
+      mode: manifest.mode,
+      reportPath: manifest.reportPath,
+      batchId: manifest.batchId,
+      parentJobId: manifest.parentJobId,
+      childJobIds: manifest.childJobIds,
+    };
+    assertId("manifest jobId", contract.jobId);
+    assertId("manifest attemptId", contract.attemptId);
+    const key = this.key(contract.jobId, contract.attemptId);
+    const existing = this.contracts.get(key);
+    if (existing) {
+      if (stableJson(this.serializedContract(existing)) !== stableJson({
+        ...contract,
+        ownerSessionId: existing.ownerSessionId,
+        childJobIds: [...(contract.childJobIds ?? [])],
+        activatedAt: existing.activatedAt,
+        childGeneration: existing.childGeneration,
+      })) {
+        throw new Error(`launcher manifest ${key} conflicts with its existing contract`);
+      }
+      return this.contractSnapshot(existing);
+    }
+    return this.activateContract(contract);
+  }
+
   activateContract(input: TaskLaunchContract): TaskContractSnapshot {
     assertId("jobId", input.jobId);
     assertId("attemptId", input.attemptId);
@@ -293,7 +363,8 @@ export class TaskOutcomeManager {
     const previous = [...this.contracts.values()]
       .filter(contract => contract.jobId === input.jobId && contract.ownerSessionId === this.runtime.sessionId)
       .at(-1);
-    if (previous && previous.state !== "awaiting_input" && previous.state !== "transport_lost") {
+    const dialogueContinuation = previous?.mode === "dialogue" && input.mode === "dialogue";
+    if (previous && previous.state !== "awaiting_input" && previous.state !== "transport_lost" && !dialogueContinuation) {
       throw new Error(`job ${input.jobId} already has an active or final attempt`);
     }
 
