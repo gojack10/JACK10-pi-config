@@ -148,6 +148,20 @@ test('completed, failed, and blocked outcomes collect until batch close', { time
   for (const text of ['completed done', 'failed bad', 'blocked blocked']) assert.match(h.messages[0].text, new RegExp(text));
 });
 
+test('structured transport source survives batch completion', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'transport', expected: 1 });
+  await h.call('background_jobs_consumer', {
+    action: 'outcome', batch_id: 'transport', outcome_id: 'child', status: 'failed',
+    source: 'transport', message: 'child pane disappeared',
+  });
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'transport' });
+  await until(() => h.messages.length === 1);
+  assert.match(h.messages[0].text, /failed.*transport/);
+  const report = await h.call('background_jobs_consumer', { action: 'report', batch_id: 'transport' });
+  assert.equal(report.details.report.completions[0].source, 'transport');
+});
+
 test('shared manager is session-owned and is cleaned up on replacement', { timeout: 10000 }, async t => {
   const h = await harness(t, true);
   const oldJob = await h.gated('old-owner');

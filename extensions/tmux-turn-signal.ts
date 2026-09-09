@@ -1,6 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-type TaskOutcomeEvent = { sessionId: string; outcome: string; jobId: string; attemptId: string; final?: boolean; summary?: string };
+type TaskOutcomeEvent = {
+	sessionId: string;
+	outcome: string;
+	jobId: string;
+	attemptId: string;
+	source?: "model" | "technical" | "protocol" | "transport";
+	final?: boolean;
+	summary?: string;
+};
 const taskOutcomeEventStatus = (value: unknown): value is TaskOutcomeEvent =>
 	!!value && typeof value === "object" &&
 	typeof (value as any).sessionId === "string" &&
@@ -67,7 +75,8 @@ export default function (pi: ExtensionAPI) {
 			attempt_id: payload.attemptId,
 			mode: (payload as any).mode,
 			outcome: payload.outcome,
-			source: (payload as any).source,
+			source: payload.source,
+			final: payload.final,
 			report: (payload as any).reportPath,
 			session_file: (payload as any).sessionFile,
 		});

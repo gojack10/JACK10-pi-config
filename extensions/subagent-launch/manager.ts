@@ -2,8 +2,9 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { getSupportedThinkingLevels, StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
+import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { access, lstat, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, lstat, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,7 @@ import { BackgroundJobManager, getBackgroundJobManager } from "../background-job
 import {
   getTaskOutcomeManager,
   TASK_LAUNCH_MANIFEST_OPTION,
+  type OutcomeSource,
   type TaskLaunchManifest,
   type TaskMode,
 } from "../task-outcomes/manager.ts";
@@ -134,7 +136,12 @@ async function requireMission(path: string): Promise<void> {
   }
 }
 
-async function requireFreshReport(path: string, reserved: Set<string>): Promise<void> {
+interface ReportReservation {
+  activatedAt: number;
+  reportIdentity: { dev: string; ino: string };
+}
+
+async function requireFreshReport(path: string, reserved: Set<string>): Promise<ReportReservation> {
   if (reserved.has(path)) throw new Error(`report_file is duplicated in this launch batch: ${path}`);
   try {
     await lstat(path);
@@ -153,7 +160,21 @@ async function requireFreshReport(path: string, reserved: Set<string>): Promise<
     }
     throw new Error(`cannot reserve report_file ${path}: ${errorMessage(error)}`);
   }
-  reserved.add(path);
+  const activatedAt = Date.now();
+  let report;
+  try {
+    report = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    const info = await report.stat();
+    reserved.add(path);
+    return { activatedAt, reportIdentity: { dev: String(info.dev), ino: String(info.ino) } };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`report_file was created while it was being reserved: ${path}`);
+    }
+    throw new Error(`cannot create report reservation ${path}: ${errorMessage(error)}`);
+  } finally {
+    await report?.close().catch(() => {});
+  }
 }
 
 const extensionPaths = (): string[] => {
@@ -200,6 +221,8 @@ export class SubagentLauncher {
       cwd: string;
       missionFile: string;
       reportPath?: string;
+      reportIdentity?: { dev: string; ino: string };
+      activatedAt?: number;
       parentJobId?: string;
       state?: StoredState;
       error?: string;
@@ -221,11 +244,17 @@ export class SubagentLauncher {
         cwd: asPath(input.cwd, "cwd"),
         missionFile: asPath(input.mission_file, "mission_file"),
         reportPath: input.mode === "task" ? asPath(input.report_file, "report_file") : undefined,
+        reportIdentity: undefined as { dev: string; ino: string } | undefined,
+        activatedAt: undefined as number | undefined,
         parentJobId: parent?.jobId,
       };
       await requireDirectory(item.cwd, "cwd");
       await requireMission(item.missionFile);
-      if (input.mode === "task") await requireFreshReport(item.reportPath!, reservedReports);
+      if (input.mode === "task") {
+        const reservation = await requireFreshReport(item.reportPath!, reservedReports);
+        item.reportIdentity = reservation.reportIdentity;
+        item.activatedAt = reservation.activatedAt;
+      }
       else if (input.report_file !== undefined) throw new Error("dialogue mode must not include report_file");
       prepared.push(item);
     }
@@ -357,8 +386,8 @@ export class SubagentLauncher {
     await requireDirectory(cwd, "cwd");
     await requireMission(missionFile);
     const reportPath = input.mode === "task" ? asPath(input.report_file, "report_file") : undefined;
-    if (input.mode === "task") await requireFreshReport(reportPath!, new Set());
-    else if (input.report_file !== undefined) throw new Error("dialogue mode must not include report_file");
+    const reservation = input.mode === "task" ? await requireFreshReport(reportPath!, new Set()) : undefined;
+    if (input.mode !== "task" && input.report_file !== undefined) throw new Error("dialogue mode must not include report_file");
 
     const knownState = this.states.get(jobId);
     if (knownState?.finished && old.mode !== "dialogue") {
@@ -379,7 +408,9 @@ export class SubagentLauncher {
       sessionId,
       mode: input.mode,
       reportPath,
+      reportIdentity: reservation?.reportIdentity,
       batchId,
+      activatedAt: reservation?.activatedAt,
       parentJobId: old.parentJobId,
       provider: input.provider,
       model: input.model,
@@ -478,6 +509,8 @@ export class SubagentLauncher {
       cwd: string;
       missionFile: string;
       reportPath?: string;
+      reportIdentity?: { dev: string; ino: string };
+      activatedAt?: number;
       parentJobId?: string;
     },
     parentPane: string,
@@ -493,7 +526,9 @@ export class SubagentLauncher {
       sessionId: item.sessionId,
       mode: item.input.mode,
       reportPath: item.reportPath,
+      reportIdentity: item.reportIdentity,
       batchId: item.batchId,
+      activatedAt: item.activatedAt,
       parentJobId: item.parentJobId,
       provider: item.input.provider,
       model: item.input.model,
@@ -593,7 +628,9 @@ export class SubagentLauncher {
     state.monitorUnsubscribe = this.background.onJobSettled(monitorJob.job.id, (_job, completion) => {
       state.finished = true;
       state.monitorUnsubscribe = undefined;
-      if (state.parentJobId && completion.status) this.recordParent(state.parentJobId, state.jobId, completion.summary, completion.status);
+      if (state.parentJobId && completion.status) {
+        this.recordParent(state.parentJobId, state.jobId, completion.summary, completion.status, completion.source);
+      }
     });
   }
 
@@ -617,8 +654,11 @@ export class SubagentLauncher {
         } catch {}
       } else if (marker.kind === "final" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         const status = marker.outcome === "completed" ? "completed" : marker.outcome === "blocked" ? "blocked" : "failed";
+        const source = marker.source as OutcomeSource | undefined;
         const summary = `${marker.summary || marker.outcome} (attempt ${marker.attemptId}; session ${state.sessionId}; report ${marker.report || "none"}; monitor ${state.monitorLogPath || "pending"})`;
-        if (state.monitorJobId !== undefined) this.background.setCompletion(state.monitorJobId, { id: state.jobId, status, summary });
+        if (state.monitorJobId !== undefined) {
+          this.background.setCompletion(state.monitorJobId, { id: state.jobId, status, summary, source });
+        }
         this.resolveStart(state, marker.attemptId, false);
       }
     }
@@ -716,8 +756,14 @@ export class SubagentLauncher {
     if (result.code !== 0) throw new Error((result.stderr || result.stdout || `tmux ${args[0]} failed`).trim());
     return result.stdout;
   }
-  private recordParent(parentJobId: string, childJobId: string, summary: string, status: "completed" | "failed" | "blocked" = "failed"): void {
-    try { getTaskOutcomeManager(this.pi, this.ctx).recordChildOutcome(parentJobId, childJobId, status, summary); } catch {}
+  private recordParent(
+    parentJobId: string,
+    childJobId: string,
+    summary: string,
+    status: "completed" | "failed" | "blocked" = "failed",
+    source: OutcomeSource = "model",
+  ): void {
+    try { getTaskOutcomeManager(this.pi, this.ctx).recordChildOutcome(parentJobId, childJobId, status, summary, source); } catch {}
   }
 }
 

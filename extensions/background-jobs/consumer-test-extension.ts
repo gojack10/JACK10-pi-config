@@ -19,6 +19,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
       message: Type.Optional(Type.String()),
       outcome_id: Type.Optional(Type.String()),
       status: Type.Optional(Type.String()),
+      source: Type.Optional(Type.String()),
       expected: Type.Optional(Type.Integer({ minimum: 1 })),
     }),
     async execute(_id, args, _signal, _onUpdate, ctx) {
@@ -66,6 +67,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
             id: args.outcome_id ?? args.label ?? "outcome",
             status: (args.status ?? "completed") as BackgroundJobOutcomeStatus,
             summary: args.message,
+            source: args.source as any,
           });
           break;
         case "stats":

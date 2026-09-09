@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,6 +37,7 @@ pane="$TMUX_PANE"
 manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
 job=$(tmux show-options -qv -t "$pane" @pi_subagent_job_id)
 attempt=$(sed -n 's/.*"attemptId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
+session_id=$(sed -n 's/.*"sessionId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 mode=$(sed -n 's/.*"mode":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 report=$(sed -n 's/.*"reportPath":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 session_file="$manifest.session.jsonl"
@@ -56,7 +57,7 @@ else
   report=
 fi
 channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
-tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"fake-session\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"$outcome\\",\\"source\\":\\"model\\",\\"report\\":\\"$report\\",\\"session_file\\":\\"$session_file\\"}"
+tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"$outcome\\",\\"source\\":\\"model\\",\\"report\\":\\"$report\\",\\"session_file\\":\\"$session_file\\"}"
 tmux set-option -q -t "$pane" @pi_outcome_generation 1
 tmux wait-for -S "$channel"
 sleep .5
@@ -172,6 +173,7 @@ count=0
 while :; do
   manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
   attempt=$(sed -n 's/.*"attemptId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
+  session_id=$(sed -n 's/.*"sessionId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
   if [ "$attempt" = "$last" ]; then sleep .02; continue; fi
   last="$attempt"
   job=$(tmux show-options -qv -t "$pane" @pi_subagent_job_id)
@@ -187,7 +189,7 @@ while :; do
   tmux wait-for -S "$start"
   if [ "$count" -eq 0 ]; then
     channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
-    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"fake-session\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"needs_input\\",\\"final\\":false,\\"summary\\":\\"need a continuation\\"}"
+    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"needs_input\\",\\"source\\":\\"model\\",\\"final\\":false,\\"summary\\":\\"need a continuation\\"}"
     outcome_gen=$(tmux show-options -qv -t "$pane" @pi_outcome_generation)
     tmux set-option -q -t "$pane" @pi_outcome_generation $((outcome_gen + 1))
     tmux wait-for -S "$channel"
@@ -196,7 +198,7 @@ while :; do
   else
     printf 'follow-up report\\n' > "$report"
     channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
-    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"fake-session\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"completed\\",\\"report\\":\\"$report\\"}"
+    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"completed\\",\\"source\\":\\"model\\",\\"final\\":true,\\"report\\":\\"$report\\"}"
     outcome_gen=$(tmux show-options -qv -t "$pane" @pi_outcome_generation)
     tmux set-option -q -t "$pane" @pi_outcome_generation $((outcome_gen + 1))
     tmux wait-for -S "$channel"
@@ -284,20 +286,26 @@ test("monitor rejects a nonempty report symlink at final validation", { timeout:
     await tmux(["new-session", "-d", "-s", session, "-c", dir]);
     const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
     const report = join(dir, "report.md");
+    await writeFile(report, "");
+    const identity = await lstat(report);
     const target = join(dir, "unrelated.md");
     await writeFile(target, "unrelated nonempty target\n");
+    await unlink(report);
     await symlink(target, report);
     const sessionFile = join(dir, "session.jsonl");
     await writeFile(sessionFile, "session\n");
     const manifest = join(dir, "manifest.json");
-    await writeFile(manifest, JSON.stringify({ version: 1, jobId: job, attemptId: attempt, mode: "task",
-      reportPath: report, startChannel: "unused-start", startGeneration: 0, outcomeGeneration: 0 }));
+    await writeFile(manifest, JSON.stringify({ version: 1, jobId: job, attemptId: attempt,
+      sessionId: "monitor-session", mode: "task", reportPath: report,
+      reportIdentity: { dev: String(identity.dev), ino: String(identity.ino) }, activatedAt: Date.now(),
+      startChannel: "unused-start", startGeneration: 0, outcomeGeneration: 0 }));
     const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
     await set("@pi_subagent_job_id", job);
     await set("@pi_subagent_manifest", manifest);
     await set("@pi_start_generation", "1");
     await set("@pi_session_file", sessionFile);
-    await set("@pi_outcome", JSON.stringify({ job_id: job, attempt_id: attempt, mode: "task", outcome: "completed", report }));
+    await set("@pi_outcome", JSON.stringify({ session_id: "monitor-session", job_id: job, attempt_id: attempt,
+      mode: "task", outcome: "completed", source: "model", final: true, report }));
     await set("@pi_outcome_generation", "1");
     const result = await execFileAsync(process.execPath, [monitorPath, JSON.stringify({
       paneId: pane, manifestOption: "@pi_subagent_manifest", outcomeOption: "@pi_outcome",
