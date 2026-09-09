@@ -16,10 +16,13 @@ export interface BackgroundJobStartOptions {
   completionId?: string;
 }
 
+export type BackgroundJobCompletionSource = "model" | "technical" | "protocol" | "transport";
+
 export interface BackgroundJobCompletionOverride {
   id: string;
   status: BackgroundJobOutcomeStatus;
   summary: string;
+  source?: BackgroundJobCompletionSource;
 }
 
 export interface BackgroundJobStartHooks {
@@ -50,12 +53,14 @@ export interface BackgroundJobOutcome {
   id: string;
   status: BackgroundJobOutcomeStatus;
   summary?: string;
+  source?: BackgroundJobCompletionSource;
 }
 
 export interface BackgroundJobCompletion {
   id: string;
   status?: BackgroundJobOutcomeStatus;
   summary: string;
+  source?: BackgroundJobCompletionSource;
 }
 
 export interface BackgroundJobReport {
@@ -353,7 +358,12 @@ export class BackgroundJobManager {
     this.finishMember(
       batch,
       memberId,
-      { id: outcome.id, status: outcome.status, summary: outcome.summary ?? `${outcome.status} ${outcome.id}` },
+      {
+        id: outcome.id,
+        status: outcome.status,
+        summary: outcome.summary ?? `${outcome.status} ${outcome.id}`,
+        source: outcome.source,
+      },
     );
   }
 
@@ -612,9 +622,10 @@ export class BackgroundJobManager {
   }
 
   private renderCompletion(completion: BackgroundJobCompletion): string {
+    const source = completion.source && completion.source !== "model" ? ` [${completion.source}]` : "";
     return completion.status
-      ? `outcome ${completion.id}: [${completion.status}] ${completion.summary}`
-      : completion.summary;
+      ? `outcome ${completion.id}: [${completion.status}]${source} ${completion.summary}`
+      : `${source ? `[${completion.source}] ` : ""}${completion.summary}`;
   }
 
   private renderCompletionSummary(job: BgJob): string {

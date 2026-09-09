@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
 import test from "node:test";
+
+const execFileAsync = promisify(execFile);
 
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
   ".local/share/pi-mono/packages/coding-agent/dist/core/extensions/loader.js")).href);
@@ -478,11 +482,27 @@ test("a nonempty report symlink cannot satisfy completion", { timeout: 10000 }, 
     action: "activate", job_id: "symlink", attempt_id: "s1", mode: "task", report_path: report,
   });
   await writeFile(target, "unrelated nonempty target");
+  await unlink(report);
   await symlink(target, report);
   await assert.rejects(
     h.call("report_outcome", { outcome: "completed", summary: "symlink must fail" }),
     /report|symlink|ELOOP/i,
   );
+});
+
+test("task report validation rejects a FIFO without waiting for a writer", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const report = join(h.dir, "fifo-report.md");
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "fifo", attempt_id: "f1", mode: "task", report_path: report,
+  });
+  await unlink(report);
+  await execFileAsync("mkfifo", [report]);
+  const result = await Promise.race([
+    h.call("report_outcome", { outcome: "completed", summary: "fifo must fail" }).then(() => "accepted", () => "rejected"),
+    delay(500).then(() => "blocked"),
+  ]);
+  assert.equal(result, "rejected");
 });
 
 test("child work after completion declaration wakes the fresh settlement boundary", { timeout: 10000 }, async t => {

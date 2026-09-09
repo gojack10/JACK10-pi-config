@@ -13,8 +13,10 @@ const tmux = args => new Promise((resolve, reject) => {
   });
 });
 const show = async option => {
-  try { return await tmux(["show-options", "-qv", "-t", config.paneId, option]); }
-  catch { return undefined; }
+  try {
+    const value = await tmux(["show-options", "-qv", "-t", config.paneId, option]);
+    return value || undefined;
+  } catch { return undefined; }
 };
 const paneExists = async () => (await show("@pi_subagent_job_id")) !== undefined;
 const readManifest = async () => {
@@ -23,6 +25,7 @@ const readManifest = async () => {
   try {
     const value = JSON.parse(await readFile(path, "utf8"));
     if (value?.version !== 1 || typeof value.jobId !== "string" || typeof value.attemptId !== "string" ||
+        typeof value.sessionId !== "string" || value.sessionId.length === 0 ||
         (value.mode !== "task" && value.mode !== "dialogue") || typeof value.startChannel !== "string" ||
         !Number.isSafeInteger(value.startGeneration) || !Number.isSafeInteger(value.outcomeGeneration)) return undefined;
     return value;
@@ -51,13 +54,18 @@ const generation = async () => {
   return Number.isSafeInteger(value) ? value : 0;
 };
 const sessionFile = async () => await show(config.sessionFileOption);
-const nonEmptyRegularReport = async path => {
-  if (typeof constants.O_NOFOLLOW !== "number") return false;
+const nonEmptyRegularReport = async (path, manifest) => {
+  if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") return false;
+  const identity = manifest?.reportIdentity;
+  if (!identity || typeof identity.dev !== "string" || typeof identity.ino !== "string" ||
+      !/^\d+$/.test(identity.dev) || !/^\d+$/.test(identity.ino) ||
+      !Number.isSafeInteger(manifest.activatedAt)) return false;
   let file;
   try {
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const info = await file.stat();
-    if (!info.isFile() || info.size < 1) return false;
+    if (!info.isFile() || info.size < 1 || String(info.dev) !== identity.dev || String(info.ino) !== identity.ino) return false;
+    if (Number.isFinite(info.birthtimeMs) && info.birthtimeMs + 1 < manifest.activatedAt) return false;
     const buffer = Buffer.alloc(1);
     return (await file.read(buffer, 0, 1, 0)).bytesRead === 1;
   } catch {
@@ -68,7 +76,8 @@ const nonEmptyRegularReport = async path => {
 };
 const transportFailure = (summary, manifest) => {
   emit({ kind: "final", jobId: manifest?.jobId, attemptId: manifest?.attemptId,
-    outcome: "failed", summary, report: manifest?.reportPath });
+    outcome: "transport_lost", source: "transport", technical: true, final: true,
+    summary, report: manifest?.reportPath });
 };
 
 let lastGeneration;
@@ -118,7 +127,8 @@ while (true) {
     if (startedKey !== key) {
       startWait.cancel();
       emit({ kind: "final", jobId: manifest.jobId, attemptId: manifest.attemptId,
-        outcome: "failed", summary: "protocol_incomplete: START/session-file receipt timed out", report: manifest.reportPath });
+        outcome: "failed", source: "protocol", technical: true, final: true,
+        summary: "protocol_incomplete: START/session-file receipt timed out", report: manifest.reportPath });
       process.exit(0);
     }
   }
@@ -129,33 +139,49 @@ while (true) {
     const raw = await show(config.outcomeOption);
     let receipt;
     try { receipt = raw ? JSON.parse(raw) : undefined; } catch { receipt = undefined; }
+    const source = receipt && receipt.source === undefined ? "model" : receipt?.source;
     if (!receipt || receipt.job_id !== manifest.jobId || receipt.attempt_id !== manifest.attemptId ||
-        receipt.mode !== manifest.mode || typeof receipt.outcome !== "string") {
+        receipt.mode !== manifest.mode || receipt.session_id !== manifest.sessionId ||
+        typeof receipt.outcome !== "string" ||
+        (receipt.source !== undefined && !["model", "technical", "protocol", "transport"].includes(receipt.source))) {
       emit({ kind: "evidence", jobId: manifest.jobId, attemptId: manifest.attemptId,
-        summary: `ignored malformed or mismatched outcome generation ${currentGeneration}` });
-    } else if (receipt.outcome === "needs_input" || receipt.final === false) {
+        summary: `ignored malformed, foreign, or mismatched outcome generation ${currentGeneration}` });
+    } else if (receipt.outcome === "needs_input" || (receipt.final === false && receipt.outcome !== "transport_lost")) {
       emit({ kind: "needs_input", jobId: receipt.job_id, attemptId: receipt.attempt_id,
-        summary: receipt.summary || "child requested human input", report: receipt.report });
+        source, final: false, summary: receipt.summary || "child requested human input", report: receipt.report });
     } else {
       let outcome = receipt.outcome;
+      let finalSource = source;
       let summary = receipt.summary || `${outcome} ${manifest.jobId}`;
-      if (manifest.mode === "dialogue" && outcome === "dialogue_settled") outcome = "completed";
-      if (!["completed", "blocked", "failed"].includes(outcome)) {
-        outcome = "failed";
-        summary = `protocol_incomplete: unsupported child outcome ${receipt.outcome}`;
-      }
-      if (manifest.mode === "task" && receipt.outcome === "completed") {
-        let validReport = receipt.report === manifest.reportPath;
-        if (validReport) validReport = await nonEmptyRegularReport(manifest.reportPath);
-        if (!validReport) {
+      if (outcome === "transport_lost" && source === "transport") {
+        // A task manager transport record is non-semantic, but terminal for this monitor.
+      } else {
+        if (manifest.mode === "dialogue" && outcome === "dialogue_settled") outcome = "completed";
+        if (!["completed", "blocked", "failed"].includes(outcome)) {
           outcome = "failed";
-          summary = `protocol_incomplete: missing or mismatched report ${manifest.reportPath}`;
+          finalSource = "protocol";
+          summary = `protocol_incomplete: unsupported child outcome ${receipt.outcome}`;
+        }
+        if (manifest.mode === "task" && receipt.outcome === "completed") {
+          let validReport = receipt.report === manifest.reportPath;
+          if (validReport) validReport = await nonEmptyRegularReport(manifest.reportPath, manifest);
+          if (!validReport) {
+            outcome = "failed";
+            finalSource = "protocol";
+            summary = `protocol_incomplete: missing or mismatched report ${manifest.reportPath}`;
+          }
         }
       }
       emit({ kind: "final", jobId: receipt.job_id, attemptId: receipt.attempt_id,
-        outcome, summary, report: manifest.reportPath, sessionFile: receipt.session_file });
+        outcome, source: finalSource, technical: finalSource !== "model", final: true,
+        summary, report: manifest.reportPath, sessionFile: receipt.session_file });
       process.exit(0);
     }
+  }
+
+  if (!(await paneExists())) {
+    transportFailure("transport_lost: child pane disappeared before a durable outcome", manifest);
+    process.exit(0);
   }
 
   const event = await Promise.race([
