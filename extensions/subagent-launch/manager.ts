@@ -418,77 +418,123 @@ export class SubagentLauncher {
       ? (() => {
         knownState!.monitorUnsubscribe?.();
         this.background.retireExternal(knownState!.monitorJobId!);
+        knownState!.monitorUnsubscribe = undefined;
+        knownState!.monitorJobId = undefined;
         return this.background.reopenBatch(batchId);
       })()
       : this.background.openBatch(batchId, 1);
-    const manifestPath = await this.writeManifest({
-      version: 1,
-      jobId,
-      attemptId,
-      sessionId,
-      mode: input.mode,
-      reportPath,
-      reportIdentity: reservation?.reportIdentity,
-      batchId,
-      activatedAt: reservation?.activatedAt,
-      parentJobId: old.parentJobId,
-      provider: input.provider,
-      model: input.model,
-      thinking: input.thinking,
-      startChannel: unique("pi-subagent-start"),
-      startGeneration: Number.isSafeInteger(currentStartGeneration) ? currentStartGeneration : 0,
-      outcomeGeneration: Number.isSafeInteger(currentOutcomeGeneration) ? currentOutcomeGeneration : 0,
-    });
-    const followupManifest = await this.readManifest(manifestPath);
-    const startChannel = followupManifest.startChannel;
-    if (!startChannel) throw new Error("follow-up manifest has no start channel");
-    await this.set(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
-    await this.verify(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
-    await this.set(paneId, START_CHANNEL_OPTION, startChannel);
-    await this.verify(paneId, START_CHANNEL_OPTION, startChannel);
-    await this.set(paneId, "@pi_subagent_attempt_id", attemptId);
-    await this.set(paneId, "@pi_subagent_mode", input.mode);
+    let state: StoredState | undefined;
+    try {
+      const manifestPath = await this.writeManifest({
+        version: 1,
+        jobId,
+        attemptId,
+        sessionId,
+        mode: input.mode,
+        reportPath,
+        reportIdentity: reservation?.reportIdentity,
+        batchId,
+        activatedAt: reservation?.activatedAt,
+        parentJobId: old.parentJobId,
+        provider: input.provider,
+        model: input.model,
+        thinking: input.thinking,
+        startChannel: unique("pi-subagent-start"),
+        startGeneration: Number.isSafeInteger(currentStartGeneration) ? currentStartGeneration : 0,
+        outcomeGeneration: Number.isSafeInteger(currentOutcomeGeneration) ? currentOutcomeGeneration : 0,
+      });
+      const followupManifest = await this.readManifest(manifestPath);
+      const startChannel = followupManifest.startChannel;
+      if (!startChannel) throw new Error("follow-up manifest has no start channel");
+      await this.set(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
+      await this.verify(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
+      await this.set(paneId, START_CHANNEL_OPTION, startChannel);
+      await this.verify(paneId, START_CHANNEL_OPTION, startChannel);
+      await this.set(paneId, "@pi_subagent_attempt_id", attemptId);
+      await this.set(paneId, "@pi_subagent_mode", input.mode);
 
-    const state: StoredState = {
-      jobId,
-      sessionId,
-      attemptId,
-      batchId,
-      paneId,
-      sessionLabel: await this.show(paneId, "@pi_subagent_session_label") ?? sessionId,
-      cwd,
-      provider: input.provider,
-      model: input.model,
-      thinking: input.thinking,
-      mode: input.mode,
-      manifestPath,
-      reportPath,
-      startWaiters: new Map(),
-      startResults: new Map(),
-      outputBuffer: "",
-      finished: false,
-      parentJobId: old.parentJobId,
-    };
-    await this.armMonitor(state, batch);
-    this.states.set(jobId, state);
-    const startPromise = this.waitForStart(state, attemptId);
-    await this.paste(paneId, missionFile, state);
-    const started = await Promise.race([startPromise, this.timeout(START_WAIT_MS)]);
+      state = {
+        jobId,
+        sessionId,
+        attemptId,
+        batchId,
+        paneId,
+        sessionLabel: await this.show(paneId, "@pi_subagent_session_label") ?? sessionId,
+        cwd,
+        provider: input.provider,
+        model: input.model,
+        thinking: input.thinking,
+        mode: input.mode,
+        manifestPath,
+        reportPath,
+        startWaiters: new Map(),
+        startResults: new Map(),
+        outputBuffer: "",
+        finished: false,
+        parentJobId: old.parentJobId,
+      };
+      await this.armMonitor(state, batch);
+      this.states.set(jobId, state);
+      const startPromise = this.waitForStart(state, attemptId);
+      await this.paste(paneId, missionFile, state);
+      const started = await Promise.race([startPromise, this.timeout(START_WAIT_MS)]);
+      batch.close();
+      return {
+        job: jobId,
+        status: started ? "running" : "start_timeout",
+        attempt_id: attemptId,
+        session_id: sessionId,
+        session_label: state.sessionLabel,
+        pane_id: paneId,
+        batch_id: batchId,
+        manifest_file: manifestPath,
+        report_file: reportPath,
+        session_file: await this.show(paneId, SESSION_FILE_OPTION),
+        monitor_log: state.monitorLogPath,
+        error: started ? undefined : "START/session-file receipt timed out; saved pane and monitor evidence were preserved",
+      };
+    } catch (error) {
+      this.cleanupFollowupFailure(batch, state, knownState, jobId, old.parentJobId, attemptId, error);
+      throw error;
+    }
+  }
+
+  private cleanupFollowupFailure(
+    batch: ReturnType<BackgroundJobManager["openBatch"]>,
+    state: StoredState | undefined,
+    oldState: StoredState | undefined,
+    jobId: string,
+    parentJobId: string | undefined,
+    attemptId: string,
+    error: unknown,
+  ): void {
+    const summary = `release_failed: ${errorMessage(error)}; pane was preserved (attempt ${attemptId})`;
+    if (state?.releaseBuffered) {
+      batch.close();
+      return;
+    }
+    if (state?.monitorJobId !== undefined) {
+      state.releaseFailure = summary;
+      state.monitorUnsubscribe?.();
+      state.monitorUnsubscribe = undefined;
+      this.background.retireExternal(state.monitorJobId);
+      state.monitorJobId = undefined;
+    }
+    const failedState = state ?? oldState;
+    if (failedState) {
+      failedState.finished = true;
+      failedState.monitorUnsubscribe = undefined;
+      failedState.monitorJobId = undefined;
+      this.states.set(jobId, failedState);
+    }
+    const status = this.background.getBatchStatus(batch.id);
+    const shouldRecord = status !== undefined && !status.complete &&
+      (status.members === 0 || status.finalized < status.members);
+    if (shouldRecord) {
+      batch.recordOutcome({ id: jobId, status: "failed", source: "transport", summary });
+      if (parentJobId) this.recordParent(parentJobId, jobId, summary, "failed", "transport");
+    }
     batch.close();
-    return {
-      job: jobId,
-      status: started ? "running" : "start_timeout",
-      attempt_id: attemptId,
-      session_id: sessionId,
-      session_label: state.sessionLabel,
-      pane_id: paneId,
-      batch_id: batchId,
-      manifest_file: manifestPath,
-      report_file: reportPath,
-      session_file: await this.show(paneId, SESSION_FILE_OPTION),
-      monitor_log: state.monitorLogPath,
-      error: started ? undefined : "START/session-file receipt timed out; saved pane and monitor evidence were preserved",
-    };
   }
 
   private async validateRoutes(inputs: readonly SubagentJobInput[]): Promise<void> {
