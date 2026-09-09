@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ const { SessionManager } = await import(pathToFileURL(join(homedir(),
 const backgroundPath = fileURLToPath(new URL("../background-jobs.ts", import.meta.url));
 const taskPath = fileURLToPath(new URL("../task-outcomes.ts", import.meta.url));
 const consumerPath = fileURLToPath(new URL("./consumer-test-extension.ts", import.meta.url));
+const managerSourcePath = fileURLToPath(new URL("./manager.ts", import.meta.url));
 
 async function until(check: () => boolean | Promise<boolean>) {
   for (let i = 0; i < 250; i++) {
@@ -504,10 +505,181 @@ test("replayed work_ready is an intentional deduplicated wake, not a second deli
     jobId: "wake",
     attemptId: "w1",
     summary: "previous wake was durably recorded",
+    workReadySequence: 0,
+    notified: true,
   });
   await h.emit("session_tree");
   await h.call("task_outcomes_consumer", { action: "background", batch_id: "unrelated", command: "true" });
   await until(() => h.messages.length > 0);
   await delay(50);
   assert.equal(h.messages.filter(message => /task-outcomes/.test(message.text)).length, 0);
+});
+
+test("activation recovers a post-mutation marker without a missing helper", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  const append = h.runtime.appendEntry;
+  let fail = true;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    append(type, data);
+    if (fail && data?.kind === "contract") {
+      fail = false;
+      throw new Error("activation append failed after mutation");
+    }
+  };
+  const result = await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "activation-retry", attempt_id: "a1", mode: "dialogue",
+  });
+  assert.equal(result.details.jobId, "activation-retry");
+  assert.equal((await h.snapshot()).active.state, "active");
+});
+
+test("an append failure before mutation leaves child membership retryable", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "before-mutation", attempt_id: "b1", mode: "dialogue",
+  });
+  const append = h.runtime.appendEntry;
+  h.runtime.appendEntry = () => { throw new Error("append failed before mutation"); };
+  await assert.rejects(
+    h.call("task_outcomes_consumer", { action: "child", job_id: "before-mutation", child_job_id: "child-a" }),
+    /before mutation/,
+  );
+  assert.deepEqual((await h.snapshot()).active.childJobIds, []);
+  h.runtime.appendEntry = append;
+  await h.call("task_outcomes_consumer", { action: "child", job_id: "before-mutation", child_job_id: "child-a" });
+  assert.deepEqual((await h.snapshot()).active.childJobIds, ["child-a"]);
+});
+
+test("stable operation IDs reject changed declaration, membership, and child payloads", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "payload", attempt_id: "p1", mode: "dialogue",
+  });
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  const append = h.runtime.appendEntry;
+  let failKind = "declaration";
+  h.runtime.appendEntry = (type: string, data: any) => {
+    append(type, data);
+    if (data?.kind === failKind) {
+      failKind = "never";
+      throw new Error(`${data.kind} append failed after mutation`);
+    }
+  };
+  await assert.rejects(
+    h.call("report_outcome", { outcome: "failed", summary: "durable declaration" }),
+    /after mutation/,
+  );
+  h.runtime.appendEntry = append;
+  await assert.rejects(
+    h.call("report_outcome", { outcome: "blocked", summary: "different declaration" }),
+    /different payload/,
+  );
+  await h.call("report_outcome", { outcome: "failed", summary: "durable declaration" });
+
+  let failMembership = true;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    append(type, data);
+    if (failMembership && data?.kind === "contract" && data.contract?.childJobIds?.includes("child-a")) {
+      failMembership = false;
+      throw new Error("membership append failed after mutation");
+    }
+  };
+  await assert.rejects(
+    h.call("task_outcomes_consumer", { action: "child", job_id: "payload", child_job_id: "child-a" }),
+    /after mutation/,
+  );
+  h.runtime.appendEntry = append;
+  await assert.rejects(
+    h.call("task_outcomes_consumer", { action: "child", job_id: "payload", child_job_id: "child-b" }),
+    /different payload/,
+  );
+  await h.call("task_outcomes_consumer", { action: "child", job_id: "payload", child_job_id: "child-a" });
+
+  let failChild = true;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    append(type, data);
+    if (failChild && data?.kind === "child_outcome") {
+      failChild = false;
+      throw new Error("child append failed after mutation");
+    }
+  };
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "child_outcome", job_id: "payload", child_job_id: "child-a", status: "completed", summary: "durable child",
+    }),
+    /after mutation/,
+  );
+  h.runtime.appendEntry = append;
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "child_outcome", job_id: "payload", child_job_id: "child-a", status: "blocked", summary: "different child",
+    }),
+    /different payload/,
+  );
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "payload", child_job_id: "child-a", status: "completed", summary: "durable child",
+  });
+  const live = await h.snapshot();
+  assert.equal(live.active.declaration.summary, "durable declaration");
+  assert.deepEqual(live.active.childJobIds, ["child-a"]);
+
+  await h.emit("session_tree");
+  const replayed = await h.snapshot();
+  assert.equal(replayed.active.declaration.summary, "durable declaration");
+  assert.deepEqual(replayed.active.childJobIds, ["child-a"]);
+});
+
+test("real session-file append failure is retried only after disk recovery", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "user", content: "persist first", timestamp: Date.now() } as any);
+  h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() } as any);
+  const sessionFile = h.sm.getSessionFile();
+  assert.ok(sessionFile);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "disk-retry", attempt_id: "d1", mode: "dialogue",
+  });
+  await chmod(sessionFile, 0o444);
+  await assert.rejects(h.settle({ text: "old final" }), /EACCES|permission denied/);
+  const failedDisk = await readFile(sessionFile, "utf8");
+  assert.doesNotMatch(failedDisk, /dialogue_settled/);
+  assert.match(await readFile(`${sessionFile}.task-outcomes.jsonl`, "utf8"), /dialogue_settled/);
+
+  await chmod(sessionFile, 0o644);
+  await h.settle({ text: "old final" });
+  assert.match(await readFile(sessionFile, "utf8"), /dialogue_settled/);
+  const restarted = await harness(t, SessionManager.open(sessionFile));
+  assert.equal((await restarted.snapshot()).outcomes.at(-1).outcome, "dialogue_settled");
+  assert.equal((await restarted.snapshot()).outcomes.at(-1).summary, "old final");
+});
+
+test("a durable but unattempted work_ready wake is retried after replay", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "wake-retry", attempt_id: "w1", mode: "dialogue", children: ["child"],
+  });
+  const append = h.runtime.appendEntry;
+  let fail = true;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    append(type, data);
+    if (fail && data?.kind === "work_ready") {
+      fail = false;
+      throw new Error("work_ready append failed after mutation");
+    }
+  };
+  await h.call("task_outcomes_consumer", {
+    action: "child_outcome", job_id: "wake-retry", child_job_id: "child", status: "completed", summary: "child done",
+  });
+  assert.equal(h.messages.filter(message => /task-outcomes/.test(message.text)).length, 0);
+  h.runtime.appendEntry = append;
+  await h.emit("session_tree");
+  await h.call("task_outcomes_consumer", { action: "background", batch_id: "wake-unrelated", command: "true" });
+  await until(() => h.messages.filter(message => /task-outcomes/.test(message.text)).length === 1);
+});
+
+test("every direct transition helper call has a declared method", async () => {
+  const source = await readFile(managerSourcePath, "utf8");
+  const called = new Set([...source.matchAll(/this\.([A-Za-z_$][\w$]*)\s*\(/g)].map(match => match[1]));
+  const declared = new Set([...source.matchAll(/^\s*(?:private|protected|public)?\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(/gm)].map(match => match[1]));
+  for (const name of called) assert.ok(declared.has(name), `this.${name}() has no declared method`);
 });
