@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { chmod, lstat, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -14,6 +15,7 @@ const { loadExtensions } = await import(pathToFileURL(join(homedir(),
 const { SessionManager } = await import(pathToFileURL(join(homedir(),
   ".local/share/pi-mono/packages/coding-agent/dist/index.js")).href);
 const extensionPath = fileURLToPath(new URL("../subagent-launch.ts", import.meta.url));
+const taskOutcomeExtensionPath = fileURLToPath(new URL("../task-outcomes.ts", import.meta.url));
 const monitorPath = fileURLToPath(new URL("./monitor.mjs", import.meta.url));
 
 async function tmux(args: string[]): Promise<string> {
@@ -272,6 +274,207 @@ done
     if (oldPane === undefined) delete process.env.TMUX_PANE;
     else process.env.TMUX_PANE = oldPane;
     if (childSession) await tmux(["kill-session", "-t", childSession]).catch(() => {});
+    await tmux(["kill-session", "-t", parentSession]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("follow-ups reject busy and finished panes without consuming fresh report paths", { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-followup-preflight-test-"));
+  const parentSession = `pi-subagent-preflight-${process.pid}-${Date.now()}`;
+  const oldPath = process.env.PATH;
+  const oldPane = process.env.TMUX_PANE;
+  const fakePi = join(dir, "pi");
+  await writeFile(fakePi, `#!/bin/sh
+set -eu
+pane="$TMUX_PANE"
+last=
+count=0
+while :; do
+  manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
+  attempt=$(sed -n 's/.*"attemptId":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+  if [ "$attempt" = "$last" ]; then sleep .02; continue; fi
+  last="$attempt"
+  job=$(tmux show-options -qv -t "$pane" @pi_subagent_job_id)
+  session_id=$(sed -n 's/.*"sessionId":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+  mode=$(sed -n 's/.*"mode":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+  report=$(sed -n 's/.*"reportPath":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+  session_file="$manifest.session.jsonl"
+  printf '{"fake":true,"attempt":"%s"}\\n' "$attempt" > "$session_file"
+  tmux set-option -q -t "$pane" @pi_session_file "$session_file"
+  start_gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
+  tmux set-option -q -t "$pane" @pi_start_generation $((start_gen + 1))
+  start=$(tmux show-options -qv -t "$pane" @pi_start_channel)
+  tmux set-option -qu -t "$pane" @pi_start_channel
+  tmux wait-for -S "$start"
+  if [ "$count" -eq 0 ]; then
+    sleep .25
+    settled=$(tmux show-options -qv -t "$pane" @pi_settled_generation)
+    tmux set-option -q -t "$pane" @pi_settled_generation $((settled + 1))
+  else
+    printf 'follow-up report\\n' > "$report"
+    channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
+    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"completed\\",\\"source\\":\\"model\\",\\"final\\":true,\\"report\\":\\"$report\\"}"
+    outcome_gen=$(tmux show-options -qv -t "$pane" @pi_outcome_generation)
+    tmux set-option -q -t "$pane" @pi_outcome_generation $((outcome_gen + 1))
+    tmux wait-for -S "$channel"
+    settled=$(tmux show-options -qv -t "$pane" @pi_settled_generation)
+    tmux set-option -q -t "$pane" @pi_settled_generation $((settled + 1))
+    sleep 1
+    while :; do sleep 1; done
+  fi
+  count=$((count + 1))
+done
+`, { mode: 0o700 });
+  await chmod(fakePi, 0o700);
+  await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
+  const parentPane = await tmux(["list-panes", "-t", parentSession, "-F", "#{pane_id}"]);
+  process.env.PATH = `${dir}:${oldPath ?? ""}`;
+  process.env.TMUX_PANE = parentPane;
+  const reservation = (path: string) => join(tmpdir(), `pi-subagent-report-${createHash("sha256").update(path).digest("hex")}.reserve`);
+  const absent = async (path: string) => assert.rejects(lstat(path), { code: "ENOENT" });
+  let childSession: string | undefined;
+  let retrySession: string | undefined;
+  try {
+    const { extensions, errors, runtime } = await loadExtensions([extensionPath], dir);
+    assert.deepEqual(errors, []);
+    const messages: Array<{ text: string; options: any }> = [];
+    runtime.sendUserMessage = (text: string, options: any) => messages.push({ text, options });
+    const ctx: any = {
+      cwd: dir,
+      mode: "tui",
+      sessionManager: SessionManager.inMemory(dir),
+      modelRegistry: {
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } } : undefined,
+        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh", max: "max" } }],
+      },
+    };
+    const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
+    assert.ok(owner);
+    const launch = owner.tools.get("subagent_launch")!.definition;
+    const followup = owner.tools.get("subagent_followup")!.definition;
+    const mission = join(dir, "mission.md");
+    const retryMission = join(dir, "retry.md");
+    const busyReport = join(dir, "busy-report.md");
+    const finishedReport = join(dir, "finished-report.md");
+    await writeFile(mission, "Hold the first turn.\\n");
+    await writeFile(retryMission, "Continue the saved task.\\n");
+    const first: any = await launch.execute("test", {
+      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+        cwd: dir, session_label: "preflight", mode: "task", report_file: join(dir, "initial-report.md") }],
+    }, undefined, undefined, ctx);
+    const firstJob = first.details.jobs[0];
+    assert.equal(firstJob.status, "running");
+    childSession = firstJob.session_label;
+    await assert.rejects(
+      followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
+        provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
+        cwd: dir, session_label: "preflight", mode: "task", report_file: busyReport }, undefined, undefined, ctx),
+      /still handling its current turn/,
+    );
+    await absent(busyReport);
+    await absent(reservation(busyReport));
+    await until(async () => await tmux(["show-options", "-qv", "-t", firstJob.pane_id, "@pi_settled_generation"]) === "1");
+    const second: any = await followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
+      provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
+      cwd: dir, session_label: "preflight", mode: "task", report_file: busyReport }, undefined, undefined, ctx);
+    assert.equal(second.details.status, "running");
+    await until(() => messages.some(message => /All 1 background job/.test(message.text)));
+    assert.equal(await readFile(busyReport, "utf8"), "follow-up report\n");
+    await assert.rejects(
+      followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
+        provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
+        cwd: dir, session_label: "preflight", mode: "task", report_file: finishedReport }, undefined, undefined, ctx),
+      /already has a final monitored outcome/,
+    );
+    await absent(finishedReport);
+    await absent(reservation(finishedReport));
+    const retry: any = await launch.execute("test", {
+      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+        cwd: dir, session_label: "preflight-retry", mode: "task", report_file: finishedReport }],
+    }, undefined, undefined, ctx);
+    assert.equal(retry.details.jobs[0].status, "running");
+    retrySession = retry.details.jobs[0].session_label;
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+    if (retrySession) await tmux(["kill-session", "-t", retrySession]).catch(() => {});
+    if (childSession) await tmux(["kill-session", "-t", childSession]).catch(() => {});
+    await tmux(["kill-session", "-t", parentSession]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("technical launcher setup failure preserves transport source for parent and batch", { timeout: 10000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-launch-setup-failure-test-"));
+  const parentSession = `pi-subagent-setup-failure-${process.pid}-${Date.now()}`;
+  const oldPath = process.env.PATH;
+  const oldPane = process.env.TMUX_PANE;
+  const fakeTmux = join(dir, "tmux");
+  const parentSessionManager = SessionManager.inMemory(dir);
+  await writeFile(fakeTmux, `#!/bin/sh
+printf 'setup-denied\n' >&2
+exit 1
+`, { mode: 0o700 });
+  await chmod(fakeTmux, 0o700);
+  await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
+  const parentPane = await tmux(["list-panes", "-t", parentSession, "-F", "#{pane_id}"]);
+  process.env.PATH = `${dir}:${oldPath ?? ""}`;
+  process.env.TMUX_PANE = parentPane;
+  try {
+    const { extensions, errors, runtime } = await loadExtensions([extensionPath, taskOutcomeExtensionPath], dir);
+    assert.deepEqual(errors, []);
+    const messages: Array<{ text: string; options: any }> = [];
+    runtime.sendUserMessage = (text: string, options: any) => messages.push({ text, options });
+    runtime.appendEntry = (customType: string, data: unknown) => parentSessionManager.appendCustomEntry(customType, data);
+    const ctx: any = {
+      cwd: dir,
+      mode: "tui",
+      sessionManager: parentSessionManager,
+      modelRegistry: {
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
+        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh" } }],
+      },
+    };
+    const taskExtension = extensions.find(extension => extension.tools.has("report_outcome"));
+    assert.ok(taskExtension);
+    await taskExtension.handlers.get("session_start")?.[0]({ reason: "startup" }, ctx);
+    const parentManager = (globalThis[Symbol.for("pi.task-outcomes.manager-registry")] as WeakMap<object, any>).get(parentSessionManager);
+    assert.ok(parentManager);
+    parentManager.activateContract({ jobId: "parent-job", attemptId: "parent-attempt", mode: "dialogue" });
+    const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
+    assert.ok(owner);
+    const mission = join(dir, "mission.md");
+    const report = join(dir, "report.md");
+    await writeFile(mission, "This must not start.\\n");
+    const result: any = await owner.tools.get("subagent_launch")!.definition.execute("test", {
+      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+        cwd: dir, session_label: "setup-failure", mode: "task", report_file: report }],
+    }, undefined, undefined, ctx);
+    assert.equal(result.details.jobs[0].status, "setup_failed");
+    const batchId = result.details.batch_id;
+    const background = (globalThis[Symbol.for("pi.background-jobs.manager-registry")] as WeakMap<object, any>).get(parentSessionManager);
+    assert.ok(background);
+    const batchReport = background.getReport(batchId);
+    assert.ok(batchReport);
+    assert.equal(batchReport.completions[0].source, "transport");
+    assert.match(batchReport.text, /\[transport\]/);
+    const child = parentManager.snapshot().active?.childJobIds.at(-1);
+    assert.ok(child);
+    const childOutcome = parentManager.snapshot().active?.pendingWork;
+    assert.deepEqual(childOutcome, []);
+    const event = parentSessionManager.getBranch().find((entry: any) => entry.customType === "task-outcome/v1" && entry.data?.kind === "child_outcome");
+    assert.equal(event?.data.source, "transport");
+    assert.ok(messages.some(message => /\[transport\]/.test(message.text)));
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
     await tmux(["kill-session", "-t", parentSession]).catch(() => {});
     await rm(dir, { recursive: true, force: true });
   }
