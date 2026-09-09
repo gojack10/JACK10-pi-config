@@ -70,6 +70,7 @@ interface Runtime {
   sessionFile?: string;
   sessionOwner: object;
   branchEntries: () => readonly any[];
+  reloadSession?: () => void;
 }
 
 interface ContractState extends TaskLaunchContract {
@@ -150,6 +151,22 @@ const pathEntryExists = (path: string): boolean => {
     throw error;
   }
 };
+
+const stableJson = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+};
+
+const eventPayload = (event: object): string => stableJson(Object.fromEntries(
+  Object.entries(event).filter(([key]) => key !== "version" && key !== "eventId" && key !== "at" && key !== "branchId"),
+));
 
 export class TaskOutcomeManager {
   private readonly contracts = new Map<string, ContractState>();
@@ -250,10 +267,13 @@ export class TaskOutcomeManager {
     const contractEventId = this.operationEventId("contract", contract, "0");
     const members = contract.batchId ? [contract.jobId, ...childJobIds] : [];
     if (contract.batchId) this.background().assertCanRegisterOutcomes(contract.batchId, members);
+    const contractEvent = { kind: "contract" as const, contract: this.serializedContract(contract) };
     try {
-      this.persist({ kind: "contract", contract: this.serializedContract(contract) }, contractEventId);
+      this.persist(contractEvent, contractEventId);
     } catch (error) {
-      if (!this.hasActiveBranchEvent(contractEventId)) throw error;
+      const existing = this.durableActiveBranchEvent(contractEventId);
+      if (!existing) throw error;
+      this.assertEventPayload(existing, contractEvent);
     }
     if (contract.batchId) this.registerBatchMembers(contract.batchId, members);
     if (reportPath) this.usedReportPaths.add(reportPath);
@@ -276,10 +296,12 @@ export class TaskOutcomeManager {
     };
     const eventId = this.operationEventId("contract", parent, String(next.childGeneration));
     if (parent.batchId) this.background().assertCanRegisterOutcomes(parent.batchId, [childJobId]);
-    this.persist({ kind: "contract", contract: this.serializedContract(next) }, eventId);
-    if (parent.batchId) this.registerBatchMembers(parent.batchId, [childJobId]);
-    parent.childJobIds.push(childJobId);
-    parent.childGeneration = next.childGeneration;
+    const durable = this.persist({ kind: "contract", contract: this.serializedContract(next) }, eventId);
+    if (!durable.contract) throw new Error("invalid durable child membership");
+    const added = durable.contract.childJobIds.filter(child => !parent.childJobIds.includes(child));
+    if (parent.batchId && added.length > 0) this.registerBatchMembers(parent.batchId, added);
+    parent.childJobIds = [...durable.contract.childJobIds];
+    parent.childGeneration = durable.contract.childGeneration ?? next.childGeneration;
   }
 
   recordChildOutcome(parentJobId: string, childJobId: string, outcome: BackgroundJobOutcomeStatus, summary: string): void {
@@ -289,16 +311,25 @@ export class TaskOutcomeManager {
     const parent = this.requireActive(parentJobId);
     if (!parent.childJobIds.includes(childJobId)) throw new Error(`child ${childJobId} is not registered`);
     const text = assertSummary(summary);
-    if (parent.childOutcomes.has(childJobId)) return;
-    this.persist(
+    const wasRecorded = parent.childOutcomes.has(childJobId);
+    const durable = this.persist(
       { kind: "child_outcome", jobId: parent.jobId, attemptId: parent.attemptId, childJobId, outcome, summary: text },
       this.operationEventId("child_outcome", parent, childJobId),
     );
-    parent.childOutcomes.set(childJobId, { outcome, summary: text });
-    if (parent.batchId) {
-      try { this.background().recordOutcome(parent.batchId, { id: childJobId, status: outcome, summary: text }); } catch {}
+    if (!durable.childJobId || !isStatus(durable.outcome) || !durable.summary) {
+      throw new Error("invalid durable child outcome");
     }
-    this.wakeIfReady(parent);
+    parent.childOutcomes.set(durable.childJobId, { outcome: durable.outcome, summary: durable.summary });
+    if (parent.batchId) {
+      try {
+        this.background().recordOutcome(parent.batchId, {
+          id: durable.childJobId,
+          status: durable.outcome,
+          summary: durable.summary,
+        });
+      } catch {}
+    }
+    if (!wasRecorded) this.wakeIfReady(parent);
   }
 
   closeBatch(batchId: string): void {
@@ -331,7 +362,7 @@ export class TaskOutcomeManager {
       workGeneration: declarationWorkGeneration,
       childGeneration: declarationChildGeneration,
     };
-    this.persist({
+    const durableDeclaration = this.persist({
       kind: "declaration",
       jobId: contract.jobId,
       attemptId: contract.attemptId,
@@ -342,51 +373,64 @@ export class TaskOutcomeManager {
       declarationWorkGeneration: declaration.workGeneration,
       declarationChildGeneration: declaration.childGeneration,
     }, this.operationEventId("declaration", contract, String(declarationSequence)));
+    if (!isOutcome(durableDeclaration.outcome) || !durableDeclaration.summary) {
+      throw new Error("invalid durable declaration");
+    }
+    const durableDeclarationState = {
+      ...declaration,
+      outcome: durableDeclaration.outcome,
+      summary: durableDeclaration.summary,
+      workGeneration: durableDeclaration.declarationWorkGeneration ?? declaration.workGeneration,
+      childGeneration: durableDeclaration.declarationChildGeneration ?? declaration.childGeneration,
+    };
 
-    if (outcome === "needs_input") {
-      const durable = this.persist({
+    if (durableDeclarationState.outcome === "needs_input") {
+      const durableOutcome = this.persist({
         kind: "outcome",
         jobId: contract.jobId,
         attemptId: contract.attemptId,
-        outcome,
+        outcome: durableDeclarationState.outcome,
         source: "model",
-        summary: text,
-        reportPath: contract.reportPath,
+        summary: durableDeclarationState.summary,
+        reportPath: durableDeclaration.reportPath ?? contract.reportPath,
         notified: true,
       }, this.operationEventId("outcome", contract, "needs_input"));
-      const question = `Task ${contract.jobId} (attempt ${contract.attemptId}) needs human input:\n${durable.summary ?? text}`;
-      contract.declaration = declaration;
+      if (!isOutcome(durableOutcome.outcome) || !durableOutcome.summary || !durableOutcome.source) {
+        throw new Error("invalid durable needs-input outcome");
+      }
+      const question = `Task ${contract.jobId} (attempt ${contract.attemptId}) needs human input:\n${durableOutcome.summary}`;
+      contract.declaration = durableDeclarationState;
       contract.declarationSequence += 1;
       contract.state = "awaiting_input";
       contract.questionNotified = true;
       this.records.push({
         jobId: contract.jobId,
         attemptId: contract.attemptId,
-        outcome: durable.outcome as DeclaredOutcome,
-        source: durable.source!,
-        summary: durable.summary!,
-        reportPath: durable.reportPath,
-        at: durable.at,
+        outcome: durableOutcome.outcome,
+        source: durableOutcome.source,
+        summary: durableOutcome.summary,
+        reportPath: durableOutcome.reportPath,
+        at: durableOutcome.at,
         final: false,
       });
       this.notifyQuestion(contract, question);
       this.emitOutcome({
         contract,
-        outcome: durable.outcome as DeclaredOutcome,
-        source: durable.source ?? "model",
-        summary: durable.summary ?? text,
+        outcome: durableOutcome.outcome,
+        source: durableOutcome.source,
+        summary: durableOutcome.summary,
         final: false,
       });
     } else {
-      contract.declaration = declaration;
+      contract.declaration = durableDeclarationState;
       contract.declarationSequence += 1;
     }
 
     return {
       jobId: contract.jobId,
       attemptId: contract.attemptId,
-      outcome,
-      provisional: outcome !== "needs_input",
+      outcome: durableDeclarationState.outcome,
+      provisional: durableDeclarationState.outcome !== "needs_input",
       reportPath: contract.reportPath,
       terminate: true,
     };
@@ -617,19 +661,44 @@ export class TaskOutcomeManager {
     if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified) return;
     const summary = `background/child work finished for ${contract.jobId}; inspect the retained evidence, synthesize the report, then declare an outcome`;
     const sequence = contract.workReadySequence;
+    let ready: PersistedEvent;
     try {
-      this.persist(
-        { kind: "work_ready", jobId: contract.jobId, attemptId: contract.attemptId, summary, workReadySequence: sequence },
+      ready = this.persist(
+        {
+          kind: "work_ready",
+          jobId: contract.jobId,
+          attemptId: contract.attemptId,
+          summary,
+          workReadySequence: sequence,
+          notified: false,
+        },
         this.operationEventId("work_ready", contract, String(sequence)),
       );
     } catch {
       return;
     }
-    contract.workReadySequence += 1;
-    contract.workReadyNotified = true;
+    contract.workReadySequence = Math.max(contract.workReadySequence, (ready.workReadySequence ?? sequence) + 1);
+    if (ready.notified !== false) {
+      contract.workReadyNotified = true;
+      return;
+    }
     try {
-      const result = this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${summary}.`, { deliverAs: "steer" });
+      const result = this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${ready.summary ?? summary}.`, { deliverAs: "steer" });
       if (result !== undefined) void Promise.resolve(result).catch(() => {});
+    } catch {}
+    try {
+      this.persist(
+        {
+          kind: "work_ready",
+          jobId: contract.jobId,
+          attemptId: contract.attemptId,
+          summary: ready.summary ?? summary,
+          workReadySequence: ready.workReadySequence ?? sequence,
+          notified: true,
+        },
+        this.operationEventId("work_ready", contract, `${ready.workReadySequence ?? sequence}:attempted`),
+      );
+      contract.workReadyNotified = true;
     } catch {}
   }
 
@@ -712,20 +781,73 @@ export class TaskOutcomeManager {
     return `task-outcome:${kind}:${this.key(contract.jobId, contract.attemptId)}:${discriminator}`;
   }
 
-  private activeBranchEvent(eventId: string): PersistedEvent | undefined {
-    const entry = this.runtime.branchEntries().find(item =>
+  private activeBranchEntry(eventId: string): any | undefined {
+    return this.runtime.branchEntries().find(item =>
       item?.type === "custom" && item.customType === TASK_OUTCOME_ENTRY && item.data?.eventId === eventId);
-    return entry?.data as PersistedEvent | undefined;
+  }
+
+  private assertEventPayload(existing: PersistedEvent, requested: object): void {
+    if (eventPayload(existing) !== eventPayload(requested)) {
+      throw new Error(`event ${existing.eventId} already exists with a different payload`);
+    }
+  }
+
+  private sidecarEvent(eventId: string): PersistedEvent | undefined {
+    const sidecar = this.runtime.sessionFile ? `${this.runtime.sessionFile}.task-outcomes.jsonl` : undefined;
+    if (!sidecar || !pathEntryExists(sidecar)) return undefined;
+    let found: PersistedEvent | undefined;
+    for (const line of readFileSync(sidecar, "utf8").split("\n")) {
+      let event: PersistedEvent;
+      try { event = JSON.parse(line) as PersistedEvent; } catch { continue; }
+      if (event?.version !== 1 || event.eventId !== eventId || event.branchId !== this.branchId) continue;
+      if (found) this.assertEventPayload(found, event);
+      found = event;
+    }
+    return found;
+  }
+
+  private sessionFileHasEvent(eventId: string, entryId?: string): boolean {
+    const sessionFile = this.runtime.sessionFile;
+    if (!sessionFile || !pathEntryExists(sessionFile)) return false;
+    for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
+      try {
+        const entry = JSON.parse(line) as { id?: string; type?: string; customType?: string; data?: PersistedEvent };
+        if (entry.id === entryId && entry.type === "custom" && entry.customType === TASK_OUTCOME_ENTRY && entry.data?.eventId === eventId) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  private durableActiveBranchEvent(eventId: string): PersistedEvent | undefined {
+    const activeEntry = this.activeBranchEntry(eventId);
+    if (!activeEntry) return undefined;
+    const existing = activeEntry.data as PersistedEvent;
+    const sessionFile = this.runtime.sessionFile;
+    if (!sessionFile || !pathEntryExists(sessionFile) || this.sessionFileHasEvent(eventId, activeEntry.id)) return existing;
+    if (!this.runtime.reloadSession) {
+      throw new Error(`cannot verify durable session event ${eventId}; only an in-memory marker exists`);
+    }
+    this.runtime.reloadSession();
+    const refreshed = this.activeBranchEntry(eventId);
+    if (refreshed && !this.sessionFileHasEvent(eventId, refreshed.id)) {
+      throw new Error(`session event ${eventId} exists only in memory after reload`);
+    }
+    return refreshed?.data as PersistedEvent | undefined;
   }
 
   private persist(
     event: Omit<PersistedEvent, "version" | "eventId" | "at" | "branchId">,
     eventId = randomUUID(),
   ): PersistedEvent {
-    // SessionManager updates its in-memory branch before its file flush; an exact
-    // active-branch marker is the commit evidence used for idempotent retries.
-    const existing = this.activeBranchEvent(eventId);
-    if (existing) return existing;
+    // SessionManager updates its in-memory branch before its file flush. Only a
+    // matching active-branch event that survives a disk read is a durable retry marker.
+    const attempted = this.sidecarEvent(eventId);
+    if (attempted) this.assertEventPayload(attempted, event);
+    const existing = this.durableActiveBranchEvent(eventId);
+    if (existing) {
+      this.assertEventPayload(existing, event);
+      return existing;
+    }
     const data: PersistedEvent = {
       version: 1,
       eventId,
@@ -734,11 +856,19 @@ export class TaskOutcomeManager {
       ...event,
     };
     const sidecar = this.runtime.sessionFile ? `${this.runtime.sessionFile}.task-outcomes.jsonl` : undefined;
-    if (sidecar) {
+    if (sidecar && !attempted) {
       mkdirSync(dirname(sidecar), { recursive: true });
       appendFileSync(sidecar, `${JSON.stringify(data)}\n`, "utf8");
     }
-    this.runtime.appendEntry(TASK_OUTCOME_ENTRY, data);
+    try {
+      this.runtime.appendEntry(TASK_OUTCOME_ENTRY, data);
+    } catch (error) {
+      // The supported SessionManager API mutates its in-memory branch before a
+      // file flush. Reload an existing session file so a failed append cannot
+      // masquerade as durable evidence on the next retry.
+      try { this.runtime.reloadSession?.(); } catch {}
+      throw error;
+    }
     return data;
   }
 
@@ -823,8 +953,11 @@ export class TaskOutcomeManager {
     } else if (event.kind === "child_outcome" && event.childJobId && isStatus(event.outcome) && event.summary) {
       contract.childOutcomes.set(event.childJobId, { outcome: event.outcome, summary: event.summary });
     } else if (event.kind === "work_ready") {
-      contract.workReadySequence = Math.max(contract.workReadySequence, (event.workReadySequence ?? 0) + 1);
-      contract.workReadyNotified = true;
+      const sequence = event.workReadySequence ?? 0;
+      if (sequence + 1 >= contract.workReadySequence) {
+        contract.workReadySequence = sequence + 1;
+        contract.workReadyNotified = event.notified !== false;
+      }
     } else if (event.kind === "outcome" || event.kind === "transport_lost") {
       if (!event.outcome || !event.source || !event.summary) return;
       const final = event.kind === "outcome" && event.outcome !== "needs_input";
@@ -872,6 +1005,10 @@ export function getTaskOutcomeManager(pi: Pick<ExtensionAPI, "appendEntry" | "se
     sessionFile: ctx.sessionManager.getSessionFile(),
     sessionOwner: owner,
     branchEntries: () => ctx.sessionManager.getBranch(),
+    reloadSession: () => {
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (sessionFile && pathEntryExists(sessionFile)) ctx.sessionManager.setSessionFile(sessionFile);
+    },
   };
   let manager = managers.get(owner);
   if (!manager) {
