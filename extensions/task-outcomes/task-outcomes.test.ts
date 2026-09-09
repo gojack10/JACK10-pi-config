@@ -73,7 +73,8 @@ async function harness(t: any, sessionManager?: any, persistent = false) {
     await delay(50);
     await rm(dir, { recursive: true, force: true });
   });
-  return { dir, sm, call, emit, settle, snapshot, messages, persisted, runtime };
+  const manager = (globalThis[Symbol.for("pi.task-outcomes.manager-registry")] as any).get(sm);
+  return { dir, sm, call, emit, settle, snapshot, messages, persisted, runtime, manager };
 }
 
 const contract = (dir: string, jobId: string, attemptId: string, batchId = "batch") => ({
@@ -827,6 +828,107 @@ test("rejected needs-input notification replays the question", { timeout: 10000 
   await h.emit("session_tree");
   await until(() => h.messages.filter(message => /choose a continuation/.test(message.text)).length === 1);
   assert.equal(h.persisted.filter(entry => entry.data?.kind === "outcome" && entry.data.notified === true).length, 1);
+});
+
+test("in-memory activation reserves identity without activating or leaking batch membership", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { action: "batch_open", batch_id: "memory-batch" });
+  const original = h.runtime.appendEntry;
+  let first: any;
+  h.runtime.appendEntry = (_type: string, data: any) => {
+    first = data;
+    throw new Error("activation failed before mutation");
+  };
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "memory-retry", attempt_id: "a1", mode: "dialogue", batch_id: "memory-batch",
+    }),
+    /before mutation/,
+  );
+  assert.equal((await h.snapshot()).active, undefined);
+  assert.equal((await h.snapshot()).contracts.length, 0);
+  assert.equal((await h.call("task_outcomes_consumer", { action: "batch_stats", batch_id: "memory-batch" })).details.members, 0);
+
+  h.runtime.appendEntry = original;
+  await assert.rejects(
+    h.call("task_outcomes_consumer", {
+      action: "activate", job_id: "memory-retry", attempt_id: "a1", mode: "task",
+      report_path: join(h.dir, "changed.md"), batch_id: "memory-batch",
+    }),
+    /different payload/,
+  );
+  const result = await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "memory-retry", attempt_id: "a1", mode: "dialogue", batch_id: "memory-batch",
+  });
+  assert.equal(result.details.jobId, "memory-retry");
+  assert.equal(result.details.state, "active");
+  assert.equal(first.contract.activatedAt, h.sm.getBranch().find(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" && (entry.data as any).kind === "contract",
+  )?.data.contract.activatedAt);
+  assert.equal((await h.call("task_outcomes_consumer", { action: "batch_stats", batch_id: "memory-batch" })).details.members, 1);
+});
+
+test("pending question notification is deduplicated across replay and cannot mark a new branch", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "user", content: "seed", timestamp: Date.now() } as any);
+  const seedLeaf = h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() } as any);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "question-flight", attempt_id: "a1", mode: "dialogue",
+  });
+  let calls = 0;
+  let resolvePending!: () => void;
+  const pending = new Promise<void>(resolve => { resolvePending = resolve; });
+  h.manager.runtime.sendUserMessage = () => { calls++; return pending; };
+  await h.manager.declare("needs_input", "first question");
+  h.manager.onSessionTree();
+  h.manager.onSessionTree();
+  assert.equal(calls, 1);
+
+  h.manager.activateContract({ jobId: "question-flight", attemptId: "a2", mode: "dialogue" });
+  await h.manager.declare("needs_input", "second question");
+  assert.equal(calls, 2);
+
+  h.sm.branch(seedLeaf);
+  h.manager.onSessionTree();
+  resolvePending();
+  await delay(0);
+  await delay(0);
+  const accepted = h.sm.getEntries().filter(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" &&
+    (entry.data as any).kind === "outcome" && (entry.data as any).notified === true,
+  );
+  assert.equal(accepted.length, 0);
+  assert.equal((await h.snapshot()).active, undefined);
+});
+
+test("pending work-ready notification is deduplicated across replay and cannot mark a new branch", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "user", content: "seed", timestamp: Date.now() } as any);
+  const seedLeaf = h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop", timestamp: Date.now() } as any);
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "work-flight", attempt_id: "a1", mode: "dialogue", children: ["child"],
+  });
+  let calls = 0;
+  let resolvePending!: () => void;
+  const pending = new Promise<void>(resolve => { resolvePending = resolve; });
+  h.manager.runtime.sendUserMessage = () => { calls++; return pending; };
+  h.manager.recordChildOutcome("work-flight", "child", "completed", "child done");
+  await delay(0);
+  h.manager.onSessionTree();
+  h.manager.onSessionTree();
+  assert.equal(calls, 1);
+
+  h.sm.branch(seedLeaf);
+  h.manager.onSessionTree();
+  resolvePending();
+  await delay(0);
+  await delay(0);
+  const accepted = h.sm.getEntries().filter(entry =>
+    entry.type === "custom" && entry.customType === "task-outcome/v1" &&
+    (entry.data as any).kind === "work_ready" && (entry.data as any).notified === true,
+  );
+  assert.equal(accepted.length, 0);
+  assert.equal((await h.snapshot()).active, undefined);
 });
 
 test("every direct transition helper call has a declared method", async () => {
