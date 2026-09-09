@@ -326,7 +326,7 @@ export class SubagentLauncher {
         const summary = `release_failed: ${item.error}; pane was preserved`;
         // Before load-buffer succeeds nothing was accepted, so transport is the
         // fallback. Once buffering succeeds, the monitor owns the race.
-        if (state.monitorJobId !== undefined) {
+        if (state.monitorJobId !== undefined && !state.releaseBuffered) {
           state.releaseFailure = summary;
           this.background.setCompletion(state.monitorJobId, {
             id: item.jobId,
@@ -334,7 +334,7 @@ export class SubagentLauncher {
             source: "transport",
             summary,
           });
-        } else {
+        } else if (state.monitorJobId === undefined) {
           batch.recordOutcome({ id: item.jobId, status: "failed", source: "transport", summary });
           if (parent) this.recordParent(parent.jobId, item.jobId, summary, "failed", "transport");
         }
@@ -671,7 +671,7 @@ export class SubagentLauncher {
           : "protocol" as const;
         const summary = `${marker.summary || marker.outcome} (attempt ${marker.attemptId}; session ${state.sessionId}; report ${marker.report || "none"}; monitor ${state.monitorLogPath || "pending"})`;
         if (state.monitorJobId !== undefined &&
-            !(state.releaseFailure && !state.releaseBuffered && source === "protocol")) {
+            !(state.releaseFailure && !state.releaseBuffered)) {
           this.background.setCompletion(state.monitorJobId, { id: state.jobId, status, summary, source });
         }
         this.resolveStart(state, marker.attemptId, false);
