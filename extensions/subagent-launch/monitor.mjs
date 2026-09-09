@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readFile } from "node:fs/promises";
 
 const config = JSON.parse(process.argv[2] ?? "{}");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -50,6 +51,21 @@ const generation = async () => {
   return Number.isSafeInteger(value) ? value : 0;
 };
 const sessionFile = async () => await show(config.sessionFileOption);
+const nonEmptyRegularReport = async path => {
+  if (typeof constants.O_NOFOLLOW !== "number") return false;
+  let file;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await file.stat();
+    if (!info.isFile() || info.size < 1) return false;
+    const buffer = Buffer.alloc(1);
+    return (await file.read(buffer, 0, 1, 0)).bytesRead === 1;
+  } catch {
+    return false;
+  } finally {
+    if (file) await file.close().catch(() => {});
+  }
+};
 const transportFailure = (summary, manifest) => {
   emit({ kind: "final", jobId: manifest?.jobId, attemptId: manifest?.attemptId,
     outcome: "failed", summary, report: manifest?.reportPath });
@@ -130,9 +146,7 @@ while (true) {
       }
       if (manifest.mode === "task" && receipt.outcome === "completed") {
         let validReport = receipt.report === manifest.reportPath;
-        if (validReport) {
-          try { validReport = (await readFile(manifest.reportPath)).length > 0; } catch { validReport = false; }
-        }
+        if (validReport) validReport = await nonEmptyRegularReport(manifest.reportPath);
         if (!validReport) {
           outcome = "failed";
           summary = `protocol_incomplete: missing or mismatched report ${manifest.reportPath}`;
