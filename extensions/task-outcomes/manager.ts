@@ -70,7 +70,8 @@ interface Runtime {
   sessionFile?: string;
   sessionOwner: object;
   branchEntries: () => readonly any[];
-  reloadSession?: () => void;
+  leafId: () => string | null;
+  reloadSession?: (fallbackLeafId?: string | null, eventId?: string) => void;
 }
 
 interface ContractState extends TaskLaunchContract {
@@ -91,6 +92,8 @@ interface ContractState extends TaskLaunchContract {
   declarationSequence: number;
   workReadySequence: number;
   workReadyNotified: boolean;
+  workReadySending: boolean;
+  workReadyPendingSequence: number | undefined;
   childOutcomes: Map<string, { outcome: BackgroundJobOutcomeStatus; summary: string }>;
   questionNotified: boolean;
 }
@@ -201,6 +204,7 @@ export class TaskOutcomeManager {
       }
     }
     this.activeKey = undefined;
+    this.retryPendingNotifications();
   }
 
   onSessionTree(): void {
@@ -215,8 +219,12 @@ export class TaskOutcomeManager {
       if (contract.state === "active" && contract.ownerSessionId === this.runtime.sessionId) {
         this.activeKey = this.key(contract.jobId, contract.attemptId);
         this.watchWork(contract, false);
+        if (contract.workReadyPendingSequence !== undefined && !contract.workReadyNotified) {
+          void this.wakeIfReady(contract);
+        }
       }
     }
+    this.retryPendingNotifications();
   }
 
   activateContract(input: TaskLaunchContract): TaskContractSnapshot {
@@ -227,13 +235,21 @@ export class TaskOutcomeManager {
     const childJobIds = [...new Set(input.childJobIds ?? [])];
     for (const childJobId of childJobIds) assertId("childJobId", childJobId);
     if (childJobIds.includes(input.jobId)) throw new Error("a task cannot be its own child");
+    const key = this.key(input.jobId, input.attemptId);
+    const contractEventId = `task-outcome:contract:${key}:0`;
+    const reservation = this.sidecarEvent(contractEventId) ??
+      (this.activeBranchEntry(contractEventId)?.data as PersistedEvent | undefined);
+    const reservedContract = reservation?.kind === "contract" ? reservation.contract : undefined;
     let reportPath = input.reportPath;
     if (input.mode === "task") {
       if (!reportPath || !isAbsolute(reportPath) || reportPath.includes("\0")) {
         throw new Error("task mode requires an absolute reportPath");
       }
       reportPath = resolve(reportPath);
-      if (this.usedReportPaths.has(reportPath) || pathEntryExists(reportPath)) {
+      const reservedReportPath = reservedContract?.reportPath
+        ? resolve(reservedContract.reportPath)
+        : undefined;
+      if ((this.usedReportPaths.has(reportPath) || pathEntryExists(reportPath)) && reservedReportPath !== reportPath) {
         throw new Error("task reportPath must be a fresh, unused path for this attempt");
       }
     }
@@ -241,7 +257,6 @@ export class TaskOutcomeManager {
       throw new Error("launch contract belongs to another session");
     }
 
-    const key = this.key(input.jobId, input.attemptId);
     if (this.contracts.has(key)) throw new Error(`attempt ${key} is already registered`);
     const previous = [...this.contracts.values()]
       .filter(contract => contract.jobId === input.jobId && contract.ownerSessionId === this.runtime.sessionId)
@@ -255,16 +270,19 @@ export class TaskOutcomeManager {
       reportPath,
       ownerSessionId: this.runtime.sessionId,
       childJobIds,
-      activatedAt: Date.now(),
-      childGeneration: 0,
+      activatedAt: Number.isFinite(reservedContract?.activatedAt)
+        ? reservedContract!.activatedAt
+        : Date.now(),
+      childGeneration: reservedContract?.childGeneration ?? 0,
       state: "active",
       declarationSequence: 0,
       workReadySequence: 0,
       workReadyNotified: false,
+      workReadySending: false,
+      workReadyPendingSequence: undefined,
       childOutcomes: new Map(),
       questionNotified: false,
     };
-    const contractEventId = this.operationEventId("contract", contract, "0");
     const members = contract.batchId ? [contract.jobId, ...childJobIds] : [];
     if (contract.batchId) this.background().assertCanRegisterOutcomes(contract.batchId, members);
     const contractEvent = { kind: "contract" as const, contract: this.serializedContract(contract) };
@@ -329,7 +347,7 @@ export class TaskOutcomeManager {
         });
       } catch {}
     }
-    if (!wasRecorded) this.wakeIfReady(parent);
+    if (!wasRecorded) void this.wakeIfReady(parent);
   }
 
   closeBatch(batchId: string): void {
@@ -393,7 +411,7 @@ export class TaskOutcomeManager {
         source: "model",
         summary: durableDeclarationState.summary,
         reportPath: durableDeclaration.reportPath ?? contract.reportPath,
-        notified: true,
+        notified: false,
       }, this.operationEventId("outcome", contract, "needs_input"));
       if (!isOutcome(durableOutcome.outcome) || !durableOutcome.summary || !durableOutcome.source) {
         throw new Error("invalid durable needs-input outcome");
@@ -402,7 +420,7 @@ export class TaskOutcomeManager {
       contract.declaration = durableDeclarationState;
       contract.declarationSequence += 1;
       contract.state = "awaiting_input";
-      contract.questionNotified = true;
+      contract.questionNotified = false;
       this.records.push({
         jobId: contract.jobId,
         attemptId: contract.attemptId,
@@ -413,7 +431,7 @@ export class TaskOutcomeManager {
         at: durableOutcome.at,
         final: false,
       });
-      this.notifyQuestion(contract, question);
+      void this.notifyQuestion(contract, question);
       this.emitOutcome({
         contract,
         outcome: durableOutcome.outcome,
@@ -468,6 +486,10 @@ export class TaskOutcomeManager {
     const contract = this.activeContract();
     if (!contract || contract.state !== "active") return;
     if (hasPendingMessages || contract.state === "awaiting_input") return;
+    // Persistent SessionManager instances can hold entries in memory before Pi
+    // writes the first assistant response. Do not publish a settlement that a
+    // restart cannot reach; in-memory sessions have no file boundary to check.
+    if (this.runtime.sessionFile && !pathEntryExists(this.runtime.sessionFile)) return;
 
     if (this.lastRunFailure) {
       this.finalize(contract, "failed", "technical", `provider/transport failure: ${this.lastRunFailure}`);
@@ -491,7 +513,7 @@ export class TaskOutcomeManager {
             : "work started after the completed declaration",
         }, this.operationEventId("declaration_invalidated", contract, String(declaration.sequence)));
         contract.declaration = undefined;
-        this.wakeIfReady(contract);
+        void this.wakeIfReady(contract);
         return;
       }
       if (declaration.outcome === "completed") {
@@ -633,22 +655,46 @@ export class TaskOutcomeManager {
     if (emit) this.emitOutcome({ contract, outcome: record.outcome, source: record.source, summary: record.summary, final: true });
   }
 
-  private notifyQuestion(contract: ContractState, question: string): void {
+  private async notifyQuestion(contract: ContractState, question: string): Promise<void> {
     try {
-      if (contract.batchId && this.background().getBatchStatus(contract.batchId)) {
-        this.background().notifyNeedsInput(contract.batchId, question);
-      } else {
-        this.runtime.sendUserMessage(question, { deliverAs: "steer" });
-      }
+      const result = contract.batchId && this.background().getBatchStatus(contract.batchId)
+        ? this.background().notifyNeedsInput(contract.batchId, question)
+        : this.runtime.sendUserMessage(question, { deliverAs: "steer" });
+      if (result !== undefined) await Promise.resolve(result);
     } catch {
-      // The question is durable; a later monitor can inspect it without claiming delivery.
+      // A rejected invocation remains unaccepted and is retried by a later monitor.
+      return;
+    }
+    contract.questionNotified = true;
+    try {
+      this.persist({
+        kind: "outcome",
+        jobId: contract.jobId,
+        attemptId: contract.attemptId,
+        outcome: "needs_input",
+        source: "model",
+        summary: contract.declaration?.summary ?? question,
+        reportPath: contract.reportPath,
+        notified: true,
+      }, this.operationEventId("outcome", contract, "needs_input:attempted"));
+    } catch {
+      // The invocation was accepted, but the durable attempted marker remains retryable.
+    }
+  }
+
+  private retryPendingNotifications(): void {
+    for (const contract of this.contracts.values()) {
+      if (contract.state !== "awaiting_input" || contract.questionNotified) continue;
+      const summary = contract.declaration?.summary;
+      if (!summary) continue;
+      void this.notifyQuestion(contract, `Task ${contract.jobId} (attempt ${contract.attemptId}) needs human input:\n${summary}`);
     }
   }
 
   private watchWork(contract: ContractState, resetNotification = true): void {
     this.stopWatchingWork();
     if (resetNotification) contract.workReadyNotified = false;
-    this.workUnsubscribe = this.background().onJobsSettled(() => this.wakeIfReady(contract));
+    this.workUnsubscribe = this.background().onJobsSettled(() => { void this.wakeIfReady(contract); });
   }
 
   private stopWatchingWork(): void {
@@ -656,11 +702,11 @@ export class TaskOutcomeManager {
     this.workUnsubscribe = undefined;
   }
 
-  private wakeIfReady(contract: ContractState): void {
+  private async wakeIfReady(contract: ContractState): Promise<void> {
     if (this.activeKey !== this.key(contract.jobId, contract.attemptId) || contract.state !== "active") return;
-    if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified) return;
+    if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified || contract.workReadySending) return;
     const summary = `background/child work finished for ${contract.jobId}; inspect the retained evidence, synthesize the report, then declare an outcome`;
-    const sequence = contract.workReadySequence;
+    const sequence = contract.workReadyPendingSequence ?? contract.workReadySequence;
     let ready: PersistedEvent;
     try {
       ready = this.persist(
@@ -680,12 +726,19 @@ export class TaskOutcomeManager {
     contract.workReadySequence = Math.max(contract.workReadySequence, (ready.workReadySequence ?? sequence) + 1);
     if (ready.notified !== false) {
       contract.workReadyNotified = true;
+      contract.workReadyPendingSequence = undefined;
       return;
     }
+    contract.workReadyPendingSequence = ready.workReadySequence ?? sequence;
+    contract.workReadySending = true;
     try {
       const result = this.runtime.sendUserMessage(`SYSTEM (task-outcomes): ${ready.summary ?? summary}.`, { deliverAs: "steer" });
-      if (result !== undefined) void Promise.resolve(result).catch(() => {});
-    } catch {}
+      if (result !== undefined) await Promise.resolve(result);
+    } catch {
+      contract.workReadySending = false;
+      return;
+    }
+    contract.workReadySending = false;
     try {
       this.persist(
         {
@@ -699,7 +752,13 @@ export class TaskOutcomeManager {
         this.operationEventId("work_ready", contract, `${ready.workReadySequence ?? sequence}:attempted`),
       );
       contract.workReadyNotified = true;
-    } catch {}
+      contract.workReadyPendingSequence = undefined;
+    } catch {
+      // Invocation acceptance is retained in memory; a later replay may retry
+      // because Pi exposes no durable reception acknowledgement.
+      contract.workReadyNotified = true;
+      contract.workReadyPendingSequence = undefined;
+    }
   }
 
   private emitOutcome(input: { contract: ContractState; outcome: MonitorOutcome; source: OutcomeSource; summary: string; final: boolean }): void {
@@ -823,11 +882,13 @@ export class TaskOutcomeManager {
     if (!activeEntry) return undefined;
     const existing = activeEntry.data as PersistedEvent;
     const sessionFile = this.runtime.sessionFile;
-    if (!sessionFile || !pathEntryExists(sessionFile) || this.sessionFileHasEvent(eventId, activeEntry.id)) return existing;
+    if (!sessionFile) return existing;
+    if (!pathEntryExists(sessionFile) || this.sessionFileHasEvent(eventId, activeEntry.id)) return existing;
     if (!this.runtime.reloadSession) {
       throw new Error(`cannot verify durable session event ${eventId}; only an in-memory marker exists`);
     }
-    this.runtime.reloadSession();
+    const fallbackLeaf = activeEntry.parentId ?? this.runtime.leafId();
+    this.runtime.reloadSession(fallbackLeaf, eventId);
     const refreshed = this.activeBranchEntry(eventId);
     if (refreshed && !this.sessionFileHasEvent(eventId, refreshed.id)) {
       throw new Error(`session event ${eventId} exists only in memory after reload`);
@@ -860,13 +921,14 @@ export class TaskOutcomeManager {
       mkdirSync(dirname(sidecar), { recursive: true });
       appendFileSync(sidecar, `${JSON.stringify(data)}\n`, "utf8");
     }
+    const priorLeafId = this.runtime.leafId();
     try {
       this.runtime.appendEntry(TASK_OUTCOME_ENTRY, data);
     } catch (error) {
-      // The supported SessionManager API mutates its in-memory branch before a
-      // file flush. Reload an existing session file so a failed append cannot
-      // masquerade as durable evidence on the next retry.
-      try { this.runtime.reloadSession?.(); } catch {}
+      // SessionManager mutates its in-memory leaf before its file flush. Reload
+      // through the supported API, selecting the exact appended event when it
+      // reached disk or the exact prior leaf when it did not.
+      try { this.runtime.reloadSession?.(priorLeafId, eventId); } catch {}
       throw error;
     }
     return data;
@@ -925,6 +987,8 @@ export class TaskOutcomeManager {
         declarationSequence: previous?.declarationSequence ?? 0,
         workReadySequence: previous?.workReadySequence ?? 0,
         workReadyNotified: previous?.workReadyNotified ?? false,
+        workReadySending: false,
+        workReadyPendingSequence: undefined,
         childOutcomes: previous?.childOutcomes ?? new Map(),
         questionNotified: previous?.questionNotified ?? false,
       };
@@ -957,9 +1021,16 @@ export class TaskOutcomeManager {
       if (sequence + 1 >= contract.workReadySequence) {
         contract.workReadySequence = sequence + 1;
         contract.workReadyNotified = event.notified !== false;
+        contract.workReadyPendingSequence = event.notified === false ? sequence : undefined;
       }
     } else if (event.kind === "outcome" || event.kind === "transport_lost") {
       if (!event.outcome || !event.source || !event.summary) return;
+      if (event.kind === "outcome" && event.outcome === "needs_input" &&
+          event.notified === true && event.eventId.endsWith(":needs_input:attempted")) {
+        contract.state = "awaiting_input";
+        contract.questionNotified = true;
+        return;
+      }
       const final = event.kind === "outcome" && event.outcome !== "needs_input";
       this.records.push({
         jobId: event.jobId,
@@ -1005,9 +1076,25 @@ export function getTaskOutcomeManager(pi: Pick<ExtensionAPI, "appendEntry" | "se
     sessionFile: ctx.sessionManager.getSessionFile(),
     sessionOwner: owner,
     branchEntries: () => ctx.sessionManager.getBranch(),
-    reloadSession: () => {
+    leafId: () => ctx.sessionManager.getLeafId(),
+    reloadSession: (fallbackLeafId, eventId) => {
       const sessionFile = ctx.sessionManager.getSessionFile();
-      if (sessionFile && pathEntryExists(sessionFile)) ctx.sessionManager.setSessionFile(sessionFile);
+      if (!sessionFile || !pathEntryExists(sessionFile)) return;
+      ctx.sessionManager.setSessionFile(sessionFile);
+      const candidates = fallbackLeafId === null
+        ? ctx.sessionManager.getTree().map(node => node.entry)
+        : fallbackLeafId
+          ? ctx.sessionManager.getChildren(fallbackLeafId)
+          : ctx.sessionManager.getEntries();
+      const eventEntry = eventId && candidates.find(entry =>
+        entry.type === "custom" && entry.customType === TASK_OUTCOME_ENTRY && (entry.data as any)?.eventId === eventId);
+      if (eventEntry) {
+        ctx.sessionManager.branch(eventEntry.id);
+      } else if (fallbackLeafId === null) {
+        ctx.sessionManager.resetLeaf();
+      } else if (fallbackLeafId && ctx.sessionManager.getEntry(fallbackLeafId)) {
+        ctx.sessionManager.branch(fallbackLeafId);
+      }
     },
   };
   let manager = managers.get(owner);
