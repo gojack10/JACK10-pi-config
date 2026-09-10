@@ -114,7 +114,7 @@ const contract = (dir: string, jobId: string, attemptId: string, batchId = "batc
   await writeFile(gate, "");
   await until(async () => (await h.snapshot()).active.pendingWork.length === 0);
   await until(() => h.messages.length === 1);
-  assert.match(h.messages[0].text, /work finished/);
+  assert.match(h.messages[0].text, /No background or child jobs remain running for this attempt/);
   await writeFile(join(h.dir, "P-p1.md"), "full report");
   await h.settle({ outcome: "completed", summary: "P synthesized" });
   await until(() => h.messages.length === 2);
@@ -885,6 +885,7 @@ test("rejected work-ready notification remains retryable without duplicate sends
   };
   await h.emit("session_tree");
   await until(() => h.messages.filter(message => /task-outcomes/.test(message.text)).length === 1);
+  assert.equal(h.messages[0].text, "SYSTEM (task-outcomes): No background or child jobs remain running for this attempt.");
   assert.equal(h.persisted.filter(entry => entry.data?.kind === "work_ready" && entry.data.notified === false).length, 1);
   assert.equal(h.persisted.filter(entry => entry.data?.kind === "work_ready" && entry.data.notified === true).length, 1);
 });

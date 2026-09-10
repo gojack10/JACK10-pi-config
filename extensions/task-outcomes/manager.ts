@@ -950,7 +950,7 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (contract.ownerSessionId !== this.runtime.sessionId ||
         this.activeKey !== this.key(contract.jobId, contract.attemptId) || contract.state !== "active") return;
     if (contract.declaration || this.pendingWork(contract).length > 0 || contract.workReadyNotified) return;
-    const summary = `background/child work finished for ${contract.jobId}; inspect the retained evidence, synthesize the report, then declare an outcome`;
+    const summary = "No background or child jobs remain running for this attempt";
     const sequence = contract.workReadyPendingSequence ?? contract.workReadySequence;
     let ready: PersistedEvent;
     try {
