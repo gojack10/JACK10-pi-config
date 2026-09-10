@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { constants, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { open, readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 
 const config = JSON.parse(process.argv[2] ?? "{}");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -18,6 +19,60 @@ const show = async option => {
     const value = await tmux(["show-options", "-qv", "-t", config.paneId, option]);
     return value || undefined;
   } catch { return undefined; }
+};
+// Must match Pi's ERROR_RECORD_ENTRY; this monitor is a standalone child process.
+const ERROR_RECORD_ENTRY = "pi-error/v1";
+const resultModule = config.resultModulePath
+  ? await import(pathToFileURL(config.resultModulePath).href).catch(() => undefined)
+  : undefined;
+// The fallback is only for direct standalone tests; launched monitors receive
+// Pi's own Result constructors through the runtime package path.
+const success = resultModule?.Success ?? (value => ({ ok: true, value }));
+const failure = resultModule?.Failure ?? (error => ({ ok: false, error }));
+let errorStorageIntegrity;
+const errorText = error => (error instanceof Error ? error.message : String(error))
+  .replace(/\b(api[_-]?key|token|password|secret|authorization)\b(\s*[:=]\s*)(?:bearer\s+)?\S+/gi, "$1$2[redacted]")
+  .replace(/[\0\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/g, " ")
+  .replace(/[\r\n\t]+/g, " ")
+  .trim().slice(0, 2048) || "unknown error";
+const isMissing = error => error?.code === "ENOENT" || error?.errno === -2 || /\bENOENT\b/.test(error?.message ?? "");
+const readStoredError = async () => {
+  const path = await sessionFile();
+  if (!path || !startedSessionId) return success(undefined);
+
+  const identity = await piSessionId(path);
+  if (!identity.ok) {
+    // ENOENT before the first durable header is the normal START race. Once
+    // START established the file, the same error is genuine read evidence.
+    if (isMissing(identity.error) && !sessionFileReady) return success(undefined);
+    return failure(identity.error);
+  }
+  if (!identity.value) return success(undefined); // partial/malformed header; try again
+  const liveIdentity = await show(config.sessionIdOption);
+  if (identity.value !== startedSessionId || (liveIdentity && liveIdentity !== startedSessionId)) {
+    errorStorageIntegrity = "Pi session identity changed while reading the error record";
+    return success(undefined);
+  }
+  sessionFileReady = true;
+  try {
+    const text = await readFile(path, "utf8");
+    for (const line of text.split("\n")) {
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      const record = entry?.type === "custom" && entry.customType === ERROR_RECORD_ENTRY ? entry.data : undefined;
+      const correlation = record?.correlation;
+      if (record?.version !== 1 || record.source !== "subagent" || record.operation !== "outcome_publication" ||
+          typeof record.message !== "string" || record.message.length === 0 || record.message.length > 2048 ||
+          /[\0\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(record.message) ||
+          correlation?.session_id !== startedSessionId || correlation?.job_id !== expected.jobId ||
+          correlation?.attempt_id !== expected.attemptId) continue;
+      return success(record.message);
+    }
+    errorStorageIntegrity = undefined;
+    return success(undefined);
+  } catch (error) {
+    return failure(error);
+  }
 };
 const validIdentity = value => !!value && typeof value.dev === "string" && typeof value.ino === "string" &&
   /^\d+$/.test(value.dev) && /^\d+$/.test(value.ino);
@@ -75,18 +130,19 @@ const generation = async () => {
 const sessionFile = async () => await show(config.sessionFileOption);
 // Pi owns the identity; the manifest sessionId is only a transport handle.
 const piSessionId = async path => {
-  const published = await show(config.sessionIdOption);
-  if (published) return published;
-  if (!path) return undefined;
+  if (!path) return success(await show(config.sessionIdOption));
   const stream = createReadStream(path, { encoding: "utf8" });
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
     for await (const line of lines) {
-      const header = JSON.parse(line);
-      return header.type === "session" && typeof header.id === "string" && header.id ? header.id : undefined;
+      let header;
+      try { header = JSON.parse(line); } catch { continue; }
+      return success(header.type === "session" && typeof header.id === "string" && header.id ? header.id : undefined);
     }
-  } catch { return undefined; }
-  finally { lines.close(); stream.destroy(); }
+    return success(undefined);
+  } catch (error) {
+    return failure(error);
+  } finally { lines.close(); stream.destroy(); }
 };
 const nonEmptyRegularReport = async (path, manifest) => {
   if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") return false;
@@ -137,6 +193,7 @@ let lastGeneration;
 let activeKey;
 let startedKey;
 let startedSessionId;
+let sessionFileReady = false;
 let signal = waitForChannel(config.outcomeChannel, config.pollMs * 4);
 
 while (true) {
@@ -184,16 +241,34 @@ while (true) {
       const startGeneration = Number.parseInt(await show(config.startGenerationOption) ?? "", 10);
       const file = await sessionFile();
       if (Number.isSafeInteger(startGeneration) && startGeneration > manifest.startGeneration && file) {
-        startWait.cancel();
-        startedSessionId = await piSessionId(file);
-        if (!startedSessionId) {
-          protocolFailure("protocol_incomplete: missing or invalid Pi session header");
-          process.exit(0);
+        const identity = await piSessionId(file);
+        if (!identity.ok) {
+          if (!isMissing(identity.error)) {
+            startWait.cancel();
+            transportFailure(`transport_lost: cannot read Pi session header: ${errorText(identity.error)}`, manifest);
+            process.exit(0);
+          }
+          // Pi publishes its identity before creating the JSONL. ENOENT is
+          // startup readiness only when that live identity is available.
+          const liveIdentity = await show(config.sessionIdOption);
+          if (liveIdentity) {
+            startWait.cancel();
+            startedSessionId = liveIdentity;
+            startedKey = key;
+            emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
+              sessionFile: file, channel: observedChannel });
+            break;
+          }
+        } else if (identity.value) {
+          startWait.cancel();
+          const liveIdentity = await show(config.sessionIdOption);
+          startedSessionId = liveIdentity ?? identity.value;
+          sessionFileReady = true;
+          startedKey = key;
+          emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
+            sessionFile: file, channel: observedChannel });
+          break;
         }
-        startedKey = key;
-        emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
-          sessionFile: file, channel: observedChannel });
-        break;
       }
       if (!(await paneExists())) {
         startWait.cancel();
@@ -205,9 +280,21 @@ while (true) {
       startWait.cancel();
       emit({ kind: "final", jobId: manifest.jobId, attemptId: manifest.attemptId,
         outcome: "failed", source: "protocol", technical: true, final: true,
-        summary: "protocol_incomplete: START/session-file receipt timed out", report: manifest.reportPath });
+        summary: "protocol_incomplete: missing or invalid Pi session header", report: manifest.reportPath });
       process.exit(0);
     }
+  }
+
+  const storedError = await readStoredError();
+  if (!storedError.ok) {
+    transportFailure(`transport_lost: cannot read Pi error record: ${errorText(storedError.error)}`, manifest);
+    process.exit(0);
+  }
+  if (storedError.value) {
+    emit({ kind: "final", jobId: expected.jobId, attemptId: expected.attemptId,
+      outcome: "failed", source: "transport", technical: true, final: true,
+      summary: `Subagent error: ${storedError.value}`, report: manifest.reportPath });
+    process.exit(0);
   }
 
   const currentGeneration = await generation();
@@ -307,7 +394,9 @@ while (true) {
   }
 
   if (!(await paneExists())) {
-    transportFailure("transport_lost: child pane disappeared before a durable outcome", manifest);
+    transportFailure(errorStorageIntegrity
+      ? `transport_lost: ${errorStorageIntegrity}; child pane disappeared before a durable outcome`
+      : "transport_lost: child pane disappeared before a durable outcome", manifest);
     process.exit(0);
   }
 
