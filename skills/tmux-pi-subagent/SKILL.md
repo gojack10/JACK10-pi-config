@@ -1,6 +1,6 @@
 ---
 name: tmux-pi-subagent
-description: "Launches a steerable Pi leaf agent in a named tmux session and wakes the parent when each agent turn fully settles. Use whenever SHOTGUN or another RLM workflow delegates a probe, implementation, or verification mission."
+description: "Launches task or dialogue Pi leaf agents through the canonical subagent transport. Task leaves require a verified report and structured outcome; dialogue leaves return settled exchanges. Use whenever SHOTGUN or another RLM workflow delegates a probe, implementation, or verification mission."
 argument-hint: "[leaf mission]"
 ---
 
