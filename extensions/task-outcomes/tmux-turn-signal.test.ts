@@ -8,6 +8,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import activate from "../../extensions/tmux-turn-signal.ts";
 
+const inheritedSubagentEnv = {
+  TMUX_PANE: process.env.TMUX_PANE,
+  PI_SUBAGENT_MANIFEST: process.env.PI_SUBAGENT_MANIFEST,
+};
+delete process.env.TMUX_PANE;
+delete process.env.PI_SUBAGENT_MANIFEST;
+test.after(() => {
+  for (const [key, value] of Object.entries(inheritedSubagentEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
 const wait = () => new Promise(resolve => setTimeout(resolve, 10));
 
 test("task outcomes get a separate tmux receipt without changing legacy settlement", async t => {
