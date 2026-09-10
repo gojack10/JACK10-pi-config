@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import type { Model } from "@mariozechner/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { bumpRecencyOrder, updateRecencyFile } from "../model-recency.ts";
+import { bumpRecencyOrder, selectMostRecentModel, updateRecencyFile } from "../model-recency.ts";
 
 const accounts = new Set(["openai-codex", "openai-codex-alt", "openai-codex-sifttext"]);
 
@@ -16,6 +17,24 @@ test("Codex account selections surface only the Personal router", () => {
 		{ provider: "openai-codex-personal", modelId: "gpt-5.6-sol" },
 		{ provider: "openai", modelId: "gpt-5.6-sol" },
 	]);
+});
+
+test("startup chooses the first recent model that is available in scope", async () => {
+	const inScope = { provider: "local", id: "recent" } as Model<any>;
+	let selected: Model<any> | undefined;
+	const result = await selectMostRecentModel([
+		{ provider: "anthropic", modelId: "stale" },
+		{ provider: "local", modelId: "recent" },
+	], {
+		findModel: (provider, modelId) => provider === inScope.provider && modelId === inScope.id ? inScope : undefined,
+		scopedModels: [{ model: inScope }],
+		setModel: async (model) => {
+			selected = model;
+			return true;
+		},
+	});
+	assert.equal(result, inScope);
+	assert.equal(selected, inScope);
 });
 
 test("concurrent recency writers merge under the filesystem lock", async (t) => {
