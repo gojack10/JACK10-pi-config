@@ -572,6 +572,8 @@ export class SubagentLauncher {
     parentPane: string,
     extensions: string[],
   ): Promise<StoredState> {
+    const parentSession = (await this.tmux(["display-message", "-p", "-t", parentPane, "#{session_id}"])).trim();
+    if (!/^\$\d+$/.test(parentSession)) throw new Error("could not resolve parent tmux session");
     const paneId = (await this.tmux(["new-session", "-d", "-s", item.sessionLabel, "-c", item.cwd]),
       (await this.tmux(["list-panes", "-t", item.sessionLabel, "-F", "#{pane_id}"])).split(/\r?\n/).find(Boolean)?.trim());
     if (!paneId) throw new Error("tmux created no child pane");
@@ -599,7 +601,7 @@ export class SubagentLauncher {
       ["@pi_subagent_job_id", item.jobId],
       ["@pi_subagent_session_id", item.sessionId],
       ["@pi_subagent_session_label", item.sessionLabel],
-      ["@pi_subagent_parent_id", parentPane],
+      ["@pi_subagent_parent_id", parentSession],
       ["@pi_subagent_batch_id", item.batchId],
       ["@pi_subagent_attempt_id", item.attemptId],
       ["@pi_subagent_mode", item.input.mode],
@@ -618,7 +620,7 @@ export class SubagentLauncher {
     for (const [option, value] of values) await this.verify(paneId, option, value);
     const bootPath = join(tmpdir(), `${item.jobId}.boot`);
     const args = [
-      "pi", "--no-extensions",
+      "pi",
       ...extensions.flatMap(path => ["--extension", path]),
       "--provider", item.input.provider,
       "--model", item.input.model,
