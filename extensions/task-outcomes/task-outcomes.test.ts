@@ -141,6 +141,8 @@ test("report verification is tied to the active attempt and settlement", { timeo
 
   await h.call("task_outcomes_consumer", { ...contract(h.dir, "N", "n1") });
   await h.settle();
+  await h.settle();
+  await h.settle();
   const incomplete = (await h.snapshot()).outcomes.at(-1);
   assert.equal(incomplete.outcome, "failed");
   assert.equal(incomplete.source, "protocol");
@@ -152,6 +154,51 @@ test("report verification is tied to the active attempt and settlement", { timeo
     h.call("report_outcome", { outcome: "completed", summary: "wrong artifact" }),
     /ENOENT|no such file|report/,
   );
+});
+
+test("task contracts inject instructions and correct missing declarations without duplicate wakes", async t => {
+  const h = await harness(t);
+  assert.equal(h.manager.taskInstruction(), undefined);
+  await h.call("task_outcomes_consumer", contract(h.dir, "repair", "r1"));
+  assert.match(h.manager.taskInstruction(), /report_outcome/);
+  assert.ok(h.manager.taskInstruction().includes(JSON.stringify(join(h.dir, "repair-r1.md"))));
+  await h.settle({ stopReason: "stop", text: "Done" });
+  assert.equal((await h.snapshot()).outcomes.length, 0);
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].text, /Report validation/);
+  assert.equal(h.messages[0].options.deliverAs, "followUp");
+  await h.emit("agent_settled");
+  assert.equal(h.messages.length, 1);
+  await writeFile(join(h.dir, "repair-r1.md"), "verified findings");
+  await h.settle({ outcome: "completed", summary: "repaired" });
+  assert.equal((await h.snapshot()).outcomes.at(-1).outcome, "completed");
+  assert.equal(h.manager.taskInstruction(), undefined);
+});
+
+test("missing declarations stop after two corrective turns", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "limit", "l1"));
+  await h.settle({ stopReason: "stop", text: "first" });
+  await h.settle({ stopReason: "stop", text: "second" });
+  assert.equal(h.messages.length, 2);
+  await h.settle({ stopReason: "stop", text: "third" });
+  const outcome = (await h.snapshot()).outcomes.at(-1);
+  assert.equal(outcome.outcome, "failed");
+  assert.equal(outcome.source, "protocol");
+  assert.match(outcome.summary, /after two corrective turns/);
+  assert.equal(h.messages.length, 2);
+});
+
+test("dialogue and technical failures never trigger task corrections", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { action: "activate", job_id: "chat", attempt_id: "c1", mode: "dialogue" });
+  assert.equal(h.manager.taskInstruction(), undefined);
+  await h.settle({ stopReason: "stop", text: "hello" });
+  assert.equal((await h.snapshot()).outcomes.at(-1).outcome, "dialogue_settled");
+  await h.call("task_outcomes_consumer", contract(h.dir, "abort", "a1"));
+  await h.settle({ stopReason: "aborted" });
+  assert.equal((await h.snapshot()).outcomes.at(-1).source, "technical");
+  assert.equal(h.messages.length, 0);
 });
 
 test("batch failures wait for siblings and needs_input is non-final until a fresh attempt", { timeout: 10000 }, async t => {
