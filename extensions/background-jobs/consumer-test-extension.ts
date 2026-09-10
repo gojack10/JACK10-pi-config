@@ -18,6 +18,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
       label: Type.Optional(Type.String()),
       message: Type.Optional(Type.String()),
       outcome_id: Type.Optional(Type.String()),
+      completion_id: Type.Optional(Type.String()),
       status: Type.Optional(Type.String()),
       source: Type.Optional(Type.String()),
       expected: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -35,6 +36,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
             command: args.command ?? "true",
             cwd: ctx.cwd,
             label: args.label,
+            completionId: args.completion_id,
           };
           started = args.batch_id === undefined
             ? manager.start(options)
@@ -45,6 +47,14 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
           break;
         case "needs_input":
           manager.notifyNeedsInput(batchId, args.message ?? "Input required");
+          break;
+        case "notify_failure":
+          manager.notifyFailure(batchId, {
+            id: args.completion_id ?? args.outcome_id ?? "failure",
+            status: "failed",
+            summary: args.message ?? "failure",
+            source: "transport",
+          });
           break;
         case "register":
           manager.registerOutcome(batchId, args.outcome_id ?? args.label ?? "outcome");
