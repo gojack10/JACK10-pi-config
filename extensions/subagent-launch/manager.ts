@@ -185,6 +185,8 @@ const extensionPaths = (): string[] => {
     join(extensionsDir, "codex-workspaces.ts"),
     join(extensionsDir, "background-jobs.ts"),
     join(extensionsDir, "task-outcomes.ts"),
+    // task-outcomes emits task-outcome synchronously from agent_settled;
+    // tmux-turn-signal must run afterward to await its publication.
     join(extensionsDir, "tmux-turn-signal.ts"),
     join(extensionsDir, "subagent-launch.ts"),
   ];
@@ -669,6 +671,9 @@ export class SubagentLauncher {
       attemptId: state.attemptId,
       sessionId: state.sessionId,
       mode: state.mode,
+      resultModulePath: process.env.PI_PACKAGE_DIR
+        ? join(process.env.PI_PACKAGE_DIR, "dist/core/result.js")
+        : undefined,
     });
     const monitorJob = batch.startExternal(
       {
@@ -725,16 +730,15 @@ export class SubagentLauncher {
         const summary = `${baseSummary.slice(0, Math.max(1, 20_000 - suffix.length))}${suffix}`;
         const reportText = typeof marker.reportText === "string" ? marker.reportText : undefined;
         const reportPath = typeof marker.dialogueReportPath === "string" ? marker.dialogueReportPath : undefined;
+        const completion = { id: state.jobId, status, summary, source, reportText, reportPath } as const;
+        if (status === "failed") {
+          // A failed structured marker is effective failure evidence even when
+          // the monitor itself later exits cleanly; do not wait for siblings.
+          this.background.notifyFailure(state.batchId, completion);
+        }
         if (state.monitorJobId !== undefined &&
             !(state.releaseFailure && !state.releaseBuffered)) {
-          this.background.setCompletion(state.monitorJobId, {
-            id: state.jobId,
-            status,
-            summary,
-            source,
-            reportText,
-            reportPath,
-          });
+          this.background.setCompletion(state.monitorJobId, completion);
         }
         this.resolveStart(state, marker.attemptId, false);
       }

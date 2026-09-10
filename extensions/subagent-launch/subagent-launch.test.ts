@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -9,20 +9,40 @@ import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
-const inheritedSubagentEnv = {
-  TMUX_PANE: process.env.TMUX_PANE,
-  PI_SUBAGENT_MANIFEST: process.env.PI_SUBAGENT_MANIFEST,
-};
-delete process.env.TMUX_PANE;
-delete process.env.PI_SUBAGENT_MANIFEST;
-test.after(() => {
-  for (const [key, value] of Object.entries(inheritedSubagentEnv)) {
+const inheritedTestEnv = new Map(
+  Object.keys(process.env)
+    .filter(key => key.startsWith("TMUX") || key === "AI_AGENT" || key.startsWith("PI_"))
+    .map(key => [key, process.env[key]] as const),
+);
+for (const key of inheritedTestEnv.keys()) delete process.env[key];
+
+const execFileAsync = promisify(execFile);
+const tmuxBinary = (await execFileAsync("which", ["tmux"], { encoding: "utf8" })).stdout.trim();
+const tmuxIsolationDir = await mkdtemp(join(tmpdir(), "subagent-launch-tmux-"));
+const tmuxSocket = join(tmuxIsolationDir, "server.sock");
+const tmuxBinDir = join(tmuxIsolationDir, "bin");
+await mkdir(tmuxBinDir);
+await writeFile(join(tmuxBinDir, "tmux"), `#!/bin/sh
+set -eu
+exec ${JSON.stringify(tmuxBinary)} -S "$PI_TEST_TMUX_SOCKET" -f /dev/null "$@"
+`, { mode: 0o700 });
+const originalPath = process.env.PATH;
+process.env.PATH = `${tmuxBinDir}:${originalPath ?? ""}`;
+process.env.TMUX_TMPDIR = tmuxIsolationDir;
+process.env.PI_TEST_TMUX_SOCKET = tmuxSocket;
+
+test.after(async () => {
+  await execFileAsync(tmuxBinary, ["-S", tmuxSocket, "-f", "/dev/null", "kill-server"], { encoding: "utf8" }).catch(() => {});
+  await rm(tmuxIsolationDir, { recursive: true, force: true });
+  if (originalPath === undefined) delete process.env.PATH;
+  else process.env.PATH = originalPath;
+  const isolatedKeys = new Set([...inheritedTestEnv.keys(), "TMUX_TMPDIR", "PI_TEST_TMUX_SOCKET"]);
+  for (const key of isolatedKeys) {
+    const value = inheritedTestEnv.get(key);
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
 });
-
-const execFileAsync = promisify(execFile);
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
   ".local/share/pi-mono/packages/coding-agent/dist/core/extensions/loader.js")).href);
 const { SessionManager } = await import(pathToFileURL(join(homedir(),
@@ -109,6 +129,7 @@ sleep .5
       jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
         cwd: dir, session_label: "single", mode: "task", report_file: report }],
     }, undefined, undefined, ctx);
+    if (result.details.jobs[0].status !== "running") console.error("DEBUG LAUNCH", result.details.jobs[0]);
     assert.equal(result.details.jobs[0].status, "running");
     childSession = result.details.jobs[0].session_label;
     assert.ok(result.details.jobs[0].manifest_file);
@@ -440,7 +461,15 @@ while :; do
   tmux set-option -qu -t "$pane" @pi_start_channel
   tmux wait-for -S "$start"
   if [ "$count" -eq 0 ]; then
-    sleep .25
+    channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
+    tmux set-option -q -t "$pane" @pi_outcome "{\\\"session_id\\\":\\\"$session_id\\\",\\\"job_id\\\":\\\"$job\\\",\\\"attempt_id\\\":\\\"$attempt\\\",\\\"mode\\\":\\\"$mode\\\",\\\"outcome\\\":\\\"needs_input\\\",\\\"source\\\":\\\"model\\\",\\\"final\\\":false,\\\"summary\\\":\\\"need a continuation\\\"}"
+    publication_ready="$manifest.publication-ready"
+    publication_release="$manifest.publication-release"
+    : > "$publication_ready"
+    while [ ! -e "$publication_release" ]; do sleep .01; done
+    tmux wait-for -S "$channel"
+    outcome_gen=$(tmux show-options -qv -t "$pane" @pi_outcome_generation)
+    tmux set-option -q -t "$pane" @pi_outcome_generation $((outcome_gen + 1))
     settled=$(tmux show-options -qv -t "$pane" @pi_settled_generation)
     tmux set-option -q -t "$pane" @pi_settled_generation $((settled + 1))
   else
@@ -467,6 +496,7 @@ done
   const absent = async (path: string) => assert.rejects(lstat(path), { code: "ENOENT" });
   let childSession: string | undefined;
   let retrySession: string | undefined;
+  let publicationRelease: string | undefined;
   try {
     const { extensions, errors, runtime } = await loadExtensions([extensionPath], dir);
     assert.deepEqual(errors, []);
@@ -500,6 +530,11 @@ done
     const firstJob = first.details.jobs[0];
     assert.equal(firstJob.status, "running");
     childSession = firstJob.session_label;
+    const publicationReady = `${firstJob.manifest_file}.publication-ready`;
+    publicationRelease = `${firstJob.manifest_file}.publication-release`;
+    await until(async () => {
+      try { await lstat(publicationReady); return true; } catch { return false; }
+    });
     await assert.rejects(
       followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
         provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
@@ -508,6 +543,7 @@ done
     );
     await absent(busyReport);
     await absent(reservation(busyReport));
+    await writeFile(publicationRelease, "");
     await until(async () => await tmux(["show-options", "-qv", "-t", firstJob.pane_id, "@pi_settled_generation"]) === "1");
     const second: any = await followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
       provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
@@ -530,6 +566,7 @@ done
     assert.equal(retry.details.jobs[0].status, "running");
     retrySession = retry.details.jobs[0].session_label;
   } finally {
+    if (publicationRelease) await writeFile(publicationRelease, "").catch(() => {});
     process.env.PATH = oldPath;
     if (oldPane === undefined) delete process.env.TMUX_PANE;
     else process.env.TMUX_PANE = oldPane;
@@ -625,7 +662,7 @@ if [ "\${1:-}" = load-buffer ]; then
   printf 'release-denied\\n' >&2
   exit 1
 fi
-exec ${realTmux} "$@"
+exec ${JSON.stringify(realTmux)} -S "$PI_TEST_TMUX_SOCKET" -f /dev/null "$@"
 `, { mode: 0o700 });
   await chmod(fakeTmux, 0o700);
   await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
