@@ -1,13 +1,37 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { constants } from "node:fs";
+import { open, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type TaskOutcomeEvent = {
 	sessionId: string;
+	sessionFile?: string;
 	outcome: string;
 	jobId: string;
 	attemptId: string;
+	mode?: "task" | "dialogue";
 	source?: "model" | "technical" | "protocol" | "transport";
 	final?: boolean;
 	summary?: string;
+	reportPath?: string;
+	reportText?: string;
+};
+
+type ArtifactIdentity = { dev: string; ino: string };
+const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+const writeArtifact = async (prefix: string, text: string): Promise<{ path: string; identity: ArtifactIdentity }> => {
+	const path = join(tmpdir(), `${prefix}-${process.pid}-${randomUUID()}`);
+	const file = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+	try {
+		await file.writeFile(text, "utf8");
+		const info = await file.stat();
+		return { path, identity: { dev: String(info.dev), ino: String(info.ino) } };
+	} finally {
+		await file.close();
+	}
 };
 const taskOutcomeEventStatus = (value: unknown): value is TaskOutcomeEvent =>
 	!!value && typeof value === "object" &&
@@ -69,28 +93,62 @@ export default function (pi: ExtensionAPI) {
 			await pi.exec("tmux", ["set-option", "-q", "-t", pane, OUTCOME_CHANNEL_OPTION, channel]);
 		}
 		const generation = Number.parseInt(await readOption(pane, OUTCOME_GENERATION_OPTION), 10);
-		const outcome = JSON.stringify({
-			session_id: payload.sessionId,
-			job_id: payload.jobId,
-			attempt_id: payload.attemptId,
-			mode: (payload as any).mode,
-			outcome: payload.outcome,
-			source: payload.source,
-			final: payload.final,
-			report: (payload as any).reportPath,
-			session_file: (payload as any).sessionFile,
-		});
-		await pi.exec("tmux", ["set-option", "-q", "-t", pane, OUTCOME_OPTION, outcome]);
-		await pi.exec("tmux", [
-			"set-option", "-q", "-t", pane, OUTCOME_GENERATION_OPTION,
-			String(Number.isSafeInteger(generation) ? generation + 1 : 1),
-		]);
-		await pi.exec("tmux", ["wait-for", "-S", channel]);
+		let reportArtifact: { path: string; identity: ArtifactIdentity } | undefined;
+		let receiptArtifact: { path: string; identity: ArtifactIdentity } | undefined;
+		let published = false;
+		try {
+			if (payload.reportText !== undefined) {
+				reportArtifact = await writeArtifact("pi-subagent-dialogue-report", payload.reportText);
+			}
+			const receipt = {
+				version: 1,
+				session_id: payload.sessionId,
+				job_id: payload.jobId,
+				attempt_id: payload.attemptId,
+				mode: payload.mode,
+				outcome: payload.outcome,
+				source: payload.source,
+				final: payload.final,
+				summary: payload.summary,
+				report: payload.reportPath,
+				session_file: payload.sessionFile,
+				transport_report_path: reportArtifact?.path,
+				transport_report_identity: reportArtifact?.identity,
+				transport_report_present: payload.reportText !== undefined,
+			};
+			receiptArtifact = await writeArtifact("pi-subagent-outcome", JSON.stringify(receipt));
+			const outcome = JSON.stringify({
+				session_id: payload.sessionId,
+				job_id: payload.jobId,
+				attempt_id: payload.attemptId,
+				mode: payload.mode,
+				outcome: payload.outcome,
+				source: payload.source,
+				final: payload.final,
+				receipt_path: receiptArtifact.path,
+				receipt_identity: receiptArtifact.identity,
+			});
+			await pi.exec("tmux", ["set-option", "-q", "-t", pane, OUTCOME_OPTION, outcome]);
+			published = true;
+			await pi.exec("tmux", [
+				"set-option", "-q", "-t", pane, OUTCOME_GENERATION_OPTION,
+				String(Number.isSafeInteger(generation) ? generation + 1 : 1),
+			]);
+			await pi.exec("tmux", ["wait-for", "-S", channel]);
+		} catch (error) {
+			if (!published) await Promise.all([
+				reportArtifact && unlink(reportArtifact.path).catch(() => {}),
+				receiptArtifact && unlink(receiptArtifact.path).catch(() => {}),
+			]);
+			throw error;
+		}
 	};
 
 	const deliverOutcome = (payload: TaskOutcomeEvent) => {
-		outcomeQueue = outcomeQueue.then(() => publishOutcome(payload)).catch(() => {});
-		return outcomeQueue;
+		outcomeQueue = outcomeQueue.catch(() => {}).then(() => publishOutcome(payload));
+		return outcomeQueue.catch(error => {
+			console.error(`[tmux-turn-signal] outcome publication failed: ${errorMessage(error)}`);
+		});
 	};
 
 	const signalOutcome = async (payload: unknown) => {
