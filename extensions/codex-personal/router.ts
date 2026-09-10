@@ -89,7 +89,6 @@ const formatBlockedError = (
 		const nonTimeReasons = evaluation.reasons.filter(
 			(reason) =>
 				!reason.startsWith("WINDOW EXHAUSTED") &&
-				!reason.startsWith("UNSAFE WINDOW") &&
 				!reason.startsWith("NOT BEFORE") &&
 				!(reason === "RATE LIMITED" && telemetry.notBefore != null && telemetry.notBefore * 1000 > now),
 		);
@@ -98,7 +97,7 @@ const formatBlockedError = (
 			.filter((window) =>
 				evaluation.reasons.some(
 					(reason) =>
-						reason === `WINDOW EXHAUSTED ${window.minutes}m` || reason === `UNSAFE WINDOW ${window.minutes}m`,
+						reason === `WINDOW EXHAUSTED ${window.minutes}m`,
 				),
 			)
 			.map((window) => window.resetAt);
@@ -211,7 +210,6 @@ export const evaluateCodexRoute = (options: {
 	const work = options.work ?? { workClass: "unpredictable" };
 	const now = options.now ?? Date.now();
 	const feedSource = options.feedSource ?? "state";
-	const horizon = work.horizonMinutes === undefined ? undefined : now / 1000 + work.horizonMinutes * 60;
 	const telemetryByKey = new Map(feed.accounts.map((account) => [account.accountKey, account]));
 	const accounts = registry.accounts.map((account): AccountEligibility => {
 		const telemetry = telemetryByKey.get(account.accountKey);
@@ -230,7 +228,7 @@ export const evaluateCodexRoute = (options: {
 			};
 		if (telemetry.id !== account.providerId || telemetry.policyClass !== account.policyClass)
 			reasons.push("REGISTRY/FEED MISMATCH");
-		const quota = evaluateQuotaAccount(telemetry, now, horizon);
+		const quota = evaluateQuotaAccount(telemetry, now);
 		reasons.push(...quota.reasons);
 		return {
 			...quota,

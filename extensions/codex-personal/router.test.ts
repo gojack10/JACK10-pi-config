@@ -145,7 +145,7 @@ test("unsupported models name the missing compatible account", () => {
 	assert.match(result.error!, /MODEL UNAVAILABLE:.*no configured Codex account supports this model/);
 });
 
-test("known safe projection may route above 90 percent", () => {
+test("projection never blocks currently available quota", () => {
 	const projected = telemetry(alt, [
 		{ minutes: 300, pctUsed: 95, resetIn: 7200, projectedIn: 8000 },
 		{ minutes: 10080, pctUsed: 30, resetIn: 4 * 24 * 3600 },
@@ -153,7 +153,7 @@ test("known safe projection may route above 90 percent", () => {
 	const result = evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(projected), model, now });
 	assert.equal(result.allBlocked, false);
 	projected.windows[0]!.projectedExhaustAt = nowSeconds + 100;
-	assert.equal(evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(projected), model, now }).allBlocked, true);
+	assert.equal(evaluateCodexRoute({ registry: { ...registry, accounts: [alt] }, feed: feed(projected), model, now }).allBlocked, false);
 });
 
 test("uses reported quota through 99 percent when no projection exists", () => {
