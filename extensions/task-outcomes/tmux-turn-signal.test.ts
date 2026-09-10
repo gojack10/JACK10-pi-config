@@ -87,9 +87,14 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
     reportPath: "/tmp/report.md",
     final: true,
   });
-  await wait();
+  for (let i = 0; i < 100 && options.get(key("@pi_outcome_generation")) !== "1"; i++) await wait();
   const receipt = JSON.parse(options.get(key("@pi_outcome"))!);
-  assert.deepEqual(receipt, {
+  assert.deepEqual(Object.keys(receipt).sort(), [
+    "attempt_id", "final", "job_id", "mode", "outcome", "receipt_identity", "receipt_path", "session_id", "source",
+  ]);
+  assert.ok(options.get(key("@pi_outcome"))!.length < 16 * 1024);
+  assert.deepEqual(JSON.parse(await readFile(receipt.receipt_path, "utf8")), {
+    version: 1,
     session_id: sessionId,
     job_id: "job-1",
     attempt_id: "attempt-1",
@@ -99,6 +104,7 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
     final: true,
     report: "/tmp/report.md",
     session_file: "/tmp/session.jsonl",
+    transport_report_present: false,
   });
   assert.equal(options.get(key("@pi_outcome_generation")), "1");
   assert.equal(signals.length, 4);
@@ -107,6 +113,63 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
   pi.events.emit("task-outcome", { sessionId: "other", jobId: "wrong", attemptId: "wrong", outcome: "completed" });
   await wait();
   assert.equal(options.get(key("@pi_outcome_generation")), "1");
+});
+
+test("large dialogue reports use protected sidecars while tmux stays bounded", async t => {
+  const handlers = new Map<string, ((event: any, ctx: any) => unknown)[]>();
+  const options = new Map<string, string>();
+  const pane = "%large-dialogue-test";
+  const oldPane = process.env.TMUX_PANE;
+  process.env.TMUX_PANE = pane;
+  const key = (name: string) => `${pane}|${name}`;
+  let outcomeListener: ((data: unknown) => void) | undefined;
+  const pi = {
+    on(event: string, handler: (event: any, ctx: any) => unknown) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    events: {
+      on(event: string, listener: (data: unknown) => void) {
+        if (event === "task-outcome") outcomeListener = listener;
+        return () => {};
+      },
+      emit(event: string, data: unknown) {
+        if (event === "task-outcome") void outcomeListener?.(data);
+      },
+    },
+    async exec(_command: string, args: string[]) {
+      if (args[0] === "show-options") return { stdout: `${options.get(key(args.at(-1)!)) ?? ""}\n`, code: 0 };
+      if (args[0] === "set-option") {
+        const nameIndex = args.findIndex(arg => arg.startsWith("@pi_"));
+        options.set(key(args[nameIndex]), args[nameIndex + 1]);
+        return { stdout: "", code: 0 };
+      }
+      if (args[0] === "wait-for") return { stdout: "", code: 0 };
+      throw new Error(`unexpected tmux call: ${args.join(" ")}`);
+    },
+  };
+  const sessionId = "large-dialogue-session";
+  const ctx = { mode: "tui", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined } };
+  activate(pi as never);
+  t.after(() => { process.env.TMUX_PANE = oldPane; });
+  for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+  const exact = "😀".repeat(11_000) + "\nend  ";
+  pi.events.emit("task-outcome", {
+    sessionId,
+    jobId: "large-dialogue-job",
+    attemptId: "large-dialogue-attempt",
+    mode: "dialogue",
+    outcome: "dialogue_settled",
+    source: "model",
+    summary: "dialogue_settled",
+    reportText: exact,
+    final: true,
+  });
+  for (let i = 0; i < 100 && options.get(key("@pi_outcome_generation")) !== "1"; i++) await delay(10);
+  const pointer = JSON.parse(options.get(key("@pi_outcome"))!);
+  assert.ok(options.get(key("@pi_outcome"))!.length < 16 * 1024);
+  const stored = JSON.parse(await readFile(pointer.receipt_path, "utf8"));
+  assert.equal(stored.transport_report_present, true);
+  assert.equal(await readFile(stored.transport_report_path, "utf8"), exact);
 });
 
 test("restart transport loss waits for tmux owner initialization", { timeout: 10000 }, async t => {

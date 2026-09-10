@@ -136,6 +136,116 @@ sleep .5
   }
 });
 
+test("dialogue launch and follow-up deliver the exact settled report to the parent", { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-dialogue-launch-test-"));
+  const parentSession = `pi-subagent-dialogue-${process.pid}-${Date.now()}`;
+  const oldPath = process.env.PATH;
+  const oldPane = process.env.TMUX_PANE;
+  const fakePi = join(dir, "pi");
+  await writeFile(fakePi, `#!/bin/sh
+set -eu
+pane="$TMUX_PANE"
+last=
+count=0
+while :; do
+  manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
+  attempt=$(sed -n 's/.*"attemptId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
+  if [ "$attempt" = "$last" ]; then sleep .02; continue; fi
+  last="$attempt"
+  job=$(tmux show-options -qv -t "$pane" @pi_subagent_job_id)
+  session_id=$(sed -n 's/.*"sessionId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
+  mode=$(sed -n 's/.*"mode":"\\([^\"]*\\)".*/\\1/p' "$manifest")
+  session_file="$manifest.session.jsonl"
+  printf '{"type":"session","id":"%s"}\\n' "$session_id" > "$session_file"
+  tmux set-option -q -t "$pane" @pi_session_file "$session_file"
+  start_gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
+  tmux set-option -q -t "$pane" @pi_start_generation $((start_gen + 1))
+  start=$(tmux show-options -qv -t "$pane" @pi_start_channel)
+  tmux set-option -qu -t "$pane" @pi_start_channel
+  tmux wait-for -S "$start"
+  channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
+  if [ "$count" -eq 0 ]; then
+    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"needs_input\\",\\"source\\":\\"model\\",\\"final\\":false,\\"summary\\":\\"need a continuation\\"}"
+    outcome_gen=$(tmux show-options -qv -t "$pane" @pi_outcome_generation)
+    tmux set-option -q -t "$pane" @pi_outcome_generation $((outcome_gen + 1))
+    tmux wait-for -S "$channel"
+    settled=$(tmux show-options -qv -t "$pane" @pi_settled_generation)
+    tmux set-option -q -t "$pane" @pi_settled_generation $((settled + 1))
+  else
+    tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"dialogue_settled\\",\\"source\\":\\"model\\",\\"final\\":true,\\"summary\\":\\"dialogue_settled\\",\\"report_text\\":\\"  follow-up 😀  \\"}"
+    outcome_gen=$(tmux show-options -qv -t "$pane" @pi_outcome_generation)
+    tmux set-option -q -t "$pane" @pi_outcome_generation $((outcome_gen + 1))
+    tmux wait-for -S "$channel"
+    settled=$(tmux show-options -qv -t "$pane" @pi_settled_generation)
+    tmux set-option -q -t "$pane" @pi_settled_generation $((settled + 1))
+    sleep .2
+    exit 0
+  fi
+  count=$((count + 1))
+done
+`, { mode: 0o700 });
+  await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
+  const parentPane = await tmux(["list-panes", "-t", parentSession, "-F", "#{pane_id}"]);
+  process.env.PATH = `${dir}:${oldPath ?? ""}`;
+  process.env.TMUX_PANE = parentPane;
+  let childSession: string | undefined;
+  try {
+    const { extensions, errors, runtime } = await loadExtensions([extensionPath], dir);
+    assert.deepEqual(errors, []);
+    const messages: Array<{ text: string; options: any }> = [];
+    runtime.sendUserMessage = (text: string, options: any) => messages.push({ text, options });
+    const ctx: any = {
+      cwd: dir,
+      mode: "tui",
+      sessionManager: SessionManager.inMemory(dir),
+      modelRegistry: {
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
+        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh" } }],
+      },
+    };
+    const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
+    assert.ok(owner);
+    const launch = owner.tools.get("subagent_launch")!.definition;
+    const followup = owner.tools.get("subagent_followup")!.definition;
+    const mission = join(dir, "mission.md");
+    const followupMission = join(dir, "followup.md");
+    await writeFile(mission, "Ask for input.\n");
+    await writeFile(followupMission, "Continue after input.\n");
+    const first: any = await launch.execute("test", {
+      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+        cwd: dir, session_label: "dialogue", mode: "dialogue" }],
+    }, undefined, undefined, ctx);
+    const firstJob = first.details.jobs[0];
+    assert.equal(firstJob.status, "running");
+    childSession = firstJob.session_label;
+    await until(() => messages.some(message => /need a continuation/.test(message.text)));
+    const second: any = await followup.execute("test", {
+      job_id: firstJob.job,
+      session_id: firstJob.session_id,
+      provider: "fake-provider",
+      model: "fake-model",
+      thinking: "xhigh",
+      mission_file: followupMission,
+      cwd: dir,
+      session_label: "dialogue",
+      mode: "dialogue",
+    }, undefined, undefined, ctx);
+    assert.equal(second.details.status, "running");
+    await until(() => messages.some(message => message.text.endsWith("  follow-up 😀  ")));
+    assert.equal(messages.filter(message => message.text.includes("follow-up 😀")).length, 1);
+    assert.equal(messages.find(message => message.text.includes("follow-up 😀"))!.options.deliverAs, "steer");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+    if (childSession) await tmux(["kill-session", "-t", childSession]).catch(() => {});
+    await tmux(["kill-session", "-t", parentSession]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("subagent_launch rejects an explicitly unsupported thinking level before tmux setup", { timeout: 5000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), "subagent-route-test-"));
   const parentSession = `pi-subagent-route-${process.pid}-${Date.now()}`;

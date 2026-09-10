@@ -19,6 +19,24 @@ const show = async option => {
     return value || undefined;
   } catch { return undefined; }
 };
+const validIdentity = value => !!value && typeof value.dev === "string" && typeof value.ino === "string" &&
+  /^\d+$/.test(value.dev) && /^\d+$/.test(value.ino);
+const readProtected = async (path, identity, label) => {
+  if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0") || !validIdentity(identity)) {
+    throw new Error(`${label} path or identity is invalid`);
+  }
+  if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") {
+    throw new Error(`${label} cannot be read safely on this platform`);
+  }
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || String(info.dev) !== identity.dev || String(info.ino) !== identity.ino) {
+      throw new Error(`${label} no longer matches its publication identity`);
+    }
+    return await file.readFile({ encoding: "utf8" });
+  } finally { await file.close(); }
+};
 const paneExists = async () => (await show("@pi_subagent_job_id")) !== undefined;
 const readManifest = async () => {
   const path = await show(config.manifestOption);
@@ -201,45 +219,90 @@ while (true) {
       process.exit(0);
     }
     const raw = await show(config.outcomeOption);
-    let receipt;
-    try { receipt = raw ? JSON.parse(raw) : undefined; } catch { receipt = undefined; }
-    const source = receipt && receipt.source === undefined ? "model" : receipt?.source;
-    if (!receipt || receipt.job_id !== expected.jobId || receipt.attempt_id !== expected.attemptId ||
-        receipt.mode !== expected.mode || receipt.session_id !== startedSessionId ||
-        typeof receipt.outcome !== "string" ||
-        (receipt.source !== undefined && !["model", "technical", "protocol", "transport"].includes(receipt.source))) {
+    let shortReceipt;
+    try { shortReceipt = raw ? JSON.parse(raw) : undefined; } catch { shortReceipt = undefined; }
+    const source = shortReceipt && shortReceipt.source === undefined ? "model" : shortReceipt?.source;
+    if (!shortReceipt || shortReceipt.job_id !== expected.jobId || shortReceipt.attempt_id !== expected.attemptId ||
+        shortReceipt.mode !== expected.mode || shortReceipt.session_id !== startedSessionId ||
+        typeof shortReceipt.outcome !== "string" ||
+        (shortReceipt.source !== undefined && !["model", "technical", "protocol", "transport"].includes(shortReceipt.source))) {
       emit({ kind: "evidence", jobId: manifest.jobId, attemptId: manifest.attemptId,
         summary: `ignored malformed, foreign, or mismatched outcome generation ${currentGeneration}` });
-    } else if (receipt.outcome === "needs_input" || (receipt.final === false && receipt.outcome !== "transport_lost")) {
-      emit({ kind: "needs_input", jobId: receipt.job_id, attemptId: receipt.attempt_id,
-        source, final: false, summary: receipt.summary || "child requested human input", report: receipt.report });
     } else {
-      let outcome = receipt.outcome;
-      let finalSource = source;
-      let summary = receipt.summary || `${outcome} ${manifest.jobId}`;
-      if (outcome === "transport_lost" && source === "transport") {
-        // A task manager transport record is non-semantic, but terminal for this monitor.
-      } else {
-        if (manifest.mode === "dialogue" && outcome === "dialogue_settled") outcome = "completed";
-        if (!["completed", "blocked", "failed"].includes(outcome)) {
-          outcome = "failed";
-          finalSource = "protocol";
-          summary = `protocol_incomplete: unsupported child outcome ${receipt.outcome}`;
+      let receipt = shortReceipt;
+      let reportText;
+      try {
+        if (shortReceipt.receipt_path !== undefined) {
+          const receiptText = await readProtected(shortReceipt.receipt_path, shortReceipt.receipt_identity, "outcome receipt");
+          receipt = JSON.parse(receiptText);
+          if (!receipt || receipt.version !== 1 || receipt.session_id !== shortReceipt.session_id ||
+              receipt.job_id !== shortReceipt.job_id || receipt.attempt_id !== shortReceipt.attempt_id ||
+              receipt.mode !== shortReceipt.mode || receipt.outcome !== shortReceipt.outcome ||
+              receipt.source !== shortReceipt.source || receipt.final !== shortReceipt.final) {
+            throw new Error("outcome receipt identity does not match its tmux pointer");
+          }
+          if (receipt.transport_report_present === true) {
+            reportText = await readProtected(
+              receipt.transport_report_path,
+              receipt.transport_report_identity,
+              "dialogue report",
+            );
+          } else if (receipt.transport_report_path !== undefined || receipt.transport_report_identity !== undefined) {
+            throw new Error("outcome receipt has an invalid dialogue report publication");
+          }
+        } else if (Object.prototype.hasOwnProperty.call(receipt, "report_text")) {
+          if (typeof receipt.report_text !== "string") throw new Error("inline dialogue report is invalid");
+          reportText = receipt.report_text;
         }
-        if (manifest.mode === "task" && receipt.outcome === "completed") {
-          let validReport = receipt.report === manifest.reportPath;
-          if (validReport) validReport = await nonEmptyRegularReport(manifest.reportPath, manifest);
-          if (!validReport) {
+      } catch (error) {
+        transportFailure(`transport_lost: cannot read published outcome: ${error instanceof Error ? error.message : String(error)}`, manifest);
+        process.exit(0);
+      }
+      const hasReport = reportText !== undefined;
+      if (receipt.outcome === "needs_input" || (receipt.final === false && receipt.outcome !== "transport_lost")) {
+        emit({ kind: "needs_input", jobId: receipt.job_id, attemptId: receipt.attempt_id,
+          source, final: false, summary: receipt.summary ?? "child requested human input", report: receipt.report });
+      } else {
+        let outcome = receipt.outcome;
+        let finalSource = source;
+        let summary = receipt.summary ?? `${outcome} ${manifest.jobId}`;
+        if (outcome === "transport_lost" && source === "transport") {
+          // A task manager transport record is non-semantic, but terminal for this monitor.
+        } else {
+          if (manifest.mode === "dialogue" && (outcome === "dialogue_settled" || outcome === "completed")) {
+            if (!hasReport) {
+              outcome = "failed";
+              finalSource = "protocol";
+              summary = "protocol_incomplete: settled dialogue has no assistant text report";
+            } else {
+              outcome = "completed";
+            }
+          }
+          if (!["completed", "blocked", "failed"].includes(outcome)) {
             outcome = "failed";
             finalSource = "protocol";
-            summary = `protocol_incomplete: missing or mismatched report ${manifest.reportPath}`;
+            summary = `protocol_incomplete: unsupported child outcome ${receipt.outcome}`;
+          }
+          if (manifest.mode === "task" && receipt.outcome === "completed") {
+            let validReport = receipt.report === manifest.reportPath;
+            if (validReport) validReport = await nonEmptyRegularReport(manifest.reportPath, manifest);
+            if (!validReport) {
+              outcome = "failed";
+              finalSource = "protocol";
+              summary = `protocol_incomplete: missing or mismatched report ${manifest.reportPath}`;
+            }
           }
         }
+        const marker = { kind: "final", jobId: receipt.job_id, attemptId: receipt.attempt_id,
+          outcome, source: finalSource, technical: finalSource !== "model", final: true,
+          summary, report: receipt.report ?? manifest.reportPath, sessionFile: receipt.session_file };
+        if (manifest.mode === "dialogue" && outcome === "completed" && hasReport) {
+          if (Buffer.byteLength(reportText, "utf8") <= 16 * 1024) marker.reportText = reportText;
+          else marker.dialogueReportPath = receipt.transport_report_path;
+        }
+        emit(marker);
+        process.exit(0);
       }
-      emit({ kind: "final", jobId: receipt.job_id, attemptId: receipt.attempt_id,
-        outcome, source: finalSource, technical: finalSource !== "model", final: true,
-        summary, report: manifest.reportPath, sessionFile: receipt.session_file });
-      process.exit(0);
     }
   }
 

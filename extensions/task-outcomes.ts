@@ -14,7 +14,7 @@ export default function taskOutcomes(pi: ExtensionAPI) {
     name: "report_outcome",
     label: "report_outcome",
     description:
-      "Declare the explicit outcome of the active task attempt. The active launch contract supplies the job, attempt, and report path; do not invent or select another job. In task mode, completed requires a readable nonempty report and no registered child/background work still running. A declaration is provisional until the declaring turn settles cleanly.",
+      "Declare the explicit outcome of the active task attempt. The active launch contract supplies the job, attempt, and report path; do not invent or select another job. In task mode, completed requires a readable nonempty report and no registered child/background work still running. A declaration is provisional until the declaring turn settles cleanly; clean dialogue responses are returned separately and verbatim.",
     parameters: Type.Object({
       outcome: StringEnum(outcomes, { description: "completed, blocked, needs_input, or failed" }),
       summary: Type.String({ description: "Short structured outcome summary", minLength: 1, maxLength: 20_000 }),

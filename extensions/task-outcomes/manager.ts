@@ -667,14 +667,12 @@ The declaration is provisional until clean settlement. Do not start more work af
     this.turn = turnIndex;
   }
 
-  onTurnEnd(message: any): void {
-    if (message?.role === "assistant") this.lastAssistant = message;
-  }
+  onTurnEnd(_message: any): void {}
 
   onAgentEnd(messages: readonly any[]): void {
     const assistant = [...messages].reverse().find(message => message?.role === "assistant");
-    if (!assistant) return;
     this.lastAssistant = assistant;
+    if (!assistant) return;
     if (assistant.stopReason === "error" || assistant.stopReason === "aborted") {
       this.lastRunFailure = assistant.errorMessage || `assistant ${assistant.stopReason}`;
     } else {
@@ -732,7 +730,11 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (pending.length > 0) return;
     if (contract.mode === "dialogue") {
       const response = assistantText(this.lastAssistant);
-      this.finalize(contract, "dialogue_settled", "model", response || "Assistant settled; read the saved session response.");
+      if (response === undefined) {
+        this.finalize(contract, "failed", "protocol", "protocol-incomplete: settled dialogue has no valid assistant text");
+      } else {
+        this.finalize(contract, "dialogue_settled", "model", dialogueSummary(response), true, response);
+      }
       return;
     }
     const key = this.key(contract.jobId, contract.attemptId);
@@ -848,6 +850,7 @@ The declaration is provisional until clean settlement. Do not start more work af
     source: OutcomeSource,
     summary: string,
     emit = true,
+    reportText?: string,
   ): void {
     if (contract.state === "final") return;
     const durable = this.persist({
@@ -887,7 +890,14 @@ The declaration is provisional until clean settlement. Do not start more work af
         // The durable record and monitor event remain authoritative if a manager was replaced.
       }
     }
-    if (emit) this.emitOutcome({ contract, outcome: record.outcome, source: record.source, summary: record.summary, final: true });
+    if (emit) this.emitOutcome({
+      contract,
+      outcome: record.outcome,
+      source: record.source,
+      summary: record.summary,
+      final: true,
+      reportText,
+    });
   }
 
   private async notifyQuestion(contract: ContractState, question: string): Promise<void> {
@@ -1037,7 +1047,14 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (this.notificationFlights.get(flight.key) === flight) this.notificationFlights.delete(flight.key);
   }
 
-  private emitOutcome(input: { contract: ContractState; outcome: MonitorOutcome; source: OutcomeSource; summary: string; final: boolean }): void {
+  private emitOutcome(input: {
+    contract: ContractState;
+    outcome: MonitorOutcome;
+    source: OutcomeSource;
+    summary: string;
+    final: boolean;
+    reportText?: string;
+  }): void {
     this.runtime.emit(TASK_OUTCOME_EVENT, {
       sessionId: this.runtime.sessionId,
       sessionFile: this.runtime.sessionFile,
@@ -1048,6 +1065,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       source: input.source,
       summary: input.summary,
       reportPath: input.contract.reportPath,
+      ...(input.reportText !== undefined ? { reportText: input.reportText } : {}),
       final: input.final,
     });
   }
@@ -1336,9 +1354,16 @@ The declaration is provisional until clean settlement. Do not start more work af
   }
 }
 
-const assistantText = (message: any): string => {
-  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return "";
-  return message.content.filter((block: any) => block?.type === "text").map((block: any) => block.text).join("").trim();
+const assistantText = (message: any): string | undefined => {
+  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+  const blocks = message.content.filter((block: any) => block?.type === "text");
+  if (blocks.some((block: any) => typeof block.text !== "string")) return undefined;
+  return blocks.map((block: any) => block.text).join("");
+};
+
+const dialogueSummary = (text: string): string => {
+  if (text.trim().length === 0) return "dialogue_settled";
+  return text.length > SUMMARY_MAX ? text.slice(0, SUMMARY_MAX) : text;
 };
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
