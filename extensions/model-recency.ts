@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Model } from "@mariozechner/pi-coding-agent";
 
-interface RecencyEntry { provider: string; modelId: string }
+export interface RecencyEntry { provider: string; modelId: string }
 interface RecencyCache { order: RecencyEntry[] }
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
@@ -24,6 +24,8 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 5_000;
 
 const key = (entry: RecencyEntry): string => `${entry.provider}\0${entry.modelId}`;
+const isUsableModel = (model: Model<any> | undefined): model is Model<any> =>
+	!!model && model.provider !== "unknown" && model.id !== "unknown";
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const accountProviders = (): Set<string> => {
@@ -62,6 +64,31 @@ export const bumpRecencyOrder = (
 			&& entries.findIndex((candidate) => key(candidate) === key(entry)) === index)
 		.slice(0, MAX_ENTRIES);
 };
+
+export async function selectMostRecentModel(
+	order: readonly RecencyEntry[],
+	options: {
+		findModel: (provider: string, modelId: string) => Model<any> | undefined;
+		scopedModels: readonly { model: Model<any> }[];
+		setModel: (model: Model<any>) => Promise<boolean>;
+	},
+): Promise<Model<any> | undefined> {
+	for (const entry of order) {
+		const model = options.findModel(entry.provider, entry.modelId);
+		if (!model) continue;
+		if (
+			options.scopedModels.length > 0 &&
+			!options.scopedModels.some((scoped) => scoped.model.provider === model.provider && scoped.model.id === model.id)
+		)
+			continue;
+		try {
+			if (await options.setModel(model)) return model;
+		} catch {
+			// Skip stale or currently unavailable recency entries.
+		}
+	}
+	return undefined;
+}
 
 const acquireLock = async (path: string): Promise<number> => {
 	const startedAt = Date.now();
@@ -114,7 +141,7 @@ export default function modelRecencyExtension(pi: ExtensionAPI) {
 		pi.appendEntry("model-recency", { order: recentOrder });
 	};
 	const bump = (model: Model<any> | undefined) => {
-		if (!model) return pending;
+		if (!isUsableModel(model)) return pending;
 		pending = pending.catch(() => undefined).then(async () => {
 			recentOrder = await updateRecencyFile(CACHE_PATH, {
 				provider: model.provider,
@@ -124,9 +151,17 @@ export default function modelRecencyExtension(pi: ExtensionAPI) {
 		});
 		return pending;
 	};
+	pi.on("session_start", async (_event, ctx) => {
+		if (!isUsableModel(ctx.model)) {
+			await selectMostRecentModel(recentOrder, {
+				findModel: (provider, modelId) => ctx.modelRegistry.find(provider, modelId),
+				scopedModels: ctx.scopedModels,
+				setModel: (model) => pi.setModel(model),
+			});
+		}
+		await bump(ctx.model);
+	});
 	const bumpCurrent = (_event: unknown, ctx: ExtensionContext) => bump(ctx.model);
-
-	pi.on("session_start", bumpCurrent);
 	pi.on("session_switch", bumpCurrent);
 	pi.on("session_tree", bumpCurrent);
 	pi.on("model_select", (event) => bump(event.model));
