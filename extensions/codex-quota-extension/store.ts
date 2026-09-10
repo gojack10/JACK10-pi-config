@@ -240,7 +240,6 @@ const quotaAge = (milliseconds: number): string => `${Math.max(0, Math.floor(mil
 export const evaluateQuotaAccount = (
 	account: CodexAccount,
 	now: number = Date.now(),
-	horizon?: number,
 ): QuotaAccountEvaluation => {
 	const reasons: string[] = [];
 	const degradations: string[] = [];
@@ -292,19 +291,12 @@ export const evaluateQuotaAccount = (
 			recoveryGates.push(window.resetAt);
 			continue;
 		}
-		const boundary = horizon === undefined ? window.resetAt : Math.min(horizon, window.resetAt);
-		const safe = aged && slope == null ? true : projectedExhaustAt == null || projectedExhaustAt >= boundary;
-		if (!safe) {
-			reasons.push(`UNSAFE WINDOW ${window.minutes}m`);
-			recoveryGates.push(window.resetAt);
-		}
 	}
 	const onlyTimedReasons = reasons.every(
 		(reason) =>
 			reason === "RATE LIMITED" ||
 			reason.startsWith("NOT BEFORE") ||
-			reason.startsWith("WINDOW EXHAUSTED") ||
-			reason.startsWith("UNSAFE WINDOW"),
+			reason.startsWith("WINDOW EXHAUSTED"),
 	);
 	return {
 		routable: reasons.length === 0,
