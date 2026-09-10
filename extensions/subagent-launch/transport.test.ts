@@ -38,7 +38,7 @@ job=$(sed -n 's/.*"jobId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 attempt=$(sed -n 's/.*"attemptId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 session_id=$(sed -n 's/.*"sessionId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 session_file="$manifest.session.jsonl"
-printf '{"fake":true}\\n' > "$session_file"
+printf '{"type":"session","id":"%s"}\\n' "$session_id" > "$session_file"
 tmux set-option -q -t "$pane" @pi_session_file "$session_file"
 gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
 tmux set-option -q -t "$pane" @pi_start_generation $((gen + 1))

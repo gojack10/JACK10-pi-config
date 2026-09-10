@@ -659,6 +659,7 @@ export class SubagentLauncher {
       outcomeGenerationOption: OUTCOME_GENERATION_OPTION,
       startGenerationOption: START_GENERATION_OPTION,
       sessionFileOption: SESSION_FILE_OPTION,
+      sessionIdOption: "@pi_session_id",
       outcomeChannel: await this.show(state.paneId, OUTCOME_CHANNEL_OPTION),
       pollMs: POLL_MS,
       startTimeoutMs: MONITOR_START_MS,

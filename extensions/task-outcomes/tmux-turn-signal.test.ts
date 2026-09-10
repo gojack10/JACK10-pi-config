@@ -58,6 +58,7 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
   for (const handler of handlers.get("agent_start") ?? []) await handler({}, ctx);
   for (const handler of handlers.get("agent_settled") ?? []) await handler({}, ctx);
   assert.equal(signals.length, 3);
+  assert.equal(options.get(key("@pi_session_id")), sessionId);
   assert.ok(signals.includes("legacy-start"));
   assert.ok(signals.includes("legacy-done"));
   assert.ok(signals.some(signal => signal.includes("pi-settled")));
