@@ -86,7 +86,7 @@ async function invoke(route: Route, prompt: string, input: string, cwd: string, 
 }
 
 export default function vegaRewriter(pi: ExtensionAPI) {
-	let enabled = true;
+	let enabled = false;
 	let armed = false;
 	let tuiMode = false;
 	let lifetime = new AbortController();
@@ -105,7 +105,7 @@ export default function vegaRewriter(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		enabled = true;
+		enabled = false;
 		armed = false;
 		tuiMode = ctx.mode === "tui";
 		lifetime = new AbortController();

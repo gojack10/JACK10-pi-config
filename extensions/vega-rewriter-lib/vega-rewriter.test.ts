@@ -14,25 +14,36 @@ function harness() {
 	const entries: Array<{ type: string; data: any }> = [];
 	const statuses = new Map<string, string | undefined>();
 	let transformer: (markdown: string, context: any) => string = (markdown) => markdown;
+	let commandHandler: ((...args: any[]) => any) | undefined;
 	vegaRewriter({
 		on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler),
 		appendEntry: (type: string, data: any) => entries.push({ type, data }),
-		registerCommand: () => {},
+		registerCommand: (_name: string, command: { handler: (...args: any[]) => any }) => { commandHandler = command.handler; },
 		registerMarkdownTransformer: (value: typeof transformer) => { transformer = value; },
 	} as any);
 	const user = { type: "message", message: { role: "user", content: [{ type: "text", text: "question" }] } };
 	const ctx = {
 		mode: "tui", cwd: "/tmp", signal: new AbortController().signal,
 		sessionManager: { getEntries: () => [], getBranch: () => [user] },
-		ui: { setStatus: (key: string, text: string | undefined) => statuses.set(key, text) },
+		ui: {
+			setStatus: (key: string, text: string | undefined) => statuses.set(key, text),
+			notify: () => {},
+		},
 	};
-	return { ctx, entries, handlers, statuses, transformer, user };
+	return { ctx, entries, handlers, statuses, transformer, user, commandHandler };
 }
 
 async function arm(value: ReturnType<typeof harness>) {
 	await value.handlers.get("session_start")?.({}, value.ctx);
+	await value.commandHandler?.("", value.ctx);
 	await value.handlers.get("message_end")?.(value.user, value.ctx);
 }
+
+test("starts with rewriting disabled", async () => {
+	const value = harness();
+	await value.handlers.get("session_start")?.({}, value.ctx);
+	assert.equal(value.transformer("raw", { messageType: "assistant", isStreaming: false }), "raw");
+});
 
 test("hides pending assistant text, then displays its rewrite without changing content", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "vega-rewriter-"));
