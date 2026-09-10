@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { lstat, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,7 +104,8 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     await until(() => markers.some(marker => marker.kind === "start"));
     assert.equal(markers.filter(marker => marker.kind === "final").length, 0);
     await set("@pi_outcome", JSON.stringify({ session_id: "arrival-session", job_id: "arrival-job",
-      attempt_id: "arrival-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true }));
+      attempt_id: "arrival-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+      report_text: "" }));
     await set("@pi_outcome_generation", "1");
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("monitor did not settle valid manifest")), 1000);
@@ -121,7 +122,105 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
   }
 });
 
- test("monitor rejects a replaced regular report and a FIFO without blocking", { timeout: 10000 }, async t => {
+test("monitor reads protected full dialogue reports without tmux or summary truncation", { timeout: 10000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-dialogue-report-test-"));
+  const session = `pi-subagent-dialogue-report-${process.pid}-${Date.now()}`;
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    await tmux(["new-session", "-d", "-s", session, "-c", dir]);
+    const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
+    const sessionFile = join(dir, "session.jsonl");
+    const manifest = join(dir, "manifest.json");
+    const report = join(dir, "dialogue-report.txt");
+    const receipt = join(dir, "outcome-receipt.json");
+    const exact = "😀".repeat(11_000) + "\nleading/trailing  ";
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "dialogue-report-session" }) + "\n");
+    await writeFile(report, exact);
+    const reportIdentity = await lstat(report);
+    await writeFile(manifest, JSON.stringify({ version: 1, jobId: "dialogue-report-job", attemptId: "dialogue-report-attempt",
+      sessionId: "dialogue-report-session", mode: "dialogue", startChannel: "unused-start",
+      startGeneration: 0, outcomeGeneration: 0 }));
+    const full = { version: 1, session_id: "dialogue-report-session", job_id: "dialogue-report-job",
+      attempt_id: "dialogue-report-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+      summary: "dialogue_settled", transport_report_path: report,
+      transport_report_identity: { dev: String(reportIdentity.dev), ino: String(reportIdentity.ino) },
+      transport_report_present: true };
+    await writeFile(receipt, JSON.stringify(full));
+    const receiptIdentity = await lstat(receipt);
+    const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
+    await set("@pi_subagent_job_id", "dialogue-report-job");
+    await set("@pi_subagent_manifest", manifest);
+    await set("@pi_start_generation", "1");
+    await set("@pi_session_file", sessionFile);
+    const markers: any[] = [];
+    child = spawn(process.execPath, [monitorPath, monitorConfig(pane, "dialogue-report-job", "dialogue-report-attempt", 1000,
+      "dialogue-report-session", "dialogue")], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout!.setEncoding("utf8").on("data", chunk => {
+      for (const line of String(chunk).split(/\r?\n/).filter(Boolean)) markers.push(JSON.parse(line));
+    });
+    await until(() => markers.some(marker => marker.kind === "start"));
+    await set("@pi_outcome", JSON.stringify({ session_id: "dialogue-report-session", job_id: "dialogue-report-job",
+      attempt_id: "dialogue-report-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+      receipt_path: receipt, receipt_identity: { dev: String(receiptIdentity.dev), ino: String(receiptIdentity.ino) } }));
+    await set("@pi_outcome_generation", "1");
+    await until(() => markers.some(marker => marker.kind === "final"));
+    const final = markers.find(marker => marker.kind === "final");
+    assert.equal(final.outcome, "completed");
+    assert.equal(final.source, "model");
+    assert.equal(final.reportText, undefined);
+    assert.equal(final.dialogueReportPath, report);
+    assert.equal(await readFile(final.dialogueReportPath, "utf8"), exact);
+  } finally {
+    child?.kill("SIGTERM");
+    await tmux(["kill-session", "-t", session]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("monitor turns a published receipt read failure into visible transport evidence", { timeout: 10000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-receipt-failure-test-"));
+  const session = `pi-subagent-receipt-failure-${process.pid}-${Date.now()}`;
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    await tmux(["new-session", "-d", "-s", session, "-c", dir]);
+    const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
+    const sessionFile = join(dir, "session.jsonl");
+    const manifest = join(dir, "manifest.json");
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "receipt-failure-session" }) + "\n");
+    await writeFile(manifest, JSON.stringify({ version: 1, jobId: "receipt-failure-job", attemptId: "receipt-failure-attempt",
+      sessionId: "receipt-failure-session", mode: "dialogue", startChannel: "unused-start",
+      startGeneration: 0, outcomeGeneration: 0 }));
+    const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
+    for (const [option, value] of [["@pi_subagent_job_id", "receipt-failure-job"],
+      ["@pi_subagent_manifest", manifest], ["@pi_start_generation", "1"], ["@pi_session_file", sessionFile]] as const) {
+      await set(option, value);
+    }
+    const markers: any[] = [];
+    child = spawn(process.execPath, [monitorPath, monitorConfig(pane,
+      "receipt-failure-job", "receipt-failure-attempt", 1000, "receipt-failure-session", "dialogue")], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout!.setEncoding("utf8").on("data", chunk => {
+      for (const line of String(chunk).split(/\r?\n/).filter(Boolean)) markers.push(JSON.parse(line));
+    });
+    await until(() => markers.some(marker => marker.kind === "start"));
+    await set("@pi_outcome", JSON.stringify({ session_id: "receipt-failure-session", job_id: "receipt-failure-job",
+      attempt_id: "receipt-failure-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+      receipt_path: join(dir, "missing-receipt"), receipt_identity: { dev: "1", ino: "1" } }));
+    await set("@pi_outcome_generation", "1");
+    await until(() => markers.some(marker => marker.kind === "final"));
+    const final = markers.find(marker => marker.kind === "final");
+    assert.equal(final.outcome, "transport_lost");
+    assert.equal(final.source, "transport");
+    assert.match(final.summary, /cannot read published outcome/);
+  } finally {
+    child?.kill("SIGTERM");
+    await tmux(["kill-session", "-t", session]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("monitor rejects a replaced regular report and a FIFO without blocking", { timeout: 10000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-report-test-"));
   const session = `pi-subagent-report-${process.pid}-${Date.now()}`;
   try {
@@ -247,7 +346,8 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     await until(() => markers.some(marker => marker.kind === "evidence"));
     assert.equal(markers.some(marker => marker.kind === "final"), false);
     await set("@pi_outcome", JSON.stringify({ session_id: "actual-pi-session", job_id: "session-job",
-      attempt_id: "session-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true }));
+      attempt_id: "session-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+      report_text: "" }));
     await set("@pi_outcome_generation", "2");
     await until(() => markers.some(marker => marker.kind === "final"));
     assert.equal(markers.at(-1).outcome, "completed");
@@ -367,7 +467,8 @@ test("monitor binds manifest identity and allows same-identity replacement", { t
       await writeFile(replacement, JSON.stringify({ ...base, ...scenario.replacement }));
       await set("@pi_subagent_manifest", replacement);
       await set("@pi_outcome", JSON.stringify({ ...scenario.receipt, mode: "dialogue",
-        outcome: scenario.name === "same identity" ? "dialogue_settled" : "completed", source: "model", final: true }));
+        outcome: scenario.name === "same identity" ? "dialogue_settled" : "completed", source: "model", final: true,
+        report_text: "" }));
       await set("@pi_outcome_generation", "1");
       await until(() => markers.some(marker => marker.kind === "final"));
       await delay(30);

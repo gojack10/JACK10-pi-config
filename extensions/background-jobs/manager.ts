@@ -23,6 +23,8 @@ export interface BackgroundJobCompletionOverride {
   status: BackgroundJobOutcomeStatus;
   summary: string;
   source?: BackgroundJobCompletionSource;
+  reportText?: string;
+  reportPath?: string;
 }
 
 export interface BackgroundJobStartHooks {
@@ -61,6 +63,8 @@ export interface BackgroundJobCompletion {
   status?: BackgroundJobOutcomeStatus;
   summary: string;
   source?: BackgroundJobCompletionSource;
+  reportText?: string;
+  reportPath?: string;
 }
 
 export interface BackgroundJobReport {
@@ -650,9 +654,14 @@ export class BackgroundJobManager {
 
   private renderCompletion(completion: BackgroundJobCompletion): string {
     const source = completion.source && completion.source !== "model" ? ` [${completion.source}]` : "";
-    return completion.status
+    const status = completion.status
       ? `outcome ${completion.id}: [${completion.status}]${source} ${completion.summary}`
       : `${source ? `[${completion.source}] ` : ""}${completion.summary}`;
+    if (completion.reportText !== undefined) {
+      return `${status}\n--- dialogue report${completion.reportText.length === 0 ? " (empty)" : ""} ---\n${completion.reportText}`;
+    }
+    if (completion.reportPath !== undefined) return `${status}\nFull dialogue report: ${completion.reportPath}`;
+    return status;
   }
 
   private renderCompletionSummary(job: BgJob): string {

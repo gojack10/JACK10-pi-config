@@ -708,7 +708,7 @@ export class SubagentLauncher {
       if (marker.kind === "start" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         this.resolveStart(state, marker.attemptId, true);
       } else if (marker.kind === "needs_input" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
-        const message = `Subagent ${state.jobId} (attempt ${marker.attemptId}) needs input:\n${marker.summary || "child requested human input"}`;
+        const message = `Subagent ${state.jobId} (attempt ${marker.attemptId}) needs input:\n${marker.summary ?? "child requested human input"}`;
         try {
           const result = this.pi.sendUserMessage(message, { deliverAs: "steer" });
           if (result !== undefined) void Promise.resolve(result).catch(() => {});
@@ -718,10 +718,23 @@ export class SubagentLauncher {
         const source = ["model", "technical", "protocol", "transport"].includes(marker.source)
           ? marker.source as OutcomeSource
           : "protocol" as const;
-        const summary = `${marker.summary || marker.outcome} (attempt ${marker.attemptId}; session ${state.sessionId}; report ${marker.report || "none"}; monitor ${state.monitorLogPath || "pending"})`;
+        const suffix = ` (attempt ${marker.attemptId}; session ${state.sessionId}; report ${marker.report || "none"}; monitor ${state.monitorLogPath || "pending"})`;
+        const baseSummary = typeof marker.summary === "string" && marker.summary.length > 0
+          ? marker.summary
+          : marker.outcome;
+        const summary = `${baseSummary.slice(0, Math.max(1, 20_000 - suffix.length))}${suffix}`;
+        const reportText = typeof marker.reportText === "string" ? marker.reportText : undefined;
+        const reportPath = typeof marker.dialogueReportPath === "string" ? marker.dialogueReportPath : undefined;
         if (state.monitorJobId !== undefined &&
             !(state.releaseFailure && !state.releaseBuffered)) {
-          this.background.setCompletion(state.monitorJobId, { id: state.jobId, status, summary, source });
+          this.background.setCompletion(state.monitorJobId, {
+            id: state.jobId,
+            status,
+            summary,
+            source,
+            reportText,
+            reportPath,
+          });
         }
         this.resolveStart(state, marker.attemptId, false);
       }
@@ -864,7 +877,7 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_launch",
     label: "subagent_launch",
-    description: "Launch one or more saved interactive Pi subagents in ordinary tmux sessions. Every job requires an explicit provider/model/thinking route, absolute mission file, cwd, session label, and task/dialogue mode. Task mode also requires a fresh report file. Returns verified per-job START/session receipts; partial setup failures never release an unarmed child. Task outcomes and batch completion are delivered from durable receipts, not process exit.",
+    description: "Launch one or more saved interactive Pi subagents in ordinary tmux sessions. Every job requires an explicit provider/model/thinking route, absolute mission file, cwd, session label, and task/dialogue mode. Task mode also requires a fresh report file. Dialogue reports return automatically at clean settlement, verbatim when small or through a readable artifact when large. Returns verified per-job START/session receipts; partial setup failures never release an unarmed child. Task outcomes and batch completion are delivered from durable receipts, not process exit.",
     parameters: launchSchema,
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await forContext(ctx).launch(args.jobs as SubagentJobInput[]);
@@ -874,7 +887,7 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_followup",
     label: "subagent_followup",
-    description: "Continue a saved subagent by returned job_id/session_id. Supply the route explicitly again; it must match the saved route. Follow-ups create a fresh attempt and, in task mode, require a fresh report file. The contract and monitor are armed before the mission file is pasted into the interactive pane.",
+    description: "Continue a saved subagent by returned job_id/session_id. Supply the route explicitly again; it must match the saved route. Follow-ups create a fresh attempt and, in task mode, require a fresh report file. Dialogue reports return automatically at clean settlement, verbatim when small or through a readable artifact when large. The contract and monitor are armed before the mission file is pasted into the interactive pane.",
     parameters: followupSchema,
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await forContext(ctx).followup(args as SubagentFollowupInput);

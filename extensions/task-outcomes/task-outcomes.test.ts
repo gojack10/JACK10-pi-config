@@ -77,7 +77,7 @@ async function harness(t: any, sessionManager?: any, persistent = false) {
     const assistant = {
       role: "assistant",
       stopReason: options.stopReason ?? "toolUse",
-      content: options.text ? [{ type: "text", text: options.text }] : [],
+      content: options.text !== undefined ? [{ type: "text", text: options.text }] : [],
     };
     await emit("turn_end", { turnIndex: 0, message: assistant, toolResults: [] });
     if (options.saveAssistant !== false) sm.appendMessage(assistant);
@@ -284,6 +284,57 @@ test("dialogue mode saves a settled assistant response without a report or comma
   assert.match(outcome.summary, /saved dialogue response/);
   assert.equal(h.messages.length, 0);
   assert.deepEqual((await h.snapshot()).events.map((event: any) => event.outcome), ["dialogue_settled"]);
+});
+
+test("dialogue reports preserve text blocks, explicit empty output, and absent output is not success", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { action: "activate", job_id: "verbatim", attempt_id: "v1", mode: "dialogue" });
+  const assistant = {
+    role: "assistant",
+    stopReason: "stop",
+    content: [{ type: "text", text: "  leading\n" }, { type: "text", text: "unicode 😀\ntrailing  " }],
+  };
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  await h.emit("turn_end", { turnIndex: 0, message: assistant, toolResults: [] });
+  h.sm.appendMessage(assistant as any);
+  await h.emit("agent_end", { messages: [assistant] });
+  assert.equal((await h.snapshot()).outcomes.length, 0);
+  await h.emit("agent_settled");
+  const event = (await h.snapshot()).events.at(-1);
+  assert.equal(event.reportText, "  leading\nunicode 😀\ntrailing  ");
+  assert.equal((await h.snapshot()).outcomes.at(-1).summary, event.reportText);
+
+  await h.call("task_outcomes_consumer", { action: "activate", job_id: "verbatim", attempt_id: "v2", mode: "dialogue" });
+  await h.settle();
+  const emptyEvent = (await h.snapshot()).events.at(-1);
+  assert.equal(emptyEvent.outcome, "dialogue_settled");
+  assert.equal(emptyEvent.reportText, "");
+
+  await h.call("task_outcomes_consumer", { action: "activate", job_id: "absent", attempt_id: "a1", mode: "dialogue" });
+  await h.emit("agent_start");
+  await h.emit("turn_start", { turnIndex: 0 });
+  await h.emit("turn_end", { turnIndex: 0, message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] });
+  await h.emit("agent_end", { messages: [] });
+  await h.emit("agent_settled");
+  const absent = (await h.snapshot()).outcomes.at(-1);
+  assert.equal(absent.outcome, "failed");
+  assert.equal(absent.source, "protocol");
+  assert.match(absent.summary, /no valid assistant text/);
+  assert.equal(Object.prototype.hasOwnProperty.call((await h.snapshot()).events.at(-1), "reportText"), false);
+});
+
+test("dialogue reports keep large text separate from bounded status", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { action: "activate", job_id: "large", attempt_id: "l1", mode: "dialogue" });
+  const exact = "😀".repeat(11_000) + "\nend  ";
+  await h.settle({ text: exact });
+  const outcome = (await h.snapshot()).outcomes.at(-1);
+  const event = (await h.snapshot()).events.at(-1);
+  assert.equal(event.reportText, exact);
+  assert.ok(Buffer.byteLength(exact) > 16 * 1024);
+  assert.ok(outcome.summary.length <= 20_000);
+  assert.notEqual(outcome.summary, exact);
 });
 
 test("durable records precede notification and restart does not claim stale ownership", { timeout: 10000 }, async t => {
