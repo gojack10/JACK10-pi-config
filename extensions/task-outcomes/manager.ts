@@ -234,6 +234,7 @@ export class TaskOutcomeManager {
   private branchId = randomUUID();
   private notificationBranchId = randomUUID();
   private restored = false;
+  private readonly corrections = new Map<string, { count: number; run: number }>();
   private run = 0;
   private turn = -1;
   private lastAssistant: any;
@@ -643,6 +644,16 @@ export class TaskOutcomeManager {
     };
   }
 
+  taskInstruction(): string | undefined {
+    const contract = this.activeContract();
+    if (!contract || contract.mode !== "task" || contract.state !== "active") return undefined;
+    return `SYSTEM TASK CONTRACT: ${contract.jobId}/${contract.attemptId}
+You are a task subagent. A prose answer alone does not complete this task.
+Write your report to ${JSON.stringify(contract.reportPath)}. This file is already reserved: write into it without deleting, replacing, or renaming it.
+Then call report_outcome with an honest outcome and summary. Use completed only after writing a readable nonempty report and finishing all tracked child/background work. Otherwise declare blocked, needs_input, or failed with the reason; include partial findings in the report when possible. Never invent success to satisfy this contract.
+The declaration is provisional until clean settlement. Do not start more work after declaring. Missing declarations trigger at most two corrective turns, then protocol failure.`;
+  }
+
   onAgentStart(): void {
     this.run += 1;
     this.turn = -1;
@@ -724,7 +735,33 @@ export class TaskOutcomeManager {
       this.finalize(contract, "dialogue_settled", "model", response || "Assistant settled; read the saved session response.");
       return;
     }
-    this.finalize(contract, "failed", "protocol", "protocol-incomplete: task settled without a structured outcome declaration");
+    const key = this.key(contract.jobId, contract.attemptId);
+    const previous = this.corrections.get(key);
+    // Duplicate settlement callbacks must not consume retries or enqueue twice.
+    if (previous?.run === this.run) return;
+    if ((previous?.count ?? 0) >= 2) {
+      this.finalize(contract, "failed", "protocol", "protocol-incomplete: task settled without a structured outcome declaration after two corrective turns");
+      return;
+    }
+    let missing = "No accepted report_outcome declaration.";
+    try { await this.verifyReport(contract); }
+    catch (error) { missing += ` Report validation: ${errorMessage(error)}.`; }
+    // Recheck after asynchronous validation in case shutdown or another callback intervened.
+    if (this.activeContract() !== contract || contract.state !== "active" || this.corrections.get(key)?.run === this.run) return;
+    this.corrections.set(key, { count: (previous?.count ?? 0) + 1, run: this.run });
+    const failed = (error: unknown) => {
+      if (this.activeContract() === contract && contract.state === "active") {
+        this.finalize(contract, "failed", "protocol", `protocol-incomplete: cannot queue task correction: ${errorMessage(error)}`);
+      }
+    };
+    try {
+      const delivery = this.runtime.sendUserMessage(
+        `SYSTEM (task-outcomes): Task remains incomplete. ${missing}\n${this.taskInstruction()}`,
+        { deliverAs: "followUp" },
+      );
+      // Delivery can cover the next model run; never await it inside settlement.
+      void Promise.resolve(delivery).catch(failed);
+    } catch (error) { failed(error); }
   }
 
   shutdown(reason: string): void {
