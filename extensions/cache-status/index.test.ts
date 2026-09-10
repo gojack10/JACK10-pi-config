@@ -12,6 +12,8 @@ test("publishes pane and session cache options through tmux", async (t) => {
 	const options = new Map<string, string>();
 	const messages: string[] = [];
 	const cacheUpdates: unknown[] = [];
+	const calls: string[][] = [];
+	const intervals: (() => void)[] = [];
 	const paneId = "%cache-test";
 	const originalPane = process.env.TMUX_PANE;
 	process.env.TMUX_PANE = paneId;
@@ -31,6 +33,7 @@ test("publishes pane and session cache options through tmux", async (t) => {
 			},
 		},
 		async exec(command: string, args: string[]) {
+			calls.push(args);
 			assert.equal(command, "tmux");
 			if (args[0] === "set-option") {
 				const scope = args.includes("-p") ? "pane" : args.includes("-w") ? "window" : "session";
@@ -70,10 +73,19 @@ test("publishes pane and session cache options through tmux", async (t) => {
 			getHeader: () => ({ timestamp: "2026-01-01T00:00:00.000Z" }),
 		},
 	};
+	const originalSetInterval = globalThis.setInterval;
+	const originalClearInterval = globalThis.clearInterval;
+	globalThis.setInterval = ((callback: () => void) => {
+		intervals.push(callback);
+		return intervals.length as unknown as ReturnType<typeof setInterval>;
+	}) as typeof setInterval;
+	globalThis.clearInterval = (() => {}) as typeof clearInterval;
 
 	activate(pi as never);
 	t.after(async () => {
 		await handlers.get("session_shutdown")?.({}, ctx);
+		globalThis.setInterval = originalSetInterval;
+		globalThis.clearInterval = originalClearInterval;
 		process.env.TMUX_PANE = originalPane;
 	});
 	handlers.get("session_start")?.({}, ctx);
@@ -89,10 +101,51 @@ test("publishes pane and session cache options through tmux", async (t) => {
 		/RUN \$0\.00 TOTAL \$0\.00/,
 	);
 
+	const initialCalls = calls.length;
 	handlers.get("agent_start")?.({}, ctx);
+	await wait();
+	const afterAgentStartCalls = calls.length;
+	assert.ok(afterAgentStartCalls > initialCalls);
+	assert.match(
+		options.get(optionKey("pane", paneId, "@pi_cache_pane")) ?? "",
+		/BUSY/,
+	);
+
 	handlers.get("agent_settled")?.({}, ctx);
 	await wait();
+	const afterAgentSettledCalls = calls.length;
+	assert.ok(afterAgentSettledCalls > afterAgentStartCalls);
 	assert.match(messages.at(-1) ?? "", /\[pi\] \(0\) cache-test: AGENT DONE/);
+
+	handlers.get("before_provider_request")?.({ payload: {} }, ctx);
+	await wait();
+	const afterRequestCalls = calls.length;
+	assert.ok(afterRequestCalls > afterAgentSettledCalls);
+
+	for (const cacheRead of [1, 2]) {
+		handlers.get("message_update")?.(
+			{
+				message: {
+					role: "assistant",
+					provider: "anthropic",
+					model: "claude-fable-5",
+					usage: { cacheRead },
+				},
+			},
+			ctx,
+		);
+	}
+	assert.equal(calls.length, afterRequestCalls);
+
+	const periodicTick = intervals[0];
+	assert.ok(periodicTick);
+	periodicTick();
+	await wait();
+	assert.ok(calls.length > afterRequestCalls);
+	const snapshot = JSON.parse(
+		Buffer.from(options.get(optionKey("pane", paneId, "@pi_cache_data")) ?? "", "base64url").toString(),
+	) as { entries: { result?: string }[] };
+	assert.equal(snapshot.entries[0]?.result, "REUSED");
 
 	await handlers.get("session_shutdown")?.({}, ctx);
 	assert.equal(options.get(optionKey("pane", paneId, "@pi_cache_data")), undefined);
