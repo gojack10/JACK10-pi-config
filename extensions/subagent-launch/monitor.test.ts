@@ -28,6 +28,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
   outcomeGenerationOption: "@pi_outcome_generation",
   startGenerationOption: "@pi_start_generation",
   sessionFileOption: "@pi_session_file",
+  sessionIdOption: "@pi_session_id",
   pollMs: 10,
   startTimeoutMs,
   jobId,
@@ -85,7 +86,6 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     await writeFile(manifest, JSON.stringify({ version: 1, jobId: "arrival-job", attemptId: "arrival-attempt",
       sessionId: "arrival-session", mode: "dialogue", startChannel: "unused-start",
       startGeneration: 0, outcomeGeneration: 0 }));
-    await writeFile(sessionFile, "session\n");
     const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
     await set("@pi_subagent_job_id", "arrival-job");
     await set("@pi_subagent_manifest", badManifest);
@@ -100,6 +100,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     await set("@pi_subagent_manifest", manifest);
     await set("@pi_start_generation", "1");
     await set("@pi_session_file", sessionFile);
+    await set("@pi_session_id", "arrival-session");
     await until(() => markers.some(marker => marker.kind === "start"));
     assert.equal(markers.filter(marker => marker.kind === "final").length, 0);
     await set("@pi_outcome", JSON.stringify({ session_id: "arrival-session", job_id: "arrival-job",
@@ -127,7 +128,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     await tmux(["new-session", "-d", "-s", session, "-c", dir]);
     const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
     const sessionFile = join(dir, "session.jsonl");
-    await writeFile(sessionFile, "session\n");
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "report-session" }) + "\n");
     const set = async (option: string, value: string) => tmux(["set-option", "-q", "-t", pane, option, value]);
     await set("@pi_subagent_job_id", "report-job");
     await set("@pi_start_generation", "1");
@@ -180,7 +181,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
     const sessionFile = join(dir, "session.jsonl");
     const manifest = join(dir, "manifest.json");
-    await writeFile(sessionFile, "session\n");
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "loss-session" }) + "\n");
     await writeFile(manifest, JSON.stringify({ version: 1, jobId: "loss-job", attemptId: "loss-attempt",
       sessionId: "loss-session", mode: "dialogue", startChannel: "unused-start",
       startGeneration: 0, outcomeGeneration: 0 }));
@@ -215,7 +216,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
   }
 });
 
- test("monitor ignores a foreign session receipt before accepting the matching session", { timeout: 10000 }, async t => {
+ test("monitor ignores a foreign receipt and accepts the real Pi ID rather than the transport ID", { timeout: 10000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-session-test-"));
   const session = `pi-subagent-session-${process.pid}-${Date.now()}`;
   let child: ReturnType<typeof spawn> | undefined;
@@ -224,7 +225,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
     const sessionFile = join(dir, "session.jsonl");
     const manifest = join(dir, "manifest.json");
-    await writeFile(sessionFile, "session\n");
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "actual-pi-session" }) + "\n");
     await writeFile(manifest, JSON.stringify({ version: 1, jobId: "session-job", attemptId: "session-attempt",
       sessionId: "expected-session", mode: "dialogue", startChannel: "unused-start",
       startGeneration: 0, outcomeGeneration: 0 }));
@@ -245,7 +246,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     });
     await until(() => markers.some(marker => marker.kind === "evidence"));
     assert.equal(markers.some(marker => marker.kind === "final"), false);
-    await set("@pi_outcome", JSON.stringify({ session_id: "expected-session", job_id: "session-job",
+    await set("@pi_outcome", JSON.stringify({ session_id: "actual-pi-session", job_id: "session-job",
       attempt_id: "session-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true }));
     await set("@pi_outcome_generation", "2");
     await until(() => markers.some(marker => marker.kind === "final"));
@@ -265,7 +266,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
     const sessionFile = join(dir, "session.jsonl");
     const manifest = join(dir, "manifest.json");
-    await writeFile(sessionFile, "session\n");
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "transport-session" }) + "\n");
     await writeFile(manifest, JSON.stringify({ version: 1, jobId: "transport-job", attemptId: "transport-attempt",
       sessionId: "transport-session", mode: "dialogue", startChannel: "unused-start",
       startGeneration: 0, outcomeGeneration: 0 }));
@@ -287,6 +288,36 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
     assert.equal(final.technical, true);
     assert.equal(final.final, true);
     assert.doesNotMatch(final.summary, /protocol_incomplete/);
+  } finally {
+    await tmux(["kill-session", "-t", session]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("monitor rejects missing or invalid session headers instead of guessing transport identity", { timeout: 10000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-monitor-header-"));
+  const session = `pi-subagent-header-${process.pid}-${Date.now()}`;
+  try {
+    await tmux(["new-session", "-d", "-s", session, "-c", dir]);
+    const pane = await tmux(["list-panes", "-t", session, "-F", "#{pane_id}"]);
+    const manifest = join(dir, "manifest.json");
+    const file = join(dir, "session.jsonl");
+    await writeFile(manifest, JSON.stringify({ version: 1, jobId: "header-job", attemptId: "header-attempt",
+      sessionId: "transport-id", mode: "dialogue", startChannel: "unused-start",
+      startGeneration: 0, outcomeGeneration: 0 }));
+    for (const [option, value] of Object.entries({ "@pi_subagent_job_id": "header-job",
+      "@pi_subagent_manifest": manifest, "@pi_session_file": file, "@pi_start_generation": "1" })) {
+      await tmux(["set-option", "-q", "-t", pane, option, value]);
+    }
+    for (const header of [undefined, "not JSON\n", '{"type":"session","id":""}\n']) {
+      if (header !== undefined) await writeFile(file, header);
+      const result = await execFileAsync(process.execPath, [monitorPath,
+        monitorConfig(pane, "header-job", "header-attempt")], { encoding: "utf8", timeout: 1500 });
+      const markers = result.stdout.trim().split("\n").map(line => JSON.parse(line));
+      assert.equal(markers.length, 1);
+      assert.equal(markers[0].source, "protocol");
+      assert.match(markers[0].summary, /invalid Pi session header/);
+    }
   } finally {
     await tmux(["kill-session", "-t", session]).catch(() => {});
     await rm(dir, { recursive: true, force: true });
@@ -315,7 +346,7 @@ test("monitor binds manifest identity and allows same-identity replacement", { t
       const sessionFile = join(dir, "session.jsonl");
       const manifest = join(dir, "manifest.json");
       const replacement = join(dir, "replacement.json");
-      await writeFile(sessionFile, "session\n");
+      await writeFile(sessionFile, JSON.stringify({ type: "session", id: "bound-session" }) + "\n");
       const base = { version: 1, jobId: "bound-job", attemptId: "bound-attempt", sessionId: "bound-session",
         mode: "dialogue", startChannel: "initial-start", startGeneration: 0, outcomeGeneration: 0 };
       await writeFile(manifest, JSON.stringify(base));

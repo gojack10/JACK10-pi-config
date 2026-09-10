@@ -123,6 +123,8 @@ export default function (pi: ExtensionAPI) {
 		const pane = process.env.TMUX_PANE;
 		if (!pane || ctx.mode !== "tui") return;
 
+		// Publish the live identity before START; Pi defers creating the JSONL until an assistant response.
+		await pi.exec("tmux", ["set-option", "-q", "-t", pane, "@pi_session_id", ownerSessionId]);
 		await saveSessionFile(pane, ctx.sessionManager.getSessionFile());
 		const startGeneration = Number.parseInt(await readOption(pane, START_GENERATION_OPTION), 10);
 		await pi.exec("tmux", [
