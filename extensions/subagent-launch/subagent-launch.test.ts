@@ -99,6 +99,14 @@ sleep .5
     assert.equal(result.details.jobs[0].status, "running");
     childSession = result.details.jobs[0].session_label;
     assert.ok(result.details.jobs[0].manifest_file);
+    const childPane = await tmux(["list-panes", "-t", childSession!, "-F", "#{pane_id}"]);
+    const parentId = await tmux(["display-message", "-p", "-t", parentPane, "#{session_id}"]);
+    const childId = await tmux(["display-message", "-p", "-t", childPane, "#{session_id}"]);
+    const rows = await tmux(["list-sessions", "-F", "#{session_id}|#{@pi_subagent_parent_id}"]);
+    assert.ok(rows.split("\n").includes(`${childId}|${parentId}`));
+    const boot = await readFile(await tmux(["show-options", "-qv", "-t", childPane, "@pi_subagent_boot_file"]), "utf8");
+    assert.doesNotMatch(boot, /--no-extensions/);
+    assert.match(boot, /--extension/);
     assert.equal(await readFile(mission, "utf8"), "Do the fake task.\n");
     await until(() => messages.length === 1);
     assert.equal(messages[0].options.deliverAs, "steer");
