@@ -134,6 +134,7 @@ interface BatchState {
   members: Set<string>;
   finalized: Set<string>;
   pending: BackgroundJobCompletion[];
+  earlyFailures: Set<string>;
 }
 
 const killJobTree = (job: BgJob): void => {
@@ -407,6 +408,22 @@ export class BackgroundJobManager {
     );
   }
 
+  notifyFailure(batchId: string, completion: BackgroundJobCompletion): void {
+    this.assertOpen();
+    const batch = this.batches.get(batchId);
+    if (!batch || completion.status !== "failed") return;
+    const jobId = [...batch.jobs].find(id => this.jobs.get(id)?.completionId === completion.id);
+    if (jobId === undefined) return;
+    const memberId = `job:${jobId}`;
+    if (!batch.members.has(memberId) || batch.earlyFailures.has(memberId)) return;
+    batch.earlyFailures.add(memberId);
+    this.sendReport({
+      batchId,
+      completions: [completion],
+      text: `SYSTEM (background-jobs): ${this.renderCompletion(completion)}`,
+    });
+  }
+
   async tail(jobId: number, lines = 50): Promise<BackgroundTailResult | undefined> {
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
@@ -602,6 +619,7 @@ export class BackgroundJobManager {
       members: new Set(),
       finalized: new Set(),
       pending: [],
+      earlyFailures: new Set(),
     };
     this.batches.set(id, batch);
     return batch;

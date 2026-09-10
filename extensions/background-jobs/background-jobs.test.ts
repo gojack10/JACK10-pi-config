@@ -106,6 +106,33 @@ test('explicit batches are isolated and emit once', { timeout: 10000 }, async t 
   await until(() => h.messages.length === 3);
 });
 
+test('failure notification bypasses siblings but batch accounting still emits once', { timeout: 10000 }, async t => {
+  const h = await harness(t, true);
+  await h.call('background_jobs_consumer', { action: 'open', batch_id: 'failure', expected: 2 });
+  const failed = await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'failure', completion_id: 'failed-job',
+    command: 'sleep .05', label: 'failed-job',
+  });
+  await h.call('background_jobs_consumer', {
+    action: 'start', batch_id: 'failure', completion_id: 'pending-job',
+    command: 'sleep .2', label: 'pending-job',
+  });
+  await h.call('background_jobs_consumer', { action: 'close', batch_id: 'failure' });
+  await h.call('background_jobs_consumer', { action: 'notify_failure', batch_id: 'failure',
+    completion_id: 'failed-job', message: 'cannot read Pi error record: EACCES: permission denied, open session.jsonl' });
+  await h.call('background_jobs_consumer', { action: 'notify_failure', batch_id: 'failure',
+    completion_id: 'failed-job', message: 'cannot read Pi error record: EACCES: permission denied, open session.jsonl' });
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].text, /failed-job.*failed.*transport.*cannot read Pi error record/);
+  assert.equal(h.messages[0].options.deliverAs, 'steer');
+  await until(() => h.messages.length === 2);
+  assert.match(h.messages[1].text, /All 2 background job\(s\)/);
+  assert.match(h.messages[1].text, /failed-job/);
+  assert.match(h.messages[1].text, /pending-job/);
+  assert.equal(h.messages.filter(message => /failed-job/.test(message.text)).length, 2);
+  assert.ok(failed.details.job_id);
+});
+
 test('needs_input notifies without consuming or cancelling an explicit batch', { timeout: 10000 }, async t => {
   const h = await harness(t, true);
   const gateA = join(h.dir, 'input-a'), gateB = join(h.dir, 'input-b');
