@@ -60,6 +60,12 @@ test("task outcomes get a separate tmux receipt without changing legacy settleme
       }
       throw new Error(`unexpected tmux call: ${args.join(" ")}`);
     },
+    async execChecked(command: string, args: string[]) {
+      const result = await pi.exec(command, args);
+      return result.code !== 0 || result.killed
+        ? { ok: false, error: { command, code: result.code, killed: result.killed ?? false, diagnostic: result.stderr } }
+        : { ok: true, value: result };
+    },
   };
   const sessionId = "session-task-outcome";
   const ctx = { mode: "tui", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => "/tmp/session.jsonl" } };
@@ -146,6 +152,12 @@ test("large dialogue reports use protected sidecars while tmux stays bounded", a
       if (args[0] === "wait-for") return { stdout: "", code: 0 };
       throw new Error(`unexpected tmux call: ${args.join(" ")}`);
     },
+    async execChecked(command: string, args: string[]) {
+      const result = await pi.exec(command, args);
+      return result.code !== 0 || result.killed
+        ? { ok: false, error: { command, code: result.code, killed: result.killed ?? false, diagnostic: result.stderr } }
+        : { ok: true, value: result };
+    },
   };
   const sessionId = "large-dialogue-session";
   const ctx = { mode: "tui", sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined } };
@@ -170,6 +182,124 @@ test("large dialogue reports use protected sidecars while tmux stays bounded", a
   const stored = JSON.parse(await readFile(pointer.receipt_path, "utf8"));
   assert.equal(stored.transport_report_present, true);
   assert.equal(await readFile(stored.transport_report_path, "utf8"), exact);
+});
+
+test("settlement waits for causal outcome publication and fails closed", { timeout: 10000 }, async t => {
+  const handlers = new Map<string, ((event: any, ctx: any) => unknown)[]>();
+  const listeners = new Map<string, ((data: unknown) => void)[]>();
+  const options = new Map<string, string>([
+    ["@pi_start_channel", "start-1"],
+    ["@pi_done_channel", "done-1"],
+    ["@pi_settled_channel", "settled"],
+    ["@pi_start_generation", "0"],
+    ["@pi_settled_generation", "0"],
+    ["@pi_outcome_channel", "outcome"],
+    ["@pi_outcome_generation", "0"],
+  ]);
+  const signals: string[] = [];
+  const errors: any[] = [];
+  let releasePublication!: () => void;
+  const publication = new Promise<void>(resolve => { releasePublication = resolve; });
+  let delayPublication = true;
+  let failPublication = false;
+  const pane = "%publication-barrier";
+  const oldPane = process.env.TMUX_PANE;
+  process.env.TMUX_PANE = pane;
+  t.after(() => {
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+  });
+  const pi: any = {
+    on(event: string, handler: (event: any, ctx: any) => unknown) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+    },
+    events: {
+      on(event: string, listener: (data: unknown) => void) {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+        return () => {};
+      },
+      emit(event: string, data: unknown) {
+        for (const listener of listeners.get(event) ?? []) listener(data);
+      },
+    },
+    async exec(_command: string, args: string[]) {
+      const option = args.find(value => value.startsWith("@pi_"));
+      if (args[0] === "show-options") return { stdout: `${options.get(option!) ?? ""}\n`, stderr: "", code: 0, killed: false };
+      if (args[0] === "set-option") {
+        if (failPublication && option === "@pi_outcome") return { stdout: "", stderr: "pane unavailable", code: 23, killed: false };
+        if (args.includes("-qu")) options.delete(option!);
+        else options.set(option!, args.at(-1)!);
+        return { stdout: "", stderr: "", code: 0, killed: false };
+      }
+      if (args[0] === "wait-for") {
+        const channel = args.at(-1)!;
+        signals.push(channel);
+        if (delayPublication && channel === "outcome") await publication;
+        return { stdout: "", stderr: "", code: 0, killed: false };
+      }
+      throw new Error(`unexpected tmux call: ${args.join(" ")}`);
+    },
+    async execChecked(command: string, args: string[]) {
+      const result = await pi.exec(command, args);
+      return result.code === 0
+        ? { ok: true, value: result }
+        : { ok: false, error: { command, code: result.code, killed: result.killed, diagnostic: result.stderr } };
+    },
+    recordError(record: unknown) { errors.push(record); return "error-entry"; },
+  };
+  const ctx = { mode: "tui", sessionManager: { getSessionId: () => "publication-session", getSessionFile: () => undefined } };
+  activate(pi);
+  for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+  for (const handler of handlers.get("agent_start") ?? []) await handler({}, ctx);
+
+  const settled = handlers.get("agent_settled")?.[0];
+  assert.ok(settled);
+  pi.events.emit("task-outcome", {
+    sessionId: "publication-session", jobId: "initial-job", attemptId: "initial-attempt",
+    mode: "task", outcome: "needs_input", source: "model", final: false, summary: "continue",
+  });
+  const firstSettlement = settled({}, ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(options.get("@pi_outcome_generation"), "0");
+  assert.equal(options.get("@pi_settled_generation"), "0");
+  assert.ok(Number(options.get("@pi_start_generation")) > Number(options.get("@pi_settled_generation")));
+  releasePublication();
+  await firstSettlement;
+  assert.equal(options.get("@pi_outcome_generation"), "1");
+  assert.equal(options.get("@pi_settled_generation"), "1");
+  const firstPointer = JSON.parse(options.get("@pi_outcome")!);
+  const firstReceipt = JSON.parse(await readFile(firstPointer.receipt_path, "utf8"));
+  assert.equal(firstReceipt.attempt_id, "initial-attempt");
+  assert.ok(signals.includes("outcome"));
+
+  options.set("@pi_start_channel", "start-2");
+  delayPublication = false;
+  for (const handler of handlers.get("agent_start") ?? []) await handler({}, ctx);
+  pi.events.emit("task-outcome", {
+    sessionId: "publication-session", jobId: "initial-job", attemptId: "followup-attempt",
+    mode: "task", outcome: "needs_input", source: "model", final: false, summary: "continue again",
+  });
+  await (settled({}, ctx));
+  assert.equal(options.get("@pi_outcome_generation"), "2");
+  assert.equal(options.get("@pi_settled_generation"), "2");
+  const secondPointer = JSON.parse(options.get("@pi_outcome")!);
+  assert.notEqual(secondPointer.attempt_id, firstPointer.attempt_id);
+  assert.equal(JSON.parse(await readFile(firstPointer.receipt_path, "utf8")).attempt_id, "initial-attempt");
+
+  options.set("@pi_start_channel", "start-3");
+  failPublication = true;
+  for (const handler of handlers.get("agent_start") ?? []) await handler({}, ctx);
+  pi.events.emit("task-outcome", {
+    sessionId: "publication-session", jobId: "initial-job", attemptId: "failed-attempt",
+    mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true, reportText: "not published",
+  });
+  await settled({}, ctx);
+  assert.equal(options.get("@pi_settled_generation"), "2");
+  assert.equal(options.get("@pi_outcome_generation"), "2");
+  assert.deepEqual(errors[0], {
+    version: 1, source: "subagent", operation: "outcome_publication", message: "tmux exited 23: pane unavailable",
+    correlation: { session_id: "publication-session", job_id: "initial-job", attempt_id: "failed-attempt" },
+  });
 });
 
 test("restart transport loss waits for tmux owner initialization", { timeout: 10000 }, async t => {
