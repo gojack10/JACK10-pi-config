@@ -83,7 +83,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_update", (event) => {
 		cacheStatus.updateMessage(event.message, false);
 		animateFlash();
-		void publish();
 		render();
 	});
 	pi.on("message_end", (event) => {
