@@ -43,7 +43,8 @@ session_id=$(sed -n 's/.*"sessionId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 mode=$(sed -n 's/.*"mode":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 report=$(sed -n 's/.*"reportPath":"\\([^\"]*\\)".*/\\1/p' "$manifest")
 session_file="$manifest.session.jsonl"
-printf '{"fake":true}\\n' > "$session_file"
+session_id="actual-pi-$job"
+printf '{"type":"session","id":"%s"}\\n' "$session_id" > "$session_file"
 tmux set-option -q -t "$pane" @pi_session_file "$session_file"
 gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
 tmux set-option -q -t "$pane" @pi_start_generation $((gen + 1))
@@ -182,7 +183,7 @@ while :; do
   mode=$(sed -n 's/.*"mode":"\\([^\"]*\\)".*/\\1/p' "$manifest")
   report=$(sed -n 's/.*"reportPath":"\\([^\"]*\\)".*/\\1/p' "$manifest")
   session_file="$manifest.session.jsonl"
-  printf '{"fake":true,"attempt":"%s"}\n' "$attempt" > "$session_file"
+  printf '{"type":"session","id":"%s"}\n' "$session_id" > "$session_file"
   tmux set-option -q -t "$pane" @pi_session_file "$session_file"
   gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
   tmux set-option -q -t "$pane" @pi_start_generation $((gen + 1))
@@ -300,7 +301,7 @@ while :; do
   mode=$(sed -n 's/.*"mode":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
   report=$(sed -n 's/.*"reportPath":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
   session_file="$manifest.session.jsonl"
-  printf '{"fake":true,"attempt":"%s"}\\n' "$attempt" > "$session_file"
+  printf '{"type":"session","id":"%s"}\\n' "$session_id" > "$session_file"
   tmux set-option -q -t "$pane" @pi_session_file "$session_file"
   start_gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
   tmux set-option -q -t "$pane" @pi_start_generation $((start_gen + 1))
@@ -576,7 +577,7 @@ test("monitor rejects a nonempty report symlink at final validation", { timeout:
     await unlink(report);
     await symlink(target, report);
     const sessionFile = join(dir, "session.jsonl");
-    await writeFile(sessionFile, "session\n");
+    await writeFile(sessionFile, JSON.stringify({ type: "session", id: "monitor-session" }) + "\n");
     const manifest = join(dir, "manifest.json");
     await writeFile(manifest, JSON.stringify({ version: 1, jobId: job, attemptId: attempt,
       sessionId: "monitor-session", mode: "task", reportPath: report,

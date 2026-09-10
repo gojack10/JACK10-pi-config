@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { open, readFile } from "node:fs/promises";
 
 const config = JSON.parse(process.argv[2] ?? "{}");
@@ -54,6 +55,21 @@ const generation = async () => {
   return Number.isSafeInteger(value) ? value : 0;
 };
 const sessionFile = async () => await show(config.sessionFileOption);
+// Pi owns the identity; the manifest sessionId is only a transport handle.
+const piSessionId = async path => {
+  const published = await show(config.sessionIdOption);
+  if (published) return published;
+  if (!path) return undefined;
+  const stream = createReadStream(path, { encoding: "utf8" });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      const header = JSON.parse(line);
+      return header.type === "session" && typeof header.id === "string" && header.id ? header.id : undefined;
+    }
+  } catch { return undefined; }
+  finally { lines.close(); stream.destroy(); }
+};
 const nonEmptyRegularReport = async (path, manifest) => {
   if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") return false;
   const identity = manifest?.reportIdentity;
@@ -102,6 +118,7 @@ const manifestDeadline = Date.now() + config.startTimeoutMs;
 let lastGeneration;
 let activeKey;
 let startedKey;
+let startedSessionId;
 let signal = waitForChannel(config.outcomeChannel, config.pollMs * 4);
 
 while (true) {
@@ -150,6 +167,11 @@ while (true) {
       const file = await sessionFile();
       if (Number.isSafeInteger(startGeneration) && startGeneration > manifest.startGeneration && file) {
         startWait.cancel();
+        startedSessionId = await piSessionId(file);
+        if (!startedSessionId) {
+          protocolFailure("protocol_incomplete: missing or invalid Pi session header");
+          process.exit(0);
+        }
         startedKey = key;
         emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
           sessionFile: file, channel: observedChannel });
@@ -183,7 +205,7 @@ while (true) {
     try { receipt = raw ? JSON.parse(raw) : undefined; } catch { receipt = undefined; }
     const source = receipt && receipt.source === undefined ? "model" : receipt?.source;
     if (!receipt || receipt.job_id !== expected.jobId || receipt.attempt_id !== expected.attemptId ||
-        receipt.mode !== expected.mode || receipt.session_id !== expected.sessionId ||
+        receipt.mode !== expected.mode || receipt.session_id !== startedSessionId ||
         typeof receipt.outcome !== "string" ||
         (receipt.source !== undefined && !["model", "technical", "protocol", "transport"].includes(receipt.source))) {
       emit({ kind: "evidence", jobId: manifest.jobId, attemptId: manifest.attemptId,
