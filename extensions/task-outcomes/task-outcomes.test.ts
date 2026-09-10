@@ -9,6 +9,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import test from "node:test";
 
+const inheritedSubagentEnv = {
+  TMUX_PANE: process.env.TMUX_PANE,
+  PI_SUBAGENT_MANIFEST: process.env.PI_SUBAGENT_MANIFEST,
+};
+delete process.env.TMUX_PANE;
+delete process.env.PI_SUBAGENT_MANIFEST;
+test.after(() => {
+  for (const [key, value] of Object.entries(inheritedSubagentEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
 const execFileAsync = promisify(execFile);
 
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
