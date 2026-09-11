@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { createRequire } from "node:module";
 import test from "node:test";
-import { registerFriendlyStop, writeReceipt } from "./rlm-friendly-stop.ts";
+
+// Use the installed Pi/Jiti dependencies and aliases, just like extension loading.
+const packageDir = join(homedir(), ".local/share/pi-mono/packages/coding-agent");
+const require = createRequire(join(packageDir, "package.json"));
+const { createJiti } = require("jiti");
+const jiti = createJiti(import.meta.url, { alias: {
+	typebox: require.resolve("typebox"),
+	"@mariozechner/pi-coding-agent": join(packageDir, "dist/index.js"),
+	"@earendil-works/pi-coding-agent": join(packageDir, "dist/index.js"),
+} });
+const { registerFriendlyStop, writeReceipt } = await jiti.import("./rlm-friendly-stop.ts");
 
 type Handler = (event: any, ctx: any) => any;
 
@@ -77,6 +88,62 @@ test("registers only when both opt-in values are valid", () => {
 	assert.equal(registerFriendlyStop(pi as any, valid("/tmp/checkpoints")), true);
 	assert.deepEqual(pi.tools.map((tool) => tool.name), ["rlm_rollover_checkpoint"]);
 	assert.ok(pi.handlers.has("turn_end"));
+});
+
+test("Astra uses the shared 50..80 band without a percentage; other models need explicit temporary opt-in", async () => {
+	const astra = new FakePi();
+	assert.equal(registerFriendlyStop(astra as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-6-astra", PI_RLM_ROLLOVER_DIR: "/tmp/checkpoints" }), true);
+	const astraCtx = context(astra, 199_999);
+	astraCtx.model = { provider: "openai", id: "gpt-6-astra" };
+	await astra.emit("turn_end", {}, astraCtx);
+	assert.equal(astra.entries.length, 0);
+	astraCtx.setTokens(200_000);
+	await astra.emit("turn_end", {}, astraCtx);
+	assert.equal(astra.entries.at(-1).data.threshold, 200_000);
+	assert.equal(astra.entries.at(-1).data.upperThreshold, 320_000);
+	const unlisted = new FakePi();
+	assert.equal(registerFriendlyStop(unlisted as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-5.6-luna", PI_RLM_ROLLOVER_DIR: "/tmp/checkpoints" }), false);
+});
+
+test("upper shared boundary forces a nonfinal stop before ordinary work continues", async (t) => {
+	const directory = await tempDir(t);
+	const pi = new FakePi();
+	registerFriendlyStop(pi as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-6-astra", PI_RLM_ROLLOVER_DIR: directory });
+	const ctx = context(pi, 320_000);
+	ctx.model = { provider: "openai", id: "gpt-6-astra" };
+	await pi.emit("context", { messages: [] }, ctx);
+	assert.equal(ctx.abortCalls, 1);
+	assert.equal(pi.entries.at(-1).data.phase, "forced");
+	assert.match(pi.entries.at(-1).data.reason, /upper boundary/);
+});
+
+test("50/65/80 use effective windows and exact model IDs, independent of account resolution", async () => {
+	for (const percent of [50, 65, 80]) for (const [provider, id, window] of [
+		["openai-codex-sifttext", "gpt-5.6-luna", 272000],
+		["openrouter", "z-ai/glm-5.3-flash", 1048576],
+	] as const) {
+		const pi = new FakePi();
+		const config = { PI_RLM_FRIENDLY_STOP_MODEL: id, PI_RLM_FRIENDLY_STOP_PERCENT: String(percent), PI_RLM_ROLLOVER_DIR: "/tmp/checkpoints" };
+		registerFriendlyStop(pi as any, config);
+		const threshold = Math.floor(window * percent / 100);
+		const ctx = context(pi, threshold - 1);
+		ctx.model = { provider, id };
+		ctx.getContextUsage = () => ({ tokens: threshold - 1, contextWindow: window, percent: null });
+		await pi.emit("turn_end", {}, ctx);
+		assert.equal(pi.entries.length, 0);
+		ctx.getContextUsage = () => ({ tokens: threshold, contextWindow: window, percent });
+		await pi.emit("turn_end", {}, ctx);
+		assert.equal(pi.entries.at(-1).data.threshold, threshold);
+		const other = new FakePi();
+		registerFriendlyStop(other as any, config);
+		await other.emit("turn_end", {}, context(other, 2000000));
+		assert.equal(other.entries.length, 0, "unlisted model never arms");
+	}
+	for (const percent of ["49", "81", "65.5", "bad", ""]) {
+		const pi = new FakePi();
+		assert.equal(registerFriendlyStop(pi as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-6-astra", PI_RLM_FRIENDLY_STOP_PERCENT: percent, PI_RLM_ROLLOVER_DIR: "/tmp" }), false);
+		assert.equal(pi.tools.length, 0);
+	}
 });
 
 test("below threshold is unchanged; crossing arms once and next context gets one instruction", async () => {
@@ -259,4 +326,90 @@ test("reload reconstruction prevents duplicate injection and checkpoint", async 
 		completedOperationIds: [], nextOperation: "", symbolicUuidBindings: {}, failures: [], receiptPaths: [], notes: "",
 	}, undefined, undefined, finalCtx), /already exists/);
 	assert.ok(result.details.receiptPath);
+});
+
+test("tracked checkpoint and forced stop require their own durable resume, then re-arm across reload", async t => {
+	const directory = await tempDir(t);
+	const key = Symbol.for("pi.task-outcomes.manager-registry");
+	const registry = (globalThis as any)[key] ??= new WeakMap();
+	for (const forced of [false, true]) {
+		const pi = new FakePi();
+		const ctx = context(pi, 200000);
+		let active: any = { jobId: "job", attemptId: "attempt", state: "active" };
+		const manager = { snapshot: () => ({ active }), pauseForContext: (reason: string) => {
+			active.state = "context_paused";
+			active.contextPause = { reason };
+			return true;
+		} };
+		registry.set(ctx.sessionManager, manager);
+		registerFriendlyStop(pi as any, valid(directory, { PI_RLM_FRIENDLY_STOP_GRACE_TURNS: "1" }));
+		await pi.emit("turn_end", {}, ctx);
+		const params = { completedOperationIds: [], nextOperation: "next", symbolicUuidBindings: {}, failures: [], receiptPaths: [], notes: "" };
+		if (forced) {
+			await pi.emit("context", { messages: [] }, ctx);
+			await pi.emit("context", { messages: [] }, ctx);
+			assert.match(active.contextPause.reason, /checkpoint missing.*1 wrap-up turns.*grace exhausted.*forced-stop receipt/);
+			assert.equal(ctx.abortCalls, 1);
+		} else {
+			await pi.tools[0].execute("call", params, undefined, undefined, ctx);
+			assert.match(active.contextPause.reason, /Friendly checkpoint saved:/);
+		}
+		assert.equal(active.state, "context_paused");
+		const phase = forced ? "forced" : "checkpoint";
+		ctx.setTokens(100);
+		await pi.emit("agent_start", {}, ctx);
+		assert.equal(pi.entries.at(-1).data.phase, phase, "still paused at session startup");
+		active = { ...active, jobId: "foreign", state: "active" };
+		await pi.emit("agent_start", {}, ctx);
+		assert.equal(pi.entries.at(-1).data.phase, phase, "unrelated active job is not recovery");
+		active.jobId = "job";
+		await pi.emit("agent_start", {}, ctx);
+		assert.equal(pi.entries.at(-1).data.phase, phase, "active flag alone is not durable resume");
+		pi.appendEntry("task-outcome/v1", { kind: "context_resume", jobId: "job", attemptId: "attempt" });
+		await pi.emit("agent_start", {}, ctx);
+		assert.equal(pi.entries.at(-1).data.phase, "reset");
+		const reloaded = new FakePi();
+		reloaded.entries = structuredClone(pi.entries);
+		const next = context(reloaded, 100);
+		registry.set(next.sessionManager, manager);
+		registerFriendlyStop(reloaded as any, valid(directory));
+		await reloaded.emit("session_start", {}, next);
+		assert.equal(reloaded.messages.length, 0, "old checkpoint does not resurrect");
+		next.setTokens(200000);
+		await reloaded.emit("turn_end", {}, next);
+		assert.equal(reloaded.entries.at(-1).data.phase, "armed");
+		await reloaded.tools[0].execute("second", params, undefined, undefined, next);
+		assert.equal(reloaded.entries.at(-1).data.phase, "checkpoint", "second crossing can checkpoint");
+		registry.delete(ctx.sessionManager); registry.delete(next.sessionManager);
+	}
+});
+
+test("restoring an unfinished friendly stop cannot queue model work before parent resume", async () => {
+	const pi = new FakePi();
+	pi.appendEntry("rlm-friendly-stop-state", { version: 1, phase: "turn-queued", threshold: 200000, usage: null, wrapupTurns: 0 });
+	const ctx = context(pi, 100);
+	const registry = (globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")] ??= new WeakMap();
+	const active = { jobId: "job", attemptId: "attempt", state: "context_paused" };
+	registry.set(ctx.sessionManager, { snapshot: () => ({ active }) });
+	registerFriendlyStop(pi as any, valid("/tmp/checkpoints"));
+	await pi.emit("session_start", {}, ctx);
+	assert.equal(pi.messages.length, 0);
+	assert.equal(pi.entries.at(-1).data.phase, "armed");
+	active.state = "active";
+	await pi.emit("agent_start", {}, ctx);
+	assert.match((await pi.emit("context", { messages: [] }, ctx)).messages[0].content, /ROLLOVER REQUIRED/);
+	registry.delete(ctx.sessionManager);
+});
+
+test("standalone legacy forced stop still aborts when a task manager has no active assignment", async t => {
+	const directory = await tempDir(t);
+	const pi = new FakePi();
+	const ctx = context(pi, 200000);
+	const registry = (globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")] ??= new WeakMap();
+	registry.set(ctx.sessionManager, { snapshot: () => ({}), pauseForContext: () => assert.fail("no active task") });
+	registerFriendlyStop(pi as any, valid(directory, { PI_RLM_FRIENDLY_STOP_GRACE_TURNS: "1" }));
+	await pi.emit("context", { messages: [] }, ctx);
+	await pi.emit("context", { messages: [] }, ctx);
+	assert.equal(ctx.abortCalls, 1);
+	registry.delete(ctx.sessionManager);
 });

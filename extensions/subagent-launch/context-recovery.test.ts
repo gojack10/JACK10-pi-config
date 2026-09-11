@@ -11,7 +11,7 @@ const exec = promisify(execFile);
 
 // Every descendant, including the launcher's monitor and fake interactive child,
 // uses this disposable socket. No default or inherited live tmux server is used.
-for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
+for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 'friendly'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
   const env = { ...process.env };
   delete process.env.TMUX; delete process.env.TMUX_PANE; delete process.env.PI_SUBAGENT_MANIFEST;
   const dir = await mkdtemp(join(tmpdir(), 'context-recovery-'));
