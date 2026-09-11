@@ -241,24 +241,21 @@ done
     await writeFile(followupMission, "Continue after input.\n");
     const first: any = await launch.execute("test", {
       jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
-        cwd: dir, session_label: "dialogue", mode: "dialogue" }],
+        cwd: dir, session_label: "dialogue", mode: "dialogue", friendly_stop_percent: 65, friendly_stop_directory: dir }],
     }, undefined, undefined, ctx);
     const firstJob = first.details.jobs[0];
     assert.equal(firstJob.status, "running");
     childSession = firstJob.session_label;
     await until(() => messages.some(message => /need a continuation/.test(message.text)));
-    const second: any = await followup.execute("test", {
-      job_id: firstJob.job,
-      session_id: firstJob.session_id,
-      provider: "fake-provider",
-      model: "fake-model",
-      thinking: "xhigh",
-      mission_file: followupMission,
-      cwd: dir,
-      session_label: "dialogue",
-      mode: "dialogue",
-    }, undefined, undefined, ctx);
+    const continuation = { job_id: firstJob.job, session_id: firstJob.session_id, provider: "fake-provider",
+      model: "fake-model", thinking: "xhigh", mission_file: followupMission, cwd: dir, session_label: "dialogue", mode: "dialogue" };
+    await assert.rejects(followup.execute("test", { ...continuation, friendly_stop_percent: 50 }, undefined, undefined, ctx), /must match the saved launch/);
+    await assert.rejects(followup.execute("test", { ...continuation, friendly_stop_percent: 65, friendly_stop_directory: join(dir, "other") }, undefined, undefined, ctx), /must match the saved launch/);
+    const second: any = await followup.execute("test", continuation, undefined, undefined, ctx);
     assert.equal(second.details.status, "running");
+    const saved = JSON.parse(await readFile(second.details.manifest_file, "utf8"));
+    assert.equal(saved.friendlyStopPercent, 65);
+    assert.equal(saved.friendlyStopDirectory, dir);
     await until(() => messages.some(message => message.text.endsWith("  follow-up 😀  ")));
     assert.equal(messages.filter(message => message.text.includes("follow-up 😀")).length, 1);
     assert.equal(messages.find(message => message.text.includes("follow-up 😀"))!.options.deliverAs, "steer");
@@ -310,6 +307,12 @@ test("subagent_launch rejects an explicitly unsupported thinking level before tm
       }, undefined, undefined, ctx),
       /does not support thinking level xhigh/,
     );
+    for (const percent of [49, 81, 65.5]) {
+      await assert.rejects(owner.tools.get("subagent_launch")!.definition.execute("test", {
+        jobs: [{ provider: "fake-provider", model: "unsupported-model", thinking: "off", mission_file: mission,
+          cwd: dir, session_label: "invalid-limit", mode: "task", report_file: report, friendly_stop_percent: percent }],
+      }, undefined, undefined, ctx), /integer from 50 through 80/);
+    }
     assert.equal(execCalls, 0);
   } finally {
     if (oldPane === undefined) delete process.env.TMUX_PANE;

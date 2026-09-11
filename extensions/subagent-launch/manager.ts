@@ -4,7 +4,7 @@ import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { access, lstat, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +35,7 @@ const START_CHANNEL_OPTION = "@pi_start_channel";
 const DONE_CHANNEL_OPTION = "@pi_done_channel";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
 const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
+const FRIENDLY_PRODUCTION_MODEL = "gpt-6-astra";
 
 export interface SubagentJobInput {
   provider: string;
@@ -45,6 +46,9 @@ export interface SubagentJobInput {
   session_label: string;
   mode: TaskMode;
   report_file?: string;
+  /** Run-scoped friendly-stop opt-in; omitted means disabled. */
+  friendly_stop_percent?: number;
+  friendly_stop_directory?: string;
 }
 
 export interface SubagentFollowupInput extends SubagentJobInput {
@@ -75,6 +79,8 @@ interface StoredState {
   startResults: Map<string, boolean>;
   outputBuffer: string;
   finished: boolean;
+  friendlyStopPercent?: number;
+  friendlyStopDirectory?: string;
   contextPauseId?: string;
   recoveryPending?: string;
   parentJobId?: string;
@@ -194,6 +200,7 @@ const extensionPaths = (): string[] => {
     join(extensionsDir, "tmux-turn-signal.ts"),
     join(extensionsDir, "subagent-launch.ts"),
     join(extensionsDir, "openai-272k-guard.ts"),
+    join(dirname(extensionsDir), "optional-extensions", "rlm-friendly-stop.ts"),
   ];
 };
 
@@ -458,6 +465,20 @@ export class SubagentLauncher {
       throw new Error("follow-up provider/model/thinking must explicitly match the saved route");
     }
     if (old.mode !== input.mode) throw new Error("follow-up mode must match the saved mode");
+    const savedFriendlyPercent = old.friendlyStopPercent as number | undefined;
+    const savedFriendlyDirectory = old.friendlyStopDirectory as string | undefined;
+    if (savedFriendlyDirectory === undefined) {
+      if (input.friendly_stop_percent !== undefined || input.friendly_stop_directory !== undefined) {
+        throw new Error("follow-up cannot change friendly-stop settings on an unconfigured launch");
+      }
+    } else {
+      if (input.friendly_stop_percent !== undefined && input.friendly_stop_percent !== savedFriendlyPercent) {
+        throw new Error("follow-up friendly_stop_percent must match the saved launch");
+      }
+      if (input.friendly_stop_directory !== undefined && asPath(input.friendly_stop_directory, "friendly_stop_directory") !== savedFriendlyDirectory) {
+        throw new Error("follow-up friendly_stop_directory must match the saved launch");
+      }
+    }
     const cwd = asPath(input.cwd, "cwd");
     const missionFile = asPath(input.mission_file, "mission_file");
     await requireDirectory(cwd, "cwd");
@@ -506,6 +527,8 @@ export class SubagentLauncher {
         provider: input.provider,
         model: input.model,
         thinking: input.thinking,
+        friendlyStopPercent: savedFriendlyPercent,
+        friendlyStopDirectory: savedFriendlyDirectory,
         startChannel: unique("pi-subagent-start"),
         startGeneration: Number.isSafeInteger(currentStartGeneration) ? currentStartGeneration : 0,
         outcomeGeneration: Number.isSafeInteger(currentOutcomeGeneration) ? currentOutcomeGeneration : 0,
@@ -538,6 +561,8 @@ export class SubagentLauncher {
         startResults: new Map(),
         outputBuffer: "",
         finished: false,
+        friendlyStopPercent: savedFriendlyPercent,
+        friendlyStopDirectory: savedFriendlyDirectory,
         parentJobId: old.parentJobId,
       };
       await this.armMonitor(state, batch);
@@ -611,6 +636,14 @@ export class SubagentLauncher {
       if (!SAFE_ID.test(provider.replaceAll("/", "_")) || /[\s]/.test(provider)) throw new Error("provider is not a safe route identifier");
       if (input.thinking === undefined || !THINKING_LEVELS.includes(input.thinking)) throw new Error("thinking must be explicit and valid");
       if (input.mode !== "task" && input.mode !== "dialogue") throw new Error("mode must be task or dialogue");
+      if (input.friendly_stop_percent !== undefined &&
+          (!Number.isInteger(input.friendly_stop_percent) || input.friendly_stop_percent < 50 || input.friendly_stop_percent > 80)) {
+        throw new Error("friendly_stop_percent must be an integer from 50 through 80");
+      }
+      if (input.friendly_stop_directory !== undefined) asPath(input.friendly_stop_directory, "friendly_stop_directory");
+      if (input.friendly_stop_directory !== undefined && input.friendly_stop_percent === undefined && input.model !== FRIENDLY_PRODUCTION_MODEL) {
+        throw new Error("friendly_stop_directory requires a friendly-stop percentage unless launching Astra");
+      }
       if (!this.ctx.modelRegistry) throw new Error("model registry is unavailable; route cannot be verified");
       const model = this.ctx.modelRegistry.find(provider, modelId);
       const available = this.ctx.modelRegistry.getAvailable().some(candidate => candidate.provider === provider && candidate.id === modelId);
@@ -639,6 +672,14 @@ export class SubagentLauncher {
     parentPane: string,
     extensions: string[],
   ): Promise<StoredState> {
+    let friendlyDirectory: string | undefined;
+    const friendlyOptIn = item.input.friendly_stop_percent !== undefined || item.input.model === FRIENDLY_PRODUCTION_MODEL;
+    if (friendlyOptIn) {
+      const configured = item.input.friendly_stop_directory ?? process.env.PI_RLM_ROLLOVER_DIR ?? join(tmpdir(), `pi-friendly-stop-${item.jobId}`);
+      friendlyDirectory = asPath(configured, "friendly_stop_directory");
+      await mkdir(friendlyDirectory, { recursive: true, mode: 0o700 });
+      await requireDirectory(friendlyDirectory, "friendly_stop_directory");
+    }
     const parentSession = (await this.tmux(["display-message", "-p", "-t", parentPane, "#{session_id}"])).trim();
     if (!/^\$\d+$/.test(parentSession)) throw new Error("could not resolve parent tmux session");
     const paneId = (await this.tmux(["new-session", "-d", "-s", item.sessionLabel, "-c", item.cwd]),
@@ -655,6 +696,8 @@ export class SubagentLauncher {
       batchId: item.batchId,
       activatedAt: item.activatedAt,
       parentJobId: item.parentJobId,
+      friendlyStopPercent: item.input.friendly_stop_percent,
+      friendlyStopDirectory: friendlyDirectory,
       provider: item.input.provider,
       model: item.input.model,
       thinking: item.input.thinking,
@@ -695,7 +738,14 @@ export class SubagentLauncher {
       "--name", item.sessionLabel,
       "--", `@${item.missionFile}`,
     ];
-    await writeFile(bootPath, `exec ${args.map(shellQuote).join(" ")}\n`, { flag: "wx" });
+    const friendlyNames = ["PI_RLM_FRIENDLY_STOP_TOKENS", "PI_RLM_FRIENDLY_STOP_MODEL", "PI_RLM_FRIENDLY_STOP_PERCENT", "PI_RLM_ROLLOVER_DIR", "PI_RLM_FRIENDLY_STOP_GRACE_TURNS"];
+    const friendlyEnv = friendlyOptIn ? [
+      `PI_RLM_FRIENDLY_STOP_MODEL=${item.input.model}`,
+      ...(item.input.friendly_stop_percent === undefined ? [] : [`PI_RLM_FRIENDLY_STOP_PERCENT=${item.input.friendly_stop_percent}`]),
+      `PI_RLM_ROLLOVER_DIR=${friendlyDirectory}`,
+    ] : [];
+    const command = ["env", ...friendlyNames.flatMap(name => ["-u", name]), ...friendlyEnv, ...args];
+    await writeFile(bootPath, `exec ${command.map(shellQuote).join(" ")}\n`, { flag: "wx" });
     await this.set(paneId, "@pi_subagent_boot_file", bootPath);
     return {
       jobId: item.jobId,
@@ -709,6 +759,8 @@ export class SubagentLauncher {
       model: item.input.model,
       thinking: item.input.thinking,
       mode: item.input.mode,
+      friendlyStopPercent: item.input.friendly_stop_percent,
+      friendlyStopDirectory: friendlyDirectory,
       manifestPath,
       reportPath: item.reportPath,
       startWaiters: new Map(),
@@ -930,6 +982,8 @@ export const launchJobSchema = Type.Object({
   session_label: Type.String({ minLength: 1, maxLength: 64 }),
   mode: StringEnum(["task", "dialogue"] as const),
   report_file: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+  friendly_stop_percent: Type.Optional(Type.Integer({ minimum: 50, maximum: 80 })),
+  friendly_stop_directory: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
 }, { additionalProperties: false });
 
 export const launchSchema = Type.Object({ jobs: Type.Array(launchJobSchema, { minItems: 1, maxItems: MAX_JOBS }) }, { additionalProperties: false });
