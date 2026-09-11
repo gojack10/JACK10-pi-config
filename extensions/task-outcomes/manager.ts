@@ -16,7 +16,7 @@ export const TASK_OUTCOME_EVENT = "task-outcome";
 
 export type TaskMode = "task" | "dialogue";
 export type DeclaredOutcome = "completed" | "blocked" | "needs_input" | "failed";
-export type MonitorOutcome = DeclaredOutcome | "protocol_incomplete" | "dialogue_settled" | "transport_lost";
+export type MonitorOutcome = DeclaredOutcome | "protocol_incomplete" | "dialogue_settled" | "transport_lost" | "context_paused";
 export type OutcomeSource = "model" | "technical" | "protocol" | "transport";
 
 export const TASK_LAUNCH_MANIFEST_OPTION = "@pi_subagent_manifest";
@@ -60,7 +60,8 @@ export interface TaskOutcomeRecord {
 export interface TaskContractSnapshot extends Omit<TaskLaunchContract, "ownerSessionId" | "childJobIds"> {
   ownerSessionId: string;
   childJobIds: readonly string[];
-  state: "active" | "awaiting_input" | "transport_lost" | "final";
+  state: "active" | "awaiting_input" | "transport_lost" | "final" | "context_paused";
+  contextPause?: { id: string; reason: string; limit: number };
   declaration?: { outcome: DeclaredOutcome; summary: string };
   pendingWork: readonly string[];
 }
@@ -98,6 +99,7 @@ interface ContractState extends TaskLaunchContract {
   activatedAt: number;
   childGeneration: number;
   state: TaskContractSnapshot["state"];
+  contextPause?: TaskContractSnapshot["contextPause"];
   declaration?: {
     outcome: DeclaredOutcome;
     summary: string;
@@ -127,7 +129,8 @@ interface PersistedEvent {
   version: 1;
   eventId: string;
   branchId?: string;
-  kind: "contract" | "declaration" | "declaration_invalidated" | "child_outcome" | "work_ready" | "outcome" | "transport_lost";
+  kind: "contract" | "declaration" | "declaration_invalidated" | "child_outcome" | "work_ready" | "outcome" | "transport_lost" | "context_pause" | "context_resume";
+  contextPause?: TaskContractSnapshot["contextPause"];
   at: string;
   contract?: TaskLaunchContract & {
     ownerSessionId: string;
@@ -270,7 +273,9 @@ export class TaskOutcomeManager {
         this.markTransportLost(contract, "monitor restarted before a final outcome");
       }
     }
-    this.activeKey = undefined;
+    this.activeKey = [...this.contracts.values()]
+      .filter(contract => contract.ownerSessionId === this.runtime.sessionId && contract.state === "context_paused")
+      .map(contract => this.key(contract.jobId, contract.attemptId)).at(-1);
     this.retryPendingNotifications();
   }
 
@@ -291,7 +296,7 @@ export class TaskOutcomeManager {
     this.observedLeafId = nextLeafId;
     this.replay();
     for (const contract of this.contracts.values()) {
-      if (contract.state === "active" && contract.ownerSessionId === this.runtime.sessionId) {
+      if ((contract.state === "active" || contract.state === "context_paused") && contract.ownerSessionId === this.runtime.sessionId) {
         this.activeKey = this.key(contract.jobId, contract.attemptId);
         this.watchWork(contract, false);
         if (contract.workReadyPendingSequence !== undefined && !contract.workReadyNotified) {
@@ -654,6 +659,37 @@ Then call report_outcome with an honest outcome and summary. Use completed only 
 The declaration is provisional until clean settlement. Do not start more work after declaring. Missing declarations trigger at most two corrective turns, then protocol failure.`;
   }
 
+  pauseForContext(reason: string, limit: number): boolean {
+    const contract = this.activeContract();
+    if (!contract || !["active", "context_paused"].includes(contract.state)) return false;
+    if (contract.contextPause) return true;
+    assertSummary(reason);
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("invalid context limit");
+    const contextPause = { id: randomUUID(), reason, limit };
+    this.persist({ kind: "context_pause", jobId: contract.jobId, attemptId: contract.attemptId, contextPause });
+    contract.contextPause = contextPause;
+    contract.state = "context_paused";
+    return true;
+  }
+
+  resumeAfterContextClean(jobId: string, attemptId: string, pauseId: string, tokens: number): void {
+    const contract = this.requireActive(jobId);
+    if (contract.attemptId !== attemptId || contract.state !== "context_paused" || contract.contextPause?.id !== pauseId) {
+      throw new Error("context recovery no longer matches the paused attempt");
+    }
+    if (!Number.isFinite(tokens) || tokens < 0 || tokens >= contract.contextPause.limit) {
+      throw new Error("cleaned context is still over the limit; assignment remains paused");
+    }
+    if (this.pendingWork(contract).length > 0) throw new Error("cannot reload while child/background work is pending");
+    this.persist({ kind: "context_resume", jobId, attemptId }, this.operationEventId("context_resume", contract, pauseId));
+    contract.contextPause = undefined;
+    contract.state = "active";
+    contract.declaration = undefined;
+    this.lastRunFailure = undefined;
+    this.corrections.delete(this.key(jobId, attemptId));
+    this.watchWork(contract);
+  }
+
   onAgentStart(): void {
     this.run += 1;
     this.turn = -1;
@@ -682,8 +718,15 @@ The declaration is provisional until clean settlement. Do not start more work af
 
   async onAgentSettled(hasPendingMessages: boolean): Promise<void> {
     const contract = this.activeContract();
-    if (!contract || contract.state !== "active") return;
-    if (hasPendingMessages || contract.state === "awaiting_input") return;
+    if (contract?.state === "context_paused" && contract.contextPause) {
+      // A known local context block is recoverable, not a generic final abort.
+      // A pause is not completion: queued input must not hide the original cause.
+      // Maintenance checks idle/queue state separately before changing anything.
+      this.emitOutcome({ contract, outcome: "context_paused", source: "technical",
+        summary: contract.contextPause.reason, final: false });
+      return;
+    }
+    if (!contract || contract.state !== "active" || hasPendingMessages) return;
     // Persistent SessionManager instances can hold entries in memory before Pi
     // writes the first assistant response. Do not publish a settlement that a
     // restart cannot reach; in-memory sessions have no file boundary to check.
@@ -794,6 +837,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       childJobIds: [...contract.childJobIds],
       ownerSessionId: contract.ownerSessionId,
       state: contract.state,
+      contextPause: contract.contextPause && { ...contract.contextPause },
       declaration: contract.declaration && { outcome: contract.declaration.outcome, summary: contract.declaration.summary },
       pendingWork: this.pendingWork(contract),
     };
@@ -1067,6 +1111,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       reportPath: input.contract.reportPath,
       ...(input.reportText !== undefined ? { reportText: input.reportText } : {}),
       final: input.final,
+      ...(input.outcome === "context_paused" ? { pauseId: input.contract.contextPause?.id } : {}),
     });
   }
 
@@ -1280,6 +1325,7 @@ The declaration is provisional until clean settlement. Do not start more work af
           : previous?.activatedAt ?? Date.parse(event.at),
         childGeneration: event.contract.childGeneration ?? previous?.childGeneration ?? 0,
         state: previous?.state ?? "active",
+        contextPause: previous?.contextPause,
         declaration: previous?.declaration,
         declarationSequence: previous?.declarationSequence ?? 0,
         workReadySequence: previous?.workReadySequence ?? 0,
@@ -1294,7 +1340,14 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (!event.jobId || !event.attemptId) return;
     const contract = this.contracts.get(this.key(event.jobId, event.attemptId));
     if (!contract) return;
-    if (event.kind === "declaration") {
+    if (event.kind === "context_pause" && event.contextPause) {
+      contract.state = "context_paused";
+      contract.contextPause = event.contextPause;
+    } else if (event.kind === "context_resume") {
+      contract.state = "active";
+      contract.contextPause = undefined;
+      contract.declaration = undefined;
+    } else if (event.kind === "declaration") {
       if (isOutcome(event.outcome) && event.summary) {
         const sequence = event.declarationSequence ?? contract.declarationSequence;
         contract.declaration = {
@@ -1412,6 +1465,11 @@ export function getTaskOutcomeManager(pi: Pick<ExtensionAPI, "appendEntry" | "se
     manager.attach(runtime);
   }
   return manager;
+}
+
+// Session replacement callbacks must use the replacement owner's manager, never captured old pi/ctx.
+export function existingTaskOutcomeManager(ctx: SessionOwnerContext): TaskOutcomeManager | undefined {
+  return managers.get(ctx.sessionManager as object);
 }
 
 export function releaseTaskOutcomeManager(ctx: SessionOwnerContext): void {

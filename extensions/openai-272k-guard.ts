@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { getTaskOutcomeManager } from "./task-outcomes/manager.ts";
 
 const PRICING_LIMIT = 272_000;
 // Just above Pi's 255,616-token auto-compaction threshold. Mid-loop compaction
@@ -77,10 +78,13 @@ export default function openAI272KGuard(pi: ExtensionAPI) {
 
 		const tokens = usage?.tokens ?? 0;
 		ctx.ui.setStatus(STATUS_KEY, `BLOCKED ${Math.round(tokens / 1000)}K`);
-		ctx.ui.notify(
-			`Blocked OpenAI request at ~${tokens.toLocaleString()} context tokens. Run /compact or /tool-call-clean, then retry.`,
-			"error",
-		);
+		const reason = `Blocked OpenAI request at ~${tokens.toLocaleString()} context tokens. Run /compact or /tool-call-clean, then retry.`;
+		ctx.ui.notify(reason, "error");
+		try {
+			getTaskOutcomeManager(pi, ctx).pauseForContext(reason, REQUEST_GUARD);
+		} catch (error) {
+			ctx.ui.notify(`Context pause could not be saved: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
 		ctx.abort();
 		// Codex can reuse an already-open WebSocket after abort. Replace the payload too,
 		// so even that race cannot transmit the expensive conversation.

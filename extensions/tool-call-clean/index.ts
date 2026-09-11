@@ -94,6 +94,32 @@ function rewriteAtomically(sessionFile: string, content: string) {
 	}
 }
 
+// Shared by the human command and tracked subagent maintenance; no model request here.
+export function cleanSessionFile(sessionFile: string, contextLimit = Infinity) {
+	const original = readFileSync(sessionFile, "utf8");
+	const rows = original.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	const beforeTokens = freshContextEstimate(rows);
+	const result = cleanRows(rows);
+	const afterTokens = freshContextEstimate(result.rows);
+	if (afterTokens >= contextLimit) throw new Error("Tool cleanup cannot free enough context; assignment remains paused");
+	const usageRefreshed = refreshLastUsageEstimate(result.rows);
+	const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+	const changed = result.clearedResults > 0 || usageRefreshed;
+	if (changed) {
+		if (readFileSync(sessionFile, "utf8") !== original) {
+			throw new Error("Session changed during cleanup; run the command again while idle");
+		}
+		copyFileSync(sessionFile, backupName(sessionFile));
+		rewriteAtomically(sessionFile, cleaned);
+	}
+	const summary = result.clearedResults > 0
+		? `Cleared ${result.clearedResults} tool outputs; preserved all thinking and assistant blocks; fresh message estimate ${formatTokens(beforeTokens)} → ${formatTokens(afterTokens)}`
+		: usageRefreshed
+			? `Refreshed footer context estimate to ${formatTokens(afterTokens)}`
+			: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
+	return { changed, summary, beforeTokens, afterTokens };
+}
+
 function runSelfTest() {
 	const rows: Row[] = [
 		{ type: "session", id: "session" },
@@ -162,28 +188,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			try {
-				const original = readFileSync(sessionFile, "utf8");
-				const rows = original.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-				const beforeTokens = freshContextEstimate(rows);
-				const result = cleanRows(rows);
-				const afterTokens = freshContextEstimate(result.rows);
-				const usageRefreshed = refreshLastUsageEstimate(result.rows);
-				const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
-				const changed = result.clearedResults > 0 || usageRefreshed;
-
-				if (changed) {
-					if (readFileSync(sessionFile, "utf8") !== original) {
-						throw new Error("Session changed during cleanup; run the command again while idle");
-					}
-					copyFileSync(sessionFile, backupName(sessionFile));
-					rewriteAtomically(sessionFile, cleaned);
-				}
-
-				const summary = result.clearedResults > 0
-					? `Cleared ${result.clearedResults} tool outputs; preserved all thinking and assistant blocks; fresh message estimate ${formatTokens(beforeTokens)} → ${formatTokens(afterTokens)}`
-					: usageRefreshed
-						? `Refreshed footer context estimate to ${formatTokens(afterTokens)}`
-						: `Already clean; fresh message estimate ${formatTokens(afterTokens)}`;
+				const { changed, summary } = cleanSessionFile(sessionFile);
 
 				if (!changed) {
 					ctx.ui.setStatus("tool-call-clean", summary);
