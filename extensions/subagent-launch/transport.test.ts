@@ -97,13 +97,18 @@ sleep .1
     }, undefined, undefined, ctx);
     assert.equal(result.details.jobs[0].status, "running");
     childSession = result.details.jobs[0].session_label;
-    await until(() => messages.length === 1);
+    // Both the immediate failure and final batch recap can arrive before this check.
+    await until(() => messages.length >= 1);
     assert.match(messages[0].text, /child transport ended/);
     assert.match(messages[0].text, /\[transport\]/);
     assert.doesNotMatch(messages[0].text, /protocol_incomplete/);
     const background = (globalThis[Symbol.for("pi.background-jobs.manager-registry")] as WeakMap<object, any>)
       .get(ctx.sessionManager);
+    // The failure notification precedes final batch accounting.
+    await until(() => background.getReport(result.details.batch_id) !== undefined);
     assert.equal(background.getReport(result.details.batch_id).completions[0].source, "transport");
+    assert.equal(messages.filter(message => message.text.startsWith("SYSTEM (background-jobs): outcome ")).length, 1,
+      "one immediate failure notice, separate from the final batch recap");
   } finally {
     process.env.PATH = oldPath;
     if (oldPane === undefined) delete process.env.TMUX_PANE;
