@@ -347,7 +347,8 @@ while (true) {
       }
       const hasReport = reportText !== undefined;
       if (receipt.outcome === "needs_input" || (receipt.final === false && receipt.outcome !== "transport_lost")) {
-        emit({ kind: "needs_input", jobId: receipt.job_id, attemptId: receipt.attempt_id,
+        emit({ kind: receipt.outcome === "context_paused" ? "context_paused" : "needs_input",
+          jobId: receipt.job_id, attemptId: receipt.attempt_id, pauseId: receipt.pause_id,
           source, final: false, summary: receipt.summary ?? "child requested human input", report: receipt.report });
       } else {
         let outcome = receipt.outcome;
