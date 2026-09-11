@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { link, mkdir, open, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { Type } from "typebox";
+import { existingTaskOutcomeManager } from "../extensions/task-outcomes/manager.ts";
 
 const STATE_TYPE = "rlm-friendly-stop-state";
 const STATE_VERSION = 1;
@@ -10,18 +11,25 @@ const INSTRUCTION =
 	"RLM ROLLOVER REQUIRED. Start no new work and make no SiftText/ideation mutations. Preserve exact execution state for the replacement model: completed operation IDs, the exact next operation, symbolic UUID bindings, failures, and receipt paths. Call rlm_rollover_checkpoint as your FINAL action; do not respond after it.";
 
 type Usage = { tokens: number | null; contextWindow: number; percent: number | null };
-type Phase = "armed" | "turn-queued" | "injected" | "checkpoint" | "forced";
+type Phase = "armed" | "turn-queued" | "injected" | "checkpoint" | "forced" | "reset";
 type State = {
 	version: 1;
 	phase: Phase;
 	threshold: number;
+	upperThreshold: number;
 	usage: Usage | null;
 	wrapupTurns: number;
 	receiptPath?: string;
 	reason?: string;
+	pausedTask?: { jobId: string; attemptId: string };
 };
 
 type Env = Record<string, string | undefined>;
+
+type Config = { threshold?: number; model?: string; percent?: number; directory: string; graceTurns: number };
+const PRODUCTION_MODEL = "gpt-6-astra";
+const LOWER_PERCENT = 50;
+const UPPER_PERCENT = 80;
 
 function positiveInteger(value: string | undefined): number | undefined {
 	if (!value || !/^\d+$/.test(value)) return;
@@ -30,12 +38,22 @@ function positiveInteger(value: string | undefined): number | undefined {
 	return parsed;
 }
 
-function config(env: Env) {
-	const threshold = positiveInteger(env.PI_RLM_FRIENDLY_STOP_TOKENS);
+function config(env: Env): Config | undefined {
+	const legacyThreshold = positiveInteger(env.PI_RLM_FRIENDLY_STOP_TOKENS);
+	const model = env.PI_RLM_FRIENDLY_STOP_MODEL;
+	const parsedPercent = positiveInteger(env.PI_RLM_FRIENDLY_STOP_PERCENT);
+	const percent = parsedPercent !== undefined && parsedPercent >= 50 && parsedPercent <= 80 ? parsedPercent : undefined;
 	const directory = env.PI_RLM_ROLLOVER_DIR;
 	const graceTurns = positiveInteger(env.PI_RLM_FRIENDLY_STOP_GRACE_TURNS) ?? 2;
-	if (!threshold || !directory || !isAbsolute(directory)) return;
-	return { threshold, directory, graceTurns };
+	if (!directory || !isAbsolute(directory)) return;
+	if (legacyThreshold) return { threshold: legacyThreshold, directory, graceTurns };
+	if (env.PI_RLM_FRIENDLY_STOP_PERCENT !== undefined && percent === undefined) return;
+	if (model && (percent !== undefined || model === PRODUCTION_MODEL)) return { model, percent, directory, graceTurns };
+	return;
+}
+
+export function friendlyStopThreshold(contextWindow: number, percent: number): number {
+	return Math.floor(contextWindow * percent / 100);
 }
 
 function safePart(value: string | null | undefined): string {
@@ -89,8 +107,14 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 	};
 	const arm = (ctx: ExtensionContext): boolean => {
 		const current = usage(ctx);
-		if (state || current?.tokens === null || current === null || current.tokens < enabled.threshold) return false;
-		state = { version: STATE_VERSION, phase: "armed", threshold: enabled.threshold, usage: current, wrapupTurns: 0 };
+		const identity = ctx.model?.id ?? "";
+		const threshold = enabled.threshold ?? (current && Number.isFinite(current.contextWindow) && current.contextWindow > 0
+			? friendlyStopThreshold(current.contextWindow, enabled.percent ?? LOWER_PERCENT) : undefined);
+		const upperThreshold = current && Number.isFinite(current.contextWindow) && current.contextWindow > 0
+			? friendlyStopThreshold(current.contextWindow, UPPER_PERCENT) : undefined;
+		if (state || threshold === undefined || upperThreshold === undefined || threshold < 1 || (enabled.model && enabled.model !== identity) ||
+			current?.tokens === null || current === null || current.tokens < threshold) return false;
+		state = { version: STATE_VERSION, phase: "armed", threshold, upperThreshold, usage: current, wrapupTurns: 0 };
 		persist();
 		show(ctx, `RLM rollover armed at ${current.tokens.toLocaleString()} tokens`, "warning");
 		return true;
@@ -114,7 +138,8 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 	};
 	const metadata = (ctx: ExtensionContext) => ({
 		stateVersion: STATE_VERSION,
-		thresholdTokens: state?.threshold ?? enabled.threshold,
+		thresholdTokens: state?.threshold ?? enabled.threshold ?? null,
+		upperThresholdTokens: state?.upperThreshold ?? null,
 		currentUsage: usage(ctx),
 		session: {
 			id: ctx.sessionManager.getSessionId(),
@@ -128,17 +153,28 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 		},
 		timestamp: new Date().toISOString(),
 	});
-	const forceStop = async (ctx: ExtensionContext) => {
-		if (!state || state.phase === "forced" || state.phase === "checkpoint") return;
+	const pauseTask = (ctx: ExtensionContext, reason: string): State["pausedTask"] => {
+		const task = existingTaskOutcomeManager(ctx);
+		const active = task?.snapshot().active;
+		if (!active) return; // Standalone legacy use has no tracked assignment.
+		if (!task!.pauseForContext(reason, state!.threshold)) throw new Error("friendly stop could not record its pause");
+		return { jobId: active.jobId, attemptId: active.attemptId };
+	};
+	const forceStop = async (ctx: ExtensionContext, cause = `checkpoint tool not called within ${enabled.graceTurns} wrap-up turns`) => {
+		if (!state || state.phase === "forced" || state.phase === "checkpoint" || state.phase === "reset") return;
 		const trusted = metadata(ctx);
 		const receiptPath = await writeReceipt(
 			enabled.directory,
 			`forced-stop-${safePart(trusted.session.id)}-${safePart(trusted.session.leaf)}`,
-			{ kind: "forced-stop", reason: `checkpoint tool not called within ${enabled.graceTurns} wrap-up turns`, trusted },
+			{ kind: "forced-stop", reason: cause, trusted },
 		);
-		state = { ...state, phase: "forced", usage: trusted.currentUsage, receiptPath, reason: "grace-exhausted" };
+		const pauseReason = cause.startsWith("checkpoint tool")
+			? `Friendly checkpoint missing: ${cause} (grace exhausted)`
+			: `Friendly stop took control: ${cause}`;
+		const pausedTask = pauseTask(ctx, `${pauseReason}; forced-stop receipt: ${receiptPath}`);
+		state = { ...state, phase: "forced", usage: trusted.currentUsage, receiptPath, reason: pauseReason, pausedTask };
 		persist();
-		show(ctx, "RLM rollover grace exhausted; aborting", "warning");
+		show(ctx, `${pauseReason}; aborting`, "warning");
 		ctx.abort();
 	};
 
@@ -170,7 +206,8 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 				`checkpoint-${safePart(trusted.session.id)}-${safePart(trusted.session.leaf)}`,
 				{ kind: "rollover-checkpoint", trusted, reported: params },
 			);
-			state = { ...state, phase: "checkpoint", usage: trusted.currentUsage, receiptPath };
+			const pausedTask = pauseTask(ctx, `Friendly checkpoint saved: ${receiptPath}`);
+			state = { ...state, phase: "checkpoint", usage: trusted.currentUsage, receiptPath, pausedTask };
 			persist();
 			show(ctx, "RLM rollover checkpoint saved");
 			return {
@@ -188,6 +225,17 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 			if (entry.type === "custom" && entry.customType === STATE_TYPE &&
 				(entry.data as State | undefined)?.version === STATE_VERSION) state = entry.data as State;
 		}
+		// Older persisted states had only the lower threshold; derive the shared upper bound.
+		if (state && state.upperThreshold === undefined && state.usage?.contextWindow) {
+			state = { ...state, upperThreshold: friendlyStopThreshold(state.usage.contextWindow, UPPER_PERCENT) };
+		}
+		if (state?.phase === "reset") state = undefined;
+		if (existingTaskOutcomeManager(ctx)?.snapshot().active?.state === "context_paused") {
+			// Reload is maintenance, not permission to start a checkpoint model turn.
+			// A lost queued instruction will instead be injected after parent resume.
+			if (state?.phase === "turn-queued") { state = { ...state, phase: "armed" }; persist(); }
+			return;
+		}
 		if (!state && arm(ctx)) queueCheckpointTurn(ctx);
 		else if (state?.phase === "armed") queueCheckpointTurn(ctx);
 		else if (state?.phase === "turn-queued") restoreQueuedTurn(ctx);
@@ -196,12 +244,32 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 			else queueCheckpointTurn(ctx, true);
 		}
 	});
+	pi.on("agent_start", (_event, ctx) => {
+		if (shuttingDown || !state?.pausedTask || !["checkpoint", "forced"].includes(state.phase)) return;
+		const active = existingTaskOutcomeManager(ctx)?.snapshot().active;
+		if (active?.state !== "active" || active.jobId !== state.pausedTask.jobId || active.attemptId !== state.pausedTask.attemptId) return;
+		// withSession resumes AFTER session_start. Require that exact assignment's
+		// durable resume after this checkpoint, not an old resume or unrelated job.
+		const branch = ctx.sessionManager.getBranch();
+		const checkpointIndex = branch.findLastIndex(entry => entry.type === "custom" && entry.customType === STATE_TYPE);
+		if (!branch.slice(checkpointIndex + 1).some(entry => entry.type === "custom" && entry.customType === "task-outcome/v1" &&
+			(entry.data as any)?.kind === "context_resume" && (entry.data as any).jobId === active.jobId && (entry.data as any).attemptId === active.attemptId)) return;
+		state = { version: STATE_VERSION, phase: "reset", threshold: state.threshold, upperThreshold: state.upperThreshold, usage: usage(ctx), wrapupTurns: 0 };
+		persist();
+		state = undefined;
+		arm(ctx);
+	});
 	pi.on("session_shutdown", () => { shuttingDown = true; });
 	pi.on("turn_end", (_event, ctx) => { if (!shuttingDown) arm(ctx); });
 	pi.on("context", async (event, ctx) => {
 		if (shuttingDown) return;
 		if (!state) arm(ctx);
-		if (!state || state.phase === "checkpoint" || state.phase === "forced") return;
+		if (!state || state.phase === "checkpoint" || state.phase === "forced" || state.phase === "reset") return;
+		const current = usage(ctx);
+		if (current?.tokens !== null && current !== null && current.tokens >= state.upperThreshold) {
+			await forceStop(ctx, `shared friendly-stop upper boundary reached at ${state.upperThreshold} estimated tokens`);
+			return;
+		}
 		if (state.wrapupTurns >= enabled.graceTurns) {
 			await forceStop(ctx);
 			return;
@@ -221,7 +289,7 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 		};
 	});
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (shuttingDown || !state || state.phase === "checkpoint" || state.phase === "forced" || state.phase === "turn-queued") return;
+		if (shuttingDown || !state || state.phase === "checkpoint" || state.phase === "forced" || state.phase === "reset" || state.phase === "turn-queued") return;
 		if (state.phase === "armed") queueCheckpointTurn(ctx);
 		else if (state.wrapupTurns >= enabled.graceTurns) await forceStop(ctx);
 		else queueCheckpointTurn(ctx, true);
