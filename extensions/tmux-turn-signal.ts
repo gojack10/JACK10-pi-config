@@ -17,6 +17,7 @@ type TaskOutcomeEvent = {
 	summary?: string;
 	reportPath?: string;
 	reportText?: string;
+	pauseId?: string;
 };
 
 type ArtifactIdentity = { dev: string; ino: string };
@@ -163,6 +164,7 @@ export default function (pi: ExtensionAPI) {
 				outcome: payload.outcome,
 				source: payload.source,
 				final: payload.final,
+				pause_id: payload.pauseId,
 				summary: payload.summary,
 				report: payload.reportPath,
 				session_file: payload.sessionFile,

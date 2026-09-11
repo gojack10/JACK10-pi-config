@@ -4,7 +4,7 @@ import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { access, lstat, open, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { access, lstat, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,8 @@ import {
   type TaskLaunchManifest,
   type TaskMode,
 } from "../task-outcomes/manager.ts";
+
+import { RECOVERY_COMMAND, RECOVERY_OPTION, registerContextRecovery } from "./recovery.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -73,6 +75,8 @@ interface StoredState {
   startResults: Map<string, boolean>;
   outputBuffer: string;
   finished: boolean;
+  contextPauseId?: string;
+  recoveryPending?: string;
   parentJobId?: string;
   failureStatus?: "setup_failed" | "monitor_setup_failed" | "release_failed";
 }
@@ -189,6 +193,7 @@ const extensionPaths = (): string[] => {
     // tmux-turn-signal must run afterward to await its publication.
     join(extensionsDir, "tmux-turn-signal.ts"),
     join(extensionsDir, "subagent-launch.ts"),
+    join(extensionsDir, "openai-272k-guard.ts"),
   ];
 };
 
@@ -382,6 +387,63 @@ export class SubagentLauncher {
     return { batch_id: batchId, jobs: receipts };
   }
 
+  async cleanAndContinue(input: { job_id: string; session_id: string; attempt_id: string }, signal?: AbortSignal) {
+    const jobId = safeId(input.job_id, "job_id");
+    const sessionId = safeId(input.session_id, "session_id");
+    const attemptId = safeId(input.attempt_id, "attempt_id");
+    const state = this.states.get(jobId);
+    if (!state || state.sessionId !== sessionId || state.attemptId !== attemptId || state.finished || !state.contextPauseId) {
+      throw new Error("no monitored context-paused attempt matches these IDs");
+    }
+    if (state.recoveryPending) throw new Error("a recovery command is already pending; no duplicate was sent");
+    const pauseId = state.contextPauseId;
+    const nonce = unique("context-recovery");
+    state.recoveryPending = nonce;
+    let sent = false;
+    const path = join(tmpdir(), `${nonce}.command`);
+    try {
+      signal?.throwIfAborted();
+      if (await this.findPane(jobId, sessionId) !== state.paneId) throw new Error("saved subagent pane changed");
+      const manifest = await this.readManifest(state.manifestPath);
+      if (manifest.jobId !== jobId || manifest.sessionId !== sessionId || manifest.attemptId !== attemptId ||
+          await this.show(state.paneId, TASK_LAUNCH_MANIFEST_OPTION) !== state.manifestPath) {
+        throw new Error("saved subagent attempt changed");
+      }
+      // Local commands can run while model work is active. The child checks Pi's
+      // authoritative idle/queue state, not the asynchronously published counter.
+      await this.set(state.paneId, RECOVERY_OPTION, JSON.stringify({
+        nonce, jobId, attemptId, sessionId, pauseId, status: "pending",
+      }));
+      await writeFile(path, `/${RECOVERY_COMMAND} ${nonce}`, { flag: "wx", mode: 0o600 });
+      await this.tmux(["load-buffer", "-b", nonce, path]);
+      await this.tmux(["paste-buffer", "-pr", "-d", "-b", nonce, "-t", state.paneId]);
+      sent = true;
+      await this.tmux(["send-keys", "-t", state.paneId, "Enter"]);
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        signal?.throwIfAborted();
+        const raw = await this.show(state.paneId, RECOVERY_OPTION);
+        const ack = raw ? JSON.parse(raw) : undefined;
+        if (!ack || ack.nonce !== nonce || ack.jobId !== jobId || ack.attemptId !== attemptId || ack.sessionId !== sessionId) {
+          throw new Error("recovery acknowledgement missing or replaced; no retry was sent");
+        }
+        if (ack.status === "error" || ack.status === "resume_requested") {
+          state.recoveryPending = undefined;
+          if (ack.status === "error") throw new Error(ack.error || "context cleanup failed");
+          if (state.contextPauseId === pauseId) state.contextPauseId = undefined;
+          return { job_id: jobId, session_id: sessionId, attempt_id: attemptId,
+            status: "resume_requested", report_file: state.reportPath,
+            before_tokens: ack.beforeTokens, after_tokens: ack.afterTokens };
+        }
+        await this.timeout(POLL_MS);
+      }
+      throw new Error("recovery acknowledgement timed out; command may still run, no retry was sent");
+    } finally {
+      if (!sent) state.recoveryPending = undefined;
+      await unlink(path).catch(() => {});
+    }
+  }
+
   async followup(input: SubagentFollowupInput): Promise<Receipt> {
     const jobId = safeId(input.job_id, "job_id");
     const sessionId = safeId(input.session_id, "session_id");
@@ -404,6 +466,9 @@ export class SubagentLauncher {
     if (input.mode !== "task" && input.report_file !== undefined) throw new Error("dialogue mode must not include report_file");
 
     const knownState = this.states.get(jobId);
+    if (knownState?.contextPauseId || knownState?.recoveryPending) {
+      throw new Error("attempt is context-paused or recovering; use subagent_clean_and_continue, not a fresh follow-up");
+    }
     if (knownState?.finished && old.mode !== "dialogue") {
       throw new Error(`subagent ${jobId} already has a final monitored outcome`);
     }
@@ -712,6 +777,13 @@ export class SubagentLauncher {
       try { marker = JSON.parse(line); } catch { continue; }
       if (marker.kind === "start" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         this.resolveStart(state, marker.attemptId, true);
+      } else if (marker.kind === "context_paused" && marker.jobId === state.jobId && marker.attemptId === state.attemptId &&
+          typeof marker.pauseId === "string" && SAFE_ID.test(marker.pauseId)) {
+        if (state.contextPauseId === marker.pauseId) continue;
+        state.contextPauseId = marker.pauseId;
+        const message = `Subagent ${state.jobId} paused for context (attempt ${state.attemptId}; session ${state.sessionId}):\n${marker.summary}`;
+        const delivery = this.pi.sendUserMessage(message, { deliverAs: "steer" });
+        if (delivery !== undefined) void Promise.resolve(delivery).catch(() => {});
       } else if (marker.kind === "needs_input" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         const message = `Subagent ${state.jobId} (attempt ${marker.attemptId}) needs input:\n${marker.summary ?? "child requested human input"}`;
         try {
@@ -868,6 +940,7 @@ export const followupSchema = Type.Object({
 }, { additionalProperties: false });
 
 export function registerSubagentTools(pi: ExtensionAPI): void {
+  registerContextRecovery(pi);
   let launcher: SubagentLauncher | undefined;
   let launcherOwner: object | undefined;
   const forContext = (ctx: ExtensionContext): SubagentLauncher => {
@@ -886,6 +959,20 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await forContext(ctx).launch(args.jobs as SubagentJobInput[]);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "subagent_clean_and_continue",
+    label: "subagent_clean_and_continue",
+    description: "Clean tool outputs and request continuation of a monitored context-paused subagent. Use the IDs from its pause notification. Preserves the same session, attempt, report and monitor; this is maintenance, not a fresh assignment. Requires an idle worker with no queued messages or pending children/background jobs. Refuses if cleaning cannot free enough context. No automatic retries; resume_requested is not task completion.",
+    parameters: Type.Object({
+      job_id: Type.String({ minLength: 1, maxLength: 128 }),
+      session_id: Type.String({ minLength: 1, maxLength: 128 }),
+      attempt_id: Type.String({ minLength: 1, maxLength: 128 }),
+    }, { additionalProperties: false }),
+    async execute(_id, args, signal, _onUpdate, ctx) {
+      const result = await forContext(ctx).cleanAndContinue(args, signal);
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });
   pi.registerTool({

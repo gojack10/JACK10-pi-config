@@ -169,6 +169,11 @@ pane="$TMUX_PANE"
 last=
 count=0
 while :; do
+  # A real child starts a follow-up on mission input, not partial manifest setup.
+  if [ "$count" -gt 0 ]; then
+    line=
+    while [ -z "$line" ]; do IFS= read -r line || exit 0; done
+  fi
   manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
   attempt=$(sed -n 's/.*"attemptId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
   if [ "$attempt" = "$last" ]; then sleep .02; continue; fi
@@ -326,6 +331,10 @@ pane="$TMUX_PANE"
 last=
 count=0
 while :; do
+  if [ "$count" -gt 0 ]; then
+    line=
+    while [ -z "$line" ]; do IFS= read -r line || exit 0; done
+  fi
   manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
   attempt=$(sed -n 's/.*"attemptId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
   session_id=$(sed -n 's/.*"sessionId":"\\([^\"]*\\)".*/\\1/p' "$manifest")
@@ -444,6 +453,10 @@ pane="$TMUX_PANE"
 last=
 count=0
 while :; do
+  if [ "$count" -gt 0 ]; then
+    line=
+    while [ -z "$line" ]; do IFS= read -r line || exit 0; done
+  fi
   manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
   attempt=$(sed -n 's/.*"attemptId":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
   if [ "$attempt" = "$last" ]; then sleep .02; continue; fi
