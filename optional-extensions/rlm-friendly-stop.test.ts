@@ -90,16 +90,16 @@ test("registers only when both opt-in values are valid", () => {
 	assert.ok(pi.handlers.has("turn_end"));
 });
 
-test("Astra uses the shared 50..80 band without a percentage; other models need explicit temporary opt-in", async () => {
+test("Astra uses the shared 40..80 band without a percentage; other models need explicit temporary opt-in", async () => {
 	const astra = new FakePi();
 	assert.equal(registerFriendlyStop(astra as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-6-astra", PI_RLM_ROLLOVER_DIR: "/tmp/checkpoints" }), true);
-	const astraCtx = context(astra, 199_999);
+	const astraCtx = context(astra, 159_999);
 	astraCtx.model = { provider: "openai", id: "gpt-6-astra" };
 	await astra.emit("turn_end", {}, astraCtx);
 	assert.equal(astra.entries.length, 0);
-	astraCtx.setTokens(200_000);
+	astraCtx.setTokens(160_000);
 	await astra.emit("turn_end", {}, astraCtx);
-	assert.equal(astra.entries.at(-1).data.threshold, 200_000);
+	assert.equal(astra.entries.at(-1).data.threshold, 160_000);
 	assert.equal(astra.entries.at(-1).data.upperThreshold, 320_000);
 	const unlisted = new FakePi();
 	assert.equal(registerFriendlyStop(unlisted as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-5.6-luna", PI_RLM_ROLLOVER_DIR: "/tmp/checkpoints" }), false);
@@ -117,8 +117,8 @@ test("upper shared boundary forces a nonfinal stop before ordinary work continue
 	assert.match(pi.entries.at(-1).data.reason, /upper boundary/);
 });
 
-test("50/65/80 use effective windows and exact model IDs, independent of account resolution", async () => {
-	for (const percent of [50, 65, 80]) for (const [provider, id, window] of [
+test("40/50/65/80 use effective windows and exact model IDs, independent of account resolution", async () => {
+	for (const percent of [40, 50, 65, 80]) for (const [provider, id, window] of [
 		["openai-codex-sifttext", "gpt-5.6-luna", 272000],
 		["openrouter", "z-ai/glm-5.3-flash", 1048576],
 	] as const) {
@@ -139,7 +139,7 @@ test("50/65/80 use effective windows and exact model IDs, independent of account
 		await other.emit("turn_end", {}, context(other, 2000000));
 		assert.equal(other.entries.length, 0, "unlisted model never arms");
 	}
-	for (const percent of ["49", "81", "65.5", "bad", ""]) {
+	for (const percent of ["39", "81", "65.5", "bad", ""]) {
 		const pi = new FakePi();
 		assert.equal(registerFriendlyStop(pi as any, { PI_RLM_FRIENDLY_STOP_MODEL: "gpt-6-astra", PI_RLM_FRIENDLY_STOP_PERCENT: percent, PI_RLM_ROLLOVER_DIR: "/tmp" }), false);
 		assert.equal(pi.tools.length, 0);

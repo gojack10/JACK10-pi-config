@@ -62,7 +62,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   await writeFile(mission, 'Synthetic context recovery canary; no model.');
   const launch = (await call('subagent_launch', { jobs: [{ provider: model.provider, model: model.id, thinking: 'xhigh',
     mission_file: mission, cwd: dir, session_label: 'child', mode: 'task', report_file: report,
-    ...(scenario === 'friendly' ? { friendly_stop_percent: 50, friendly_stop_directory: dir } : {}) }] })).details;
+    ...(scenario === 'friendly' ? { friendly_stop_percent: 40, friendly_stop_directory: dir } : {}) }] })).details;
   const job = launch.jobs[0];
   assert.equal(job.status, 'running', job.status === 'running' ? undefined :
     `${JSON.stringify(job)}\n${await readFile(join(tmpdir(), `${job.job}.tmux.log`), 'utf8').catch(() => '(no child log)')}`);
