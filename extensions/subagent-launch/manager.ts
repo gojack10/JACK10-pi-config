@@ -8,7 +8,12 @@ import { access, lstat, mkdir, open, readFile, rename, stat, unlink, writeFile }
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BackgroundJobManager, getBackgroundJobManager } from "../background-jobs/manager.ts";
+import type { MaintenanceHandoff } from "../_shared/maintenance.ts";
+import {
+  BackgroundJobManager,
+  adoptBackgroundJobManager,
+  getBackgroundJobManager,
+} from "../background-jobs/manager.ts";
 import {
   getTaskOutcomeManager,
   TASK_LAUNCH_MANIFEST_OPTION,
@@ -36,6 +41,11 @@ const DONE_CHANNEL_OPTION = "@pi_done_channel";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
 const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
 const FRIENDLY_PRODUCTION_MODEL = "gpt-6-astra";
+
+const admissionAccepted = (result: unknown): boolean => {
+  if (result === undefined || typeof result !== "object" || result === null) return true;
+  return (result as { status?: unknown }).status === "admitted";
+};
 
 export interface SubagentJobInput {
   provider: string;
@@ -206,12 +216,25 @@ const extensionPaths = (): string[] => {
 
 export class SubagentLauncher {
   private readonly states = new Map<string, StoredState>();
+  private pi: ExtensionAPI;
+  private ctx: ExtensionContext;
+  private background: BackgroundJobManager;
 
-  constructor(
-    private readonly pi: ExtensionAPI,
-    private readonly ctx: ExtensionContext,
-    private readonly background: BackgroundJobManager,
-  ) {}
+  constructor(pi: ExtensionAPI, ctx: ExtensionContext, background: BackgroundJobManager) {
+    this.pi = pi;
+    this.ctx = ctx;
+    this.background = background;
+  }
+
+  attach(pi: ExtensionAPI, ctx: ExtensionContext, background: BackgroundJobManager): void {
+    this.pi = pi;
+    this.ctx = ctx;
+    this.background = background;
+  }
+
+  getSessionId(): string {
+    return this.ctx.sessionManager.getSessionId();
+  }
 
   async launch(inputs: readonly SubagentJobInput[]): Promise<{ batch_id: string; jobs: Receipt[] }> {
     if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > MAX_JOBS) {
@@ -490,9 +513,6 @@ export class SubagentLauncher {
     if (knownState?.contextPauseId || knownState?.recoveryPending) {
       throw new Error("attempt is context-paused or recovering; use subagent_clean_and_continue, not a fresh follow-up");
     }
-    if (knownState?.finished && old.mode !== "dialogue") {
-      throw new Error(`subagent ${jobId} already has a final monitored outcome`);
-    }
     if (!knownState?.finished && await this.paneIsBusy(paneId)) {
       throw new Error(`subagent ${jobId} is still handling its current turn; follow-up was not pasted`);
     }
@@ -637,8 +657,8 @@ export class SubagentLauncher {
       if (input.thinking === undefined || !THINKING_LEVELS.includes(input.thinking)) throw new Error("thinking must be explicit and valid");
       if (input.mode !== "task" && input.mode !== "dialogue") throw new Error("mode must be task or dialogue");
       if (input.friendly_stop_percent !== undefined &&
-          (!Number.isInteger(input.friendly_stop_percent) || input.friendly_stop_percent < 50 || input.friendly_stop_percent > 80)) {
-        throw new Error("friendly_stop_percent must be an integer from 50 through 80");
+          (!Number.isInteger(input.friendly_stop_percent) || input.friendly_stop_percent < 40 || input.friendly_stop_percent > 80)) {
+        throw new Error("friendly_stop_percent must be an integer from 40 through 80");
       }
       if (input.friendly_stop_directory !== undefined) asPath(input.friendly_stop_directory, "friendly_stop_directory");
       if (input.friendly_stop_directory !== undefined && input.friendly_stop_percent === undefined && input.model !== FRIENDLY_PRODUCTION_MODEL) {
@@ -812,7 +832,7 @@ export class SubagentLauncher {
       state.finished = true;
       state.monitorUnsubscribe = undefined;
       if (state.parentJobId && completion.status) {
-        this.recordParent(state.parentJobId, state.jobId, completion.summary, completion.status, completion.source);
+        this.recordParent(state.parentJobId, state.jobId, completion.summary, completion.status, completion.source, state.attemptId);
       }
     });
   }
@@ -832,15 +852,40 @@ export class SubagentLauncher {
       } else if (marker.kind === "context_paused" && marker.jobId === state.jobId && marker.attemptId === state.attemptId &&
           typeof marker.pauseId === "string" && SAFE_ID.test(marker.pauseId)) {
         if (state.contextPauseId === marker.pauseId) continue;
-        state.contextPauseId = marker.pauseId;
         const message = `Subagent ${state.jobId} paused for context (attempt ${state.attemptId}; session ${state.sessionId}):\n${marker.summary}`;
-        const delivery = this.pi.sendUserMessage(message, { deliverAs: "steer" });
-        if (delivery !== undefined) void Promise.resolve(delivery).catch(() => {});
+        try {
+          const delivery = this.pi.sendUserMessage(message, {
+            deliverAs: "steer",
+            admissionKey: `subagent:${state.jobId}@${state.attemptId}:context_paused:${marker.pauseId}`,
+          });
+          if (delivery !== undefined) {
+            void Promise.resolve(delivery).then(result => {
+              if (admissionAccepted(result)) state.contextPauseId = marker.pauseId;
+            }).catch(() => {});
+          } else {
+            state.contextPauseId = marker.pauseId;
+          }
+        } catch {}
+      } else if ((marker.kind === "maintenance_paused" || marker.kind === "maintenance_error") &&
+          marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
+        try {
+          this.pi.sendUserMessage(
+            `Subagent ${state.jobId} (attempt ${marker.attemptId}) ${marker.kind === "maintenance_paused" ? "is under human maintenance" : "reported a maintenance error"}:\n${marker.summary ?? marker.kind}`,
+            { deliverAs: "steer", admissionKey: `subagent:${state.jobId}@${state.attemptId}:${marker.kind}` },
+          );
+        } catch {}
       } else if (marker.kind === "needs_input" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         const message = `Subagent ${state.jobId} (attempt ${marker.attemptId}) needs input:\n${marker.summary ?? "child requested human input"}`;
         try {
-          const result = this.pi.sendUserMessage(message, { deliverAs: "steer" });
-          if (result !== undefined) void Promise.resolve(result).catch(() => {});
+          const result = this.pi.sendUserMessage(message, {
+            deliverAs: "steer",
+            admissionKey: `subagent:${state.jobId}@${state.attemptId}:needs_input`,
+          });
+          if (result !== undefined) {
+            void Promise.resolve(result).then(admission => {
+              if (!admissionAccepted(admission)) return;
+            }).catch(() => {});
+          }
         } catch {}
       } else if (marker.kind === "final" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         const status = marker.outcome === "completed" ? "completed" : marker.outcome === "blocked" ? "blocked" : "failed";
@@ -968,8 +1013,9 @@ export class SubagentLauncher {
     summary: string,
     status: "completed" | "failed" | "blocked" = "failed",
     source: OutcomeSource = "model",
+    childAttemptId?: string,
   ): void {
-    try { getTaskOutcomeManager(this.pi, this.ctx).recordChildOutcome(parentJobId, childJobId, status, summary, source); } catch {}
+    getTaskOutcomeManager(this.pi, this.ctx).recordChildOutcome(parentJobId, childJobId, status, summary, source, childAttemptId);
   }
 }
 
@@ -982,7 +1028,7 @@ export const launchJobSchema = Type.Object({
   session_label: Type.String({ minLength: 1, maxLength: 64 }),
   mode: StringEnum(["task", "dialogue"] as const),
   report_file: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
-  friendly_stop_percent: Type.Optional(Type.Integer({ minimum: 50, maximum: 80 })),
+  friendly_stop_percent: Type.Optional(Type.Integer({ minimum: 40, maximum: 80 })),
   friendly_stop_directory: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
 }, { additionalProperties: false });
 
@@ -993,6 +1039,39 @@ export const followupSchema = Type.Object({
   ...launchJobSchema.properties,
 }, { additionalProperties: false });
 
+const launcherRegistryKey = Symbol.for("pi.subagent-launch.launcher-registry");
+const launcherHandoffKey = Symbol.for("pi.subagent-launch.maintenance-handoffs");
+const launcherGlobal = globalThis as typeof globalThis & {
+  [launcherRegistryKey]?: WeakMap<object, SubagentLauncher>;
+  [launcherHandoffKey]?: Map<string, { launcher: SubagentLauncher; lease: MaintenanceHandoff }>;
+};
+const launchers = launcherGlobal[launcherRegistryKey] ??= new WeakMap();
+const launcherHandoffs = launcherGlobal[launcherHandoffKey] ??= new Map();
+
+export function parkSubagentLauncher(ctx: Pick<ExtensionContext, "sessionManager">, lease: MaintenanceHandoff): void {
+  const launcher = launchers.get(ctx.sessionManager as object);
+  if (!launcher) return;
+  if (launcher.getSessionId() !== lease.sessionId) throw new Error("subagent launcher maintenance owner mismatch");
+  launcherHandoffs.set(lease.maintenanceId, { launcher, lease: { ...lease } });
+}
+
+export function adoptSubagentLauncher(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  lease: MaintenanceHandoff,
+): SubagentLauncher | undefined {
+  const handoff = launcherHandoffs.get(lease.maintenanceId);
+  if (!handoff) return undefined;
+  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch) {
+    throw new Error("subagent launcher maintenance handoff token conflicts with its owner");
+  }
+  const launcher = handoff.launcher;
+  launcher.attach(pi, ctx, getBackgroundJobManager(pi, ctx));
+  launchers.set(ctx.sessionManager as object, launcher);
+  launcherHandoffs.delete(lease.maintenanceId);
+  return launcher;
+}
+
 export function registerSubagentTools(pi: ExtensionAPI): void {
   registerContextRecovery(pi);
   let launcher: SubagentLauncher | undefined;
@@ -1000,8 +1079,10 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
   const forContext = (ctx: ExtensionContext): SubagentLauncher => {
     const owner = ctx.sessionManager as object;
     if (!launcher || launcherOwner !== owner) {
-      launcher = new SubagentLauncher(pi, ctx, getBackgroundJobManager(pi, ctx));
+      launcher = launchers.get(owner) ?? new SubagentLauncher(pi, ctx, getBackgroundJobManager(pi, ctx));
+      launcher.attach(pi, ctx, getBackgroundJobManager(pi, ctx));
       launcherOwner = owner;
+      launchers.set(owner, launcher);
     }
     return launcher;
   };
@@ -1010,6 +1091,16 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
     label: "subagent_launch",
     description: "Launch one or more saved interactive Pi subagents in ordinary tmux sessions. Every job requires an explicit provider/model/thinking route, absolute mission file, cwd, session label, and task/dialogue mode. Task mode also requires a fresh report file. Dialogue reports return automatically at clean settlement, verbatim when small or through a readable artifact when large. Returns verified per-job START/session receipts; partial setup failures never release an unarmed child. Task outcomes and batch completion are delivered from durable receipts, not process exit.",
     parameters: launchSchema,
+    prepareArguments(input) {
+      if (!input || typeof input !== "object" || Array.isArray(input)) return input;
+      const args = input as Record<string, unknown>;
+      if (typeof args.jobs !== "string") return input;
+      try {
+        const jobs = JSON.parse(args.jobs);
+        if (Array.isArray(jobs)) return { ...args, jobs };
+      } catch {}
+      return input;
+    },
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await forContext(ctx).launch(args.jobs as SubagentJobInput[]);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
@@ -1029,6 +1120,17 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });
+  pi.on("session_start", (event, ctx) => {
+    if (event.reason === "maintenance" && event.maintenance) {
+      adoptSubagentLauncher(pi, ctx, event.maintenance);
+    }
+  });
+  pi.on("session_shutdown", (event, ctx) => {
+    if (event.reason === "maintenance" && event.maintenance) {
+      parkSubagentLauncher(ctx, event.maintenance);
+    }
+  });
+
   pi.registerTool({
     name: "subagent_followup",
     label: "subagent_followup",

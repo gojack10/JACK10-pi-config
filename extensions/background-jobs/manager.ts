@@ -4,9 +4,22 @@ import { createWriteStream } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MaintenanceHandoff } from "../_shared/maintenance.ts";
 
 type UserMessageOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
-type SendUserMessage = (content: string, options?: UserMessageOptions) => void | PromiseLike<void>;
+type SendUserMessage = (content: string, options?: UserMessageOptions) => void | PromiseLike<unknown>;
+
+const admissionAccepted = (result: unknown): boolean => {
+  if (result === undefined || typeof result !== "object" || result === null) return true;
+  return (result as { status?: unknown }).status === "admitted";
+};
+
+const admissionError = (result: unknown): Error => {
+  const error = typeof result === "object" && result !== null && "error" in result
+    ? String((result as { error?: unknown }).error)
+    : "message admission was rejected";
+  return new Error(error);
+};
 
 export interface BackgroundJobStartOptions {
   command: string;
@@ -94,7 +107,7 @@ export interface BackgroundJobBatch {
   ): BackgroundJobStartResult;
   registerOutcome(id: string): void;
   recordOutcome(outcome: BackgroundJobOutcome): void;
-  notifyNeedsInput(message: string): void | PromiseLike<void>;
+  notifyNeedsInput(message: string): void | PromiseLike<unknown>;
   getReport(): BackgroundJobReport | undefined;
   close(): void;
 }
@@ -159,6 +172,7 @@ export class BackgroundJobManager {
   private nextBatchId = 1;
   private implicitBatchId: string | undefined;
   private shuttingDown = false;
+  private maintenanceId: string | undefined;
   private sendUserMessage: SendUserMessage;
   private readonly workListeners = new Set<() => void>();
   private readonly jobListeners = new Map<number, Set<(job: BackgroundJobInfo, completion: BackgroundJobCompletion) => void>>();
@@ -170,6 +184,26 @@ export class BackgroundJobManager {
 
   attach(sendUserMessage: SendUserMessage): void {
     this.sendUserMessage = sendUserMessage;
+  }
+
+  beginMaintenance(maintenanceId: string): void {
+    if (this.shuttingDown) throw new Error("Background job manager is shut down");
+    if (this.maintenanceId && this.maintenanceId !== maintenanceId) {
+      throw new Error("another background maintenance operation is already active");
+    }
+    this.maintenanceId = maintenanceId;
+  }
+
+  isInMaintenance(maintenanceId: string): boolean {
+    return this.maintenanceId === maintenanceId;
+  }
+
+  resumeMaintenance(maintenanceId: string): void {
+    if (this.maintenanceId === undefined) return;
+    if (this.maintenanceId !== maintenanceId) {
+      throw new Error("background maintenance ownership is stale");
+    }
+    this.maintenanceId = undefined;
   }
 
   start(options: BackgroundJobStartOptions, batchOptions: { batchId?: string } = {}): BackgroundJobStartResult {
@@ -199,7 +233,7 @@ export class BackgroundJobManager {
     batchOptions: { batchId?: string } = {},
     hooks: BackgroundJobStartHooks = {},
   ): BackgroundJobStartResult {
-    this.assertOpen();
+    this.assertCanStart();
     const batch = this.batchForStart(batchOptions.batchId);
     if (batch.expectedMembers !== undefined && batch.members.size >= batch.expectedMembers) {
       throw new Error(`Batch ${batch.id} already has ${batch.expectedMembers} members`);
@@ -284,7 +318,7 @@ export class BackgroundJobManager {
   }
 
   openBatch(batchId = `batch-${this.nextBatchId++}`, expectedMembers?: number): BackgroundJobBatch {
-    this.assertOpen();
+    this.assertCanStart();
     if (expectedMembers !== undefined && expectedMembers < 1) {
       throw new Error("expectedMembers must be at least 1");
     }
@@ -308,7 +342,7 @@ export class BackgroundJobManager {
   }
 
   reopenBatch(batchId: string): BackgroundJobBatch {
-    this.assertOpen();
+    this.assertCanStart();
     const batch = this.batches.get(batchId);
     if (!batch || !this.closedBatchIds.has(batchId) || batch.jobs.size > 0 || batch.members.size > 0 || batch.pending.length > 0) {
       throw new Error(`Batch ${batchId} cannot be reopened`);
@@ -338,7 +372,7 @@ export class BackgroundJobManager {
   }
 
   registerOutcomes(batchId: string, ids: readonly string[]): void {
-    this.assertOpen();
+    this.assertCanStart();
     const uniqueIds = [...new Set(ids)];
     if (uniqueIds.length === 0) return;
     let batch = this.batches.get(batchId);
@@ -359,7 +393,7 @@ export class BackgroundJobManager {
   }
 
   assertCanRegisterOutcomes(batchId: string, ids: readonly string[]): void {
-    this.assertOpen();
+    this.assertCanStart();
     const batch = this.batches.get(batchId);
     if (!batch) {
       if (this.closedBatchIds.has(batchId)) throw new Error(`Batch ${batchId} is closed`);
@@ -399,12 +433,12 @@ export class BackgroundJobManager {
     );
   }
 
-  notifyNeedsInput(batchId: string, message: string): void | PromiseLike<void> {
+  notifyNeedsInput(batchId: string, message: string, admissionKey?: string, admissionGuard?: () => boolean): void | PromiseLike<unknown> {
     this.assertOpen();
     if (!this.batches.has(batchId)) throw new Error(`Unknown background batch ${batchId}`);
     return this.sendUserMessage(
       `SYSTEM (background-jobs): Batch ${batchId} needs human input.\n${message}`,
-      { deliverAs: "steer" },
+      { deliverAs: "steer", admissionKey, admissionGuard },
     );
   }
 
@@ -421,7 +455,7 @@ export class BackgroundJobManager {
       batchId,
       completions: [completion],
       text: `SYSTEM (background-jobs): ${this.renderCompletion(completion)}`,
-    });
+    }, `background:${batchId}:failure:${completion.id}`);
   }
 
   async tail(jobId: number, lines = 50): Promise<BackgroundTailResult | undefined> {
@@ -541,6 +575,7 @@ export class BackgroundJobManager {
   shutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.maintenanceId = undefined;
     this.batches.clear();
     this.closedBatchIds.clear();
     this.reports.clear();
@@ -651,7 +686,7 @@ export class BackgroundJobManager {
     this.closedBatchIds.add(batch.id);
     this.batches.delete(batch.id);
     if (this.implicitBatchId === batch.id) this.implicitBatchId = undefined;
-    this.sendReport(report);
+    this.sendReport(report, `background:${report.batchId}:report`);
   }
 
   private createReport(batchId: string, completions: BackgroundJobCompletion[]): BackgroundJobReport {
@@ -663,10 +698,14 @@ export class BackgroundJobManager {
     };
   }
 
-  private sendReport(report: BackgroundJobReport): void {
+  private sendReport(report: BackgroundJobReport, admissionKey: string): void {
     try {
-      const result = this.sendUserMessage(report.text, { deliverAs: "steer" });
-      if (result !== undefined) void Promise.resolve(result).catch(() => {});
+      const result = this.sendUserMessage(report.text, { deliverAs: "steer", admissionKey });
+      if (result !== undefined) {
+        void Promise.resolve(result).then(accepted => {
+          if (!admissionAccepted(accepted)) throw admissionError(accepted);
+        }).catch(() => {});
+      }
     } catch {}
   }
 
@@ -702,14 +741,22 @@ export class BackgroundJobManager {
   private assertOpen(): void {
     if (this.shuttingDown) throw new Error("Background job manager is shut down");
   }
+
+  private assertCanStart(): void {
+    this.assertOpen();
+    if (this.maintenanceId) throw new Error("background job launch is fenced during maintenance");
+  }
 }
 
 type SessionOwnerContext = Pick<ExtensionContext, "sessionManager">;
 const managerRegistryKey = Symbol.for("pi.background-jobs.manager-registry");
+const handoffRegistryKey = Symbol.for("pi.background-jobs.maintenance-handoffs");
 const globalState = globalThis as typeof globalThis & {
   [managerRegistryKey]?: WeakMap<object, BackgroundJobManager>;
+  [handoffRegistryKey]?: Map<string, { manager: BackgroundJobManager; lease: MaintenanceHandoff }>;
 };
 const managers = globalState[managerRegistryKey] ??= new WeakMap();
+const handoffs = globalState[handoffRegistryKey] ??= new Map();
 
 export function getBackgroundJobManager(
   pi: Pick<ExtensionAPI, "sendUserMessage">,
@@ -723,6 +770,33 @@ export function getBackgroundJobManager(
   } else {
     manager.attach((content, options) => pi.sendUserMessage(content, options));
   }
+  return manager;
+}
+
+export function parkBackgroundJobManager(ctx: SessionOwnerContext, lease: MaintenanceHandoff): void {
+  const manager = managers.get(ctx.sessionManager as object);
+  if (!manager) throw new Error("background job manager is unavailable for maintenance");
+  if (!manager.isInMaintenance(lease.maintenanceId)) {
+    throw new Error("background job maintenance lease is stale");
+  }
+  handoffs.set(lease.maintenanceId, { manager, lease: { ...lease } });
+}
+
+export function adoptBackgroundJobManager(
+  pi: Pick<ExtensionAPI, "sendUserMessage">,
+  ctx: SessionOwnerContext,
+  lease: MaintenanceHandoff,
+): BackgroundJobManager | undefined {
+  const handoff = handoffs.get(lease.maintenanceId);
+  if (!handoff) return undefined;
+  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch) {
+    throw new Error("background job maintenance handoff token conflicts with its owner");
+  }
+  const manager = handoff.manager;
+  manager.attach((content, options) => pi.sendUserMessage(content, options));
+  manager.resumeMaintenance(lease.maintenanceId);
+  managers.set(ctx.sessionManager as object, manager);
+  handoffs.delete(lease.maintenanceId);
   return manager;
 }
 
