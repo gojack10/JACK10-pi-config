@@ -1,7 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existingTaskOutcomeManager } from "../task-outcomes/manager.ts";
+import {
+  existingTaskOutcomeManager,
+  type MaintenanceLease,
+  type TaskOutcomeManager,
+} from "../task-outcomes/manager.ts";
 import { cleanSessionFile } from "../tool-call-clean/index.ts";
 
 export const RECOVERY_OPTION = "@pi_subagent_recovery";
@@ -36,18 +40,23 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
         await exec("tmux", ["set-option", "-q", "-t", pane, RECOVERY_OPTION,
           JSON.stringify({ ...request, status, ...fields })]);
       };
+      let maintenanceLease: MaintenanceLease | undefined;
+      let maintenanceManager: TaskOutcomeManager | undefined;
       try {
         // Never queue a cleanup behind an unrelated active turn.
         if (!ctx.isIdle()) throw new Error("worker is not idle; no cleanup performed");
         await ctx.waitForIdle();
         if (ctx.hasPendingMessages()) throw new Error("queued messages remain; refusing to discard them during cleanup");
         const task = existingTaskOutcomeManager(ctx);
-        const snapshot = task?.snapshot().active;
+        if (!task) throw new Error("paused assignment task manager is unavailable");
+        const snapshot = task.snapshot().active;
         if (!snapshot || snapshot.jobId !== request.jobId || snapshot.attemptId !== request.attemptId ||
             snapshot.state !== "context_paused" || !snapshot.contextPause || snapshot.contextPause.id !== request.pauseId) {
           throw new Error("recovery does not match the paused assignment");
         }
         const contextPause = snapshot.contextPause;
+        const taskManager = task;
+        maintenanceManager = taskManager;
         const liveSession = (await exec("tmux", ["show-options", "-qv", "-t", pane, "@pi_subagent_session_id"])).stdout.trim();
         if (liveSession !== request.sessionId) throw new Error("saved subagent session changed");
         if (snapshot.pendingWork.length) throw new Error("child/background work remains pending; no cleanup performed");
@@ -55,8 +64,21 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
         const sessionId = ctx.sessionManager.getSessionId();
         const modelId = ctx.model?.id;
         if (!file) throw new Error("context cleanup requires a saved session");
-        const result = cleanSessionFile(file, contextPause.limit);
+        const lease: MaintenanceLease = taskManager.beginMaintenance(file);
+        maintenanceLease = lease;
+        let result: ReturnType<typeof cleanSessionFile> | undefined;
         const switched = await ctx.switchSession(file, {
+          maintenance: {
+            token: lease,
+            beforeReplace: () => {
+              result = cleanSessionFile(file, contextPause.limit);
+              if (!result.changed) {
+                taskManager.resumeMaintenance(lease);
+                return { replace: false };
+              }
+              return { replace: true };
+            },
+          },
           async withSession(replacement) {
             if (replacement.sessionManager.getSessionId() !== sessionId) throw new Error("Pi session identity changed during cleanup");
             if (!modelId || replacement.model?.id !== modelId) throw new Error("session model changed during cleanup; assignment remains paused");
@@ -67,7 +89,7 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
             if (tokens == null) throw new Error("cleaned context usage is unavailable; assignment remains paused");
             resumed.resumeAfterContextClean(request.jobId, request.attemptId, request.pauseId, tokens);
             try {
-              await acknowledge("resume_requested", { beforeTokens: result.beforeTokens, afterTokens: tokens });
+              await acknowledge("resume_requested", { beforeTokens: result?.beforeTokens, afterTokens: tokens });
               await replacement.sendUserMessage("Tool outputs were cleaned. Continue the same assignment from retained progress; the report path and completion requirements are unchanged.");
             } catch (error) {
               // If dispatch never started, leave a recoverable assignment, not an
@@ -77,8 +99,13 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
             }
           },
         });
-        if (switched.cancelled) throw new Error("session reload cancelled; assignment remains paused");
+        if (switched.cancelled) {
+          taskManager.resumeMaintenance(lease);
+          maintenanceLease = undefined;
+          throw new Error("session reload cancelled; assignment remains paused");
+        }
       } catch (error) {
+        if (maintenanceLease) maintenanceManager?.failMaintenance(maintenanceLease, error);
         const message = (error instanceof Error ? error.message : String(error))
           .replace(/\b(api[_-]?key|token|password|secret|authorization)\b(\s*[:=]\s*)(?:bearer\s+)?\S+/gi, "$1$2[redacted]")
           .slice(0, 2048);
