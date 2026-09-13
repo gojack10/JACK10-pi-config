@@ -307,11 +307,11 @@ test("subagent_launch rejects an explicitly unsupported thinking level before tm
       }, undefined, undefined, ctx),
       /does not support thinking level xhigh/,
     );
-    for (const percent of [49, 81, 65.5]) {
+    for (const percent of [39, 81, 65.5]) {
       await assert.rejects(owner.tools.get("subagent_launch")!.definition.execute("test", {
         jobs: [{ provider: "fake-provider", model: "unsupported-model", thinking: "off", mission_file: mission,
           cwd: dir, session_label: "invalid-limit", mode: "task", report_file: report, friendly_stop_percent: percent }],
-      }, undefined, undefined, ctx), /integer from 50 through 80/);
+      }, undefined, undefined, ctx), /integer from 40 through 80/);
     }
     assert.equal(execCalls, 0);
   } finally {
@@ -444,7 +444,7 @@ done
   }
 });
 
-test("follow-ups reject busy and finished panes without consuming fresh report paths", { timeout: 20000 }, async t => {
+test("follow-ups reject busy panes and allow finished panes", { timeout: 20000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), "subagent-followup-preflight-test-"));
   const parentSession = `pi-subagent-preflight-${process.pid}-${Date.now()}`;
   const oldPath = process.env.PATH;
@@ -497,8 +497,6 @@ while :; do
     tmux wait-for -S "$channel"
     settled=$(tmux show-options -qv -t "$pane" @pi_settled_generation)
     tmux set-option -q -t "$pane" @pi_settled_generation $((settled + 1))
-    sleep 1
-    while :; do sleep 1; done
   fi
   count=$((count + 1))
 done
@@ -511,7 +509,6 @@ done
   const reservation = (path: string) => join(tmpdir(), `pi-subagent-report-${createHash("sha256").update(path).digest("hex")}.reserve`);
   const absent = async (path: string) => assert.rejects(lstat(path), { code: "ENOENT" });
   let childSession: string | undefined;
-  let retrySession: string | undefined;
   let publicationRelease: string | undefined;
   try {
     const { extensions, errors, runtime } = await loadExtensions([extensionPath], dir);
@@ -567,26 +564,16 @@ done
     assert.equal(second.details.status, "running");
     await until(() => messages.some(message => /All 1 background job/.test(message.text)));
     assert.equal(await readFile(busyReport, "utf8"), "follow-up report\n");
-    await assert.rejects(
-      followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
-        provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
-        cwd: dir, session_label: "preflight", mode: "task", report_file: finishedReport }, undefined, undefined, ctx),
-      /already has a final monitored outcome/,
-    );
-    await absent(finishedReport);
-    await absent(reservation(finishedReport));
-    const retry: any = await launch.execute("test", {
-      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
-        cwd: dir, session_label: "preflight-retry", mode: "task", report_file: finishedReport }],
-    }, undefined, undefined, ctx);
-    assert.equal(retry.details.jobs[0].status, "running");
-    retrySession = retry.details.jobs[0].session_label;
+    const third: any = await followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
+      provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
+      cwd: dir, session_label: "preflight", mode: "task", report_file: finishedReport }, undefined, undefined, ctx);
+    assert.equal(third.details.status, "running");
+    await until(async () => await readFile(finishedReport, "utf8").then(value => value === "follow-up report\n").catch(() => false));
   } finally {
     if (publicationRelease) await writeFile(publicationRelease, "").catch(() => {});
     process.env.PATH = oldPath;
     if (oldPane === undefined) delete process.env.TMUX_PANE;
     else process.env.TMUX_PANE = oldPane;
-    if (retrySession) await tmux(["kill-session", "-t", retrySession]).catch(() => {});
     if (childSession) await tmux(["kill-session", "-t", childSession]).catch(() => {});
     await tmux(["kill-session", "-t", parentSession]).catch(() => {});
     await rm(dir, { recursive: true, force: true });

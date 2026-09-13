@@ -727,9 +727,17 @@ export default function todoLoop(pi: ExtensionAPI) {
     }
     lastNudgeAt = Date.now();
     const open = openTodos().length;
-    pi.sendUserMessage(
+    void pi.sendUserMessage(
       `SYSTEM (todo-loop): continue — ${open} open todo${open === 1 ? "" : "s"}. Call todo_list() for state. Do not stop until every todo is checked.`,
-    );
+    ).then(result => {
+      if (result?.status === "rejected") {
+        lastNudgeAt = 0;
+        kickPump();
+      }
+    }).catch(() => {
+      lastNudgeAt = 0;
+      kickPump();
+    });
   };
 
   const kickPump = (): void => {

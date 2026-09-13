@@ -2,7 +2,9 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
+  adoptTaskOutcomeManager,
   getTaskOutcomeManager,
+  parkTaskOutcomeManager,
   releaseTaskOutcomeManager,
   type DeclaredOutcome,
 } from "./task-outcomes/manager.ts";
@@ -29,10 +31,28 @@ export default function taskOutcomes(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", (_event, ctx) => {
-    const manager = getTaskOutcomeManager(pi, ctx);
+  pi.registerCommand("task-cancel", {
+    description: "Cancel the active task attempt without relaunching it",
+    handler: async (_args, ctx) => {
+      const manager = getTaskOutcomeManager(pi, ctx);
+      manager.requestCancellation("task_cancel", "explicit /task-cancel");
+      ctx.abort();
+      await ctx.waitForIdle();
+    },
+  });
+
+  pi.on("session_start", (event, ctx) => {
+    const adopted = event.reason === "maintenance" && event.maintenance
+      ? adoptTaskOutcomeManager(pi, ctx, event.maintenance)
+      : undefined;
+    if (process.env.PI_DEBUG_MAINTENANCE === "1") console.error("task session start", event.reason, event.maintenance?.maintenanceId, Boolean(adopted));
+    const manager = adopted ?? getTaskOutcomeManager(pi, ctx);
     manager.restore();
     manager.ingestLauncherContract();
+    if (event.reason === "maintenance" && event.maintenance) {
+      if (!adopted) throw new Error("maintenance task manager handoff is missing");
+      manager.resumeMaintenance(event.maintenance);
+    }
   });
   pi.on("before_agent_start", (event, ctx) => {
     const manager = getTaskOutcomeManager(pi, ctx);
@@ -53,12 +73,16 @@ export default function taskOutcomes(pi: ExtensionAPI) {
     getTaskOutcomeManager(pi, ctx).onTurnEnd(event.message);
   });
   pi.on("agent_end", (event, ctx) => {
-    getTaskOutcomeManager(pi, ctx).onAgentEnd(event.messages);
+    getTaskOutcomeManager(pi, ctx).onAgentEnd(event.messages, event.interruption);
   });
   pi.on("agent_settled", async (_event, ctx) => {
     await getTaskOutcomeManager(pi, ctx).onAgentSettled(ctx.hasPendingMessages?.() ?? false);
   });
   pi.on("session_shutdown", (event, ctx) => {
+    if (event.reason === "maintenance" && event.maintenance) {
+      parkTaskOutcomeManager(ctx, event.maintenance);
+      return;
+    }
     getTaskOutcomeManager(pi, ctx).shutdown(`session ${event.reason}`);
     releaseTaskOutcomeManager(ctx);
   });

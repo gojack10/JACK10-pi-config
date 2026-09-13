@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -103,6 +103,141 @@ const contract = (dir: string, jobId: string, attemptId: string, batchId = "batc
   batch_id: batchId,
 });
 
+test("unqualified maintenance rejects before persistence and preserves later child/background results", async t => {
+  const h = await harness(t);
+  const gate = join(h.dir, "maintenance-background-release");
+  await h.call("task_outcomes_consumer", {
+    ...contract(h.dir, "maintenance-parent", "attempt", "maintenance-batch"), children: ["child"],
+  });
+  await h.call("task_outcomes_consumer", {
+    action: "background", batch_id: "maintenance-batch", job_id: "background",
+    command: `while [ ! -f '${gate}' ]; do sleep .02; done; printf preserved`,
+  });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "maintenance-batch" });
+  const before = await h.snapshot();
+  const persisted = h.persisted.length;
+  for (let i = 0; i < 2; i++) {
+    assert.throws(() => h.manager.beginMaintenance(), /ownership transfer is not yet verified/);
+    assert.deepEqual(await h.snapshot(), before);
+    assert.equal(h.persisted.length, persisted, "no marker or false final may be written");
+    assert.equal(h.messages.length, 0);
+  }
+  for (let i = 0; i < 2; i++) {
+    h.manager.recordChildOutcome("maintenance-parent", "child", "completed", "child survived", "model", "child-attempt");
+  }
+  await writeFile(gate, "");
+  await until(async () => (await h.snapshot()).active.pendingWork.length === 0);
+  await until(() => h.messages.length === 1);
+  assert.equal(h.persisted.filter(row => row.data.kind === "child_outcome").length, 1);
+  assert.equal((await h.snapshot()).outcomes.length, 0);
+});
+
+test("launcher ingestion preserves durable dynamic child membership", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  const jobId = "manifest-parent";
+  const attemptId = "manifest-attempt";
+  const batchId = "manifest-batch";
+  const reportPath = join(h.dir, "manifest-parent.md");
+  const manifestPath = join(h.dir, "manifest.json");
+  await h.call("task_outcomes_consumer", { action: "batch_open", batch_id: batchId, expected: 3 });
+  const activatedAt = Date.now();
+  await writeFile(reportPath, "");
+  const report = await lstat(reportPath);
+  await writeFile(manifestPath, JSON.stringify({
+    version: 1,
+    jobId,
+    attemptId,
+    mode: "task",
+    reportPath,
+    reportIdentity: { dev: String(report.dev), ino: String(report.ino) },
+    activatedAt,
+    batchId,
+    parentJobId: "outer-parent",
+    childJobIds: [],
+  }));
+  const oldManifest = process.env.PI_SUBAGENT_MANIFEST;
+  process.env.PI_SUBAGENT_MANIFEST = manifestPath;
+  try {
+    assert.deepEqual(h.manager.ingestLauncherContract()?.childJobIds, []);
+    h.manager.registerChild(jobId, "child-one");
+    h.manager.registerChild(jobId, "child-two");
+    await h.emit("session_tree");
+    const reingested = h.manager.ingestLauncherContract();
+    assert.deepEqual(reingested?.childJobIds, ["child-one", "child-two"]);
+    assert.deepEqual((await h.snapshot()).active.childJobIds, ["child-one", "child-two"]);
+    h.manager.recordChildOutcome(jobId, "child-one", "completed", "child one done");
+    h.manager.recordChildOutcome(jobId, "child-two", "completed", "child two done");
+    await h.call("task_outcomes_consumer", { action: "close", batch_id: batchId });
+    await writeFile(reportPath, "final report");
+    await h.settle({ outcome: "completed", summary: "parent done" });
+    const final = h.manager.ingestLauncherContract();
+    assert.equal(final?.state, "final");
+    assert.deepEqual(final?.childJobIds, ["child-one", "child-two"]);
+    assert.throws(() => h.manager.registerChild(jobId, "late-child"), /no active/);
+  } finally {
+    if (oldManifest === undefined) delete process.env.PI_SUBAGENT_MANIFEST;
+    else process.env.PI_SUBAGENT_MANIFEST = oldManifest;
+  }
+});
+
+ test("launcher ingestion still rejects immutable manifest changes", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  const base = {
+    version: 1,
+    jobId: "manifest-check",
+    attemptId: "manifest-attempt",
+    mode: "task",
+    reportPath: join(h.dir, "manifest-check.md"),
+    batchId: "manifest-check-batch",
+    parentJobId: "outer-parent",
+    childJobIds: [] as string[],
+  };
+  const manifestPath = join(h.dir, "manifest-check.json");
+  await h.call("task_outcomes_consumer", { action: "batch_open", batch_id: base.batchId, expected: 3 });
+  const activatedAt = Date.now();
+  await writeFile(base.reportPath, "");
+  const report = await lstat(base.reportPath);
+  const withReservation = {
+    ...base,
+    reportIdentity: { dev: String(report.dev), ino: String(report.ino) },
+    activatedAt,
+  };
+  const writeManifest = async (changes: Record<string, unknown> = {}) =>
+    writeFile(manifestPath, JSON.stringify({ ...withReservation, ...changes }));
+  await writeManifest();
+  const oldManifest = process.env.PI_SUBAGENT_MANIFEST;
+  process.env.PI_SUBAGENT_MANIFEST = manifestPath;
+  try {
+    assert.deepEqual(h.manager.ingestLauncherContract()?.childJobIds, []);
+    h.manager.registerChild(base.jobId, "manifest-child");
+    for (const [name, changes] of [
+      ["job", { jobId: "different-job" }],
+      ["attempt", { attemptId: "different-attempt" }],
+      ["mode", { mode: "dialogue" }],
+      ["report path", { reportPath: join(h.dir, "different-report.md") }],
+      ["report reservation", { reportIdentity: { dev: "0", ino: "0" } }],
+      ["parent", { parentJobId: "different-parent" }],
+      ["batch", { batchId: "different-batch" }],
+    ] as const) {
+      await writeManifest(changes);
+      assert.throws(() => h.manager.ingestLauncherContract(), /conflicts with/, `${name} mismatch was accepted`);
+    }
+    await writeManifest({ childJobIds: ["stale-manifest-child"] });
+    assert.deepEqual(h.manager.ingestLauncherContract()?.childJobIds, ["manifest-child"]);
+    assert.throws(() => h.manager.registerChild(base.jobId, base.jobId), /own child/);
+    await assert.rejects(
+      h.call("task_outcomes_consumer", {
+        action: "activate", job_id: "reservation-other", attempt_id: "other-attempt", mode: "task",
+        report_path: base.reportPath, batch_id: base.batchId,
+      }),
+      /fresh|unused|report/i,
+    );
+  } finally {
+    if (oldManifest === undefined) delete process.env.PI_SUBAGENT_MANIFEST;
+    else process.env.PI_SUBAGENT_MANIFEST = oldManifest;
+  }
+});
+
  test("pending child and bash_bg work hold the parent until fresh declaration", { timeout: 15000 }, async t => {
   const h = await harness(t);
   const gate = join(h.dir, "release-g");
@@ -167,6 +302,24 @@ test("report verification is tied to the active attempt and settlement", { timeo
     h.call("report_outcome", { outcome: "completed", summary: "wrong artifact" }),
     /ENOENT|no such file|report/,
   );
+});
+
+test("final task attempts can be followed up in the same saved session", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "continue", "c1", "continue-batch-1") });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "continue-batch-1" });
+  await writeFile(join(h.dir, "continue-c1.md"), "first report");
+  await h.settle({ outcome: "completed", summary: "first attempt" });
+  assert.equal((await h.snapshot()).active, undefined);
+
+  const next = await h.call("task_outcomes_consumer", { ...contract(h.dir, "continue", "c2", "continue-batch-2") });
+  assert.equal(next.details.state, "active");
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "continue-batch-2" });
+  await writeFile(join(h.dir, "continue-c2.md"), "second report");
+  await h.settle({ outcome: "completed", summary: "second attempt" });
+
+  const records = (await h.snapshot()).outcomes.filter((item: any) => item.jobId === "continue");
+  assert.deepEqual(records.map((item: any) => [item.attemptId, item.outcome]), [["c1", "completed"], ["c2", "completed"]]);
 });
 
 test("task contracts inject instructions and correct missing declarations without duplicate wakes", async t => {
@@ -926,6 +1079,32 @@ test("failed append reload restores the selected branch before retry", { timeout
   assert.ok(outcome);
   assert.equal(outcome.parentId, intendedLeaf);
   assert.equal(h.sm.getLeafId(), outcome.id);
+});
+
+test("finality rejects a work-ready admission that is still preflighted", { timeout: 10000 }, async t => {
+  const h = await harness(t, undefined, true);
+  let releaseAdmission!: () => void;
+  let admissionStarted = false;
+  h.runtime.sendUserMessage = async (_text: string, options: any) => {
+    admissionStarted = true;
+    await new Promise<void>(resolve => { releaseAdmission = resolve; });
+    if (options.admissionGuard?.() === false) {
+      return { status: "rejected", reason: "finality", error: "attempt is final" };
+    }
+    return { status: "admitted", delivery: "steer" };
+  };
+  await h.call("task_outcomes_consumer", {
+    action: "activate", job_id: "finality-fence", attempt_id: "a1", mode: "dialogue", children: ["child"],
+  });
+  h.manager.recordChildOutcome("finality-fence", "child", "completed", "child done");
+  await until(() => admissionStarted);
+  await h.settle({ stopReason: "stop", text: "dialogue is final" });
+  releaseAdmission();
+  await delay(0);
+  const snapshot = await h.snapshot();
+  assert.equal(snapshot.active, undefined);
+  assert.ok(snapshot.outcomes.some((item: any) => item.attemptId === "a1" && item.final));
+  assert.equal(h.persisted.filter(entry => entry.data?.kind === "work_ready" && entry.data.notified === true).length, 0);
 });
 
 test("rejected work-ready notification remains retryable without duplicate sends", { timeout: 10000 }, async t => {
