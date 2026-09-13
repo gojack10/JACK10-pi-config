@@ -28,7 +28,7 @@ type Env = Record<string, string | undefined>;
 
 type Config = { threshold?: number; model?: string; percent?: number; directory: string; graceTurns: number };
 const PRODUCTION_MODEL = "gpt-6-astra";
-const LOWER_PERCENT = 50;
+const LOWER_PERCENT = 40;
 const UPPER_PERCENT = 80;
 
 function positiveInteger(value: string | undefined): number | undefined {
@@ -42,7 +42,7 @@ function config(env: Env): Config | undefined {
 	const legacyThreshold = positiveInteger(env.PI_RLM_FRIENDLY_STOP_TOKENS);
 	const model = env.PI_RLM_FRIENDLY_STOP_MODEL;
 	const parsedPercent = positiveInteger(env.PI_RLM_FRIENDLY_STOP_PERCENT);
-	const percent = parsedPercent !== undefined && parsedPercent >= 50 && parsedPercent <= 80 ? parsedPercent : undefined;
+	const percent = parsedPercent !== undefined && parsedPercent >= 40 && parsedPercent <= 80 ? parsedPercent : undefined;
 	const directory = env.PI_RLM_ROLLOVER_DIR;
 	const graceTurns = positiveInteger(env.PI_RLM_FRIENDLY_STOP_GRACE_TURNS) ?? 2;
 	if (!directory || !isAbsolute(directory)) return;
