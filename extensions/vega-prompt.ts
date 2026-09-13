@@ -58,8 +58,10 @@ export default function (pi: ExtensionAPI) {
       if (!r.ok) return;
       const text = ((await r.json())?.text ?? "").trim();
       if (!text) return;
-      try { pi.sendUserMessage(text); }
-      catch { pi.sendUserMessage(text, { deliverAs: "steer" }); }
+      const admission = await pi.sendUserMessage(text);
+      if (admission?.status === "rejected") {
+        await pi.sendUserMessage(text, { deliverAs: "steer" });
+      }
     } catch { /* retry next tick */ }
   }
 
