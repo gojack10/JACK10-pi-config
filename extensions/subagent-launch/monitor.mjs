@@ -346,7 +346,10 @@ while (true) {
         process.exit(0);
       }
       const hasReport = reportText !== undefined;
-      if (receipt.outcome === "needs_input" || (receipt.final === false && receipt.outcome !== "transport_lost")) {
+      if (receipt.outcome === "maintenance_paused" || receipt.outcome === "maintenance_error") {
+        emit({ kind: receipt.outcome, jobId: receipt.job_id, attemptId: receipt.attempt_id,
+          source, final: false, summary: receipt.summary ?? receipt.outcome });
+      } else if (receipt.outcome === "needs_input" || (receipt.final === false && receipt.outcome !== "transport_lost")) {
         emit({ kind: receipt.outcome === "context_paused" ? "context_paused" : "needs_input",
           jobId: receipt.job_id, attemptId: receipt.attempt_id, pauseId: receipt.pause_id,
           source, final: false, summary: receipt.summary ?? "child requested human input", report: receipt.report });

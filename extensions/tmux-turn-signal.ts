@@ -4,6 +4,7 @@ import { open, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MaintenanceHandoff } from "./_shared/maintenance.ts";
 
 type TaskOutcomeEvent = {
 	sessionId: string;
@@ -18,6 +19,9 @@ type TaskOutcomeEvent = {
 	reportPath?: string;
 	reportText?: string;
 	pauseId?: string;
+	maintenanceId?: string;
+	ownerEpoch?: string;
+	phase?: string;
 };
 
 type ArtifactIdentity = { dev: string; ino: string };
@@ -59,35 +63,45 @@ const OUTCOME_GENERATION_OPTION = "@pi_outcome_generation";
 // ponytail: Pi exposes no post-command event; extension commands bypass `input`
 // (docs/extensions.md, “Lifecycle Overview” and “Input Events”). Keep local
 // command ACKs command-specific until a real completion hook exists.
+interface SignalState {
+	ownerSessionId?: string;
+	pendingOutcomes: unknown[];
+	outcomeQueue: Promise<void>;
+	pendingOutcomePublication?: Promise<boolean>;
+}
+
+const handoffKey = Symbol.for("pi.tmux-turn-signal.maintenance-handoffs");
+const globalState = globalThis as typeof globalThis & {
+	[handoffKey]?: Map<string, { state: SignalState; lease: MaintenanceHandoff }>;
+};
+const handoffs = globalState[handoffKey] ??= new Map();
+
 export default function (pi: ExtensionAPI) {
-	let ownerSessionId: string | undefined;
-	const pendingOutcomes: unknown[] = [];
-	let outcomeQueue = Promise.resolve();
-	let pendingOutcomePublication: Promise<boolean> | undefined;
-	// Keep already-loaded runtimes usable until the core API is deployed; normal
-	// Pi execution uses the reusable checked boundary exposed by ExtensionAPI.
-	const execChecked = typeof pi.execChecked === "function"
-		? pi.execChecked.bind(pi)
-		: async (command: string, args: string[]) => {
-			const value = await pi.exec(command, args);
-			return value.code === 0 && !value.killed
-				? { ok: true as const, value }
-				: {
-					ok: false as const,
-					error: {
-						command: command.split(/[\\/]/).at(-1) || command,
-						code: value.code,
-						killed: value.killed,
-						diagnostic: redactSensitiveText(value.stderr.trim().slice(0, 1024)) || undefined,
-					},
-				};
-		};
-	const recordError = typeof pi.recordError === "function"
-		? pi.recordError.bind(pi)
-		: (record: Parameters<ExtensionAPI["recordError"]>[0]) => {
-			pi.appendEntry("pi-error/v1", record);
-			return "";
-		};
+	let activePi = pi;
+	let signalState: SignalState = {
+		pendingOutcomes: [],
+		outcomeQueue: Promise.resolve(),
+	};
+	const execChecked = async (command: string, args: string[]) => {
+		if (typeof activePi.execChecked === "function") return activePi.execChecked(command, args);
+		const value = await activePi.exec(command, args);
+		return value.code === 0 && !value.killed
+			? { ok: true as const, value }
+			: {
+				ok: false as const,
+				error: {
+					command: command.split(/[\\/]/).at(-1) || command,
+					code: value.code,
+					killed: value.killed,
+					diagnostic: redactSensitiveText(value.stderr.trim().slice(0, 1024)) || undefined,
+				},
+			};
+	};
+	const recordError = (record: Parameters<ExtensionAPI["recordError"]>[0]) => {
+		if (typeof activePi.recordError === "function") return activePi.recordError(record);
+		activePi.appendEntry("pi-error/v1", record);
+		return "";
+	};
 	const execTmux = async (args: string[]) => {
 		const result = await execChecked("tmux", args);
 		if (!result.ok) {
@@ -218,8 +232,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const deliverOutcome = (payload: TaskOutcomeEvent): Promise<boolean> => {
-		const publication = outcomeQueue.then(() => publishOutcome(payload));
-		outcomeQueue = publication.catch(error => {
+		const publication = signalState.outcomeQueue.then(() => publishOutcome(payload));
+		signalState.outcomeQueue = publication.catch(error => {
 			console.error(`[tmux-turn-signal] outcome publication failed: ${errorMessage(error)}`);
 		});
 		return publication.then(() => true, () => false);
@@ -227,40 +241,59 @@ export default function (pi: ExtensionAPI) {
 
 	const signalOutcome = async (payload: unknown) => {
 		if (!taskOutcomeEventStatus(payload)) return;
-		if (!ownerSessionId) {
-			pendingOutcomes.push(payload);
+		if (!signalState.ownerSessionId) {
+			signalState.pendingOutcomes.push(payload);
 			return;
 		}
-		if (payload.sessionId === ownerSessionId) {
+		if (payload.sessionId === signalState.ownerSessionId) {
 			const publication = deliverOutcome(payload);
-			pendingOutcomePublication = publication;
+			signalState.pendingOutcomePublication = publication;
 			await publication;
 		}
 	};
 
 	const flushPendingOutcomes = async () => {
-		const queued = pendingOutcomes.splice(0);
+		const queued = signalState.pendingOutcomes.splice(0);
 		for (const payload of queued) {
-			if (taskOutcomeEventStatus(payload) && payload.sessionId === ownerSessionId) {
+			if (taskOutcomeEventStatus(payload) && payload.sessionId === signalState.ownerSessionId) {
 				await deliverOutcome(payload);
 			}
 		}
-		await outcomeQueue;
+		await signalState.outcomeQueue;
 	};
 
-	pi.events.on("task-outcome", signalOutcome);
-	pi.on("session_start", async (_event, ctx) => {
-		ownerSessionId = ctx.sessionManager.getSessionId();
+	activePi.events.on("task-outcome", signalOutcome);
+	activePi.on("session_start", async (event, ctx) => {
+		if (event.reason === "maintenance" && event.maintenance) {
+			const handoff = handoffs.get(event.maintenance.maintenanceId);
+			if (!handoff || handoff.lease.ownerEpoch !== event.maintenance.ownerEpoch ||
+				handoff.lease.sessionId !== event.maintenance.sessionId) {
+				throw new Error("tmux outcome publication handoff is missing or stale");
+			}
+			signalState = handoff.state;
+			handoffs.delete(event.maintenance.maintenanceId);
+			activePi = pi;
+		}
+		signalState.ownerSessionId = ctx.sessionManager.getSessionId();
 		await flushPendingOutcomes();
 	});
 
-	pi.on("agent_start", async (_event, ctx) => {
-		ownerSessionId = ctx.sessionManager.getSessionId();
+	activePi.on("session_shutdown", (event, ctx) => {
+		if (event.reason === "maintenance" && event.maintenance) {
+			if (signalState.ownerSessionId !== ctx.sessionManager.getSessionId()) {
+				throw new Error("tmux outcome publication owner mismatch");
+			}
+			handoffs.set(event.maintenance.maintenanceId, { state: signalState, lease: { ...event.maintenance } });
+		}
+	});
+
+	activePi.on("agent_start", async (_event, ctx) => {
+		signalState.ownerSessionId = ctx.sessionManager.getSessionId();
 		const pane = process.env.TMUX_PANE;
 		if (!pane || ctx.mode !== "tui") return;
 
 		// Publish the live identity before START; Pi defers creating the JSONL until an assistant response.
-		await execTmux(["set-option", "-q", "-t", pane, "@pi_session_id", ownerSessionId]);
+		await execTmux(["set-option", "-q", "-t", pane, "@pi_session_id", signalState.ownerSessionId]);
 		await saveSessionFile(pane, ctx.sessionManager.getSessionFile());
 		const startGeneration = Number.parseInt(await readOption(pane, START_GENERATION_OPTION), 10);
 		await execTmux([
@@ -278,8 +311,8 @@ export default function (pi: ExtensionAPI) {
 		// task-outcomes emits task-outcome synchronously from its settled handler.
 		// Its event-bus listener assigns this promise before yielding, so the
 		// settled generation cannot advertise availability before publication commits.
-		const publication = pendingOutcomePublication;
-		pendingOutcomePublication = undefined;
+		const publication = signalState.pendingOutcomePublication;
+		signalState.pendingOutcomePublication = undefined;
 		if (publication && !(await publication)) return;
 
 		await saveSessionFile(pane, ctx.sessionManager.getSessionFile());
