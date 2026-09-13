@@ -17,6 +17,7 @@ import {
 	type ExtensionAPI,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { getTaskOutcomeManager, type MaintenanceLease } from "../task-outcomes/manager.ts";
 
 const KEEP = new Set(["sifttext_get_node", "sifttext_get_outline"]);
 const CLEARED_RESULT = "[tool result cleared by /tool-call-clean]";
@@ -180,30 +181,40 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("tool-call-clean", {
 		description: "Clear non-ideation tool outputs while preserving every assistant and thinking block",
 		handler: async (_args, ctx) => {
-			await ctx.waitForIdle();
 			const sessionFile = ctx.sessionManager.getSessionFile();
 			if (!sessionFile) {
 				ctx.ui.notify("tool-call-clean requires a saved session", "error");
 				return;
 			}
 
+			const manager = getTaskOutcomeManager(pi, ctx);
+			let lease: MaintenanceLease | undefined;
 			try {
-				const { changed, summary } = cleanSessionFile(sessionFile);
-
-				if (!changed) {
-					ctx.ui.setStatus("tool-call-clean", summary);
-					ctx.ui.notify(summary, "info");
-					return;
-				}
-
+				// Persist intent before the core aborts a streaming turn. A failed
+				// marker leaves the run untouched and therefore retryable.
+				lease = manager.beginMaintenance(sessionFile);
+				let result: ReturnType<typeof cleanSessionFile> | undefined;
 				const switched = await ctx.switchSession(sessionFile, {
+					maintenance: {
+						token: lease,
+						beforeReplace: () => {
+							result = cleanSessionFile(sessionFile);
+							if (!result.changed) {
+								manager.resumeMaintenance(lease!);
+								return { replace: false };
+							}
+							return { replace: true };
+						},
+					},
 					withSession: async (replacementCtx) => {
+						const summary = result?.summary ?? "Session cleaned";
 						replacementCtx.ui.setStatus("tool-call-clean", summary);
 						replacementCtx.ui.notify(`${summary}. The estimate becomes exact after the next successful response.`, "info");
 					},
 				});
-				if (switched.cancelled) ctx.ui.notify(`${summary}, but session reload was cancelled`, "warning");
+				if (switched.cancelled) ctx.ui.notify("Maintenance was cancelled", "warning");
 			} catch (error) {
+				if (lease) manager.failMaintenance(lease, error);
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
 		},

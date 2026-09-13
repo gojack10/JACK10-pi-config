@@ -53,11 +53,20 @@ async function bind() {
       contextWindow: 272000, percent: null }),
     switchSession: async (file, options) => {
       if (process.env.PI_TEST_RECOVERY_CASE === 'cancel') return { cancelled: true };
-      await emit('session_shutdown', { reason: 'resume', targetSessionFile: file });
+      const maintenance = options.maintenance;
+      if (maintenance?.beforeReplace) {
+        const prepared = await maintenance.beforeReplace();
+        if (prepared?.replace === false) return { cancelled: false };
+      }
+      await emit('session_shutdown', maintenance
+        ? { reason: 'maintenance', targetSessionFile: file, maintenance: maintenance.token }
+        : { reason: 'resume', targetSessionFile: file });
       sm = SessionManager.open(file);
       resumed = true;
       await bind();
-      await emit('session_start', { reason: 'resume', previousSessionFile: file });
+      await emit('session_start', maintenance
+        ? { reason: 'maintenance', previousSessionFile: file, maintenance: maintenance.token }
+        : { reason: 'resume', previousSessionFile: file });
       await options.withSession({ ...ctx, sendUserMessage: async text => {
         if (!text.includes('Continue the same assignment')) throw new Error('missing continuation');
         await finish();
@@ -93,7 +102,7 @@ idle = false;
 await emit('agent_start');
 if (friendly) {
   if (process.env.PI_RLM_FRIENDLY_STOP_TOKENS !== undefined || process.env.PI_RLM_FRIENDLY_STOP_MODEL !== 'fake' ||
-      process.env.PI_RLM_FRIENDLY_STOP_PERCENT !== '50') throw new Error('launcher opt-in environment is wrong');
+      process.env.PI_RLM_FRIENDLY_STOP_PERCENT !== '40') throw new Error('launcher opt-in environment is wrong');
   await emit('turn_end', {});
   await emit('context', { messages: [] });
   const checkpoint = loaded.extensions.find(ext => ext.tools.has('rlm_rollover_checkpoint'))?.tools.get('rlm_rollover_checkpoint').definition;
