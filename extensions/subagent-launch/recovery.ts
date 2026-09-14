@@ -42,6 +42,7 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
       };
       let maintenanceLease: MaintenanceLease | undefined;
       let maintenanceManager: TaskOutcomeManager | undefined;
+      let replacementAttempted = false;
       try {
         // Never queue a cleanup behind an unrelated active turn.
         if (!ctx.isIdle()) throw new Error("worker is not idle; no cleanup performed");
@@ -67,45 +68,51 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
         const lease: MaintenanceLease = taskManager.beginMaintenance(file);
         maintenanceLease = lease;
         let result: ReturnType<typeof cleanSessionFile> | undefined;
+        // Rejection can occur after disposal, before withSession supplies an owner.
+        replacementAttempted = true;
         const switched = await ctx.switchSession(file, {
           maintenance: {
             token: lease,
             beforeReplace: () => {
-              result = cleanSessionFile(file, contextPause.limit);
+              result = cleanSessionFile(file, ctx.sessionManager.getLeafId(), contextPause.limit);
               if (!result.changed) {
-                taskManager.resumeMaintenance(lease);
-                return { replace: false };
+                return { replace: false, afterNoReplace: () => taskManager.resumeMaintenance(lease) };
               }
               return { replace: true };
             },
           },
           async withSession(replacement) {
-            if (replacement.sessionManager.getSessionId() !== sessionId) throw new Error("Pi session identity changed during cleanup");
-            if (!modelId || replacement.model?.id !== modelId) throw new Error("session model changed during cleanup; assignment remains paused");
-            const resumed = existingTaskOutcomeManager(replacement);
-            if (!resumed) throw new Error("replacement task manager is unavailable");
-            // Use the replacement runtime's usage (the same estimator used by the guard).
-            const tokens = replacement.getContextUsage()?.tokens;
-            if (tokens == null) throw new Error("cleaned context usage is unavailable; assignment remains paused");
-            resumed.resumeAfterContextClean(request.jobId, request.attemptId, request.pauseId, tokens);
             try {
-              await acknowledge("resume_requested", { beforeTokens: result?.beforeTokens, afterTokens: tokens });
-              await replacement.sendUserMessage("Tool outputs were cleaned. Continue the same assignment from retained progress; the report path and completion requirements are unchanged.");
+              if (replacement.sessionManager.getSessionId() !== sessionId) throw new Error("Pi session identity changed during cleanup");
+              if (!modelId || replacement.model?.id !== modelId) throw new Error("session model changed during cleanup; assignment remains paused");
+              const resumed = existingTaskOutcomeManager(replacement);
+              if (!resumed) throw new Error("replacement task manager is unavailable");
+              // Use the replacement runtime's usage (the same estimator used by the guard).
+              const tokens = replacement.getContextUsage()?.tokens;
+              if (tokens == null) throw new Error("cleaned context usage is unavailable; assignment remains paused");
+              resumed.resumeAfterContextClean(request.jobId, request.attemptId, request.pauseId, tokens);
+              try {
+                await acknowledge("resume_requested", { beforeTokens: result?.beforeTokens, afterTokens: tokens });
+                await replacement.sendUserMessage("Tool outputs were cleaned. Continue the same assignment from retained progress; the report path and completion requirements are unchanged.");
+              } catch (error) {
+                // If dispatch never started, leave a recoverable assignment, not an
+                // active contract with no running turn. Already-final outcomes stay final.
+                resumed.pauseForContext(contextPause.reason, contextPause.limit);
+                throw error;
+              }
             } catch (error) {
-              // If dispatch never started, leave a recoverable assignment, not an
-              // active contract with no running turn. Already-final outcomes stay final.
-              resumed.pauseForContext(contextPause.reason, contextPause.limit);
+              existingTaskOutcomeManager(replacement)?.failMaintenance(lease, error);
               throw error;
             }
           },
         });
         if (switched.cancelled) {
-          taskManager.resumeMaintenance(lease);
-          maintenanceLease = undefined;
           throw new Error("session reload cancelled; assignment remains paused");
         }
       } catch (error) {
-        if (maintenanceLease) maintenanceManager?.failMaintenance(maintenanceLease, error);
+        // Core records replacement failures through a fresh file owner.
+        // This disposed command frame may only use the process-local acknowledgment.
+        if (!replacementAttempted && maintenanceLease) maintenanceManager?.failMaintenance(maintenanceLease, error);
         const message = (error instanceof Error ? error.message : String(error))
           .replace(/\b(api[_-]?key|token|password|secret|authorization)\b(\s*[:=]\s*)(?:bearer\s+)?\S+/gi, "$1$2[redacted]")
           .slice(0, 2048);

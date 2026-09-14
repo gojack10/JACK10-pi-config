@@ -17,7 +17,7 @@ import {
 	type ExtensionAPI,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { getTaskOutcomeManager, type MaintenanceLease } from "../task-outcomes/manager.ts";
+import { existingTaskOutcomeManager, getTaskOutcomeManager, type MaintenanceLease } from "../task-outcomes/manager.ts";
 
 const KEEP = new Set(["sifttext_get_node", "sifttext_get_outline"]);
 const CLEARED_RESULT = "[tool result cleared by /tool-call-clean]";
@@ -28,11 +28,27 @@ type CleanResult = {
 	clearedResults: number;
 };
 
-export function cleanRows(input: Row[]): CleanResult {
+export function cleanRows(input: Row[], leafId?: string | null): CleanResult {
 	const rows = structuredClone(input);
+	const selected = new Set<string>();
+	if (leafId !== undefined) {
+		const entries = rows.filter((row) => row.type !== "session");
+		const byId = new Map(entries.map((row) => [row.id, row]));
+		if (byId.size !== entries.length) throw new Error("Duplicate session entry IDs; no cleanup performed");
+		let id = leafId;
+		while (id !== null) {
+			const row = byId.get(id);
+			if (!row || selected.has(id) || !(row.parentId === null || typeof row.parentId === "string")) {
+				throw new Error("Selected cleanup branch is missing or malformed; no cleanup performed");
+			}
+			selected.add(id);
+			id = row.parentId;
+		}
+	}
 	let clearedResults = 0;
 
 	for (const row of rows) {
+		if (leafId !== undefined && !selected.has(row.id)) continue;
 		if (row.message?.role !== "toolResult" || KEEP.has(row.message.toolName)) continue;
 		const content = row.message.content ?? [];
 		if (content.length === 1 && content[0]?.type === "text" && content[0].text === CLEARED_RESULT) continue;
@@ -43,17 +59,17 @@ export function cleanRows(input: Row[]): CleanResult {
 	return { rows, clearedResults };
 }
 
-function contextMessages(rows: Row[]): AgentMessage[] {
+function contextMessages(rows: Row[], leafId: string | null): AgentMessage[] {
 	const entries = rows.filter((row) => row.type !== "session") as SessionEntry[];
-	return buildSessionContext(entries, entries.at(-1)?.id ?? null).messages;
+	return buildSessionContext(entries, leafId).messages;
 }
 
-function freshContextEstimate(rows: Row[]): number {
-	return contextMessages(rows).reduce((total, message) => total + estimateTokens(message), 0);
+function freshContextEstimate(rows: Row[], leafId: string | null): number {
+	return contextMessages(rows, leafId).reduce((total, message) => total + estimateTokens(message), 0);
 }
 
-function refreshLastUsageEstimate(rows: Row[]): boolean {
-	const messages = contextMessages(rows);
+function refreshLastUsageEstimate(rows: Row[], leafId: string | null): boolean {
+	const messages = contextMessages(rows, leafId);
 	const index = messages.findLastIndex(
 		(message) =>
 			message.role === "assistant" &&
@@ -96,14 +112,15 @@ function rewriteAtomically(sessionFile: string, content: string) {
 }
 
 // Shared by the human command and tracked subagent maintenance; no model request here.
-export function cleanSessionFile(sessionFile: string, contextLimit = Infinity) {
+export function cleanSessionFile(sessionFile: string, leafId: string | null, contextLimit = Infinity) {
+	if (!(leafId === null || typeof leafId === "string")) throw new Error("Cleanup requires an explicit selected branch");
 	const original = readFileSync(sessionFile, "utf8");
 	const rows = original.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-	const beforeTokens = freshContextEstimate(rows);
-	const result = cleanRows(rows);
-	const afterTokens = freshContextEstimate(result.rows);
+	const result = cleanRows(rows, leafId);
+	const beforeTokens = freshContextEstimate(rows, leafId);
+	const afterTokens = freshContextEstimate(result.rows, leafId);
 	if (afterTokens >= contextLimit) throw new Error("Tool cleanup cannot free enough context; assignment remains paused");
-	const usageRefreshed = refreshLastUsageEstimate(result.rows);
+	const usageRefreshed = refreshLastUsageEstimate(result.rows, leafId);
 	const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
 	const changed = result.clearedResults > 0 || usageRefreshed;
 	if (changed) {
@@ -171,7 +188,7 @@ function runSelfTest() {
 	assert.deepEqual(result.rows[3].message.details, { state: "preserved" });
 	assert.deepEqual(result.rows[4], rows[4]);
 	assert.equal(cleanRows(result.rows).clearedResults, 0);
-	assert.equal(refreshLastUsageEstimate(result.rows), true);
+	assert.equal(refreshLastUsageEstimate(result.rows, "keep-result"), true);
 	assert.notEqual(result.rows[2].message.usage.totalTokens, 999);
 }
 
@@ -189,33 +206,48 @@ export default function (pi: ExtensionAPI) {
 
 			const manager = getTaskOutcomeManager(pi, ctx);
 			let lease: MaintenanceLease | undefined;
+			let replacementAttempted = false;
 			try {
 				// Persist intent before the core aborts a streaming turn. A failed
 				// marker leaves the run untouched and therefore retryable.
 				lease = manager.beginMaintenance(sessionFile);
 				let result: ReturnType<typeof cleanSessionFile> | undefined;
+				// A rejection can occur after disposal but before withSession. From
+				// this point the outer frame must not access either outgoing handle.
+				replacementAttempted = true;
 				const switched = await ctx.switchSession(sessionFile, {
 					maintenance: {
 						token: lease,
 						beforeReplace: () => {
-							result = cleanSessionFile(sessionFile);
+							result = cleanSessionFile(sessionFile, ctx.sessionManager.getLeafId());
 							if (!result.changed) {
-								manager.resumeMaintenance(lease!);
-								return { replace: false };
+								return { replace: false, afterNoReplace: () => manager.resumeMaintenance(lease!) };
 							}
 							return { replace: true };
 						},
 					},
 					withSession: async (replacementCtx) => {
-						const summary = result?.summary ?? "Session cleaned";
-						replacementCtx.ui.setStatus("tool-call-clean", summary);
-						replacementCtx.ui.notify(`${summary}. The estimate becomes exact after the next successful response.`, "info");
+						try {
+							const summary = result?.summary ?? "Session cleaned";
+							replacementCtx.ui.setStatus("tool-call-clean", summary);
+							replacementCtx.ui.notify(`${summary}. The estimate becomes exact after the next successful response.`, "info");
+						} catch (error) {
+							existingTaskOutcomeManager(replacementCtx)?.failMaintenance(lease!, error);
+							throw error;
+						}
 					},
 				});
-				if (switched.cancelled) ctx.ui.notify("Maintenance was cancelled", "warning");
+				if (switched.cancelled) throw new Error("Maintenance was cancelled");
 			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (replacementAttempted) {
+					// Core owns durable replacement failures through a fresh file owner;
+					// this old command frame is only allowed to log.
+					console.error(`tool-call-clean: ${message}`);
+					return;
+				}
 				if (lease) manager.failMaintenance(lease, error);
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				ctx.ui.notify(message, "error");
 			}
 		},
 	});
