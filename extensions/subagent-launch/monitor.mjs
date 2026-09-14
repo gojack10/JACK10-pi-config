@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { constants, createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { open, readFile } from "node:fs/promises";
@@ -113,24 +113,6 @@ const readManifest = async () => {
         !Number.isSafeInteger(value.startGeneration) || !Number.isSafeInteger(value.outcomeGeneration)) return undefined;
     return value;
   } catch { return undefined; }
-};
-const waitForChannel = (channel, timeoutMs) => {
-  if (!channel) return { promise: Promise.resolve(false), cancel: () => {} };
-  const child = spawn("tmux", ["wait-for", channel], { stdio: "ignore" });
-  let settled = false;
-  let timer;
-  let resolvePromise;
-  const promise = new Promise(resolve => { resolvePromise = resolve; });
-  const finish = value => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    resolvePromise(value);
-  };
-  child.once("error", () => finish(false));
-  child.once("close", code => finish(code === 0));
-  timer = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} finish(false); }, timeoutMs);
-  return { promise, cancel: () => { try { child.kill("SIGTERM"); } catch {} finish(false); } };
 };
 const generation = async () => {
   const value = Number.parseInt(await show(config.outcomeGenerationOption) ?? "", 10);
@@ -307,8 +289,6 @@ const consumeReceipt = async (receipt, manifest, suppliedReportText) => {
         emitOnce(marker);
       }
 };
-let signal = waitForChannel(config.outcomeChannel, config.pollMs * 4);
-
 while (true) {
   const observedManifest = await readManifest();
   const manifest = observedManifest ?? cachedManifest;
@@ -339,17 +319,9 @@ while (true) {
     if (lastGeneration === undefined) lastGeneration = manifest.outcomeGeneration;
     else lastGeneration = Math.max(lastGeneration, manifest.outcomeGeneration);
     const deadline = Date.now() + config.startTimeoutMs;
-    let observedChannel = false;
-    const startWait = waitForChannel(manifest.startChannel, config.pollMs * 4);
     while (Date.now() < deadline) {
-      const result = await Promise.race([
-        startWait.promise.then(value => ({ kind: "signal", value })),
-        sleep(config.pollMs).then(() => ({ kind: "poll", value: false })),
-      ]);
-      if (result.kind === "signal" && result.value) observedChannel = true;
       const liveManifest = await readManifest();
       if (liveManifest && !bindManifest(liveManifest)) {
-        startWait.cancel();
         protocolFailure("protocol_incomplete: launcher manifest identity changed");
         process.exit(0);
       }
@@ -359,7 +331,6 @@ while (true) {
         const identity = await piSessionId(file);
         if (!identity.ok) {
           if (!isMissing(identity.error)) {
-            startWait.cancel();
             transportFailure(`transport_lost: cannot read Pi session header: ${errorText(identity.error)}`, manifest);
             process.exit(0);
           }
@@ -367,16 +338,14 @@ while (true) {
           // startup readiness only when that live identity is available.
           const liveIdentity = await show(config.sessionIdOption);
           if (liveIdentity) {
-            startWait.cancel();
             cachedSessionFile = file;
             startedSessionId = liveIdentity;
             startedKey = key;
             emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
-              sessionId: startedSessionId, sessionFile: file, channel: observedChannel });
+              sessionId: startedSessionId, sessionFile: file, channel: false });
             break;
           }
         } else if (identity.value) {
-          startWait.cancel();
           const liveIdentity = await show(config.sessionIdOption);
           if (liveIdentity && liveIdentity !== identity.value) {
             protocolFailure("protocol_incomplete: Pi session identity changed at START");
@@ -387,18 +356,17 @@ while (true) {
           sessionFileReady = true;
           startedKey = key;
           emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
-            sessionId: startedSessionId, sessionFile: file, channel: observedChannel });
+            sessionId: startedSessionId, sessionFile: file, channel: false });
           break;
         }
       }
       if (await confirmedDead()) {
-        startWait.cancel();
         transportFailure("transport_lost: child pane disappeared before START", manifest);
         process.exit(0);
       }
+      await sleep(config.pollMs);
     }
     if (startedKey !== key) {
-      startWait.cancel();
       emit({ kind: "final", jobId: manifest.jobId, attemptId: manifest.attemptId,
         outcome: "failed", source: "protocol", technical: true, final: true,
         summary: "protocol_incomplete: missing or invalid Pi session header", report: manifest.reportPath });
@@ -487,9 +455,5 @@ while (true) {
     }
   }
 
-  const event = await Promise.race([
-    signal.promise.then(value => ({ kind: "signal", value })),
-    sleep(config.pollMs).then(() => ({ kind: "poll", value: false })),
-  ]);
-  if (event.kind === "signal") signal = waitForChannel(config.outcomeChannel, config.pollMs * 4);
+  await sleep(config.pollMs);
 }
