@@ -255,7 +255,7 @@ test("registry background-adoption failure releases the handoff and compensates 
   const task = await jiti.import(fileURLToPath(new URL("../task-outcomes/manager.ts", import.meta.url)));
   const { file } = saved(t);
   const sm = SessionManager.open(file);
-  const ctx = { sessionManager: sm, isIdle: () => true };
+  const ctx = { sessionManager: sm, isIdle: () => true, hasPendingMessages: () => false };
   const pi = { events: { emit() {} }, sendUserMessage() { assert.fail("unexpected continuation"); },
     appendEntry(type: string, data: unknown) { sm.appendCustomEntry(type, data); } };
   const manager = task.getTaskOutcomeManager(pi, ctx);
