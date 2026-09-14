@@ -7,19 +7,10 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { isolateLauncherEnvironment } from "../_test-helpers/launcher-env.ts";
 
-const inheritedSubagentEnv = {
-  TMUX_PANE: process.env.TMUX_PANE,
-  PI_SUBAGENT_MANIFEST: process.env.PI_SUBAGENT_MANIFEST,
-};
-delete process.env.TMUX_PANE;
-delete process.env.PI_SUBAGENT_MANIFEST;
-test.after(() => {
-  for (const [key, value] of Object.entries(inheritedSubagentEnv)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
-});
+const restoreLauncherEnvironment = isolateLauncherEnvironment();
+test.after(restoreLauncherEnvironment);
 
 const execFileAsync = promisify(execFile);
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
@@ -58,12 +49,13 @@ tmux set-option -q -t "$pane" @pi_start_generation $((gen + 1))
 start=$(tmux show-options -qv -t "$pane" @pi_start_channel)
 tmux set-option -qu -t "$pane" @pi_start_channel
 tmux wait-for -S "$start"
-sleep .05
 channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
 tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"dialogue\\",\\"outcome\\":\\"transport_lost\\",\\"source\\":\\"transport\\",\\"final\\":false,\\"summary\\":\\"child transport ended\\"}"
 tmux set-option -q -t "$pane" @pi_outcome_generation 1
 tmux wait-for -S "$channel"
-sleep .1
+# Keep the pane alive until the parent has observed the receipt. The monitor
+# polls the durable generation, so this avoids racing a short-lived pane.
+tmux wait-for "transport-test-hold-$session_id"
 `, { mode: 0o700 });
   await chmod(fakePi, 0o700);
   await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);

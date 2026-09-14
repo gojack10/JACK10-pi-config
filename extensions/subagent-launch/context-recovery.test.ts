@@ -7,13 +7,16 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
+import { isolateLauncherEnvironment } from '../_test-helpers/launcher-env.ts';
 const exec = promisify(execFile);
+
+const restoreLauncherEnvironment = isolateLauncherEnvironment();
+test.after(restoreLauncherEnvironment);
 
 // Every descendant, including the launcher's monitor and fake interactive child,
 // uses this disposable socket. No default or inherited live tmux server is used.
 for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 'friendly'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
   const env = { ...process.env };
-  delete process.env.TMUX; delete process.env.TMUX_PANE; delete process.env.PI_SUBAGENT_MANIFEST;
   const dir = await mkdtemp(join(tmpdir(), 'context-recovery-'));
   const bin = join(dir, 'bin');
   const socket = join(dir, 'tmux.sock');
