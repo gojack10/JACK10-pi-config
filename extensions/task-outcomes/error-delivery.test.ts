@@ -10,7 +10,7 @@ import test from "node:test";
 import activate from "../tmux-turn-signal.ts";
 
 const monitorPath = fileURLToPath(new URL("../subagent-launch/monitor.mjs", import.meta.url));
-const pane = "%fake-error-delivery";
+const pane = "%123";
 
 const success = (stdout = "") => ({ ok: true as const, value: { stdout, stderr: "", code: 0, killed: false } });
 const failure = () => ({
@@ -51,6 +51,7 @@ case "$1" in
     file="$(file_for "$5")"
     if [ -f "$file" ]; then cat "$file"; else exit 1; fi
     ;;
+  list-panes) printf '%s\\t0\\n' '${pane}' ;;
   wait-for) exit 0 ;;
   *) exit 0 ;;
 esac

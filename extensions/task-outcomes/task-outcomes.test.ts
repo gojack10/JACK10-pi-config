@@ -1405,6 +1405,38 @@ test("pending work-ready notification is deduplicated across replay and cannot m
   assert.equal((await h.snapshot()).active, undefined);
 });
 
+test("durable pause wins report-validation race; final-first rejects pause and duplicate settlement", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "seed", stopReason: "stop" });
+  await h.call("task_outcomes_consumer", contract(h.dir, "race", "attempt"));
+  await writeFile(join(h.dir, "race-attempt.md"), "report");
+  await h.call("report_outcome", { outcome: "completed", summary: "done" });
+  let release!: () => void;
+  const verification = new Promise<void>(resolve => { release = resolve; });
+  const original = h.manager.verifyReport;
+  h.manager.verifyReport = () => verification;
+  const settling = h.manager.onAgentSettled(false);
+  assert.equal(h.manager.pauseForContext("clean first", 100), true);
+  const pause = h.manager.snapshot().active.contextPause;
+  release(); await settling;
+  assert.equal(h.manager.snapshot().active.state, "context_paused");
+  assert.equal(h.manager.snapshot().outcomes.filter(o => o.final).length, 0);
+  const path = `${h.sm.getSessionFile()}.task-monitor-attempt.json`;
+  const receipt = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(receipt.state, "context_paused");
+  assert.equal(receipt.payload.pause_id, pause.id);
+  h.manager.verifyReport = original;
+  h.manager.resumeAfterContextClean("race", "attempt", pause.id, 0);
+  await h.call("report_outcome", { outcome: "completed", summary: "done" });
+  await h.manager.onAgentSettled(false);
+  const final = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(final.state, "final");
+  assert.equal(h.manager.pauseForContext("too late", 100), false);
+  await h.manager.onAgentSettled(false);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).revision, final.revision);
+  assert.equal(h.manager.snapshot().outcomes.filter(o => o.final).length, 1);
+});
+
 test("every direct transition helper call has a declared method", async () => {
   const source = await readFile(managerSourcePath, "utf8");
   const called = new Set([...source.matchAll(/this\.([A-Za-z_$][\w$]*)\s*\(/g)].map(match => match[1]));

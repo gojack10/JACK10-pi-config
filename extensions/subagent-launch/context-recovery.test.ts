@@ -163,3 +163,45 @@ test('paused state rejects insufficient context and pending children; normal abo
   assert.equal(manager.snapshot().outcomes.at(-1).outcome, 'failed');
   assert.match(manager.snapshot().outcomes.at(-1).summary, /user cancelled/);
 });
+
+test('launcher admits racing final markers once and never resurrects a resumed pause', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'monitor-admission-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const packageDir = join(homedir(), '.local/share/pi-mono/packages/coding-agent');
+  const { loadExtensions } = await import(pathToFileURL(`${packageDir}/dist/core/extensions/loader.js`).href);
+  const { SessionManager } = await import(pathToFileURL(`${packageDir}/dist/index.js`).href);
+  const loaded = await loadExtensions([fileURLToPath(new URL('../subagent-launch.ts', import.meta.url))], dir);
+  assert.deepEqual(loaded.errors, []);
+  const ctx = { cwd: dir, mode: 'tui', sessionManager: SessionManager.inMemory(dir) };
+  let release!: (value: unknown) => void;
+  const messages: string[] = [];
+  loaded.runtime.sendUserMessage = (text: string) => {
+    messages.push(text);
+    return new Promise(resolve => { release = resolve; });
+  };
+  const tool = loaded.extensions[0].tools.get('subagent_clean_and_continue').definition;
+  await assert.rejects(tool.execute('test', { job_id: 'job', session_id: 'transport', attempt_id: 'attempt' }, undefined, undefined, ctx));
+  const launcher = (globalThis as any)[Symbol.for('pi.subagent-launch.launcher-registry')].get(ctx.sessionManager);
+  let completions = 0;
+  launcher.background = { setCompletion: () => { completions++; } };
+  const state: any = { jobId: 'job', attemptId: 'attempt', sessionId: 'transport', outputBuffer: '',
+    monitorJobId: 1, startResults: new Map(), startWaiters: new Map() };
+  const marker = { jobId: 'job', attemptId: 'attempt', sessionId: 'pi-session',
+    eventId: 'pause-event', revision: 1, kind: 'context_paused', pauseId: 'pause', summary: 'clean' };
+  const send = (m: any) => launcher.onMonitorOutput(state, JSON.stringify(m) + '\n');
+  send(marker); send(marker);
+  assert.equal(messages.length, 1);
+  send({ ...marker, eventId: 'resume-event', revision: 2, kind: 'active' });
+  release(undefined); await delay(0);
+  send(marker);
+  assert.equal(state.contextPauseId, undefined);
+  const final = { ...marker, eventId: 'final-event', revision: 3, kind: 'final', outcome: 'completed', source: 'model', summary: 'done' };
+  const chunk = JSON.stringify(final) + '\n' + JSON.stringify({ ...final, outcome: 'failed' }) + '\n';
+  launcher.onMonitorOutput(state, chunk.slice(0, 10));
+  launcher.onMonitorOutput(state, chunk.slice(10));
+  send({ ...marker, revision: 4 });
+  assert.equal(completions, 1);
+  assert.equal(messages.length, 1);
+  assert.equal(state.finalAdmitted, true);
+  assert.equal(state.contextPauseId, undefined);
+});
