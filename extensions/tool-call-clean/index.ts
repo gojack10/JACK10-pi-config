@@ -112,7 +112,7 @@ function rewriteAtomically(sessionFile: string, content: string) {
 }
 
 // Shared by the human command and tracked subagent maintenance; no model request here.
-export function cleanSessionFile(sessionFile: string, leafId: string | null, contextLimit = Infinity) {
+export function cleanSessionFile(sessionFile: string, leafId: string | null, contextLimit = Infinity, dryRun = false) {
 	if (!(leafId === null || typeof leafId === "string")) throw new Error("Cleanup requires an explicit selected branch");
 	const original = readFileSync(sessionFile, "utf8");
 	const rows = original.split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -123,7 +123,7 @@ export function cleanSessionFile(sessionFile: string, leafId: string | null, con
 	const usageRefreshed = refreshLastUsageEstimate(result.rows, leafId);
 	const cleaned = `${result.rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
 	const changed = result.clearedResults > 0 || usageRefreshed;
-	if (changed) {
+	if (changed && !dryRun) {
 		if (readFileSync(sessionFile, "utf8") !== original) {
 			throw new Error("Session changed during cleanup; run the command again while idle");
 		}

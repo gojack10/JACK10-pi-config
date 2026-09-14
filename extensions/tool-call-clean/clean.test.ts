@@ -92,6 +92,18 @@ test("missing, cyclic, duplicate and broken branches reject without writes", t =
   }
 });
 
+test("cleanup preflight checks feasibility without rewriting or creating a backup", t => {
+  const { file, dir } = saved(t);
+  const before = readFileSync(file, "utf8");
+  const preview = cleanSessionFile(file, "marker", Infinity, true);
+  assert.equal(preview.changed, true);
+  assert.ok(preview.afterTokens < preview.beforeTokens);
+  assert.throws(() => cleanSessionFile(file, "marker", 1, true), /cannot free enough context/);
+  assert.equal(readFileSync(file, "utf8"), before);
+  assert.deepEqual(readdirSync(dir), ["session.jsonl"]);
+  assert.deepEqual(cleanSessionFile(file, "marker"), preview);
+});
+
 test("insufficient context reduction leaves the file and backups untouched", t => {
   const { file, dir } = saved(t);
   const before = readFileSync(file, "utf8");
@@ -168,7 +180,7 @@ test("manual clean never touches outgoing handles after a replacement attempt", 
 
 test("context recovery acknowledges errors without using a disposed maintenance manager", async t => {
   const request = { nonce: "nonce", status: "pending", jobId: "job", attemptId: "attempt", sessionId: "session", pauseId: "pause" };
-  const { dir } = saved(t);
+  const { dir, file } = saved(t);
   const ackFile = join(dir, "acknowledgments.jsonl");
   // A local executable double: no real tmux pane or provider is contacted.
   writeFileSync(join(dir, "tmux"), `#!/bin/sh
@@ -196,7 +208,8 @@ fi
     let invalidated = false;
     let newFailures = 0;
     const owner = {
-      getSessionFile: () => "/unused/session.jsonl",
+      getSessionFile: () => file,
+      getLeafId: () => "marker",
       getSessionId: () => "session",
     };
     const replacementOwner = { getSessionId: () => "session" };
@@ -240,7 +253,6 @@ fi
 test("registry background-adoption failure releases the handoff and compensates the task claim", async t => {
   const { SessionManager } = await import(host);
   const task = await jiti.import(fileURLToPath(new URL("../task-outcomes/manager.ts", import.meta.url)));
-  const bg = await jiti.import(fileURLToPath(new URL("../background-jobs/manager.ts", import.meta.url)));
   const { file } = saved(t);
   const sm = SessionManager.open(file);
   const ctx = { sessionManager: sm, isIdle: () => true };
@@ -249,7 +261,6 @@ test("registry background-adoption failure releases the handoff and compensates 
   const manager = task.getTaskOutcomeManager(pi, ctx);
   const lease = manager.beginMaintenance(file);
   task.parkTaskOutcomeManager(ctx, lease);
-  bg.parkBackgroundJobManager(ctx, lease);
   const backgroundHandoffs = (globalThis as any)[Symbol.for("pi.background-jobs.maintenance-handoffs")];
   const background = backgroundHandoffs.get(lease.maintenanceId).manager;
   const stats = t.mock.method(background, "stats", () => ({ running: 1 }));
@@ -267,7 +278,6 @@ test("registry background-adoption failure releases the handoff and compensates 
 test("enabled leaf command cleans the real file, atomically adopts, and returns usable without a final", async t => {
   const { SessionManager } = await import(host);
   const task = await jiti.import(fileURLToPath(new URL("../task-outcomes/manager.ts", import.meta.url)));
-  const bg = await jiti.import(fileURLToPath(new URL("../background-jobs/manager.ts", import.meta.url)));
   const { file } = saved(t);
   let sm = SessionManager.open(file);
   sm.branch("marker");
@@ -287,7 +297,6 @@ test("enabled leaf command cleans the real file, atomically adopts, and returns 
       lease.replacementAnchor = sm.getLeafId();
       assert.equal(options.maintenance.beforeReplace().replace, true);
       task.parkTaskOutcomeManager(ctx, lease);
-      bg.parkBackgroundJobManager(ctx, lease);
       sm = SessionManager.open(file);
       sm.branch(lease.replacementAnchor);
       const replacement = { ...ctx, sessionManager: sm };

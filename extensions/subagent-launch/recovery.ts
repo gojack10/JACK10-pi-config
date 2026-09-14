@@ -65,6 +65,9 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
         const sessionId = ctx.sessionManager.getSessionId();
         const modelId = ctx.model?.id;
         if (!file) throw new Error("context cleanup requires a saved session");
+        // Refuse infeasible cleanup before persisting maintenance intent. The
+        // drained callback repeats validation against the sealed current branch.
+        cleanSessionFile(file, ctx.sessionManager.getLeafId(), contextPause.limit, true);
         const lease: MaintenanceLease = taskManager.beginMaintenance(file);
         maintenanceLease = lease;
         let result: ReturnType<typeof cleanSessionFile> | undefined;
