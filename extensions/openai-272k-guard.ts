@@ -85,7 +85,7 @@ export default function openAI272KGuard(pi: ExtensionAPI) {
 		} catch (error) {
 			ctx.ui.notify(`Context pause could not be saved: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
-		ctx.abort();
+		ctx.abort({ kind: "context", reason });
 		// Codex can reuse an already-open WebSocket after abort. Replace the payload too,
 		// so even that race cannot transmit the expensive conversation.
 		return harmlessPayload(event.payload);

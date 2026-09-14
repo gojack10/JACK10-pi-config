@@ -162,20 +162,24 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 	};
 	const forceStop = async (ctx: ExtensionContext, cause = `checkpoint tool not called within ${enabled.graceTurns} wrap-up turns`) => {
 		if (!state || state.phase === "forced" || state.phase === "checkpoint" || state.phase === "reset") return;
-		const trusted = metadata(ctx);
-		const receiptPath = await writeReceipt(
-			enabled.directory,
-			`forced-stop-${safePart(trusted.session.id)}-${safePart(trusted.session.leaf)}`,
-			{ kind: "forced-stop", reason: cause, trusted },
-		);
 		const pauseReason = cause.startsWith("checkpoint tool")
 			? `Friendly checkpoint missing: ${cause} (grace exhausted)`
 			: `Friendly stop took control: ${cause}`;
-		const pausedTask = pauseTask(ctx, `${pauseReason}; forced-stop receipt: ${receiptPath}`);
-		state = { ...state, phase: "forced", usage: trusted.currentUsage, receiptPath, reason: pauseReason, pausedTask };
-		persist();
-		show(ctx, `${pauseReason}; aborting`, "warning");
-		ctx.abort();
+		try {
+			const trusted = metadata(ctx);
+			const receiptPath = await writeReceipt(
+				enabled.directory,
+				`forced-stop-${safePart(trusted.session.id)}-${safePart(trusted.session.leaf)}`,
+				{ kind: "forced-stop", reason: cause, trusted },
+			);
+			const pausedTask = pauseTask(ctx, `${pauseReason}; forced-stop receipt: ${receiptPath}`);
+			state = { ...state, phase: "forced", usage: trusted.currentUsage, receiptPath, reason: pauseReason, pausedTask };
+			persist();
+			show(ctx, `${pauseReason}; aborting`, "warning");
+		} finally {
+			// Saving a pause must precede abort, but storage failure must not permit another request.
+			ctx.abort({ kind: "context", reason: pauseReason });
+		}
 	};
 
 	pi.registerTool({
