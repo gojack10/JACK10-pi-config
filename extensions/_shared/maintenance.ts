@@ -1,10 +1,3 @@
-// Fail closed until the replacement path has a drained admission/publication
-// boundary and verified bind rollback. Do not fall back to ordinary switchSession:
-// its shutdown kills background jobs and disconnects helper monitors.
-export function assertMaintenanceAvailable(): void {
-  throw new Error("Maintenance cleanup is unavailable: live ownership transfer is not yet verified. No interruption or cleanup was performed.");
-}
-
 export type MaintenancePhase = "pending" | "parked" | "claimed" | "error";
 
 export interface MaintenanceHandoff {
@@ -13,10 +6,14 @@ export interface MaintenanceHandoff {
   sessionId: string;
   sessionFile?: string;
   branchAnchor?: string | null;
+  /** Selected leaf sealed after the outgoing run drains. */
+  replacementAnchor?: string | null;
   jobId?: string;
   attemptId?: string;
+  reportPath?: string;
 }
 
 export interface MaintenancePrepareResult {
   replace?: boolean;
+  afterNoReplace?: () => void | Promise<void>;
 }

@@ -103,7 +103,100 @@ const contract = (dir: string, jobId: string, attemptId: string, batchId = "batc
   batch_id: batchId,
 });
 
-test("unqualified maintenance rejects before persistence and preserves later child/background results", async t => {
+test("maintenance preparation seals the marker and validates single-use source-to-replacement ownership", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "saved", stopReason: "stop" });
+  await h.call("task_outcomes_consumer", contract(h.dir, "handoff", "attempt"));
+  const source = h.sm.getLeafId();
+  // Exercise the enabled preparation used by the human command.
+  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
+  assert.notEqual(lease.branchAnchor, source);
+  assert.equal(lease.branchAnchor, h.sm.getLeafId());
+  assert.equal(h.sm.getLeafEntry().data.kind, "maintenance_begin");
+  assert.equal(h.sm.getLeafEntry().data.maintenance.branchAnchor, source);
+  assert.equal(lease.reportPath, join(h.dir, "handoff-attempt.md"));
+  h.manager.parkMaintenance(lease);
+  assert.throws(() => h.manager.parkMaintenance(lease), /stale/);
+  assert.throws(() => h.manager.claimMaintenance(lease), /owner/);
+  const reopened = SessionManager.open(h.sm.getSessionFile());
+  assert.equal(reopened.getSessionId(), h.sm.getSessionId());
+  assert.equal(reopened.getSessionFile(), h.sm.getSessionFile());
+  const outgoingRuntime = h.manager.runtime;
+  const replacement = {
+    ...outgoingRuntime, sessionOwner: reopened,
+    leafId: () => reopened.getLeafId(), branchEntries: () => reopened.getBranch(),
+    appendEntry: (type: string, data: unknown) => reopened.appendCustomEntry(type, data),
+  };
+  for (const field of ["maintenanceId", "ownerEpoch", "sessionId", "sessionFile", "jobId", "attemptId", "reportPath", "branchAnchor", "replacementAnchor"]) {
+    assert.throws(() => h.manager.adopt(replacement, { ...lease, [field]: "wrong" }), /handoff/);
+    assert.equal(h.manager.runtime, outgoingRuntime);
+  }
+  assert.throws(() => h.manager.adopt(outgoingRuntime, lease), /replacement session/);
+  h.manager.adopt(replacement, lease);
+  assert.throws(() => h.manager.claimMaintenance(lease), /stale/);
+  assert.throws(() => h.manager.adopt(replacement, lease), /stale/);
+  h.manager.resumeMaintenance(lease);
+  assert.equal(h.manager.snapshot().maintenance, undefined);
+  assert.throws(() => h.manager.claimMaintenance(lease), /stale/);
+});
+
+test("background failure compensates the task claim and durable error replays at session_start", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "saved", stopReason: "stop" });
+  await h.call("task_outcomes_consumer", contract(h.dir, "rollback", "attempt"));
+  const lease = h.manager.prepareMaintenance(h.sm.getSessionFile());
+  h.manager.parkMaintenance(lease);
+  const fresh = SessionManager.open(h.sm.getSessionFile());
+  const outgoing = h.manager.runtime;
+  assert.throws(() => h.manager.adopt({ ...outgoing, sessionOwner: fresh,
+    leafId: () => fresh.getLeafId(), branchEntries: () => fresh.getBranch(),
+  }, lease, () => { throw new Error("background adoption failed"); }), /background adoption failed/);
+  assert.equal(h.manager.runtime, outgoing);
+  assert.equal(h.manager.snapshot().maintenance.phase, "parked");
+  assert.deepEqual(h.manager.snapshot().outcomes, []);
+  const { recordMaintenanceFailure } = await import(pathToFileURL(join(homedir(),
+    ".local/share/pi-mono/packages/coding-agent/dist/core/agent-session-runtime.js")).href);
+  recordMaintenanceFailure(h.sm.getSessionFile(), lease);
+  recordMaintenanceFailure(h.sm.getSessionFile(), lease);
+  assert.equal(SessionManager.open(h.sm.getSessionFile()).getBranch().filter((entry: any) =>
+    entry.customType === "session-maintenance/v1").length, 1);
+  const restored = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+  assert.equal(restored.manager.snapshot().maintenance.phase, "error");
+  assert.equal(restored.manager.snapshot().active.state, "maintenance_pending");
+  assert.deepEqual(restored.manager.snapshot().outcomes, []);
+  await restored.emit("agent_settled");
+  assert.equal(restored.manager.snapshot().outcomes.some((o: any) => o.final), false);
+});
+
+test("maintenance no-change releases its lease; finality, pending work and cancellation still fence preparation", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "no-change", "attempt"));
+  const lease = h.manager.prepareMaintenance();
+  h.manager.resumeMaintenance(lease);
+  assert.equal(h.manager.snapshot().maintenance, undefined);
+  const next = h.manager.prepareMaintenance();
+  assert.notEqual(next.ownerEpoch, lease.ownerEpoch);
+  assert.throws(() => h.manager.parkMaintenance(lease), /stale/);
+  h.manager.requestCancellation("task_cancel", "human cancelled");
+  assert.throws(() => h.manager.parkMaintenance(next), /stale/);
+  await h.emit("agent_settled");
+  assert.equal((await h.snapshot()).contracts.at(-1).state, "final");
+  assert.throws(() => h.manager.prepareMaintenance(), /cancellation|finalized/);
+
+  const pending = await harness(t);
+  await pending.call("task_outcomes_consumer", { ...contract(pending.dir, "pending", "attempt"), children: ["child"] });
+  const before = pending.sm.getLeafId();
+  assert.throws(() => pending.manager.prepareMaintenance(), /child\/background work is pending/);
+  assert.equal(pending.sm.getLeafId(), before);
+
+  const final = await harness(t);
+  await final.call("task_outcomes_consumer", contract(final.dir, "final", "attempt"));
+  await writeFile(join(final.dir, "final-attempt.md"), "verified report");
+  await final.settle({ outcome: "completed" });
+  assert.throws(() => final.manager.prepareMaintenance(), /finalized/);
+});
+
+test("pending-work maintenance rejects before persistence and preserves later child/background results", async t => {
   const h = await harness(t);
   const gate = join(h.dir, "maintenance-background-release");
   await h.call("task_outcomes_consumer", {
@@ -117,7 +210,7 @@ test("unqualified maintenance rejects before persistence and preserves later chi
   const before = await h.snapshot();
   const persisted = h.persisted.length;
   for (let i = 0; i < 2; i++) {
-    assert.throws(() => h.manager.beginMaintenance(), /ownership transfer is not yet verified/);
+    assert.throws(() => h.manager.beginMaintenance(), /child\/background work is pending/);
     assert.deepEqual(await h.snapshot(), before);
     assert.equal(h.persisted.length, persisted, "no marker or false final may be written");
     assert.equal(h.messages.length, 0);
