@@ -140,6 +140,34 @@ test("maintenance preparation seals the marker and validates single-use source-t
   assert.throws(() => h.manager.claimMaintenance(lease), /stale/);
 });
 
+test("task lifecycle parks and adopts both owners independently of background extension order", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "saved", stopReason: "stop" });
+  await h.call("task_outcomes_consumer", contract(h.dir, "paired", "attempt"));
+  const backgrounds = (globalThis as any)[Symbol.for("pi.background-jobs.manager-registry")];
+  const background = backgrounds.get(h.sm);
+  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
+  await h.emit("session_shutdown", { reason: "maintenance", maintenance: lease });
+  const sm = SessionManager.open(h.sm.getSessionFile());
+  // Outgoing harness loads background first; the replacement loads task first.
+  const loaded = await loadExtensions([taskPath, backgroundPath], h.dir);
+  assert.deepEqual(loaded.errors, []);
+  loaded.runtime.appendEntry = (type: string, data: unknown) => sm.appendCustomEntry(type, data);
+  loaded.runtime.sendUserMessage = () => assert.fail("maintenance must not request a model turn");
+  const ctx = { cwd: h.dir, sessionManager: sm };
+  for (const ext of loaded.extensions) for (const handler of ext.handlers.get("session_start") ?? []) {
+    await handler({ reason: "maintenance", maintenance: lease }, ctx);
+  }
+  assert.equal((globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")].get(sm), h.manager);
+  assert.equal(backgrounds.get(sm), background);
+  assert.equal(background.isInMaintenance(lease.maintenanceId), false);
+  assert.equal(h.manager.snapshot().maintenance, undefined);
+  assert.equal(h.manager.snapshot().active.state, "active");
+  for (const key of ["pi.task-outcomes.maintenance-handoffs", "pi.background-jobs.maintenance-handoffs"]) {
+    assert.equal((globalThis as any)[Symbol.for(key)].has(lease.maintenanceId), false);
+  }
+});
+
 test("background failure compensates the task claim and durable error replays at session_start", async t => {
   const h = await harness(t, undefined, true);
   await h.settle({ text: "saved", stopReason: "stop" });

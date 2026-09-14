@@ -103,7 +103,17 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.doesNotMatch(cleaned, /large output large output/);
   const backup = (await readdir(dir)).find(name => name.includes('.tool-call-clean.') && name.endsWith('.bak'));
   assert.ok(backup);
-  assert.equal(await readFile(join(dir, backup), 'utf8'), original);
+  // The atomic handoff now persists ownership before cleanup takes its backup.
+  const backedUp = await readFile(join(dir, backup), 'utf8');
+  assert.equal(backedUp.slice(0, original.length), original, 'backup preserves every pre-maintenance byte');
+  const added = backedUp.slice(original.length).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(added.length, 1, 'only the required ownership marker precedes cleanup');
+  assert.equal(added[0].type, 'custom');
+  assert.equal(added[0].customType, 'task-outcome/v1');
+  assert.equal(added[0].data.kind, 'maintenance_begin');
+  assert.equal(added[0].data.jobId, job.job);
+  assert.equal(added[0].data.attemptId, job.attempt_id);
+  assert.equal(added[0].parentId, JSON.parse(original.trim().split('\n').at(-1)!).id);
   await assert.rejects(call('subagent_clean_and_continue', ids), /no monitored context-paused/);
 });
 

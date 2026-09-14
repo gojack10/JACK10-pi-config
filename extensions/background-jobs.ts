@@ -2,7 +2,6 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   getBackgroundJobManager,
-  parkBackgroundJobManager,
   releaseBackgroundJobManager,
 } from "./background-jobs/manager.ts";
 
@@ -107,13 +106,10 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   // Events
   // ============================================================
 
-  // Task outcomes owns the atomic task/background adoption on session_start.
+  // Task outcomes owns both parking and atomic task/background adoption.
 
   pi.on("session_shutdown", (event, ctx) => {
-    if (event.reason === "maintenance" && event.maintenance) {
-      parkBackgroundJobManager(ctx, event.maintenance);
-      return;
-    }
+    if (event.reason === "maintenance" && event.maintenance) return;
     releaseBackgroundJobManager(ctx);
   });
 }
