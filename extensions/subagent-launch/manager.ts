@@ -8,10 +8,8 @@ import { access, lstat, mkdir, open, readFile, rename, stat, unlink, writeFile }
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { MaintenanceHandoff } from "../_shared/maintenance.ts";
 import {
   BackgroundJobManager,
-  adoptBackgroundJobManager,
   getBackgroundJobManager,
 } from "../background-jobs/manager.ts";
 import {
@@ -1067,37 +1065,10 @@ export const followupSchema = Type.Object({
 }, { additionalProperties: false });
 
 const launcherRegistryKey = Symbol.for("pi.subagent-launch.launcher-registry");
-const launcherHandoffKey = Symbol.for("pi.subagent-launch.maintenance-handoffs");
 const launcherGlobal = globalThis as typeof globalThis & {
   [launcherRegistryKey]?: WeakMap<object, SubagentLauncher>;
-  [launcherHandoffKey]?: Map<string, { launcher: SubagentLauncher; lease: MaintenanceHandoff }>;
 };
 const launchers = launcherGlobal[launcherRegistryKey] ??= new WeakMap();
-const launcherHandoffs = launcherGlobal[launcherHandoffKey] ??= new Map();
-
-export function parkSubagentLauncher(ctx: Pick<ExtensionContext, "sessionManager">, lease: MaintenanceHandoff): void {
-  const launcher = launchers.get(ctx.sessionManager as object);
-  if (!launcher) return;
-  if (launcher.getSessionId() !== lease.sessionId) throw new Error("subagent launcher maintenance owner mismatch");
-  launcherHandoffs.set(lease.maintenanceId, { launcher, lease: { ...lease } });
-}
-
-export function adoptSubagentLauncher(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  lease: MaintenanceHandoff,
-): SubagentLauncher | undefined {
-  const handoff = launcherHandoffs.get(lease.maintenanceId);
-  if (!handoff) return undefined;
-  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch) {
-    throw new Error("subagent launcher maintenance handoff token conflicts with its owner");
-  }
-  const launcher = handoff.launcher;
-  launcher.attach(pi, ctx, getBackgroundJobManager(pi, ctx));
-  launchers.set(ctx.sessionManager as object, launcher);
-  launcherHandoffs.delete(lease.maintenanceId);
-  return launcher;
-}
 
 export function registerSubagentTools(pi: ExtensionAPI): void {
   registerContextRecovery(pi);
@@ -1147,17 +1118,6 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });
-  pi.on("session_start", (event, ctx) => {
-    if (event.reason === "maintenance" && event.maintenance) {
-      adoptSubagentLauncher(pi, ctx, event.maintenance);
-    }
-  });
-  pi.on("session_shutdown", (event, ctx) => {
-    if (event.reason === "maintenance" && event.maintenance) {
-      parkSubagentLauncher(ctx, event.maintenance);
-    }
-  });
-
   pi.registerTool({
     name: "subagent_followup",
     label: "subagent_followup",

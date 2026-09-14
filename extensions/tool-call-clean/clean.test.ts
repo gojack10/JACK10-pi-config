@@ -112,8 +112,8 @@ test("insufficient context reduction leaves the file and backups untouched", t =
   assert.deepEqual(readdirSync(dir), ["session.jsonl"]);
 });
 
-// These are command error-routing checks with a fake handoff, not transaction acceptance.
-test("manual clean never touches outgoing handles after a replacement attempt", async t => {
+// Command error routing: maintenance keeps the current owner authoritative.
+test("manual clean routes refresh failures through the live owner", async t => {
   for (const phase of ["prepare", "create", "cancelled", "callback", "success"] as const) {
     const { file } = saved(t);
     let invalidated = false;
@@ -137,6 +137,7 @@ test("manual clean never touches outgoing handles after a replacement attempt", 
         return { maintenanceId: "lease", ownerEpoch: "epoch", sessionId: "session", phase: "pending" };
       },
       failMaintenance() { assertLive(); oldFailures++; },
+      resumeMaintenance() { assertLive(); },
     });
     registry.set(replacementOwner, { failMaintenance() { newFailures++; } });
     let handler: (args: string, ctx: any) => Promise<void> = async () => { throw new Error("command missing"); };
@@ -149,7 +150,6 @@ test("manual clean never touches outgoing handles after a replacement attempt", 
         return { notify(message: string) { assertLive(); notices.push(message); } };
       },
       async switchSession(_path: string, options: any) {
-        invalidated = true;
         if (phase === "create") throw new Error("create failed before callback");
         if (phase === "cancelled") return { cancelled: true };
         await options.withSession({
@@ -165,10 +165,10 @@ test("manual clean never touches outgoing handles after a replacement attempt", 
     };
     try {
       await handler("", ctx);
-      assert.equal(oldFailures, 0);
-      assert.equal(newFailures, phase === "callback" ? 1 : 0);
-      assert.equal(diagnostics.length, ["create", "cancelled", "callback"].includes(phase) ? 1 : 0);
-      assert.equal(notices.length, ["prepare", "success"].includes(phase) ? 1 : 0);
+      assert.equal(oldFailures, ["create", "cancelled", "callback"].includes(phase) ? 1 : 0);
+      assert.equal(newFailures, 0);
+      assert.equal(diagnostics.length, 0);
+      assert.equal(notices.length, 1);
       if (phase === "prepare") assert.equal(invalidated, false);
     } finally {
       registry.delete(owner);
@@ -178,7 +178,7 @@ test("manual clean never touches outgoing handles after a replacement attempt", 
   }
 });
 
-test("context recovery acknowledges errors without using a disposed maintenance manager", async t => {
+test("context recovery acknowledges errors using the same live maintenance manager", async t => {
   const request = { nonce: "nonce", status: "pending", jobId: "job", attemptId: "attempt", sessionId: "session", pauseId: "pause" };
   const { dir, file } = saved(t);
   const ackFile = join(dir, "acknowledgments.jsonl");
@@ -231,14 +231,13 @@ fi
         hasPendingMessages: () => false,
         model: { id: "model" },
         async switchSession(_path: string, options: any) {
-          invalidated = true;
           if (phase === "create") throw new Error("create failed before callback");
           if (phase === "cancelled") return { cancelled: true };
           await options.withSession({ sessionManager: replacementOwner, model: { id: "different-model" } });
           assert.fail("replacement model mismatch must reject");
         },
       });
-      assert.equal(newFailures, phase === "callback" ? 1 : 0);
+      assert.equal(newFailures, 0);
       const acknowledgments = readFileSync(ackFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
       assert.equal(acknowledgments.at(-1)?.status, "error");
       assert.match(acknowledgments.at(-1)?.error, phase === "create" ? /create failed/ : phase === "cancelled" ? /reload cancelled/ : /model changed/);
@@ -250,32 +249,7 @@ fi
   assert.equal(readFileSync(ackFile, "utf8").trim().split("\n").length, 3);
 });
 
-test("registry background-adoption failure releases the handoff and compensates the task claim", async t => {
-  const { SessionManager } = await import(host);
-  const task = await jiti.import(fileURLToPath(new URL("../task-outcomes/manager.ts", import.meta.url)));
-  const { file } = saved(t);
-  const sm = SessionManager.open(file);
-  const ctx = { sessionManager: sm, isIdle: () => true, hasPendingMessages: () => false };
-  const pi = { events: { emit() {} }, sendUserMessage() { assert.fail("unexpected continuation"); },
-    appendEntry(type: string, data: unknown) { sm.appendCustomEntry(type, data); } };
-  const manager = task.getTaskOutcomeManager(pi, ctx);
-  const lease = manager.beginMaintenance(file);
-  task.parkTaskOutcomeManager(ctx, lease);
-  const backgroundHandoffs = (globalThis as any)[Symbol.for("pi.background-jobs.maintenance-handoffs")];
-  const background = backgroundHandoffs.get(lease.maintenanceId).manager;
-  const stats = t.mock.method(background, "stats", () => ({ running: 1 }));
-  const replacement = { ...ctx, sessionManager: SessionManager.open(file) };
-  assert.throws(() => task.adoptTaskOutcomeManager(pi, replacement, lease), /background/);
-  stats.mock.restore();
-  assert.equal(manager.snapshot().maintenance.phase, "parked");
-  assert.equal(backgroundHandoffs.has(lease.maintenanceId), false);
-  assert.equal(background.isInMaintenance(lease.maintenanceId), false);
-  assert.equal(task.existingTaskOutcomeManager(replacement), undefined);
-  assert.throws(() => task.adoptTaskOutcomeManager(pi, replacement, lease), /missing|consumed/);
-  assert.deepEqual(manager.snapshot().outcomes, []);
-});
-
-test("enabled leaf command retries a historical failure, cleans, and adopts across startup metadata without a final", async t => {
+test("enabled leaf command retries a historical failure and refreshes the same manager without a final", async t => {
   const { SessionManager } = await import(host);
   const task = await jiti.import(fileURLToPath(new URL("../task-outcomes/manager.ts", import.meta.url)));
   const { file } = saved(t);
@@ -294,19 +268,13 @@ test("enabled leaf command retries a historical failure, cleans, and adopts acro
     async switchSession(_file: string, options: any) {
       const lease = options.maintenance.token;
       assert.equal(sm.getLeafEntry().data.kind, "maintenance_begin");
-      lease.replacementAnchor = sm.getLeafId();
-      assert.equal(options.maintenance.beforeReplace().replace, true);
-      task.parkTaskOutcomeManager(ctx, lease);
-      sm = SessionManager.open(file);
-      sm.branch(lease.replacementAnchor);
-      sm.appendModelChange("openai-codex-alt", "gpt-5.6-luna");
-      sm.appendThinkingLevelChange("high");
-      sm.appendCustomEntry("model-recency", { order: [] });
-      const replacement = { ...ctx, sessionManager: sm };
-      const manager = task.adoptTaskOutcomeManager(pi, replacement, lease);
-      manager.resumeMaintenance(lease);
-      assert.throws(() => task.adoptTaskOutcomeManager(pi, replacement, lease), /consumed/);
-      await options.withSession(replacement);
+      const prepared = options.maintenance.beforeReplace();
+      assert.equal(prepared.replace, true);
+      const manager = task.existingTaskOutcomeManager(ctx);
+      sm.setSessionFile(file);
+      sm.branch(sm.getLeafId());
+      assert.equal(task.existingTaskOutcomeManager(ctx), manager);
+      await options.withSession(ctx);
       assert.equal(manager.snapshot().maintenance, undefined);
       assert.equal(manager.snapshot().active.state, "active");
       assert.deepEqual(manager.snapshot().outcomes, []);

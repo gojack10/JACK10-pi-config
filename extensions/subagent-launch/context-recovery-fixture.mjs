@@ -54,19 +54,30 @@ async function bind() {
     switchSession: async (file, options) => {
       if (process.env.PI_TEST_RECOVERY_CASE === 'cancel') return { cancelled: true };
       const maintenance = options.maintenance;
+      const anchor = sm.getLeafId();
+      const manager = task();
+      const extensionInstances = loaded;
       if (maintenance?.beforeReplace) {
         const prepared = await maintenance.beforeReplace();
-        if (prepared?.replace === false) return { cancelled: false };
+        if (prepared?.replace === false) {
+          await prepared.afterNoReplace?.();
+          return { cancelled: false };
+        }
       }
-      await emit('session_shutdown', maintenance
-        ? { reason: 'maintenance', targetSessionFile: file, maintenance: maintenance.token }
-        : { reason: 'resume', targetSessionFile: file });
-      sm = SessionManager.open(file);
-      resumed = true;
-      await bind();
-      await emit('session_start', maintenance
-        ? { reason: 'maintenance', previousSessionFile: file, maintenance: maintenance.token }
-        : { reason: 'resume', previousSessionFile: file });
+      if (maintenance) {
+        // In-place refresh: preserve the SessionManager and extension instances.
+        sm.setSessionFile(file);
+        if (anchor === null) sm.resetLeaf();
+        else sm.branch(anchor);
+        if (task() !== manager || loaded !== extensionInstances) throw new Error('maintenance replaced the live owner');
+        resumed = true;
+      } else {
+        await emit('session_shutdown', { reason: 'resume', targetSessionFile: file });
+        sm = SessionManager.open(file);
+        resumed = true;
+        await bind();
+        await emit('session_start', { reason: 'resume', previousSessionFile: file });
+      }
       await options.withSession({ ...ctx, sendUserMessage: async text => {
         if (!text.includes('Continue the same assignment')) throw new Error('missing continuation');
         await finish();

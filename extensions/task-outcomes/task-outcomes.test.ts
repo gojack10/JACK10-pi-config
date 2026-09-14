@@ -103,113 +103,120 @@ const contract = (dir: string, jobId: string, attemptId: string, batchId = "batc
   batch_id: batchId,
 });
 
-test("maintenance preparation seals the marker and validates single-use source-to-replacement ownership", async t => {
+test("live maintenance retains marker, target, stale-token and cancellation fences without ownership transfer", async t => {
   const h = await harness(t, undefined, true);
-  await h.settle({ text: "saved", stopReason: "stop" });
-  await h.call("task_outcomes_consumer", contract(h.dir, "handoff", "attempt"));
-  const source = h.sm.getLeafId();
-  // Exercise the enabled preparation used by the human command.
-  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
-  assert.notEqual(lease.branchAnchor, source);
+  h.sm.appendMessage({ role: 'assistant', content: [], stopReason: 'stop' });
+  await h.call('task_outcomes_consumer', contract(h.dir, 'lease', 'A'));
+  const before = h.sm.getLeafId();
+  assert.throws(() => h.manager.beginMaintenance(join(h.dir, 'other.jsonl')), /current session file/);
+  assert.equal(h.sm.getLeafId(), before);
+  const lease = h.manager.beginMaintenance();
+  assert.equal(h.sm.getLeafEntry().data.kind, 'maintenance_begin');
+  assert.equal(h.sm.getLeafEntry().data.maintenance.branchAnchor, before);
   assert.equal(lease.branchAnchor, h.sm.getLeafId());
-  assert.equal(h.sm.getLeafEntry().data.kind, "maintenance_begin");
-  assert.equal(h.sm.getLeafEntry().data.maintenance.branchAnchor, source);
-  assert.equal(lease.reportPath, join(h.dir, "handoff-attempt.md"));
-  h.manager.parkMaintenance(lease);
-  assert.throws(() => h.manager.parkMaintenance(lease), /stale/);
-  assert.throws(() => h.manager.claimMaintenance(lease), /owner/);
-  const reopened = SessionManager.open(h.sm.getSessionFile());
-  assert.equal(reopened.getSessionId(), h.sm.getSessionId());
-  assert.equal(reopened.getSessionFile(), h.sm.getSessionFile());
-  const outgoingRuntime = h.manager.runtime;
-  const replacement = {
-    ...outgoingRuntime, sessionOwner: reopened,
-    leafId: () => reopened.getLeafId(), branchEntries: () => reopened.getBranch(),
-    appendEntry: (type: string, data: unknown) => reopened.appendCustomEntry(type, data),
-  };
-  for (const field of ["maintenanceId", "ownerEpoch", "sessionId", "sessionFile", "jobId", "attemptId", "reportPath", "branchAnchor", "replacementAnchor"]) {
-    assert.throws(() => h.manager.adopt(replacement, { ...lease, [field]: "wrong" }), /handoff/);
-    assert.equal(h.manager.runtime, outgoingRuntime);
+  const repeated = h.manager.beginMaintenance();
+  for (const field of Object.keys(lease)) assert.equal(repeated[field], lease[field]);
+  assert.equal(h.sm.getLeafId(), lease.branchAnchor, 'repeat must not append another marker');
+  for (const field of ['maintenanceId', 'ownerEpoch', 'sessionId', 'sessionFile', 'branchAnchor', 'jobId', 'attemptId', 'reportPath']) {
+    assert.throws(() => h.manager.resumeMaintenance({ ...lease, [field]: 'wrong' }), /stale|not active/);
+    assert.equal(h.manager.snapshot().active.state, 'maintenance_pending');
   }
-  assert.throws(() => h.manager.adopt(outgoingRuntime, lease), /replacement session/);
-  reopened.branch(source);
-  reopened.appendCustomEntry("unrelated-branch", {});
-  assert.throws(() => h.manager.adopt(replacement, lease), /replacement session/);
-  for (const kind of ["cancellation_requested", "outcome", "maintenance_error", "message"]) {
-    reopened.branch(lease.branchAnchor);
-    if (kind === "message") reopened.appendMessage({ role: "user", content: "new work", timestamp: Date.now() });
-    else reopened.appendCustomEntry(kind === "maintenance_error" ? "session-maintenance/v1" : "task-outcome/v1", { kind });
-    assert.throws(() => h.manager.adopt(replacement, lease), /replacement session/);
-  }
-  reopened.branch(lease.branchAnchor);
-  h.manager.adopt(replacement, lease);
-  assert.throws(() => h.manager.claimMaintenance(lease), /stale/);
-  assert.throws(() => h.manager.adopt(replacement, lease), /stale/);
   h.manager.resumeMaintenance(lease);
-  assert.equal(h.manager.snapshot().maintenance, undefined);
-  assert.throws(() => h.manager.claimMaintenance(lease), /stale/);
+  assert.throws(() => h.manager.resumeMaintenance(lease), /not active/);
+  const next = h.manager.beginMaintenance();
+  h.manager.requestCancellation('task_cancel', 'human cancelled');
+  assert.throws(() => h.manager.resumeMaintenance(next), /cancelled|stale/);
+  assert.throws(() => h.manager.beginMaintenance(), /cancellation/);
 });
 
-test("task lifecycle parks and adopts both owners independently of background extension order", async t => {
+test("legacy replacement-error journals remain retryable without the removed failure writer", async t => {
   const h = await harness(t, undefined, true);
-  await h.settle({ text: "saved", stopReason: "stop" });
-  await h.call("task_outcomes_consumer", contract(h.dir, "paired", "attempt"));
-  const backgrounds = (globalThis as any)[Symbol.for("pi.background-jobs.manager-registry")];
-  const background = backgrounds.get(h.sm);
-  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
-  await h.emit("session_shutdown", { reason: "maintenance", maintenance: lease });
-  const sm = SessionManager.open(h.sm.getSessionFile());
-  // Production 01a09e49: sdk + model-recency append metadata before task adoption.
-  sm.appendModelChange("openai-codex-alt", "gpt-5.6-luna");
-  sm.appendThinkingLevelChange("high");
-  sm.appendCustomEntry("model-recency", { order: [] });
-  sm.appendCustomEntry("model-recency", { order: [] });
-  assert.notEqual(sm.getLeafId(), lease.branchAnchor);
-  // Outgoing harness loads background first; the replacement loads task first.
-  const loaded = await loadExtensions([taskPath, backgroundPath], h.dir);
-  assert.deepEqual(loaded.errors, []);
-  loaded.runtime.appendEntry = (type: string, data: unknown) => sm.appendCustomEntry(type, data);
-  loaded.runtime.sendUserMessage = () => assert.fail("maintenance must not request a model turn");
-  const ctx = { cwd: h.dir, sessionManager: sm };
-  for (const ext of loaded.extensions) for (const handler of ext.handlers.get("session_start") ?? []) {
-    await handler({ reason: "maintenance", maintenance: lease }, ctx);
-  }
-  assert.equal((globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")].get(sm), h.manager);
-  assert.equal(backgrounds.get(sm), background);
-  assert.equal(background.isInMaintenance(lease.maintenanceId), false);
-  assert.equal(h.manager.snapshot().maintenance, undefined);
-  assert.equal(h.manager.snapshot().active.state, "active");
-  for (const key of ["pi.task-outcomes.maintenance-handoffs", "pi.background-jobs.maintenance-handoffs"]) {
-    assert.equal((globalThis as any)[Symbol.for(key)].has(lease.maintenanceId), false);
-  }
-});
-
-test("background failure compensates the task claim and durable error replays at session_start", async t => {
-  const h = await harness(t, undefined, true);
-  await h.settle({ text: "saved", stopReason: "stop" });
-  await h.call("task_outcomes_consumer", contract(h.dir, "rollback", "attempt"));
-  const lease = h.manager.prepareMaintenance(h.sm.getSessionFile());
-  h.manager.parkMaintenance(lease);
-  const fresh = SessionManager.open(h.sm.getSessionFile());
-  const outgoing = h.manager.runtime;
-  assert.throws(() => h.manager.adopt({ ...outgoing, sessionOwner: fresh,
-    leafId: () => fresh.getLeafId(), branchEntries: () => fresh.getBranch(),
-  }, lease, () => { throw new Error("background adoption failed"); }), /background adoption failed/);
-  assert.equal(h.manager.runtime, outgoing);
-  assert.equal(h.manager.snapshot().maintenance.phase, "parked");
-  assert.deepEqual(h.manager.snapshot().outcomes, []);
-  const { recordMaintenanceFailure } = await import(pathToFileURL(join(homedir(),
-    ".local/share/pi-mono/packages/coding-agent/dist/core/agent-session-runtime.js")).href);
-  recordMaintenanceFailure(h.sm.getSessionFile(), lease);
-  recordMaintenanceFailure(h.sm.getSessionFile(), lease);
-  assert.equal(SessionManager.open(h.sm.getSessionFile()).getBranch().filter((entry: any) =>
-    entry.customType === "session-maintenance/v1").length, 1);
+  h.sm.appendMessage({ role: 'assistant', content: [], stopReason: 'stop' });
+  const lease = h.manager.beginMaintenance();
+  h.sm.appendCustomEntry('session-maintenance/v1', {
+    version: 1, eventId: `session-maintenance:error:${lease.maintenanceId}:${lease.ownerEpoch}`,
+    kind: 'maintenance_error', at: new Date().toISOString(), final: false,
+    maintenance: { ...lease, phase: 'error', error: 'legacy failure' }, summary: 'legacy failure',
+  });
   const restored = await harness(t, SessionManager.open(h.sm.getSessionFile()));
-  assert.equal(restored.manager.snapshot().maintenance.phase, "error");
-  assert.equal(restored.manager.snapshot().active.state, "maintenance_pending");
-  assert.deepEqual(restored.manager.snapshot().outcomes, []);
-  await restored.emit("agent_settled");
+  assert.equal(restored.manager.snapshot().maintenance.error, 'legacy failure');
+  const retry = restored.manager.beginMaintenance();
+  restored.manager.resumeMaintenance(retry);
+  assert.equal(restored.manager.snapshot().maintenance, undefined);
+  assert.equal(restored.sm.getBranch().filter((row: any) => row.customType === 'session-maintenance/v1').length, 1);
   assert.equal(restored.manager.snapshot().outcomes.some((o: any) => o.final), false);
+});
+
+test("nested child and grandchild ownership stays pending through in-place maintenance and settles once", async t => {
+  const root = await harness(t, undefined, true);
+  const child = await harness(t, undefined, true);
+  for (const h of [root, child]) h.sm.appendMessage({ role: 'assistant', content: [], stopReason: 'stop' });
+  await root.call('task_outcomes_consumer', { ...contract(root.dir, 'root', 'A'), children: ['child'] });
+  await child.call('task_outcomes_consumer', { ...contract(child.dir, 'child', 'B'), children: ['grandchild'] });
+  await writeFile(join(child.dir, 'child-B.md'), 'child report');
+  for (const h of [root, child]) {
+    const lease = h.manager.beginMaintenance();
+    const leaf = h.sm.getLeafId();
+    h.sm.setSessionFile(h.sm.getSessionFile());
+    h.sm.branch(leaf);
+    h.manager.resumeMaintenance(lease);
+    assert.equal(h.manager.snapshot().active.pendingWork.length, 1);
+  }
+  await assert.rejects(child.call('report_outcome', { outcome: 'completed', summary: 'too early' }), /pending|unresolved|running/);
+  for (let i = 0; i < 2; i++) child.manager.recordChildOutcome('child', 'grandchild', 'completed', 'done', 'model', 'C');
+  await child.settle({ outcome: 'completed' });
+  assert.equal(child.manager.snapshot().outcomes.filter((o: any) => o.final).length, 1);
+  for (let i = 0; i < 2; i++) root.manager.recordChildOutcome('root', 'child', 'completed', 'child done', 'model', 'B');
+  assert.equal(root.manager.snapshot().active.pendingWork.length, 0);
+  for (const h of [root, child]) {
+    assert.equal(h.persisted.filter((row: any) => row.data.kind === 'child_outcome').length, 1);
+    assert.equal(h.manager.snapshot().outcomes.some((o: any) => o.outcome === 'transport_lost'), false);
+  }
+});
+
+test("in-place refresh failure is nonfinal, releases the live lease and permits append-only retry", async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop" });
+  h.manager.activateContract({ jobId: "refresh", attemptId: "attempt", mode: "task", reportPath: join(h.dir, "report.md") });
+  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
+  h.manager.failMaintenance(lease, new Error("injected refresh failure"), { resume: true });
+  const failed = h.manager.snapshot();
+  assert.equal(failed.maintenance, undefined);
+  assert.equal(failed.active.state, "active");
+  assert.equal(failed.outcomes.length, 1);
+  assert.equal(failed.outcomes[0].outcome, "maintenance_error");
+  assert.equal(failed.outcomes[0].final, false);
+  assert.deepEqual(h.messages, []);
+  const retry = h.manager.beginMaintenance(h.sm.getSessionFile());
+  assert.notEqual(retry.maintenanceId, lease.maintenanceId);
+  h.manager.resumeMaintenance(retry);
+  assert.equal(h.manager.snapshot().maintenance, undefined);
+  const kinds = h.sm.getBranch().filter((entry: any) => entry.customType === "task-outcome/v1").map((entry: any) => entry.data.kind);
+  assert.deepEqual(kinds.filter((kind: string) => kind.startsWith("maintenance_")), ["maintenance_begin", "maintenance_error", "maintenance_resume", "maintenance_begin", "maintenance_resume"]);
+  // End the first owner before opening a restart owner against the same journal.
+  h.manager.shutdown("test restart");
+  const replay = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+  assert.equal(replay.manager.snapshot().maintenance, undefined);
+  // A real restart still relinquishes an active attempt; refresh itself never restarts it.
+  assert.equal(replay.manager.snapshot().active, undefined);
+  assert.equal(replay.manager.snapshot().outcomes.at(-1).outcome, "transport_lost");
+  assert.equal(replay.manager.snapshot().outcomes.some((outcome: any) => outcome.final), false);
+});
+
+test("in-place error recovery stays fenced if durable resume cannot be saved", async t => {
+  const h = await harness(t, undefined, true);
+  h.sm.appendMessage({ role: "assistant", content: [], stopReason: "stop" });
+  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
+  const append = h.runtime.appendEntry;
+  h.runtime.appendEntry = (type: string, data: any) => {
+    if (data.kind === "maintenance_resume") throw new Error("resume storage unavailable");
+    append(type, data);
+  };
+  assert.throws(() => h.manager.failMaintenance(lease, new Error("refresh failed"), { resume: true }), /resume storage unavailable/);
+  assert.equal(h.manager.snapshot().maintenance.error, "maintenance_error: refresh failed");
+  assert.equal(h.manager.snapshot().outcomes.some((outcome: any) => outcome.final), false);
+  assert.deepEqual(h.messages, []);
+  h.runtime.appendEntry = append;
 });
 
 test("historical maintenance errors retry append-only and stay released after replay", async t => {
@@ -224,13 +231,11 @@ test("historical maintenance errors retry append-only and stay released after re
     }
     const outcomes = h.manager.snapshot().outcomes;
     const failed = h.manager.beginMaintenance();
-    const { recordMaintenanceFailure } = await import(pathToFileURL(join(homedir(),
-      ".local/share/pi-mono/packages/coding-agent/dist/core/agent-session-runtime.js")).href);
-    recordMaintenanceFailure(h.sm.getSessionFile(), failed);
+    h.manager.failMaintenance(failed, new Error("historical maintenance failure"));
     const restored = await harness(t, SessionManager.open(h.sm.getSessionFile()));
     const before = await readFile(h.sm.getSessionFile(), "utf8");
-    const error = restored.sm.getBranch().find((e: any) => e.customType === "session-maintenance/v1");
-    assert.equal(restored.manager.snapshot().maintenance.phase, "error");
+    const error = restored.sm.getBranch().find((e: any) => e.customType === "task-outcome/v1" && e.data?.kind === "maintenance_error");
+    assert.equal(restored.manager.snapshot().maintenance.error, "maintenance_error: historical maintenance failure");
     const retry = restored.manager.beginMaintenance();
     assert.notEqual(retry.maintenanceId, failed.maintenanceId);
     assert.notEqual(retry.ownerEpoch, failed.ownerEpoch);
@@ -256,8 +261,8 @@ test("historical maintenance errors retry append-only and stay released after re
   }
 });
 
-test("maintenance error retry keeps idle, cancellation, work, persistence and owner fences", async t => {
-  for (const scenario of ["busy", "queued", "cancellation", "child", "background", "owner", "other-lease", "write-failure"]) {
+test("maintenance error retry keeps idle, cancellation, persistence and competing-lease fences", async t => {
+  for (const scenario of ["busy", "queued", "cancellation", "other-lease", "write-failure"]) {
     const h = await harness(t, undefined, true);
     await h.settle({ text: "saved", stopReason: "stop" });
     const failed = h.manager.beginMaintenance();
@@ -266,47 +271,42 @@ test("maintenance error retry keeps idle, cancellation, work, persistence and ow
     if (scenario === "busy") restored.manager.runtime.isIdle = () => false;
     if (scenario === "queued") restored.manager.runtime.hasPendingMessages = () => true;
     if (scenario === "cancellation") restored.manager.requestCancellation("escape", "later cancellation");
-    if (scenario === "child") {
-      await restored.call("task_outcomes_consumer", { ...contract(restored.dir, "pending", "attempt"), children: ["child"] });
-    }
-    if (scenario === "background") restored.manager.background = () => ({
-      isInMaintenance: () => false, stats: () => ({ running: 1 }),
-    });
     if (scenario === "other-lease") restored.manager.background().beginMaintenance("another-live-lease");
     if (scenario === "write-failure") restored.manager.runtime.appendEntry = () => { throw new Error("disk unavailable"); };
     const before = restored.sm.getLeafId();
-    assert.throws(() => restored.manager.beginMaintenance(), /idle|cancellation|pending|outstanding|disk unavailable|does not belong/);
+    assert.throws(() => restored.manager.beginMaintenance(), /idle|cancellation|pending|outstanding|another background|disk unavailable|does not belong/);
     assert.equal(restored.sm.getLeafId(), before);
-    assert.equal(restored.manager.snapshot().maintenance.phase, "error");
+    assert.equal(restored.manager.snapshot().maintenance.error, "maintenance_error: original failure");
   }
 });
 
-test("maintenance no-change releases its lease; finality, pending work and cancellation still fence preparation", async t => {
+test("maintenance releases a live lease without blocking child or background completion", { timeout: 10000 }, async t => {
   const h = await harness(t);
-  await h.call("task_outcomes_consumer", contract(h.dir, "no-change", "attempt"));
-  const lease = h.manager.prepareMaintenance();
+  const gate = join(h.dir, "maintenance-release");
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "live", "attempt", "live-batch"), children: ["child"] });
+  await h.call("task_outcomes_consumer", {
+    action: "background", batch_id: "live-batch", job_id: "background",
+    command: `while [ ! -f '${gate}' ]; do sleep .02; done; printf live`,
+  });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "live-batch" });
+  const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
+  assert.equal(h.manager.snapshot().active.state, "maintenance_pending");
+  assert.equal(h.manager.snapshot().maintenance.maintenanceId, lease.maintenanceId);
+  h.manager.recordChildOutcome("live", "child", "completed", "child survived", "model", "child-attempt");
+  h.manager.recordChildOutcome("live", "child", "completed", "child survived", "model", "child-attempt");
+  await writeFile(gate, "");
+  await until(() => h.manager.snapshot().active.pendingWork.length === 0);
+  assert.equal(h.persisted.filter(row => row.data.kind === "child_outcome").length, 1);
   h.manager.resumeMaintenance(lease);
   assert.equal(h.manager.snapshot().maintenance, undefined);
-  const next = h.manager.prepareMaintenance();
-  assert.notEqual(next.ownerEpoch, lease.ownerEpoch);
-  assert.throws(() => h.manager.parkMaintenance(lease), /stale/);
-  h.manager.requestCancellation("task_cancel", "human cancelled");
-  assert.throws(() => h.manager.parkMaintenance(next), /stale/);
-  await h.emit("agent_settled");
-  assert.equal((await h.snapshot()).contracts.at(-1).state, "final");
-  assert.throws(() => h.manager.prepareMaintenance(), /cancellation|finalized/);
-
-  const pending = await harness(t);
-  await pending.call("task_outcomes_consumer", { ...contract(pending.dir, "pending", "attempt"), children: ["child"] });
-  const before = pending.sm.getLeafId();
-  assert.throws(() => pending.manager.prepareMaintenance(), /child\/background work is pending/);
-  assert.equal(pending.sm.getLeafId(), before);
+  assert.equal(h.manager.snapshot().active.state, "active");
+  assert.deepEqual(h.manager.snapshot().active.pendingWork, []);
 
   const final = await harness(t);
   await final.call("task_outcomes_consumer", contract(final.dir, "final", "attempt"));
   await writeFile(join(final.dir, "final-attempt.md"), "verified report");
   await final.settle({ outcome: "completed" });
-  assert.throws(() => final.manager.resumeAfterContextClean("final", "attempt", 0), /paused|final/);
+  assert.throws(() => final.manager.resumeAfterContextClean("final", "attempt", "missing", 0), /paused|final/);
   const sessionLease = final.manager.prepareMaintenance();
   assert.equal(sessionLease.jobId, undefined);
   final.manager.resumeMaintenance(sessionLease);
@@ -329,18 +329,11 @@ test("historical session cancellation releases durably without deleting history;
   assert.equal(replayed.manager.cancellation, undefined);
   assert.deepEqual(replayed.sm.getBranch().find((e: any) => e.data?.eventId === cancellation.eventId).data, cancellation);
   const next = replayed.manager.beginMaintenance();
-  replayed.manager.parkMaintenance(next);
-  const fresh = SessionManager.open(h.sm.getSessionFile());
-  replayed.manager.adopt({ ...replayed.manager.runtime, sessionOwner: fresh,
-    branchEntries: () => fresh.getBranch(), leafId: () => fresh.getLeafId(),
-    appendEntry: (type: string, data: unknown) => fresh.appendCustomEntry(type, data),
-  }, next);
   replayed.manager.resumeMaintenance(next);
   const race = replayed.manager.beginMaintenance();
   replayed.manager.requestCancellation("task_cancel", "later cancellation");
   assert.notEqual(replayed.manager.cancellation.eventId, cancellation.eventId);
-  assert.throws(() => replayed.manager.parkMaintenance(race), /stale/);
-  assert.throws(() => replayed.manager.resumeMaintenance(race), /cancelled/);
+  assert.throws(() => replayed.manager.resumeMaintenance(race), /cancelled|stale/);
   assert.throws(() => replayed.manager.beginMaintenance(), /cancellation/);
   assert.equal(replayed.manager.snapshot().outcomes.length, 0);
 });
@@ -409,19 +402,13 @@ test("settled cancelled attempts allow only session cleaning, and new attempt ac
 });
 
 test("historical release eligibility and persistence fail closed before any new marker", async t => {
-  for (const scenario of ["nonfinal", "queued", "busy", "child", "background", "write-failure"]) {
+  for (const scenario of ["nonfinal", "queued", "busy", "write-failure"]) {
     const h = await harness(t, undefined, true);
     await h.settle({ text: "saved", stopReason: "stop" });
-    if (scenario === "nonfinal" || scenario === "child") {
-      await h.call("task_outcomes_consumer", { ...contract(h.dir, scenario, "A"), ...(scenario === "child" ? { children: ["pending-child"] } : {}) });
+    if (scenario === "nonfinal") {
+      await h.call("task_outcomes_consumer", { ...contract(h.dir, scenario, "A") });
     }
-    const gate = join(h.dir, "release-background");
-    if (scenario === "background") await h.call("task_outcomes_consumer", {
-      action: "background", batch_id: "running-batch", job_id: "running-job",
-      command: `while [ ! -f '${gate}' ]; do sleep .02; done`,
-    });
     h.manager.requestCancellation("task_cancel", scenario);
-    if (scenario === "child") await h.emit("agent_settled");
     if (scenario === "queued") h.manager.runtime.hasPendingMessages = () => true;
     if (scenario === "busy") h.manager.runtime.isIdle = () => false;
     if (scenario === "write-failure") h.runtime.appendEntry = () => { throw new Error("marker storage failed"); };
@@ -430,10 +417,6 @@ test("historical release eligibility and persistence fail closed before any new 
     assert.throws(() => h.manager.beginMaintenance(), /cancellation|queued|idle|pending|marker storage failed/);
     assert.equal(await readFile(h.sm.getSessionFile(), "utf8"), before);
     assert.deepEqual(h.manager.cancellation, latch);
-    if (scenario === "background") {
-      await writeFile(gate, "");
-      await until(() => h.manager.background().stats().running === 0);
-    }
     if (scenario === "write-failure") {
       const replayed = await harness(t, SessionManager.open(h.sm.getSessionFile()));
       assert.deepEqual(replayed.manager.cancellation, latch);
@@ -541,12 +524,11 @@ test("friendly forceStop saves before typed abort and still aborts if pause stor
 });
 
 test("typed context stops retain pauses while every terminal source wins exactly once", async t => {
-  for (const phase of ["context", "pending", "parked"]) for (const source of [undefined, "escape", "task_cancel", "extension"]) {
+  for (const phase of ["context", "pending"]) for (const source of [undefined, "escape", "task_cancel", "extension"]) {
     const h = await harness(t);
     await h.call("task_outcomes_consumer", contract(h.dir, "typed", "A"));
     h.manager.pauseForContext("guard at 271925", 256000);
     const lease = phase === "context" ? undefined : h.manager.beginMaintenance();
-    if (phase === "parked") h.manager.parkMaintenance(lease);
     const interruption = source
       ? { kind: "cancel", source, reason: "terminal" }
       : { kind: "context", source: "context", reason: "guard at 271925" };
@@ -567,35 +549,6 @@ test("typed context stops retain pauses while every terminal source wins exactly
     }
     assert.equal(h.messages.length, 0);
   }
-});
-
-test("pending-work maintenance rejects before persistence and preserves later child/background results", async t => {
-  const h = await harness(t);
-  const gate = join(h.dir, "maintenance-background-release");
-  await h.call("task_outcomes_consumer", {
-    ...contract(h.dir, "maintenance-parent", "attempt", "maintenance-batch"), children: ["child"],
-  });
-  await h.call("task_outcomes_consumer", {
-    action: "background", batch_id: "maintenance-batch", job_id: "background",
-    command: `while [ ! -f '${gate}' ]; do sleep .02; done; printf preserved`,
-  });
-  await h.call("task_outcomes_consumer", { action: "close", batch_id: "maintenance-batch" });
-  const before = await h.snapshot();
-  const persisted = h.persisted.length;
-  for (let i = 0; i < 2; i++) {
-    assert.throws(() => h.manager.beginMaintenance(), /child\/background work is pending/);
-    assert.deepEqual(await h.snapshot(), before);
-    assert.equal(h.persisted.length, persisted, "no marker or false final may be written");
-    assert.equal(h.messages.length, 0);
-  }
-  for (let i = 0; i < 2; i++) {
-    h.manager.recordChildOutcome("maintenance-parent", "child", "completed", "child survived", "model", "child-attempt");
-  }
-  await writeFile(gate, "");
-  await until(async () => (await h.snapshot()).active.pendingWork.length === 0);
-  await until(() => h.messages.length === 1);
-  assert.equal(h.persisted.filter(row => row.data.kind === "child_outcome").length, 1);
-  assert.equal((await h.snapshot()).outcomes.length, 0);
 });
 
 test("launcher ingestion preserves durable dynamic child membership", { timeout: 10000 }, async t => {
