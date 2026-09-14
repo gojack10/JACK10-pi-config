@@ -312,12 +312,21 @@ export class TaskOutcomeManager {
     this.assertMaintenanceLease(lease, "parked");
     // SessionManager.open preserves the header ID and file, not the live owner.
     // A handoff must transfer to a distinct SessionManager for that same file.
+    // SDK/model-select/session-start hooks can append metadata before adoption;
+    // the sealed anchor must remain on the selected branch, not its exact leaf.
+    // New conversation or lifecycle records are not harmless startup metadata.
+    const anchor = lease.replacementAnchor ?? lease.branchAnchor;
+    const branch = runtime.branchEntries();
+    const anchorIndex = branch.findIndex(entry => entry.id === anchor);
+    const anchored = anchor === runtime.leafId() || (anchorIndex >= 0 && branch.slice(anchorIndex + 1).every(entry =>
+      ["model_change", "thinking_level_change", "session_info", "label"].includes(entry.type) ||
+      (entry.type === "custom" && entry.customType !== TASK_OUTCOME_ENTRY && entry.customType !== "session-maintenance/v1")));
     if (runtime.sessionOwner === this.runtime.sessionOwner ||
         lease.sessionId !== this.runtime.sessionId || lease.sessionId !== runtime.sessionId ||
         !lease.sessionFile || !this.runtime.sessionFile || !runtime.sessionFile ||
         resolve(lease.sessionFile) !== resolve(this.runtime.sessionFile) ||
         resolve(lease.sessionFile) !== resolve(runtime.sessionFile) ||
-        (lease.replacementAnchor ?? lease.branchAnchor) !== runtime.leafId()) {
+        !anchored) {
       throw new Error("maintenance task manager handoff does not match the replacement session");
     }
     const outgoing = this.runtime;
@@ -771,7 +780,14 @@ The declaration is provisional until clean settlement. Do not start more work af
       throw new Error("cancellation is already committed; maintenance is rejected");
     }
     const existing = this.maintenanceState;
-    if (existing) {
+    // A replayed error is historical evidence, not a live lease. Only a fresh
+    // owner may retry; a partially disposed runtime must be restarted first.
+    const retryingError = existing?.phase === "error";
+    if (retryingError && (this.maintenanceOutgoingOwner || handoffs.has(existing.maintenanceId) ||
+        this.background().isInMaintenance())) {
+      throw new Error("maintenance still has an outstanding owner; restart before retrying");
+    }
+    if (existing && !retryingError) {
       if (existing.phase !== "pending") throw new Error(existing.error ?? "maintenance ownership has already transferred");
       if (existing.sessionId !== this.runtime.sessionId ||
           (sessionFile !== undefined && existing.sessionFile !== undefined && resolve(existing.sessionFile) !== resolve(sessionFile))) {
@@ -780,6 +796,11 @@ The declaration is provisional until clean settlement. Do not start more work af
       return { ...existing };
     }
     const current = this.activeContract();
+    if (retryingError && (existing.sessionId !== this.runtime.sessionId ||
+        (existing.sessionFile !== undefined && existing.sessionFile !== this.runtime.sessionFile) ||
+        (current && (current.jobId !== existing.jobId || current.attemptId !== existing.attemptId)))) {
+      throw new Error("failed maintenance does not belong to the current session or attempt");
+    }
     if (current?.state === "final") {
       throw new Error("cannot take over a finalized task attempt");
     }
@@ -787,7 +808,7 @@ The declaration is provisional until clean settlement. Do not start more work af
         resolve(sessionFile) !== resolve(this.runtime.sessionFile)) {
       throw new Error("maintenance target is not the current session file");
     }
-    if (!current && (this.runtime.isIdle?.() !== true || this.runtime.hasPendingMessages?.() !== false)) {
+    if ((!current || retryingError) && (this.runtime.isIdle?.() !== true || this.runtime.hasPendingMessages?.() !== false)) {
       throw new Error("session-only maintenance requires idle execution and no queued messages");
     }
     if (owned.some(contract => this.pendingWork(contract).length > 0) || this.background().stats().running > 0) {
@@ -805,7 +826,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       reportPath: current?.reportPath,
       phase: "pending" as const,
     };
-    const previousState = (current?.state ?? "active") as Exclude<TaskContractSnapshot["state"], "maintenance_pending">;
+    const previousState = (retryingError && current ? existing.previousState : current?.state ?? "active") as Exclude<TaskContractSnapshot["state"], "maintenance_pending">;
     const releasedCancellationEventId = this.cancellation?.eventId;
     this.persist({
       kind: "maintenance_begin",
