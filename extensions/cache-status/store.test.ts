@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	formatGroupCacheStatus,
 	formatHubTimer,
+	getSessionCacheState,
 	formatPaneCacheStatus,
 	type PaneCacheSnapshot,
 } from "./store.ts";
@@ -72,24 +73,41 @@ test("labels a reused cache without remaining time as expired", () => {
 	assert.doesNotMatch(detail, /CACHE REUSED/);
 });
 
-test("labels a policy-derived timer as cache warm without token counters", () => {
-	const detail = formatPaneCacheStatus(
-		snapshot({
-			entries: [
-				{
-					provider: "openai",
-					model: "gpt-5.6",
-					result: "NO CACHE",
-					expiresAt: 1_300_000,
-					durationMs: 1_800_000,
-					lastSeenAt: 1_000_000,
-				},
-			],
-		}),
-		1_000_000,
-	);
-	assert.match(detail, /CACHE WARM/);
-	assert.doesNotMatch(detail, /NO CACHE/);
+test("labels a policy-derived timer as warm only until expiry", () => {
+	const value = snapshot({
+		entries: [
+			{
+				provider: "openai",
+				model: "gpt-5.6",
+				result: "NO CACHE",
+				expiresAt: 1_300_000,
+				durationMs: 1_800_000,
+				lastSeenAt: 1_000_000,
+			},
+		],
+	});
+	const warm = formatPaneCacheStatus(value, 1_000_000);
+	assert.match(warm, /CACHE WARM/);
+	assert.doesNotMatch(warm, /NO CACHE/);
+	assert.match(formatPaneCacheStatus(value, 1_300_000), /NO CACHE/);
+});
+
+test("stable snapshot rendering advances countdown and busy elapsed time", () => {
+	const value = snapshot({
+		updatedAt: 900_000,
+		busyStartedAt: 820_000,
+		entries: [{
+			provider: "openai",
+			model: "gpt-5.6",
+			result: "REUSED",
+			expiresAt: 1_121_000,
+			durationMs: 300_000,
+			lastSeenAt: 900_000,
+		}],
+	});
+	assert.match(formatPaneCacheStatus(value, 1_000_000), /02:01.*BUSY 3m/);
+	assert.match(formatPaneCacheStatus(value, 1_061_000), /01:00.*BUSY 4m/);
+	assert.match(formatPaneCacheStatus(value, 1_121_000), /CACHE EXPIRED.*BUSY 5m/);
 });
 
 test("group summary favors the warm cache and worst live context", () => {
@@ -131,4 +149,56 @@ test("group summary favors the warm cache and worst live context", () => {
 	assert.match(summary, /CTX\s+91%/);
 	assert.match(summary, /\$ 4\.00/);
 	assert.match(summary, /BUSY 14m/);
+});
+
+test("session state aggregates the earliest warm cache and oldest busy pane", () => {
+	const state = getSessionCacheState([
+		snapshot({
+			updatedAt: 100,
+			busyStartedAt: 200,
+			entries: [{
+				provider: "anthropic",
+				model: "later",
+				result: "REUSED",
+				expiresAt: 2_000,
+				durationMs: 1_000,
+				lastSeenAt: 100,
+			}],
+		}),
+		snapshot({
+			updatedAt: 100,
+			busyStartedAt: 150,
+			entries: [{
+				provider: "openai",
+				model: "first",
+				result: "CREATED",
+				expiresAt: 1_500,
+				durationMs: 1_000,
+				lastSeenAt: 100,
+			}],
+		}),
+	], 1_000);
+	assert.deepEqual(state, {
+		version: 1,
+		entries: [
+			{
+				provider: "anthropic",
+				model: "later",
+				result: "REUSED",
+				expiresAt: 2_000,
+				durationMs: 1_000,
+				lastSeenAt: 100,
+			},
+			{
+				provider: "openai",
+				model: "first",
+				result: "CREATED",
+				expiresAt: 1_500,
+				durationMs: 1_000,
+				lastSeenAt: 100,
+			},
+		],
+		busyStartedAt: 150,
+		agentDone: false,
+	});
 });

@@ -96,6 +96,10 @@ test("publishes pane and session cache options through tmux", async (t) => {
 		options.get(optionKey("session", "$1", "@pi_cache_session")) ?? "",
 		/NO CACHE/,
 	);
+	assert.deepEqual(
+		JSON.parse(options.get(optionKey("session", "$1", "@pi_cache_state")) ?? ""),
+		{ version: 1, entries: [], agentDone: false },
+	);
 	assert.match(
 		options.get(optionKey("window", "@1", "@pi_cache_window")) ?? "",
 		/RUN \$0\.00 TOTAL \$0\.00/,
@@ -139,14 +143,44 @@ test("publishes pane and session cache options through tmux", async (t) => {
 
 	const periodicTick = intervals[0];
 	assert.ok(periodicTick);
+	const updatesBeforeTick = cacheUpdates.length;
 	periodicTick();
+	await wait();
+	assert.equal(calls.length, afterRequestCalls);
+	assert.ok(cacheUpdates.length > updatesBeforeTick);
+
+	handlers.get("message_end")?.(
+		{
+			message: {
+				role: "assistant",
+				provider: "anthropic",
+				model: "claude-fable-5",
+				usage: { cacheRead: 2 },
+			},
+		},
+		ctx,
+	);
 	await wait();
 	assert.ok(calls.length > afterRequestCalls);
 	const snapshot = JSON.parse(
 		Buffer.from(options.get(optionKey("pane", paneId, "@pi_cache_data")) ?? "", "base64url").toString(),
 	) as { entries: { result?: string }[] };
 	assert.equal(snapshot.entries[0]?.result, "REUSED");
+	assert.equal(
+		JSON.parse(options.get(optionKey("session", "$1", "@pi_cache_state")) ?? "").entries[0]?.result,
+		"REUSED",
+	);
+
+	let eventCalls = calls.length;
+	for (const event of ["model_select", "session_switch", "session_tree", "session_compact"]) {
+		handlers.get(event)?.({}, ctx);
+		await wait();
+		assert.ok(calls.length > eventCalls, `${event} did not publish`);
+		eventCalls = calls.length;
+	}
 
 	await handlers.get("session_shutdown")?.({}, ctx);
 	assert.equal(options.get(optionKey("pane", paneId, "@pi_cache_data")), undefined);
+	assert.equal(options.get(optionKey("window", paneId, "@pi_cache_window")), undefined);
+	assert.equal(options.get(optionKey("session", "$1", "@pi_cache_state")), undefined);
 });
