@@ -788,16 +788,24 @@ export function adoptBackgroundJobManager(
   lease: MaintenanceHandoff,
 ): BackgroundJobManager | undefined {
   const handoff = handoffs.get(lease.maintenanceId);
-  if (!handoff) return undefined;
-  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch) {
+  if (!handoff) throw new Error("background maintenance handoff is missing or already consumed");
+  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch ||
+      !handoff.manager.isInMaintenance(lease.maintenanceId) || handoff.manager.stats().running > 0) {
     throw new Error("background job maintenance handoff token conflicts with its owner");
   }
   const manager = handoff.manager;
-  manager.attach((content, options) => pi.sendUserMessage(content, options));
   manager.resumeMaintenance(lease.maintenanceId);
+  manager.attach((content, options) => pi.sendUserMessage(content, options));
   managers.set(ctx.sessionManager as object, manager);
   handoffs.delete(lease.maintenanceId);
   return manager;
+}
+
+export function abandonBackgroundMaintenance(lease: MaintenanceHandoff): void {
+  const handoff = handoffs.get(lease.maintenanceId);
+  if (!handoff || handoff.lease.ownerEpoch !== lease.ownerEpoch) return;
+  handoffs.delete(lease.maintenanceId);
+  handoff.manager.resumeMaintenance(lease.maintenanceId);
 }
 
 export function releaseBackgroundJobManager(ctx: SessionOwnerContext): void {
