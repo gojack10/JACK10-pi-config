@@ -194,8 +194,8 @@ export class BackgroundJobManager {
     this.maintenanceId = maintenanceId;
   }
 
-  isInMaintenance(maintenanceId: string): boolean {
-    return this.maintenanceId === maintenanceId;
+  isInMaintenance(maintenanceId?: string): boolean {
+    return this.maintenanceId !== undefined && (maintenanceId === undefined || this.maintenanceId === maintenanceId);
   }
 
   resumeMaintenance(maintenanceId: string): void {
