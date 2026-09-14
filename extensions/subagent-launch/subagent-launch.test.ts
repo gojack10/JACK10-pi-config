@@ -45,10 +45,11 @@ test.after(async () => {
 });
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
   ".local/share/pi-mono/packages/coding-agent/dist/core/extensions/loader.js")).href);
-const { SessionManager } = await import(pathToFileURL(join(homedir(),
+const { SessionManager, ModelRuntime, createAgentSessionServices, createAgentSessionFromServices, createAgentSessionRuntime } = await import(pathToFileURL(join(homedir(),
   ".local/share/pi-mono/packages/coding-agent/dist/index.js")).href);
 const extensionPath = fileURLToPath(new URL("../subagent-launch.ts", import.meta.url));
 const taskOutcomeExtensionPath = fileURLToPath(new URL("../task-outcomes.ts", import.meta.url));
+const taskOutcomeConsumerPath = fileURLToPath(new URL("../task-outcomes/consumer-test-extension.ts", import.meta.url));
 const monitorPath = fileURLToPath(new URL("./monitor.mjs", import.meta.url));
 
 async function tmux(args: string[]): Promise<string> {
@@ -148,6 +149,177 @@ sleep .5
     assert.match(messages[0].text, /completed/);
     assert.equal(await readFile(report, "utf8"), "fake task report\n");
   } finally {
+    process.env.PATH = oldPath;
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+    if (childSession) await tmux(["kill-session", "-t", childSession]).catch(() => {});
+    await tmux(["kill-session", "-t", parentSession]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const timing of ["after-refresh", "during-drain"] as const) test(`real in-place clean keeps a live monitor and delivers once: ${timing}`, { timeout: 20000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-maintenance-live-test-"));
+  const parentSession = `pi-subagent-maintenance-${process.pid}-${Date.now()}`;
+  const oldPath = process.env.PATH;
+  const oldPane = process.env.TMUX_PANE;
+  const fakePi = join(dir, "pi");
+  await writeFile(fakePi, `#!/bin/sh
+set -eu
+pane="$TMUX_PANE"
+manifest=$(tmux show-options -qv -t "$pane" @pi_subagent_manifest)
+job=$(tmux show-options -qv -t "$pane" @pi_subagent_job_id)
+attempt=$(sed -n 's/.*"attemptId":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+session_id=$(sed -n 's/.*"sessionId":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+mode=$(sed -n 's/.*"mode":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+report=$(sed -n 's/.*"reportPath":"\\([^\\"]*\\)".*/\\1/p' "$manifest")
+session_file="$manifest.session.jsonl"
+printf '{"type":"session","id":"%s"}\\n' "$session_id" > "$session_file"
+tmux set-option -q -t "$pane" @pi_session_file "$session_file"
+gen=$(tmux show-options -qv -t "$pane" @pi_start_generation)
+tmux set-option -q -t "$pane" @pi_start_generation $((gen + 1))
+start=$(tmux show-options -qv -t "$pane" @pi_start_channel)
+tmux set-option -qu -t "$pane" @pi_start_channel
+tmux wait-for -S "$start"
+while [ ! -f '${join(dir, "release-child")}' ]; do sleep .02; done
+${JSON.stringify(process.execPath)} ${JSON.stringify(fileURLToPath(new URL('./live-maintenance-fixture.mjs', import.meta.url)))} "$manifest" "$session_file"
+channel=$(tmux show-options -qv -t "$pane" @pi_outcome_channel)
+tmux set-option -q -t "$pane" @pi_outcome "{\\"session_id\\":\\"$session_id\\",\\"job_id\\":\\"$job\\",\\"attempt_id\\":\\"$attempt\\",\\"mode\\":\\"$mode\\",\\"outcome\\":\\"completed\\",\\"source\\":\\"model\\",\\"report\\":\\"$report\\",\\"session_file\\":\\"$session_file\\"}"
+tmux set-option -q -t "$pane" @pi_outcome_generation 1
+tmux wait-for -S "$channel"
+sleep .2
+`, { mode: 0o700 });
+  await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
+  const parentPane = await tmux(["list-panes", "-t", parentSession, "-F", "#{pane_id}"]);
+  process.env.PATH = `${dir}:${oldPath ?? ""}`;
+  process.env.TMUX_PANE = parentPane;
+  let childSession: string | undefined;
+  let host: any;
+  const oldManifest = process.env.PI_SUBAGENT_MANIFEST;
+  delete process.env.PI_SUBAGENT_MANIFEST;
+  try {
+    const messages: string[] = [];
+    const lifecycle: string[] = [];
+    let extensions: any[] = [];
+    const modelRuntime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: join(dir, 'models.json') });
+    const factory = async ({ sessionManager, sessionStartEvent }: any) => {
+      const services = await createAgentSessionServices({ cwd: dir, agentDir: dir, modelRuntime,
+        resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+          additionalExtensionPaths: [taskOutcomeExtensionPath, extensionPath, taskOutcomeConsumerPath,
+            fileURLToPath(new URL('../tool-call-clean/index.ts', import.meta.url))],
+          extensionFactories: [(pi: any) => {
+            pi.on('session_start', () => lifecycle.push('start'));
+            pi.on('session_shutdown', () => lifecycle.push('shutdown'));
+            pi.on('input', (event: any) => { messages.push(event.text); return { action: 'handled' }; });
+          }],
+        } });
+      const result = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent });
+      extensions = result.extensionsResult.extensions;
+      assert.deepEqual(result.extensionsResult.errors, []);
+      return { ...result, services, diagnostics: services.diagnostics };
+    };
+    host = await createAgentSessionRuntime(factory, { cwd: dir, agentDir: dir, sessionManager: SessionManager.create(dir, dir) });
+    const session = host.session;
+    await session.bindExtensions({ mode: 'tui', commandContextActions: {
+      switchSession: (file: string, options: any) => host.switchSession(file, options),
+    } });
+    lifecycle.length = 0;
+    const disposed = t.mock.method(session, 'dispose');
+    const sm = session.sessionManager;
+    const runner = session.extensionRunner;
+    sm.appendMessage({ role: 'assistant', content: [], stopReason: 'stop', timestamp: Date.now() });
+    sm.appendMessage({ role: 'toolResult', toolCallId: 'bulky', toolName: 'bash', content: [{ type: 'text', text: 'BULKY'.repeat(2000) }], isError: false, timestamp: Date.now() });
+    const ctx: any = {
+      ...session.createReplacedSessionContext(),
+      cwd: dir,
+      mode: "tui",
+      sessionManager: sm,
+      modelRegistry: {
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
+        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+          thinkingLevelMap: { xhigh: "xhigh" } }],
+      },
+    };
+    const consumer = extensions.find(extension => extension.tools.has("task_outcomes_consumer"));
+    assert.ok(consumer);
+    await consumer.tools.get("task_outcomes_consumer")!.definition.execute("test", {
+      action: "activate", job_id: "parent", attempt_id: "parent-attempt", mode: "task",
+      report_path: join(dir, "parent.md"),
+    }, undefined, undefined, ctx);
+    const manager = (globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")].get(sm);
+    const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
+    assert.ok(owner);
+    const mission = join(dir, "mission.md");
+    const report = join(dir, "child.md");
+    await writeFile(mission, "Do the fake task.\\n");
+    const launch: any = await owner.tools.get("subagent_launch")!.definition.execute("test", {
+      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+        cwd: dir, session_label: "live", mode: "task", report_file: report }],
+    }, undefined, undefined, ctx);
+    const job = launch.details.jobs[0];
+    assert.equal(job.status, "running");
+    childSession = job.session_label;
+    const background = (globalThis as any)[Symbol.for("pi.background-jobs.manager-registry")].get(sm);
+    assert.ok(background.stats().running > 0);
+    const launcher = (globalThis as any)[Symbol.for('pi.subagent-launch.launcher-registry')].get(sm);
+    const release = join(dir, 'release-child');
+    background.start({ command: `while [ ! -f '${release}' ]; do sleep .02; done; printf background-survived`, cwd: dir });
+    assert.equal(background.stats().running, 2);
+    const abort = session.abort.bind(session);
+    t.mock.method(session, 'abort', async () => {
+      await abort();
+      if (timing === 'during-drain') {
+        assert.equal(manager.snapshot().active.state, 'maintenance_pending');
+        await writeFile(release, '');
+        await until(() => manager.snapshot().active.pendingWork.length === 0 && background.stats().running === 0 && messages.some(text => text.includes('child.md')));
+      }
+    });
+    await session.prompt('/tool-call-clean');
+    assert.equal(host.session, session);
+    assert.equal(session.sessionManager, sm);
+    assert.equal(session.extensionRunner, runner);
+    assert.equal(disposed.mock.callCount(), 0);
+    assert.deepEqual(lifecycle, []);
+    assert.equal((globalThis as any)[Symbol.for('pi.subagent-launch.launcher-registry')].get(sm), launcher);
+    assert.equal((globalThis as any)[Symbol.for('pi.background-jobs.manager-registry')].get(sm), background);
+    assert.equal(manager.snapshot().maintenance, undefined);
+    assert.equal(manager.snapshot().active.state, 'active');
+    assert.ok(!JSON.stringify(session.messages).includes('BULKY'));
+    assert.match(await readFile(sm.getSessionFile(), 'utf8'), /tool result cleared/);
+    if (timing === 'after-refresh') {
+      assert.ok(background.stats().running > 0);
+      assert.ok(manager.snapshot().active.pendingWork.length > 0);
+      assert.equal(messages.length, 0);
+      await session.prompt('/tool-call-clean'); // no-change refresh releases the same live owner too
+      assert.equal(manager.snapshot().maintenance, undefined);
+      assert.equal(disposed.mock.callCount(), 0);
+      assert.deepEqual(lifecycle, []);
+      await writeFile(release, '');
+    }
+    await until(() => manager.snapshot().active.pendingWork.length === 0 && background.stats().running === 0 && messages.some(text => text.includes('child.md')));
+    assert.equal(manager.snapshot().outcomes.filter((outcome: any) => outcome.outcome === 'transport_lost').length, 0);
+    // Duplicate monitor final markers must not produce another journal row or admission.
+    const state = [...launcher.states.values()][0];
+    assert.equal(state.finalAdmitted, true);
+    const receipt = JSON.parse(await readFile(`${state.manifestPath}.session.jsonl.task-monitor-${state.attemptId}.json`, 'utf8'));
+    assert.equal(receipt.state, 'final');
+    assert.equal(receipt.payload.outcome, 'completed');
+    assert.equal(receipt.eventId, 'child-final');
+    launcher.onMonitorOutput(state, JSON.stringify({ kind: 'final', eventId: receipt.eventId,
+      jobId: state.jobId, attemptId: state.attemptId, outcome: 'completed' }) + '\n');
+    await session.waitForIdle();
+    const childRows = sm.getBranch().filter((entry: any) => entry.data?.kind === 'child_outcome');
+    assert.equal(childRows.length, 1);
+    assert.equal(childRows[0].data.outcome, 'completed');
+    assert.equal(childRows[0].data.source, 'model');
+    assert.ok(!childRows[0].data.summary.includes('transport_lost'));
+    assert.equal(messages.filter(text => text.includes("child.md") || text.includes("live maintenance report")).length, 1);
+    assert.equal(background.stats().running, 0);
+  } finally {
+    await host?.dispose();
+    if (oldManifest === undefined) delete process.env.PI_SUBAGENT_MANIFEST;
+    else process.env.PI_SUBAGENT_MANIFEST = oldManifest;
     process.env.PATH = oldPath;
     if (oldPane === undefined) delete process.env.TMUX_PANE;
     else process.env.TMUX_PANE = oldPane;

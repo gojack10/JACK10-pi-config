@@ -4,7 +4,6 @@ import { open, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MaintenanceHandoff } from "./_shared/maintenance.ts";
 
 type TaskOutcomeEvent = {
 	sessionId: string;
@@ -23,7 +22,6 @@ type TaskOutcomeEvent = {
 	pauseId?: string;
 	maintenanceId?: string;
 	ownerEpoch?: string;
-	phase?: string;
 };
 
 type ArtifactIdentity = { dev: string; ino: string };
@@ -72,12 +70,6 @@ interface SignalState {
 	pendingOutcomePublication?: Promise<boolean>;
 	publishedOutcomes?: Map<string, string>;
 }
-
-const handoffKey = Symbol.for("pi.tmux-turn-signal.maintenance-handoffs");
-const globalState = globalThis as typeof globalThis & {
-	[handoffKey]?: Map<string, { state: SignalState; lease: MaintenanceHandoff }>;
-};
-const handoffs = globalState[handoffKey] ??= new Map();
 
 export default function (pi: ExtensionAPI) {
 	let activePi = pi;
@@ -186,7 +178,6 @@ export default function (pi: ExtensionAPI) {
 				pause_id: payload.pauseId,
 				maintenance_id: payload.maintenanceId,
 				owner_epoch: payload.ownerEpoch,
-				phase: payload.phase,
 				summary: payload.summary,
 				report: payload.reportPath,
 				session_file: payload.sessionFile,
@@ -282,28 +273,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	activePi.events.on("task-outcome", signalOutcome);
-	activePi.on("session_start", async (event, ctx) => {
-		if (event.reason === "maintenance" && event.maintenance) {
-			const handoff = handoffs.get(event.maintenance.maintenanceId);
-			if (!handoff || handoff.lease.ownerEpoch !== event.maintenance.ownerEpoch ||
-				handoff.lease.sessionId !== event.maintenance.sessionId) {
-				throw new Error("tmux outcome publication handoff is missing or stale");
-			}
-			signalState = handoff.state;
-			handoffs.delete(event.maintenance.maintenanceId);
-			activePi = pi;
-		}
+	activePi.on("session_start", async (_event, ctx) => {
 		signalState.ownerSessionId = ctx.sessionManager.getSessionId();
 		await flushPendingOutcomes();
-	});
-
-	activePi.on("session_shutdown", (event, ctx) => {
-		if (event.reason === "maintenance" && event.maintenance) {
-			if (signalState.ownerSessionId !== ctx.sessionManager.getSessionId()) {
-				throw new Error("tmux outcome publication owner mismatch");
-			}
-			handoffs.set(event.maintenance.maintenanceId, { state: signalState, lease: { ...event.maintenance } });
-		}
 	});
 
 	activePi.on("agent_start", async (_event, ctx) => {

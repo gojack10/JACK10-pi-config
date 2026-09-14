@@ -97,6 +97,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.ok(result.details.after_tokens < 256000);
   await until(() => messages.some(text => text.includes('recovered assignment completed')));
   assert.equal(background.getBatchStatus(launch.batch_id).complete, true);
+  assert.equal(messages.filter(text => text.includes('recovered assignment completed')).length, 1);
   assert.equal(messages.slice(pauseMessageCount).some(text => /Operation aborted|transport_lost/.test(text)), false);
   assert.match(await readFile(report, 'utf8'), new RegExp(job.attempt_id));
   assert.match(await readFile(report, 'utf8'), new RegExp(paused.piSessionId));
@@ -106,7 +107,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.doesNotMatch(cleaned, /large output large output/);
   const backup = (await readdir(dir)).find(name => name.includes('.tool-call-clean.') && name.endsWith('.bak'));
   assert.ok(backup);
-  // The atomic handoff now persists ownership before cleanup takes its backup.
+  // In-place maintenance persists ownership before cleanup takes its backup.
   const backedUp = await readFile(join(dir, backup), 'utf8');
   assert.equal(backedUp.slice(0, original.length), original, 'backup preserves every pre-maintenance byte');
   const added = backedUp.slice(original.length).trim().split('\n').map(line => JSON.parse(line));

@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionMaintenanceToken } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, constants, existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { open } from "node:fs/promises";
@@ -6,14 +6,10 @@ import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 import {
-  adoptBackgroundJobManager,
-  parkBackgroundJobManager,
-  abandonBackgroundMaintenance,
   getBackgroundJobManager,
   type BackgroundJobManager,
   type BackgroundJobOutcomeStatus,
 } from "../background-jobs/manager.ts";
-import type { MaintenanceHandoff, MaintenancePhase } from "../_shared/maintenance.ts";
 import { publishMonitorReceipt } from "./monitor-receipt.mjs";
 
 export const TASK_OUTCOME_ENTRY = "task-outcome/v1";
@@ -24,9 +20,7 @@ export type DeclaredOutcome = "completed" | "blocked" | "needs_input" | "failed"
 export type MonitorOutcome = DeclaredOutcome | "protocol_incomplete" | "dialogue_settled" | "transport_lost" | "context_paused" | "maintenance_paused" | "maintenance_error";
 export type OutcomeSource = "model" | "technical" | "protocol" | "transport";
 
-export interface MaintenanceLease extends MaintenanceHandoff {
-  phase: MaintenancePhase;
-}
+export type MaintenanceLease = SessionMaintenanceToken;
 
 export const TASK_LAUNCH_MANIFEST_OPTION = "@pi_subagent_manifest";
 
@@ -150,7 +144,7 @@ interface PersistedEvent {
   branchId?: string;
   kind: "contract" | "declaration" | "declaration_invalidated" | "child_outcome" | "work_ready" | "outcome" | "transport_lost" | "context_pause" | "context_resume" | "maintenance_begin" | "maintenance_paused" | "maintenance_error" | "maintenance_resume" | "cancellation_requested";
   contextPause?: TaskContractSnapshot["contextPause"];
-  maintenance?: MaintenanceHandoff & { phase: MaintenancePhase; previousState?: Exclude<TaskContractSnapshot["state"], "maintenance_pending">; error?: string };
+  maintenance?: MaintenanceLease & { previousState?: Exclude<TaskContractSnapshot["state"], "maintenance_pending">; error?: string };
   cancellation?: { reason: string; source: "escape" | "task_cancel" | "extension" };
   releasedCancellationEventId?: string;
   at: string;
@@ -278,7 +272,6 @@ export class TaskOutcomeManager {
   private turn = -1;
   private lastAssistant: any;
   private lastRunFailure: string | undefined;
-  private maintenanceOutgoingOwner?: object;
   private lastInterruption?: { kind: "cancel" | "context" | "maintenance" | "lifecycle"; source: string; reason: string; operationId?: string };
   private maintenanceState?: MaintenanceLease & {
     previousState: Exclude<TaskContractSnapshot["state"], "maintenance_pending">;
@@ -306,45 +299,6 @@ export class TaskOutcomeManager {
     }
     this.runtime = runtime;
     if (ownerChanged) this.observedLeafId = runtime.leafId();
-  }
-
-  adopt(runtime: Runtime, lease: MaintenanceHandoff, adoptBackground?: () => void): void {
-    this.assertMaintenanceLease(lease, "parked");
-    // SessionManager.open preserves the header ID and file, not the live owner.
-    // A handoff must transfer to a distinct SessionManager for that same file.
-    // SDK/model-select/session-start hooks can append metadata before adoption;
-    // the sealed anchor must remain on the selected branch, not its exact leaf.
-    // New conversation or lifecycle records are not harmless startup metadata.
-    const anchor = lease.replacementAnchor ?? lease.branchAnchor;
-    const branch = runtime.branchEntries();
-    const anchorIndex = branch.findIndex(entry => entry.id === anchor);
-    const anchored = anchor === runtime.leafId() || (anchorIndex >= 0 && branch.slice(anchorIndex + 1).every(entry =>
-      ["model_change", "thinking_level_change", "session_info", "label"].includes(entry.type) ||
-      (entry.type === "custom" && entry.customType !== TASK_OUTCOME_ENTRY && entry.customType !== "session-maintenance/v1")));
-    if (runtime.sessionOwner === this.runtime.sessionOwner ||
-        lease.sessionId !== this.runtime.sessionId || lease.sessionId !== runtime.sessionId ||
-        !lease.sessionFile || !this.runtime.sessionFile || !runtime.sessionFile ||
-        resolve(lease.sessionFile) !== resolve(this.runtime.sessionFile) ||
-        resolve(lease.sessionFile) !== resolve(runtime.sessionFile) ||
-        !anchored) {
-      throw new Error("maintenance task manager handoff does not match the replacement session");
-    }
-    const outgoing = this.runtime;
-    this.runtime = runtime;
-    try {
-      this.claimMaintenance(lease);
-      adoptBackground?.();
-    } catch (error) {
-      this.runtime = outgoing;
-      this.maintenanceState!.phase = "parked";
-      throw error;
-    }
-    this.observedLeafId = runtime.leafId();
-    const contract = this.activeContract();
-    if (contract && contract.ownerSessionId === runtime.sessionId) {
-      this.activeKey = this.key(contract.jobId, contract.attemptId);
-      this.watchWork(contract, false);
-    }
   }
 
   restore(): void {
@@ -780,20 +734,21 @@ The declaration is provisional until clean settlement. Do not start more work af
       throw new Error("cancellation is already committed; maintenance is rejected");
     }
     const existing = this.maintenanceState;
-    // A replayed error is historical evidence, not a live lease. Only a fresh
-    // owner may retry; a partially disposed runtime must be restarted first.
-    const retryingError = existing?.phase === "error";
-    if (retryingError && (this.maintenanceOutgoingOwner || handoffs.has(existing.maintenanceId) ||
-        this.background().isInMaintenance())) {
-      throw new Error("maintenance still has an outstanding owner; restart before retrying");
+    // A replayed error is historical evidence, not a live lease. A failed
+    // durable resume remains fenced until a fresh owner replays the journal.
+    const retryingError = existing?.error !== undefined;
+    if (retryingError && this.background().isInMaintenance(existing.maintenanceId)) {
+      throw new Error("maintenance still has an outstanding owner; retry is fenced");
     }
     if (existing && !retryingError) {
-      if (existing.phase !== "pending") throw new Error(existing.error ?? "maintenance ownership has already transferred");
       if (existing.sessionId !== this.runtime.sessionId ||
           (sessionFile !== undefined && existing.sessionFile !== undefined && resolve(existing.sessionFile) !== resolve(sessionFile))) {
         throw new Error("another maintenance operation is already in progress");
       }
       return { ...existing };
+    }
+    if (this.background().isInMaintenance()) {
+      throw new Error("another background maintenance operation is already active");
     }
     const current = this.activeContract();
     if (retryingError && (existing.sessionId !== this.runtime.sessionId ||
@@ -811,9 +766,6 @@ The declaration is provisional until clean settlement. Do not start more work af
     if ((!current || retryingError) && (this.runtime.isIdle?.() !== true || this.runtime.hasPendingMessages?.() !== false)) {
       throw new Error("session-only maintenance requires idle execution and no queued messages");
     }
-    if (owned.some(contract => this.pendingWork(contract).length > 0) || this.background().stats().running > 0) {
-      throw new Error("cannot maintain while child/background work is pending");
-    }
     const maintenanceId = randomUUID();
     const lease = {
       maintenanceId,
@@ -824,7 +776,6 @@ The declaration is provisional until clean settlement. Do not start more work af
       jobId: current?.jobId,
       attemptId: current?.attemptId,
       reportPath: current?.reportPath,
-      phase: "pending" as const,
     };
     const previousState = (retryingError && current ? existing.previousState : current?.state ?? "active") as Exclude<TaskContractSnapshot["state"], "maintenance_pending">;
     const releasedCancellationEventId = this.cancellation?.eventId;
@@ -839,7 +790,6 @@ The declaration is provisional until clean settlement. Do not start more work af
     // appendEntry advances the selected leaf. The persisted intent records its
     // source; the live lease must instead name the durable marker just written.
     lease.branchAnchor = this.runtime.leafId();
-    this.maintenanceOutgoingOwner = this.runtime.sessionOwner;
     this.maintenanceState = { ...lease, previousState, pausedNotified: false };
     if (current) {
       current.maintenanceState = this.maintenanceState;
@@ -854,40 +804,19 @@ The declaration is provisional until clean settlement. Do not start more work af
     return { ...lease };
   }
 
-  private assertMaintenanceLease(lease: MaintenanceHandoff, phase: MaintenancePhase): void {
+  private assertMaintenanceLease(lease: MaintenanceLease): void {
     const current = this.maintenanceState;
     const contract = this.activeContract();
-    if (this.cancellation || !current || current.phase !== phase ||
+    if (this.cancellation || !current || current.error ||
         current.maintenanceId !== lease.maintenanceId || current.ownerEpoch !== lease.ownerEpoch ||
         current.sessionId !== lease.sessionId || current.sessionFile !== lease.sessionFile ||
         current.branchAnchor !== lease.branchAnchor ||
-        (phase === "parked" && current.replacementAnchor !== (lease.replacementAnchor ?? lease.branchAnchor)) ||
         current.jobId !== lease.jobId || current.attemptId !== lease.attemptId ||
         current.reportPath !== lease.reportPath ||
         contract?.jobId !== lease.jobId || contract?.attemptId !== lease.attemptId ||
         contract?.reportPath !== lease.reportPath || contract?.state === "final") {
-      throw new Error("maintenance task manager handoff is stale or conflicts with its owner");
+      throw new Error("maintenance lease is stale or conflicts with its owner");
     }
-  }
-
-  parkMaintenance(lease: MaintenanceHandoff): void {
-    this.assertMaintenanceLease(lease, "pending");
-    const anchor = lease.replacementAnchor ?? lease.branchAnchor;
-    if (anchor !== this.runtime.leafId() ||
-        (lease.branchAnchor !== null && !this.runtime.branchEntries().some(entry => entry.id === lease.branchAnchor))) {
-      throw new Error("maintenance replacement anchor is not on the outgoing branch");
-    }
-    this.maintenanceState!.replacementAnchor = anchor;
-    this.maintenanceState!.phase = "parked";
-  }
-
-  claimMaintenance(lease: MaintenanceHandoff): void {
-    this.assertMaintenanceLease(lease, "parked");
-    if (this.runtime.sessionOwner === this.maintenanceOutgoingOwner ||
-        this.maintenanceState!.replacementAnchor !== (lease.replacementAnchor ?? lease.branchAnchor)) {
-      throw new Error("maintenance replacement anchor conflicts with its owner");
-    }
-    this.maintenanceState!.phase = "claimed";
   }
 
   requestCancellation(
@@ -913,21 +842,22 @@ The declaration is provisional until clean settlement. Do not start more work af
     }
   }
 
-  failMaintenance(lease: MaintenanceHandoff, error: unknown): void {
+  failMaintenance(lease: MaintenanceLease, error: unknown, options: { resume?: boolean } = {}): void {
     const current = this.maintenanceState;
     if (this.cancellation || !current || current.maintenanceId !== lease.maintenanceId ||
         current.ownerEpoch !== lease.ownerEpoch) return;
+    const resume = options.resume === true && current.error === undefined;
+    if (resume) this.assertMaintenanceLease(lease);
     const summary = `maintenance_error: ${errorMessage(error)}`.slice(0, SUMMARY_MAX);
-    if (current.phase === "error" && current.error === summary) return;
+    if (current.error === summary) return;
     const contract = this.activeContract();
     this.persist({
       kind: "maintenance_error",
       jobId: contract?.jobId ?? lease.jobId,
       attemptId: contract?.attemptId ?? lease.attemptId,
-      maintenance: { ...lease, phase: "error", error: summary },
+      maintenance: { ...lease, error: summary },
       summary,
     }, `task-outcome:maintenance_error:${lease.maintenanceId}`);
-    current.phase = "error";
     current.error = summary;
     this.records.push({
       jobId: contract?.jobId ?? lease.jobId ?? "session",
@@ -941,23 +871,31 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (contract) {
       this.emitOutcome({ contract, outcome: "maintenance_error", source: "technical", summary, final: false });
     }
+    if (resume) {
+      current.error = undefined;
+      try {
+        this.resumeMaintenance(lease);
+      } catch (resumeError) {
+        current.error = summary;
+        throw resumeError;
+      }
+    }
   }
 
-  resumeMaintenance(lease: MaintenanceHandoff): void {
+  resumeMaintenance(lease: MaintenanceLease): void {
     const current = this.maintenanceState;
     if (!current || current.maintenanceId !== lease.maintenanceId) {
       throw new Error("maintenance lease is not active");
     }
-    if (current.phase === "error") throw new Error(current.error ?? "maintenance failed");
+    if (current.error) throw new Error(current.error);
     if (this.cancellation) throw new Error("maintenance was cancelled");
-    if (current.phase !== "pending" && current.phase !== "claimed") throw new Error("maintenance owner is parked");
-    this.assertMaintenanceLease(lease, current.phase);
+    this.assertMaintenanceLease(lease);
     const contract = this.activeContract();
     this.persist({
       kind: "maintenance_resume",
       jobId: contract?.jobId ?? lease.jobId,
       attemptId: contract?.attemptId ?? lease.attemptId,
-      maintenance: { ...lease, phase: "claimed" },
+      maintenance: { ...lease },
     }, `task-outcome:maintenance_resume:${lease.maintenanceId}`);
     if (contract) {
       contract.state = current.previousState;
@@ -968,7 +906,6 @@ The declaration is provisional until clean settlement. Do not start more work af
     }
     this.background().resumeMaintenance(lease.maintenanceId);
     this.maintenanceState = undefined;
-    this.maintenanceOutgoingOwner = undefined;
     this.lastRunFailure = undefined;
     this.lastInterruption = undefined;
   }
@@ -1069,7 +1006,7 @@ The declaration is provisional until clean settlement. Do not start more work af
           kind: "maintenance_paused",
           jobId: contract.jobId,
           attemptId: contract.attemptId,
-          maintenance: { ...this.maintenanceState, phase: this.maintenanceState.phase },
+          maintenance: { ...this.maintenanceState },
           outcome: "maintenance_paused",
           source: "technical",
           summary: "human maintenance takeover paused the current run",
@@ -1534,7 +1471,6 @@ The declaration is provisional until clean settlement. Do not start more work af
         ? {
             maintenanceId: this.maintenanceState?.maintenanceId,
             ownerEpoch: this.maintenanceState?.ownerEpoch,
-            phase: this.maintenanceState?.phase,
           }
         : {}),
     });
@@ -1829,7 +1765,6 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (event.kind === "maintenance_error" && event.maintenance) {
       this.maintenanceState = {
         ...event.maintenance,
-        phase: "error",
         previousState: this.maintenanceState?.previousState ?? event.maintenance.previousState ?? "active",
         pausedNotified: true,
         error: event.maintenance.error ?? event.summary,
@@ -1955,13 +1890,10 @@ const errorMessage = (error: unknown): string => error instanceof Error ? error.
 type SessionOwnerContext = Pick<ExtensionContext, "sessionManager" | "isIdle" | "hasPendingMessages">;
 type TaskOutcomeAPI = Pick<ExtensionAPI, "appendEntry" | "sendUserMessage" | "events">;
 const registryKey = Symbol.for("pi.task-outcomes.manager-registry");
-const handoffKey = Symbol.for("pi.task-outcomes.maintenance-handoffs");
 const state = globalThis as typeof globalThis & {
   [registryKey]?: WeakMap<object, TaskOutcomeManager>;
-  [handoffKey]?: Map<string, { manager: TaskOutcomeManager; lease: MaintenanceHandoff }>;
 };
 const managers = state[registryKey] ??= new WeakMap();
-const handoffs = state[handoffKey] ??= new Map();
 
 const runtimeFor = (pi: TaskOutcomeAPI, ctx: SessionOwnerContext): Runtime => {
   const owner = ctx.sessionManager as object;
@@ -2011,47 +1943,7 @@ export function getTaskOutcomeManager(pi: TaskOutcomeAPI, ctx: SessionOwnerConte
   return manager;
 }
 
-export function parkTaskOutcomeManager(ctx: SessionOwnerContext, lease: MaintenanceHandoff): void {
-  const owner = ctx.sessionManager as object;
-  const manager = managers.get(owner);
-  if (!manager) throw new Error("task outcome manager is unavailable for maintenance");
-  manager.parkMaintenance(lease);
-  // Task outcomes owns both halves, even without the background tool extension.
-  parkBackgroundJobManager(ctx, lease);
-  handoffs.set(lease.maintenanceId, { manager, lease: { ...lease } });
-}
-
-export function adoptTaskOutcomeManager(
-  pi: TaskOutcomeAPI,
-  ctx: SessionOwnerContext,
-  lease: MaintenanceHandoff,
-): TaskOutcomeManager | undefined {
-  const handoff = handoffs.get(lease.maintenanceId);
-  if (!handoff) throw new Error("maintenance task manager handoff is missing or already consumed");
-  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch ||
-      handoff.lease.sessionFile !== lease.sessionFile || handoff.lease.branchAnchor !== lease.branchAnchor ||
-      handoff.lease.replacementAnchor !== lease.replacementAnchor || handoff.lease.jobId !== lease.jobId ||
-      handoff.lease.attemptId !== lease.attemptId || handoff.lease.reportPath !== lease.reportPath) {
-    throw new Error("task outcome maintenance handoff token conflicts with its owner");
-  }
-  const manager = handoff.manager;
-  try {
-    manager.adopt(runtimeFor(pi, ctx), lease, () => {
-      adoptBackgroundJobManager({ sendUserMessage: pi.sendUserMessage }, ctx, lease);
-    });
-  } catch (error) {
-    // adopt compensates the task claim before this releases the unused side.
-    // The core transaction writes the durable failure using a fresh file owner.
-    handoffs.delete(lease.maintenanceId);
-    abandonBackgroundMaintenance(lease);
-    throw error;
-  }
-  managers.set(ctx.sessionManager as object, manager);
-  handoffs.delete(lease.maintenanceId);
-  return manager;
-}
-
-// Session replacement callbacks must use the replacement owner's manager, never captured old pi/ctx.
+// Read the manager for the current session owner without creating one.
 export function existingTaskOutcomeManager(ctx: SessionOwnerContext): TaskOutcomeManager | undefined {
   return managers.get(ctx.sessionManager as object);
 }

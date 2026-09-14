@@ -1,20 +1,18 @@
-# Issues 3–4: blocked implementation, fail-closed entrypoints
+# In-place maintenance
 
-Maintenance replacement is **not qualified**. `TaskOutcomeManager.beginMaintenance()` rejects before journaling and core `AgentSessionRuntime.switchSession(..., {maintenance})` rejects before interruption or cleanup. This deliberately disables manual `/tool-call-clean` and the predecessor's maintenance-based automatic context recovery; there is no ordinary-switch fallback. Existing runs and live helper/background ownership remain untouched by a rejected request. This is containment, not a completed implementation or a new context-limit policy.
+Maintenance is a same-runtime transcript refresh. `TaskOutcomeManager.beginMaintenance()` journals a durable marker and fences new background launches, `AgentSessionRuntime` drains the current run, validates the unchanged session identity/header and sealed leaf, reloads the transcript into the existing `SessionManager`/`AgentSession`, and notifies the existing UI. It emits no `session_shutdown` or `session_start` and never disposes or recreates the runtime.
 
-The interrupted predecessor's maintenance implementation remains in the worktree for repair. Do not remove either gate merely because ordinary admission/extension tests pass.
+Live child monitors and background processes remain owned by their existing manager. Their later receipts/completions continue through the same callbacks while maintenance is active; resuming the lease only clears the maintenance fence. Pending work is still rejected by `report_outcome completed` and context recovery where reloading before child results would be unsafe.
 
-## Deferred seams
+The former park/adopt/lease transfer machinery is deliberately absent: no extension handoff registries, manager claims, queue capture/restore, replacement anchor token, or maintenance lifecycle events are used. Ordinary resume/new/fork still use the normal teardown and replacement path.
 
-1. **Durable identity and selected branch:** `beginMaintenance` captures the leaf before appending its marker; core compares it to the leaf after that append. Aborted assistant/tool results and the maintenance-paused event advance it again. Validate ancestry against the selected branch, not exact leaf equality. The cleaner currently clears outputs across all rows and estimates context from the last JSONL row's ancestry, not an explicit selected branch.
-2. **Admission:** `requestMaintenance` records interruption but does not close the Issue 2 admission coordinator. Park/adopt reuses the same token without rebinding queued closures, so an old preflight can mutate a disposed owner. Accepted queue capture uses UI strings, omitting image/custom payloads, and occurs before draining the run. Keep one coordinator; add an actual hold/owner CAS and transfer exact message payloads.
-3. **Lifecycle transaction:** replacement opens before shutdown/publication drainage; extension errors are reported by the runner rather than an all-manager claim acknowledgement. Missing adoption can silently produce a new manager. A create/bind failure after dispose has no verified rollback supervisor. Freeze writes before the snapshot and require all claims before releasing the hold.
-4. **Publication:** old promise chains still close over the old publisher API. Maintenance receipts lose transaction identity in publisher/monitor serialization, and parent keys are only per-attempt/kind. Repeated maintenance cannot be distinguished safely. No verified pre-abort branch-validated publication acknowledgement exists. Do not implement the full Issue 5 health/projection slice here.
-5. **Cancellation:** extension abort wiring labels context guards/friendly stops as cancellation, whereas those callers have already committed a context pause. Retry Escape updates core interruption after agent_end, but task settlement ignores the new settled metadata. Explicit idle task cancellation does not force settlement. Fix typed callers and settlement before claiming cancellation semantics.
-6. **Finality:** replay maintenance transitions can reopen a finalized contract; declarations are not invalidated at begin/resume; post-validation settlement does not recheck every declaration/work generation. No manual human hold suppresses every automatic producer after resume.
+## Retained guardrails
 
-## Required qualification before removing the gates
+- durable maintenance marker, current-file and session-id checks;
+- selected branch/leaf and session header validation before the in-place refresh;
+- idle and no-queued-message checks for session-only maintenance;
+- typed context stops, historical cancellation release, finality/absorption, and exactly-once task outcomes;
+- completion-time pending-work rejection and the subagent recovery guard;
+- background launch fencing during the short maintenance window.
 
-Deterministic, no-network barriers must cover streaming marker/publication-before-abort; idle/no-change/repeated clean; exact selected branch; live helper + background + queued image/custom result before/during/after bind; one result admission and nested pending ownership; persist/clean/create/bind/publication failures; final/cancel versus maintenance races; raw Escape, retry Escape, explicit idle cancel, context-policy abort, and ordinary lifecycle teardown. Test actual manager/runner/runtime integration, not just mocked ownership dictionaries.
-
-Current boundary tests only verify rejection before side effects and preservation/deduplication of later child/background results **without a clean/rebind**. They do not prove maintenance works. The original context-recovery acceptance tests intentionally remain unchanged and failing until this seam is completed.
+Deterministic tests cover refresh identity/lifecycle behavior, repeated/concurrent refresh, live child/background work, delayed child results, and the unchanged ordinary lifecycle path.
