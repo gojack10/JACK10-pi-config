@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { cacheStatus, formatHubTimer, tmuxNotice } from "./store.ts";
 
 const TICK_MS = 1000;
@@ -29,6 +29,17 @@ export default function (pi: ExtensionAPI) {
 			if (!cacheStatus.hasActiveFlash()) stopFlashTimer();
 		}, FLASH_TICK_MS);
 	};
+	const announceWarnings = async () => {
+		if (stopping || !paneId || !exec) return;
+		for (const row of cacheStatus.cacheWarnings()) {
+			const level = row.remainingMs <= (row.durationMs ?? 0) * 0.25 ? "red" : "yellow";
+			await tmuxNotice(
+				exec,
+				paneId,
+				`#[fg=${level}]cache expiring in ${formatHubTimer(row.remainingMs)} (${row.model})#[default]`,
+			);
+		}
+	};
 	const publish = async (announceDone = false) => {
 		if (stopping || !paneId || !exec) return;
 		if (publishing) {
@@ -39,14 +50,7 @@ export default function (pi: ExtensionAPI) {
 		publishing = true;
 		try {
 			await cacheStatus.publish(exec, paneId);
-			for (const row of cacheStatus.cacheWarnings()) {
-				const level = row.remainingMs <= (row.durationMs ?? 0) * 0.25 ? "red" : "yellow";
-				await tmuxNotice(
-					exec,
-					paneId,
-					`#[fg=${level}]cache expiring in ${formatHubTimer(row.remainingMs)} (${row.model})#[default]`,
-				);
-			}
+			await announceWarnings();
 			if (announceDone) await tmuxNotice(exec, paneId, "AGENT DONE");
 		} finally {
 			publishing = false;
@@ -69,7 +73,7 @@ export default function (pi: ExtensionAPI) {
 		if (timer) clearInterval(timer);
 		timer = setInterval(() => {
 			render();
-			void publish();
+			void announceWarnings();
 		}, TICK_MS);
 		void publish();
 		render();
@@ -101,10 +105,18 @@ export default function (pi: ExtensionAPI) {
 		void publish(true);
 		render();
 	});
-	pi.on("model_select", () => {
+	const refresh = () => {
 		void publish();
 		render();
-	});
+	};
+	pi.on("model_select", refresh);
+	const restart = (_event: unknown, ctx: ExtensionContext) => {
+		cacheStatus.start(ctx);
+		refresh();
+	};
+	pi.on("session_switch", restart);
+	pi.on("session_tree", restart);
+	pi.on("session_compact", restart);
 	pi.on("session_shutdown", async () => {
 		stopping = true;
 		if (timer) clearInterval(timer);

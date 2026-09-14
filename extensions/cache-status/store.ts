@@ -82,12 +82,18 @@ type GroupSummary = {
 	agentDone: boolean;
 };
 
+export type SessionCacheState = {
+	version: 1;
+	entries: PaneCacheEntry[];
+	busyStartedAt?: number;
+	agentDone: boolean;
+};
+
 type TmuxExec = (args: string[]) => Promise<{ stdout: string; code: number }>;
 
 type TmuxNotice = (message: string) => Promise<void>;
 
 const CACHE_FLASH_MS = 3000;
-const STALE_RUNTIME_MS = 3000;
 const modelKey = (provider: string | undefined, model: string | undefined) =>
 	`${provider}/${model}`;
 
@@ -136,7 +142,7 @@ const statusLabel = (entry: PaneCacheEntry | undefined, now: number): string => 
 		(entry.expiresAt === undefined || entry.expiresAt <= now)
 	)
 		return "CACHE EXPIRED";
-	if (entry.result === "NO CACHE" && entry.expiresAt !== undefined)
+	if (entry.result === "NO CACHE" && (entry.expiresAt ?? 0) > now)
 		return "CACHE WARM";
 	return entry.result === "NO CACHE" ? "NO CACHE" : `CACHE ${entry.result}`;
 };
@@ -196,15 +202,12 @@ const runtimeState = (
 	snapshots: readonly PaneCacheSnapshot[],
 	now: number,
 ): string | undefined => {
-	const live = snapshots.filter(
-		(snapshot) => now - snapshot.updatedAt <= STALE_RUNTIME_MS,
-	);
-	const busy = live
+	const busy = snapshots
 		.map((snapshot) => snapshot.busyStartedAt)
 		.filter((startedAt): startedAt is number => startedAt !== undefined)
 		.sort((a, b) => a - b)[0];
 	if (busy !== undefined) return color("yellow", `BUSY ${formatBusyDuration(now - busy)}`);
-	return live.some((snapshot) => snapshot.agentDone)
+	return snapshots.some((snapshot) => snapshot.agentDone)
 		? color("green", "AGENT DONE")
 		: undefined;
 };
@@ -213,13 +216,10 @@ const summarize = (
 	snapshots: readonly PaneCacheSnapshot[],
 	now: number,
 ): GroupSummary => {
-	const live = snapshots.filter(
-		(snapshot) => now - snapshot.updatedAt <= STALE_RUNTIME_MS,
-	);
-	const contextPercent = live.length
-		? Math.max(...live.map((snapshot) => snapshot.contextPercent))
+	const contextPercent = snapshots.length
+		? Math.max(...snapshots.map((snapshot) => snapshot.contextPercent))
 		: undefined;
-	const busyStartedAt = live
+	const busyStartedAt = snapshots
 		.map((snapshot) => snapshot.busyStartedAt)
 		.filter((startedAt): startedAt is number => startedAt !== undefined)
 		.sort((a, b) => a - b)[0];
@@ -229,7 +229,23 @@ const summarize = (
 		totalCost: snapshots.reduce((total, snapshot) => total + snapshot.totalCost, 0),
 		busyStartedAt,
 		agentDone:
-			busyStartedAt === undefined && live.some((snapshot) => snapshot.agentDone),
+			busyStartedAt === undefined && snapshots.some((snapshot) => snapshot.agentDone),
+	};
+};
+
+export const getSessionCacheState = (
+	snapshots: readonly PaneCacheSnapshot[],
+	now: number = Date.now(),
+): SessionCacheState => {
+	const summary = summarize(snapshots, now);
+	return {
+		version: 1,
+		entries: snapshots.flatMap((snapshot) => snapshot.entries).map((entry) => ({
+			...entry,
+			model: tmuxText(entry.model),
+		})),
+		...(summary.busyStartedAt === undefined ? {} : { busyStartedAt: summary.busyStartedAt }),
+		agentDone: summary.agentDone,
 	};
 };
 
@@ -329,6 +345,7 @@ const clearSessionOptions = async (exec: TmuxExec, sessionId: string) => {
 		"@pi_cache_expiry",
 		"@pi_cache_duration",
 		"@pi_cache_model",
+		"@pi_cache_state",
 	]) {
 		await exec(["set-option", "-q", "-u", "-t", sessionId, name]);
 	}
@@ -388,6 +405,12 @@ const publishAggregates = async (
 		sessionId,
 		"@pi_cache_model",
 		tmuxText(summary.selection.entry?.model ?? ""),
+	]);
+	await option(exec, [
+		"-t",
+		sessionId,
+		"@pi_cache_state",
+		JSON.stringify(getSessionCacheState(snapshots, now)),
 	]);
 	return summary.selection;
 };
@@ -621,6 +644,7 @@ export class CacheStatus {
 			paneId,
 			"@pi_cache_pane",
 		]);
+		await exec(["set-option", "-q", "-u", "-w", "-t", paneId, "@pi_cache_window"]);
 		const sessionId = await getSessionId(exec, paneId);
 		if (sessionId) await publishAggregates(exec, sessionId, Date.now());
 	}
