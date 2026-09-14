@@ -14,6 +14,7 @@ import {
   type BackgroundJobOutcomeStatus,
 } from "../background-jobs/manager.ts";
 import type { MaintenanceHandoff, MaintenancePhase } from "../_shared/maintenance.ts";
+import { publishMonitorReceipt } from "./monitor-receipt.mjs";
 
 export const TASK_OUTCOME_ENTRY = "task-outcome/v1";
 export const TASK_OUTCOME_EVENT = "task-outcome";
@@ -163,6 +164,7 @@ interface PersistedEvent {
   source?: OutcomeSource;
   summary?: string;
   reportPath?: string;
+  reportText?: string;
   childJobId?: string;
   childAttemptId?: string;
   declarationSequence?: number;
@@ -948,8 +950,13 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (contract.contextPause) return true;
     assertSummary(reason);
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("invalid context limit");
-    const contextPause = { id: randomUUID(), reason, limit };
-    this.persist({ kind: "context_pause", jobId: contract.jobId, attemptId: contract.attemptId, contextPause });
+    const key = this.key(contract.jobId, contract.attemptId);
+    const contextPause = this.pendingPauses.get(key) ?? { id: randomUUID(), reason, limit };
+    if (contextPause.reason !== reason || contextPause.limit !== limit) throw new Error("pending context pause payload changed");
+    this.pendingPauses.set(key, contextPause);
+    this.persist({ kind: "context_pause", jobId: contract.jobId, attemptId: contract.attemptId, contextPause },
+      this.operationEventId("context_pause", contract, contextPause.id));
+    this.pendingPauses.delete(key);
     contract.contextPause = contextPause;
     contract.state = "context_paused";
     return true;
@@ -964,7 +971,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       throw new Error("cleaned context is still over the limit; assignment remains paused");
     }
     if (this.pendingWork(contract).length > 0) throw new Error("cannot reload while child/background work is pending");
-    this.persist({ kind: "context_resume", jobId, attemptId }, this.operationEventId("context_resume", contract, pauseId));
+    this.persist({ kind: "context_resume", jobId, attemptId, contextPause: contract.contextPause }, this.operationEventId("context_resume", contract, pauseId));
     contract.contextPause = undefined;
     contract.state = "active";
     contract.declaration = undefined;
@@ -1094,12 +1101,17 @@ The declaration is provisional until clean settlement. Do not start more work af
         try {
           await this.verifyReport(contract);
         } catch (error) {
-          if (this.maintenanceState || this.cancellation || contract.state !== "active") return;
+          if (this.maintenanceState || this.cancellation || this.activeContract() !== contract || contract.state !== "active" ||
+              contract.declaration !== declaration || this.pendingWork(contract).length > 0 ||
+              this.background().workGeneration() !== declaration.workGeneration || contract.childGeneration !== declaration.childGeneration) return;
           this.finalize(contract, "failed", "technical", `report invalid at settlement: ${errorMessage(error)}`);
           return;
         }
       }
       if (this.maintenanceState || this.cancellation || this.activeContract() !== contract || contract.state !== "active") return;
+      if (contract.declaration !== declaration || (declaration.outcome === "completed" &&
+          (this.pendingWork(contract).length > 0 || this.background().workGeneration() !== declaration.workGeneration ||
+           contract.childGeneration !== declaration.childGeneration))) return;
       this.finalize(contract, declaration.outcome, "model", declaration.summary);
       return;
     }
@@ -1237,7 +1249,7 @@ The declaration is provisional until clean settlement. Do not start more work af
     emit = true,
     reportText?: string,
   ): void {
-    if (contract.state === "final" || (this.maintenanceState && !this.cancellation) || this.activeContract() !== contract) return;
+    if (contract.state === "final" || (contract.state === "context_paused" && !this.cancellation) || (this.maintenanceState && !this.cancellation) || this.activeContract() !== contract) return;
     if (this.cancellation && !(outcome === "failed" && source === "technical")) return;
     const durable = this.persist({
       kind: "outcome",
@@ -1247,6 +1259,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       source,
       summary,
       reportPath: contract.reportPath,
+      ...(reportText !== undefined ? { reportText } : {}),
     }, this.operationEventId("outcome", contract, "final"));
     if (!durable.outcome || !durable.source || !durable.summary) throw new Error("invalid durable task outcome");
     const record: TaskOutcomeRecord = {
@@ -1466,7 +1479,10 @@ The declaration is provisional until clean settlement. Do not start more work af
     final: boolean;
     reportText?: string;
   }): void {
+    const projection = this.refreshMonitorReceipt(input.contract);
     this.runtime.emit(TASK_OUTCOME_EVENT, {
+      eventId: projection?.eventId,
+      revision: projection?.revision,
       sessionId: this.runtime.sessionId,
       sessionFile: this.runtime.sessionFile,
       jobId: input.contract.jobId,
@@ -1610,10 +1626,38 @@ The declaration is provisional until clean settlement. Do not start more work af
     return refreshed?.data as PersistedEvent | undefined;
   }
 
+  private pendingPauses = new Map<string, { id: string; reason: string; limit: number }>();
+
+  private refreshMonitorReceipt(contract: TaskLaunchContract) {
+    const file = this.runtime.sessionFile;
+    // Initial contracts can precede Pi's first disk flush; no receipt is admitted yet.
+    if (!file || !pathEntryExists(file)) return undefined;
+    return publishMonitorReceipt(file, {
+      sessionId: this.runtime.sessionId, jobId: contract.jobId, attemptId: contract.attemptId,
+      mode: contract.mode, reportPath: contract.reportPath, reportIdentity: contract.reportIdentity,
+    }, this.runtime.branchEntries(), this.runtime.leafId());
+  }
+
+  private projectPersistedEvent(event: PersistedEvent): void {
+    const contract = event.contract ?? (event.jobId && event.attemptId
+      ? this.contracts.get(this.key(event.jobId, event.attemptId)) : undefined);
+    if (contract) {
+      if (["context_pause", "context_resume"].includes(event.kind) &&
+          this.runtime.sessionFile && !pathEntryExists(this.runtime.sessionFile)) throw new Error("monitor receipt requires a durable session event");
+      this.refreshMonitorReceipt(contract);
+    }
+  }
+
   private persist(
     event: Omit<PersistedEvent, "version" | "eventId" | "at" | "branchId">,
     eventId = randomUUID(),
   ): PersistedEvent {
+    if (["context_pause", "context_resume"].includes(event.kind) && this.runtime.branchEntries().some(entry =>
+        entry?.type === "custom" && entry.customType === TASK_OUTCOME_ENTRY &&
+        entry.data?.jobId === event.jobId && entry.data?.attemptId === event.attemptId &&
+        (entry.data.kind === "transport_lost" || (entry.data.kind === "outcome" && entry.data.outcome !== "needs_input")))) {
+      throw new Error("durable finality rejects context pause/resume");
+    }
     // SessionManager updates its in-memory branch before its file flush. Only a
     // matching active-branch event that survives a disk read is a durable retry marker.
     const attempted = this.sidecarEvent(eventId);
@@ -1621,6 +1665,7 @@ The declaration is provisional until clean settlement. Do not start more work af
     const existing = this.durableActiveBranchEvent(eventId);
     if (existing) {
       this.assertEventPayload(existing, event);
+      this.projectPersistedEvent(existing);
       return existing;
     }
     const data: PersistedEvent = {
@@ -1647,6 +1692,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       throw error;
     }
     this.observedLeafId = this.runtime.leafId();
+    this.projectPersistedEvent(data);
     return data;
   }
 
@@ -1685,6 +1731,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       seen.add(event.eventId);
       this.apply(event);
     }
+    for (const contract of this.contracts.values()) this.refreshMonitorReceipt(contract);
   }
 
   private apply(event: PersistedEvent): void {
@@ -1713,6 +1760,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       this.contracts.set(key, contract);
       return;
     }
+    if (event.jobId && event.attemptId && this.contracts.get(this.key(event.jobId, event.attemptId))?.state === "final") return;
     if (event.kind === "maintenance_begin" && event.maintenance) {
       this.maintenanceState = {
         ...event.maintenance,

@@ -92,6 +92,10 @@ interface StoredState {
   friendlyStopPercent?: number;
   friendlyStopDirectory?: string;
   contextPauseId?: string;
+  finalAdmitted?: boolean;
+  admittedMarkers?: Map<string, string>;
+  receiptRevision?: number;
+  piSessionId?: string;
   recoveryPending?: string;
   parentJobId?: string;
   failureStatus?: "setup_failed" | "monitor_setup_failed" | "release_failed";
@@ -847,6 +851,28 @@ export class SubagentLauncher {
       if (!line) continue;
       let marker: any;
       try { marker = JSON.parse(line); } catch { continue; }
+      if (state.finalAdmitted || marker.jobId !== state.jobId || marker.attemptId !== state.attemptId) continue;
+      if (marker.sessionId) {
+        if (state.piSessionId && state.piSessionId !== marker.sessionId) continue;
+        state.piSessionId = marker.sessionId;
+      }
+      if (Number.isSafeInteger(marker.revision)) {
+        if (marker.revision < (state.receiptRevision ?? 0)) continue;
+        state.receiptRevision = marker.revision;
+      }
+      const admissionKey = marker.eventId ?? `${marker.kind}:${marker.pauseId ?? marker.summary ?? ""}`;
+      const payload = JSON.stringify({ ...marker, revision: undefined });
+      const admitted = state.admittedMarkers ??= new Map();
+      if (admitted.has(admissionKey)) continue; // Conflicts cannot overwrite admitted evidence.
+      admitted.set(admissionKey, payload);
+      if (marker.kind === "final") {
+        state.finalAdmitted = true;
+        state.contextPauseId = undefined;
+      }
+      if (marker.kind === "active") {
+        state.contextPauseId = undefined;
+        continue;
+      }
       if (marker.kind === "start" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
         this.resolveStart(state, marker.attemptId, true);
       } else if (marker.kind === "context_paused" && marker.jobId === state.jobId && marker.attemptId === state.attemptId &&
@@ -860,7 +886,8 @@ export class SubagentLauncher {
           });
           if (delivery !== undefined) {
             void Promise.resolve(delivery).then(result => {
-              if (admissionAccepted(result)) state.contextPauseId = marker.pauseId;
+              if (admissionAccepted(result) && !state.finalAdmitted &&
+                  (!marker.revision || marker.revision === state.receiptRevision)) state.contextPauseId = marker.pauseId;
             }).catch(() => {});
           } else {
             state.contextPauseId = marker.pauseId;
