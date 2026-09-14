@@ -106,10 +106,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   // Events
   // ============================================================
 
-  // Task outcomes owns both parking and atomic task/background adoption.
-
-  pi.on("session_shutdown", (event, ctx) => {
-    if (event.reason === "maintenance" && event.maintenance) return;
+  pi.on("session_shutdown", (_event, ctx) => {
     releaseBackgroundJobManager(ctx);
   });
 }

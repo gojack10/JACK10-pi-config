@@ -17,7 +17,7 @@ import {
 	type ExtensionAPI,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { existingTaskOutcomeManager, getTaskOutcomeManager, type MaintenanceLease } from "../task-outcomes/manager.ts";
+import { getTaskOutcomeManager, type MaintenanceLease } from "../task-outcomes/manager.ts";
 
 const KEEP = new Set(["sifttext_get_node", "sifttext_get_outline"]);
 const CLEARED_RESULT = "[tool result cleared by /tool-call-clean]";
@@ -206,15 +206,11 @@ export default function (pi: ExtensionAPI) {
 
 			const manager = getTaskOutcomeManager(pi, ctx);
 			let lease: MaintenanceLease | undefined;
-			let replacementAttempted = false;
 			try {
 				// Persist intent before the core aborts a streaming turn. A failed
 				// marker leaves the run untouched and therefore retryable.
 				lease = manager.beginMaintenance(sessionFile);
 				let result: ReturnType<typeof cleanSessionFile> | undefined;
-				// A rejection can occur after disposal but before withSession. From
-				// this point the outer frame must not access either outgoing handle.
-				replacementAttempted = true;
 				const switched = await ctx.switchSession(sessionFile, {
 					maintenance: {
 						token: lease,
@@ -226,27 +222,17 @@ export default function (pi: ExtensionAPI) {
 							return { replace: true };
 						},
 					},
-					withSession: async (replacementCtx) => {
-						try {
-							const summary = result?.summary ?? "Session cleaned";
-							replacementCtx.ui.setStatus("tool-call-clean", summary);
-							replacementCtx.ui.notify(`${summary}. The estimate becomes exact after the next successful response.`, "info");
-						} catch (error) {
-							existingTaskOutcomeManager(replacementCtx)?.failMaintenance(lease!, error);
-							throw error;
-						}
+					withSession: async (liveCtx) => {
+						manager.resumeMaintenance(lease!);
+						const summary = result?.summary ?? "Session cleaned";
+						liveCtx.ui.setStatus("tool-call-clean", summary);
+						liveCtx.ui.notify(`${summary}. The estimate becomes exact after the next successful response.`, "info");
 					},
 				});
 				if (switched.cancelled) throw new Error("Maintenance was cancelled");
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				if (replacementAttempted) {
-					// Core owns durable replacement failures through a fresh file owner;
-					// this old command frame is only allowed to log.
-					console.error(`tool-call-clean: ${message}`);
-					return;
-				}
-				if (lease) manager.failMaintenance(lease, error);
+				if (lease) manager.failMaintenance(lease, error, { resume: true });
 				ctx.ui.notify(message, "error");
 			}
 		},

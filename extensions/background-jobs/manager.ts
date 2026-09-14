@@ -4,7 +4,6 @@ import { createWriteStream } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MaintenanceHandoff } from "../_shared/maintenance.ts";
 
 type UserMessageOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
 type SendUserMessage = (content: string, options?: UserMessageOptions) => void | PromiseLike<unknown>;
@@ -750,13 +749,10 @@ export class BackgroundJobManager {
 
 type SessionOwnerContext = Pick<ExtensionContext, "sessionManager">;
 const managerRegistryKey = Symbol.for("pi.background-jobs.manager-registry");
-const handoffRegistryKey = Symbol.for("pi.background-jobs.maintenance-handoffs");
 const globalState = globalThis as typeof globalThis & {
   [managerRegistryKey]?: WeakMap<object, BackgroundJobManager>;
-  [handoffRegistryKey]?: Map<string, { manager: BackgroundJobManager; lease: MaintenanceHandoff }>;
 };
 const managers = globalState[managerRegistryKey] ??= new WeakMap();
-const handoffs = globalState[handoffRegistryKey] ??= new Map();
 
 export function getBackgroundJobManager(
   pi: Pick<ExtensionAPI, "sendUserMessage">,
@@ -771,41 +767,6 @@ export function getBackgroundJobManager(
     manager.attach((content, options) => pi.sendUserMessage(content, options));
   }
   return manager;
-}
-
-export function parkBackgroundJobManager(ctx: SessionOwnerContext, lease: MaintenanceHandoff): void {
-  const manager = managers.get(ctx.sessionManager as object);
-  if (!manager) throw new Error("background job manager is unavailable for maintenance");
-  if (!manager.isInMaintenance(lease.maintenanceId)) {
-    throw new Error("background job maintenance lease is stale");
-  }
-  handoffs.set(lease.maintenanceId, { manager, lease: { ...lease } });
-}
-
-export function adoptBackgroundJobManager(
-  pi: Pick<ExtensionAPI, "sendUserMessage">,
-  ctx: SessionOwnerContext,
-  lease: MaintenanceHandoff,
-): BackgroundJobManager | undefined {
-  const handoff = handoffs.get(lease.maintenanceId);
-  if (!handoff) throw new Error("background maintenance handoff is missing or already consumed");
-  if (handoff.lease.sessionId !== lease.sessionId || handoff.lease.ownerEpoch !== lease.ownerEpoch ||
-      !handoff.manager.isInMaintenance(lease.maintenanceId) || handoff.manager.stats().running > 0) {
-    throw new Error("background job maintenance handoff token conflicts with its owner");
-  }
-  const manager = handoff.manager;
-  manager.resumeMaintenance(lease.maintenanceId);
-  manager.attach((content, options) => pi.sendUserMessage(content, options));
-  managers.set(ctx.sessionManager as object, manager);
-  handoffs.delete(lease.maintenanceId);
-  return manager;
-}
-
-export function abandonBackgroundMaintenance(lease: MaintenanceHandoff): void {
-  const handoff = handoffs.get(lease.maintenanceId);
-  if (!handoff || handoff.lease.ownerEpoch !== lease.ownerEpoch) return;
-  handoffs.delete(lease.maintenanceId);
-  handoff.manager.resumeMaintenance(lease.maintenanceId);
 }
 
 export function releaseBackgroundJobManager(ctx: SessionOwnerContext): void {
