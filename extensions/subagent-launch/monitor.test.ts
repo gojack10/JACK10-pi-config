@@ -27,7 +27,7 @@ async function until(check: () => boolean | Promise<boolean>): Promise<void> {
 }
 
 const monitorConfig = (pane: string, jobId: string, attemptId: string, startTimeoutMs = 1000,
-  sessionId?: string, mode?: "task" | "dialogue") => JSON.stringify({
+  sessionId?: string, mode?: "task" | "dialogue", outcomeChannel?: string) => JSON.stringify({
   paneId: pane,
   manifestOption: "@pi_subagent_manifest",
   outcomeOption: "@pi_outcome",
@@ -35,6 +35,7 @@ const monitorConfig = (pane: string, jobId: string, attemptId: string, startTime
   startGenerationOption: "@pi_start_generation",
   sessionFileOption: "@pi_session_file",
   sessionIdOption: "@pi_session_id",
+  outcomeChannel,
   pollMs: 10,
   startTimeoutMs,
   jobId,
@@ -504,10 +505,10 @@ test("monitor binds manifest identity and allows same-identity replacement", { t
   }
 });
 
-async function fakeMonitor(t: any) {
+async function fakeMonitor(t: any, delayedStart = false) {
   const dir = await mkdtemp(join(tmpdir(), "monitor-durable-"));
   const file = join(dir, "session.jsonl"), manifest = join(dir, "manifest.json");
-  const control = join(dir, "control.json"), queries = join(dir, "queries");
+  const control = join(dir, "control.json"), queries = join(dir, "queries"), commands = join(dir, "commands");
   const identity = { sessionId: "pi-session", jobId: "job", attemptId: "attempt", mode: "dialogue" };
   const rows: any[] = [{ type: "session", id: identity.sessionId }];
   const branch: any[] = [];
@@ -520,20 +521,22 @@ async function fakeMonitor(t: any) {
   add({ kind: "contract", contract: { ...identity, ownerSessionId: identity.sessionId } });
   await writeFile(manifest, JSON.stringify({ version: 1, ...identity, sessionId: "transport-session",
     startChannel: "start", startGeneration: 0, outcomeGeneration: 0 }));
-  const options = { "@pi_subagent_manifest": manifest, "@pi_start_generation": "1",
+  const options = { "@pi_subagent_manifest": manifest, "@pi_start_generation": delayedStart ? "0" : "1",
     "@pi_session_file": file, "@pi_session_id": identity.sessionId, "@pi_subagent_job_id": identity.jobId };
   const set = (health: string, metadata = true) => writeFileSync(control, JSON.stringify({ health, metadata, options }));
   set("live");
   await writeFile(join(dir, "tmux"), `#!${process.execPath}\nconst fs = require('node:fs');
 const c = JSON.parse(fs.readFileSync(${JSON.stringify(control)}, 'utf8'));
 const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(commands)}, args.join('\\t') + '\\n');
 if (args[0] === 'list-panes') {
  fs.appendFileSync(${JSON.stringify(queries)}, c.health + '\\n');
  if (c.health === 'error') process.exit(23);
  if (c.health !== 'empty') console.log(c.health === 'absent' ? '%999\\t0' : '%123\\t' + (c.health === 'dead' ? '1' : '0'));
 } else if (args[0] === 'show-options' && c.metadata) console.log(c.options[args.at(-1)] || '');
 `, { mode: 0o700 });
-  const child = spawn(process.execPath, [monitorPath, monitorConfig("%123", "job", "attempt", 3000, "transport-session", "dialogue")],
+  const child = spawn(process.execPath, [monitorPath,
+    monitorConfig("%123", "job", "attempt", 3000, "transport-session", "dialogue", "outcome")],
     { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` }, stdio: ["ignore", "pipe", "pipe"] });
   const markers: any[] = []; let buffer = "", stderr = "";
   child.stderr!.on("data", chunk => stderr += chunk);
@@ -546,12 +549,32 @@ if (args[0] === 'list-panes') {
   });
   const closed = new Promise(resolve => child.once("close", resolve));
   t.after(async () => { child.kill(); await closed; await rm(dir, { recursive: true, force: true }); assert.equal(stderr, ""); });
-  await until(() => markers.some(m => m.kind === "start"));
+  if (!delayedStart) await until(() => markers.some(m => m.kind === "start"));
   const publish = () => publishMonitorReceipt(file, identity, branch, branch.at(-1).id);
   const pause = () => { add({ kind: "context_pause", jobId: "job", attemptId: "attempt", contextPause: { id: "pause", reason: "clean context", limit: 100 } }); return publish(); };
+  const updateOptions = (updates: Record<string, string>) => { Object.assign(options, updates); set("live"); };
   const countQueries = async () => (await readFile(queries, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).length;
-  return { dir, file, identity, rows, branch, add, save, set, markers, publish, pause, countQueries, closed };
+  return { dir, file, identity, rows, branch, add, save, set, updateOptions, markers, publish, pause, countQueries, closed, commands };
 }
+
+test("monitor detects generation-only START and outcome changes without tmux waiters", { timeout: 10000 }, async t => {
+  const h = await fakeMonitor(t, true);
+  h.updateOptions({ "@pi_start_generation": "1" });
+  await until(() => h.markers.some(marker => marker.kind === "start"));
+
+  h.add({ kind: "outcome", jobId: "job", attemptId: "attempt", outcome: "dialogue_settled",
+    source: "model", summary: "done", reportText: "done" });
+  h.publish();
+  h.updateOptions({ "@pi_outcome": JSON.stringify({ session_id: "pi-session", job_id: "job",
+    attempt_id: "attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+    report_text: "done" }), "@pi_outcome_generation": "1" });
+  await until(() => h.markers.some(marker => marker.kind === "final"));
+
+  const commands = (await readFile(h.commands, "utf8")).trim().split("\n").filter(Boolean);
+  assert.equal(commands.some(command => command.split("\t")[0] === "wait-for"), false);
+  assert.equal(h.markers.filter(marker => marker.kind === "start").length, 1);
+  assert.equal(h.markers.find(marker => marker.kind === "final").outcome, "completed");
+});
 
 for (const health of ["error", "empty"]) {
   test(`fake tmux ${health}: bounded re-query, durable pause beats missing metadata and stored publication error`, { timeout: 10000 }, async t => {
