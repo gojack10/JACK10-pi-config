@@ -9,6 +9,10 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { isolateLauncherEnvironment } from "../_test-helpers/launcher-env.ts";
+
+const restoreLauncherEnvironment = isolateLauncherEnvironment();
+test.after(restoreLauncherEnvironment);
 
 const execFileAsync = promisify(execFile);
 const monitorPath = fileURLToPath(new URL("./monitor.mjs", import.meta.url));
