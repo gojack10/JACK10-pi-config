@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
-  adoptBackgroundJobManager,
   getBackgroundJobManager,
   parkBackgroundJobManager,
   releaseBackgroundJobManager,
@@ -108,11 +107,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   // Events
   // ============================================================
 
-  pi.on("session_start", (event, ctx) => {
-    if (event.reason === "maintenance" && event.maintenance) {
-      adoptBackgroundJobManager(pi, ctx, event.maintenance);
-    }
-  });
+  // Task outcomes owns the atomic task/background adoption on session_start.
 
   pi.on("session_shutdown", (event, ctx) => {
     if (event.reason === "maintenance" && event.maintenance) {
