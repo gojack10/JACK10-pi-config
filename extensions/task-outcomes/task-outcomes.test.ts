@@ -132,6 +132,16 @@ test("maintenance preparation seals the marker and validates single-use source-t
     assert.equal(h.manager.runtime, outgoingRuntime);
   }
   assert.throws(() => h.manager.adopt(outgoingRuntime, lease), /replacement session/);
+  reopened.branch(source);
+  reopened.appendCustomEntry("unrelated-branch", {});
+  assert.throws(() => h.manager.adopt(replacement, lease), /replacement session/);
+  for (const kind of ["cancellation_requested", "outcome", "maintenance_error", "message"]) {
+    reopened.branch(lease.branchAnchor);
+    if (kind === "message") reopened.appendMessage({ role: "user", content: "new work", timestamp: Date.now() });
+    else reopened.appendCustomEntry(kind === "maintenance_error" ? "session-maintenance/v1" : "task-outcome/v1", { kind });
+    assert.throws(() => h.manager.adopt(replacement, lease), /replacement session/);
+  }
+  reopened.branch(lease.branchAnchor);
   h.manager.adopt(replacement, lease);
   assert.throws(() => h.manager.claimMaintenance(lease), /stale/);
   assert.throws(() => h.manager.adopt(replacement, lease), /stale/);
@@ -149,6 +159,12 @@ test("task lifecycle parks and adopts both owners independently of background ex
   const lease = h.manager.beginMaintenance(h.sm.getSessionFile());
   await h.emit("session_shutdown", { reason: "maintenance", maintenance: lease });
   const sm = SessionManager.open(h.sm.getSessionFile());
+  // Production 01a09e49: sdk + model-recency append metadata before task adoption.
+  sm.appendModelChange("openai-codex-alt", "gpt-5.6-luna");
+  sm.appendThinkingLevelChange("high");
+  sm.appendCustomEntry("model-recency", { order: [] });
+  sm.appendCustomEntry("model-recency", { order: [] });
+  assert.notEqual(sm.getLeafId(), lease.branchAnchor);
   // Outgoing harness loads background first; the replacement loads task first.
   const loaded = await loadExtensions([taskPath, backgroundPath], h.dir);
   assert.deepEqual(loaded.errors, []);
@@ -194,6 +210,75 @@ test("background failure compensates the task claim and durable error replays at
   assert.deepEqual(restored.manager.snapshot().outcomes, []);
   await restored.emit("agent_settled");
   assert.equal(restored.manager.snapshot().outcomes.some((o: any) => o.final), false);
+});
+
+test("historical maintenance errors retry append-only and stay released after replay", async t => {
+  for (const mode of ["session", "task", "final"]) {
+    const h = await harness(t, undefined, true);
+    await h.settle({ text: "saved", stopReason: "stop" });
+    if (mode !== "session") await h.call("task_outcomes_consumer", contract(h.dir, "retry", "attempt"));
+    if (mode === "task") h.manager.pauseForContext("preserve paused task", 256000);
+    if (mode === "final") {
+      await writeFile(join(h.dir, "retry-attempt.md"), "verified report");
+      await h.settle({ outcome: "completed" });
+    }
+    const outcomes = h.manager.snapshot().outcomes;
+    const failed = h.manager.beginMaintenance();
+    const { recordMaintenanceFailure } = await import(pathToFileURL(join(homedir(),
+      ".local/share/pi-mono/packages/coding-agent/dist/core/agent-session-runtime.js")).href);
+    recordMaintenanceFailure(h.sm.getSessionFile(), failed);
+    const restored = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+    const before = await readFile(h.sm.getSessionFile(), "utf8");
+    const error = restored.sm.getBranch().find((e: any) => e.customType === "session-maintenance/v1");
+    assert.equal(restored.manager.snapshot().maintenance.phase, "error");
+    const retry = restored.manager.beginMaintenance();
+    assert.notEqual(retry.maintenanceId, failed.maintenanceId);
+    assert.notEqual(retry.ownerEpoch, failed.ownerEpoch);
+    assert.throws(() => restored.manager.resumeMaintenance(failed), /not active/);
+    restored.manager.resumeMaintenance(retry);
+    if (mode === "task") assert.equal(restored.manager.snapshot().active.state, "context_paused");
+    assert.ok((await readFile(h.sm.getSessionFile(), "utf8")).startsWith(before));
+    restored.manager.onSessionTree();
+    assert.equal(restored.manager.snapshot().maintenance, undefined);
+    assert.deepEqual(restored.sm.getBranch().find((e: any) => e.id === error.id), error);
+    const again = restored.manager.beginMaintenance();
+    restored.manager.resumeMaintenance(again);
+    assert.equal(restored.messages.length, 0);
+    const replayed = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+    assert.equal(replayed.manager.snapshot().maintenance, undefined);
+    const next = replayed.manager.beginMaintenance();
+    replayed.manager.resumeMaintenance(next);
+    if (mode === "final") {
+      assert.deepEqual(replayed.manager.snapshot().outcomes, outcomes);
+      assert.equal(replayed.manager.snapshot().contracts.at(-1).state, "final");
+      await assert.rejects(() => replayed.call("report_outcome", { outcome: "failed", summary: "again" }), /active|final/);
+    }
+  }
+});
+
+test("maintenance error retry keeps idle, cancellation, work, persistence and owner fences", async t => {
+  for (const scenario of ["busy", "queued", "cancellation", "child", "background", "owner", "other-lease", "write-failure"]) {
+    const h = await harness(t, undefined, true);
+    await h.settle({ text: "saved", stopReason: "stop" });
+    const failed = h.manager.beginMaintenance();
+    h.manager.failMaintenance(failed, new Error("original failure"));
+    const restored = scenario === "owner" ? h : await harness(t, SessionManager.open(h.sm.getSessionFile()));
+    if (scenario === "busy") restored.manager.runtime.isIdle = () => false;
+    if (scenario === "queued") restored.manager.runtime.hasPendingMessages = () => true;
+    if (scenario === "cancellation") restored.manager.requestCancellation("escape", "later cancellation");
+    if (scenario === "child") {
+      await restored.call("task_outcomes_consumer", { ...contract(restored.dir, "pending", "attempt"), children: ["child"] });
+    }
+    if (scenario === "background") restored.manager.background = () => ({
+      isInMaintenance: () => false, stats: () => ({ running: 1 }),
+    });
+    if (scenario === "other-lease") restored.manager.background().beginMaintenance("another-live-lease");
+    if (scenario === "write-failure") restored.manager.runtime.appendEntry = () => { throw new Error("disk unavailable"); };
+    const before = restored.sm.getLeafId();
+    assert.throws(() => restored.manager.beginMaintenance(), /idle|cancellation|pending|outstanding|disk unavailable|does not belong/);
+    assert.equal(restored.sm.getLeafId(), before);
+    assert.equal(restored.manager.snapshot().maintenance.phase, "error");
+  }
 });
 
 test("maintenance no-change releases its lease; finality, pending work and cancellation still fence preparation", async t => {

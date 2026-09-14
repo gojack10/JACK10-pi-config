@@ -275,7 +275,7 @@ test("registry background-adoption failure releases the handoff and compensates 
   assert.deepEqual(manager.snapshot().outcomes, []);
 });
 
-test("enabled leaf command cleans the real file, atomically adopts, and returns usable without a final", async t => {
+test("enabled leaf command retries a historical failure, cleans, and adopts across startup metadata without a final", async t => {
   const { SessionManager } = await import(host);
   const task = await jiti.import(fileURLToPath(new URL("../task-outcomes/manager.ts", import.meta.url)));
   const { file } = saved(t);
@@ -289,7 +289,7 @@ test("enabled leaf command cleans the real file, atomically adopts, and returns 
     registerCommand(_name: string, command: any) { handler = command.handler; },
   };
   const ctx: any = {
-    sessionManager: sm, isIdle: () => true,
+    sessionManager: sm, isIdle: () => true, hasPendingMessages: () => false,
     ui: { notify(text: string) { notices.push(text); }, setStatus() {} },
     async switchSession(_file: string, options: any) {
       const lease = options.maintenance.token;
@@ -299,6 +299,9 @@ test("enabled leaf command cleans the real file, atomically adopts, and returns 
       task.parkTaskOutcomeManager(ctx, lease);
       sm = SessionManager.open(file);
       sm.branch(lease.replacementAnchor);
+      sm.appendModelChange("openai-codex-alt", "gpt-5.6-luna");
+      sm.appendThinkingLevelChange("high");
+      sm.appendCustomEntry("model-recency", { order: [] });
       const replacement = { ...ctx, sessionManager: sm };
       const manager = task.adoptTaskOutcomeManager(pi, replacement, lease);
       manager.resumeMaintenance(lease);
@@ -315,7 +318,14 @@ test("enabled leaf command cleans the real file, atomically adopts, and returns 
   task.getTaskOutcomeManager(pi, ctx).activateContract({
     jobId: "leaf", attemptId: "attempt", mode: "task", reportPath: join(file, "..", "report.md"),
   });
+  const outgoing = task.getTaskOutcomeManager(pi, ctx);
+  const failed = outgoing.beginMaintenance(file);
+  outgoing.failMaintenance(failed, new Error("historical adoption failure"));
+  sm = SessionManager.open(file);
+  ctx.sessionManager = sm;
+  task.getTaskOutcomeManager(pi, ctx).restore();
   await handler("", ctx);
+  assert.equal(sm.getBranch().filter((entry: any) => entry.data?.kind === "maintenance_error").length, 1);
   assert.equal(notices.length, 1);
   assert.equal(sm.getLeafEntry().customType, "usable-after-maintenance");
   assert.match(readFileSync(file, "utf8"), /tool result cleared/);
