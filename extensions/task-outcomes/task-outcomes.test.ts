@@ -56,7 +56,7 @@ async function harness(t: any, sessionManager?: any, persistent = false) {
     persisted.push({ type, data });
     sm.appendCustomEntry(type, data);
   };
-  const ctx: any = { cwd: dir, sessionManager: sm, hasPendingMessages: () => false };
+  const ctx: any = { cwd: dir, sessionManager: sm, isIdle: () => true, hasPendingMessages: () => false };
   const emit = async (name: string, event: any = {}) => {
     for (const ext of extensions) {
       for (const handler of ext.handlers.get(name) ?? []) await handler(event, ctx);
@@ -221,7 +221,267 @@ test("maintenance no-change releases its lease; finality, pending work and cance
   await final.call("task_outcomes_consumer", contract(final.dir, "final", "attempt"));
   await writeFile(join(final.dir, "final-attempt.md"), "verified report");
   await final.settle({ outcome: "completed" });
-  assert.throws(() => final.manager.prepareMaintenance(), /finalized/);
+  assert.throws(() => final.manager.resumeAfterContextClean("final", "attempt", 0), /paused|final/);
+  const sessionLease = final.manager.prepareMaintenance();
+  assert.equal(sessionLease.jobId, undefined);
+  final.manager.resumeMaintenance(sessionLease);
+  assert.equal((await final.snapshot()).contracts.at(-1).state, "final");
+});
+
+test("historical session cancellation releases durably without deleting history; later cancellation invalidates the lease", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "saved", stopReason: "stop" });
+  h.manager.requestCancellation("task_cancel", "Jack's persisted cancellation");
+  const cancellation = JSON.parse(JSON.stringify(h.sm.getLeafEntry().data));
+  const restored = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+  const lease = restored.manager.beginMaintenance();
+  assert.equal(lease.jobId, undefined);
+  assert.equal(lease.attemptId, undefined);
+  assert.equal(lease.reportPath, undefined);
+  assert.equal(restored.sm.getLeafEntry().data.releasedCancellationEventId, cancellation.eventId);
+  restored.manager.resumeMaintenance(lease);
+  const replayed = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+  assert.equal(replayed.manager.cancellation, undefined);
+  assert.deepEqual(replayed.sm.getBranch().find((e: any) => e.data?.eventId === cancellation.eventId).data, cancellation);
+  const next = replayed.manager.beginMaintenance();
+  replayed.manager.parkMaintenance(next);
+  const fresh = SessionManager.open(h.sm.getSessionFile());
+  replayed.manager.adopt({ ...replayed.manager.runtime, sessionOwner: fresh,
+    branchEntries: () => fresh.getBranch(), leafId: () => fresh.getLeafId(),
+    appendEntry: (type: string, data: unknown) => fresh.appendCustomEntry(type, data),
+  }, next);
+  replayed.manager.resumeMaintenance(next);
+  const race = replayed.manager.beginMaintenance();
+  replayed.manager.requestCancellation("task_cancel", "later cancellation");
+  assert.notEqual(replayed.manager.cancellation.eventId, cancellation.eventId);
+  assert.throws(() => replayed.manager.parkMaintenance(race), /stale/);
+  assert.throws(() => replayed.manager.resumeMaintenance(race), /cancelled/);
+  assert.throws(() => replayed.manager.beginMaintenance(), /cancellation/);
+  assert.equal(replayed.manager.snapshot().outcomes.length, 0);
+});
+
+test("untasked typed terminal cancellation is persisted so the new session-only lease can acknowledge it", async t => {
+  const h = await harness(t);
+  await h.emit("agent_end", { messages: [], interruption: { kind: "cancel", source: "extension", reason: "extension requested cancellation" } });
+  await h.emit("agent_settled");
+  const event = h.persisted.find(row => row.data.kind === "cancellation_requested").data;
+  assert.equal(event.jobId, undefined);
+  const lease = h.manager.beginMaintenance();
+  assert.equal(h.sm.getLeafEntry().data.releasedCancellationEventId, event.eventId);
+  h.manager.resumeMaintenance(lease);
+  assert.equal(h.manager.snapshot().outcomes.length, 0);
+});
+
+test("legacy session-only cancellation IDs release on replay without rewriting the historical event", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "saved", stopReason: "stop" });
+  const legacy = {
+    version: 1, eventId: `task-outcome:cancellation_requested:${h.sm.getSessionId()}:extension`,
+    at: new Date().toISOString(), kind: "cancellation_requested",
+    cancellation: { source: "extension", reason: "assistant aborted" },
+  };
+  h.runtime.appendEntry("task-outcome/v1", legacy);
+  h.manager.onSessionTree();
+  const before = await readFile(h.sm.getSessionFile(), "utf8");
+  const lease = h.manager.beginMaintenance();
+  assert.equal(h.sm.getLeafEntry().data.releasedCancellationEventId, legacy.eventId);
+  h.manager.resumeMaintenance(lease);
+  assert.ok((await readFile(h.sm.getSessionFile(), "utf8")).startsWith(before));
+  h.manager.onSessionTree();
+  assert.equal(h.manager.cancellation, undefined);
+  assert.deepEqual(h.sm.getBranch().find((e: any) => e.data?.eventId === legacy.eventId).data, legacy);
+});
+
+test("settled cancelled attempts allow only session cleaning, and new attempt activation is replay symmetric", async t => {
+  const h = await harness(t, undefined, true);
+  await h.settle({ text: "saved", stopReason: "stop" });
+  await h.call("task_outcomes_consumer", contract(h.dir, "cancelled", "A"));
+  h.manager.pauseForContext("Luna guard", 256000);
+  h.manager.requestCancellation("extension", "extension requested cancellation");
+  await h.emit("agent_settled");
+  const final = h.manager.snapshot().outcomes;
+  const replayed = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+  const lease = replayed.manager.beginMaintenance();
+  assert.equal(lease.jobId, undefined);
+  replayed.manager.resumeMaintenance(lease);
+  assert.deepEqual(replayed.manager.snapshot().outcomes, final);
+  assert.throws(() => replayed.manager.resumeAfterContextClean("cancelled", "A", 1), /paused|final|no active/);
+  await assert.rejects(() => replayed.call("report_outcome", { outcome: "failed", summary: "again" }), /active|final/);
+  assert.equal(replayed.messages.length, 0);
+
+  // Test activation retirement independently of the maintenance release.
+  await h.call("task_outcomes_consumer", contract(h.dir, "next", "B", "batch-B"));
+  assert.equal(h.manager.cancellation, undefined);
+  h.manager.onSessionTree();
+  assert.equal(h.manager.cancellation, undefined);
+  assert.equal(h.manager.snapshot().active.attemptId, "B");
+  h.manager.requestCancellation("escape", "escape B");
+  const oldLatch = h.manager.cancellation;
+  const activation = h.sm.getBranch().find((e: any) => e.data?.contract?.attemptId === "B").data;
+  h.manager.apply({ ...activation, eventId: "membership-update", contract: { ...activation.contract, childJobIds: ["child"] } });
+  assert.deepEqual(h.manager.cancellation, oldLatch);
+  assert.deepEqual(h.manager.contracts.get("next@B").cancellation, oldLatch);
+});
+
+test("historical release eligibility and persistence fail closed before any new marker", async t => {
+  for (const scenario of ["nonfinal", "queued", "busy", "child", "background", "write-failure"]) {
+    const h = await harness(t, undefined, true);
+    await h.settle({ text: "saved", stopReason: "stop" });
+    if (scenario === "nonfinal" || scenario === "child") {
+      await h.call("task_outcomes_consumer", { ...contract(h.dir, scenario, "A"), ...(scenario === "child" ? { children: ["pending-child"] } : {}) });
+    }
+    const gate = join(h.dir, "release-background");
+    if (scenario === "background") await h.call("task_outcomes_consumer", {
+      action: "background", batch_id: "running-batch", job_id: "running-job",
+      command: `while [ ! -f '${gate}' ]; do sleep .02; done`,
+    });
+    h.manager.requestCancellation("task_cancel", scenario);
+    if (scenario === "child") await h.emit("agent_settled");
+    if (scenario === "queued") h.manager.runtime.hasPendingMessages = () => true;
+    if (scenario === "busy") h.manager.runtime.isIdle = () => false;
+    if (scenario === "write-failure") h.runtime.appendEntry = () => { throw new Error("marker storage failed"); };
+    const before = await readFile(h.sm.getSessionFile(), "utf8");
+    const latch = h.manager.cancellation;
+    assert.throws(() => h.manager.beginMaintenance(), /cancellation|queued|idle|pending|marker storage failed/);
+    assert.equal(await readFile(h.sm.getSessionFile(), "utf8"), before);
+    assert.deepEqual(h.manager.cancellation, latch);
+    if (scenario === "background") {
+      await writeFile(gate, "");
+      await until(() => h.manager.background().stats().running === 0);
+    }
+    if (scenario === "write-failure") {
+      const replayed = await harness(t, SessionManager.open(h.sm.getSessionFile()));
+      assert.deepEqual(replayed.manager.cancellation, latch);
+    }
+  }
+});
+
+test("Luna guard uses the real interactive abort binding at 271925, not at 255999", async t => {
+  const core = join(homedir(), ".local/share/pi-mono/packages/coding-agent/dist");
+  const { InteractiveMode } = await import(pathToFileURL(join(core, "modes/interactive/interactive-mode.js")).href);
+  const { AgentSession } = await import(pathToFileURL(join(core, "core/agent-session.js")).href);
+  for (const [tokens, failPause] of [[255999, false], [271925, false], [271925, true]] as const) {
+    const h = await harness(t);
+    await h.call("task_outcomes_consumer", contract(h.dir, "guard", "A"));
+    const loaded = await loadExtensions([fileURLToPath(new URL("../openai-272k-guard.ts", import.meta.url))], h.dir);
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.appendEntry = h.runtime.appendEntry;
+    loaded.runtime.sendUserMessage = h.runtime.sendUserMessage;
+    let abortAction: any;
+    let aborts = 0;
+    const session: any = {
+      _runId: 42,
+      requestExtensionAbort: AgentSession.prototype.requestExtensionAbort,
+      requestCancellation: AgentSession.prototype.requestCancellation,
+      bindExtensions: (binding: any) => { abortAction = binding.abortHandler; },
+      resourceLoader: { getThemes: () => ({ themes: [] }) },
+      agent: { abort: () => { aborts++; } },
+    };
+    const mode = Object.create(InteractiveMode.prototype);
+    Object.defineProperty(mode, "session", { value: session });
+    Object.defineProperty(mode, "agent", { value: session.agent });
+    Object.assign(mode, {
+      createExtensionUIContext: () => ({}), setupAutocompleteProvider: () => {},
+      setupExtensionShortcuts: () => {}, showLoadedResources: () => {}, showStartupNoticesIfNeeded: () => {},
+      clearAllQueues: () => ({ steering: [], followUp: [] }), updatePendingMessagesDisplay: () => {},
+    });
+    await mode.bindCurrentSessionExtensions();
+    const handler = loaded.extensions[0].handlers.get("before_provider_request")[0];
+    const payload = { input: ["private"], tools: [{}] };
+    const ctx = {
+      sessionManager: h.sm, isIdle: () => true, hasPendingMessages: () => false,
+      model: { provider: "openai-codex-personal", id: "gpt-5.6-luna", contextWindow: 272000, cost: {} },
+      getContextUsage: () => ({ tokens }), ui: { setStatus: () => {}, notify: () => {} }, abort: abortAction,
+    };
+    if (failPause) loaded.runtime.appendEntry = () => { throw new Error("pause save failed"); };
+    const result = await handler({ payload }, ctx);
+    loaded.runtime.appendEntry = h.runtime.appendEntry;
+    assert.equal(aborts, tokens === 271925 ? 1 : 0);
+    if (tokens === 255999) { assert.equal(result, undefined); continue; }
+    assert.deepEqual(result, { input: [], tools: [] });
+    assert.equal(session._interruption.kind, "context");
+    assert.equal(session._interruption.runId, 42);
+    await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }], interruption: session._interruption });
+    await h.emit("agent_settled");
+    assert.equal(h.persisted.filter(e => e.data.kind === "context_pause").length, failPause ? 0 : 1);
+    assert.equal(h.persisted.filter(e => e.data.kind === "cancellation_requested").length, 0);
+    const finals = h.manager.snapshot().outcomes.filter((o: any) => o.final);
+    assert.equal(finals.length, failPause ? 1 : 0);
+    if (failPause) assert.match(finals[0].summary, /no saved recoverable pause/);
+    assert.equal(h.messages.length, 0);
+    session.requestCancellation("escape", "real Escape");
+    abortAction({ kind: "context", reason: "late guard" });
+    assert.equal(session._interruption.kind, "cancel");
+    assert.equal(session._interruption.source, "escape");
+  }
+});
+
+test("friendly forceStop saves before typed abort and still aborts if pause storage fails", async t => {
+  for (const failPause of [false, true]) {
+    const h = await harness(t);
+    await h.call("task_outcomes_consumer", contract(h.dir, "friendly", "A"));
+    const savedEnv = { PI_RLM_FRIENDLY_STOP_TOKENS: process.env.PI_RLM_FRIENDLY_STOP_TOKENS, PI_RLM_ROLLOVER_DIR: process.env.PI_RLM_ROLLOVER_DIR };
+    let loaded: any;
+    try {
+      Object.assign(process.env, { PI_RLM_FRIENDLY_STOP_TOKENS: "40", PI_RLM_ROLLOVER_DIR: h.dir });
+      loaded = await loadExtensions([fileURLToPath(new URL("../../optional-extensions/rlm-friendly-stop.ts", import.meta.url))], h.dir);
+    } finally {
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+    assert.deepEqual(loaded.errors, []);
+    const appendEntry = h.runtime.appendEntry;
+    loaded.runtime.appendEntry = appendEntry;
+    const aborts: any[] = [];
+    if (failPause) h.runtime.appendEntry = () => { throw new Error("pause storage failed"); };
+    const ctx: any = {
+      sessionManager: h.sm, getContextUsage: () => ({ tokens: 90, contextWindow: 100, percent: 90 }),
+      abort: (options: any) => {
+        assert.equal(h.persisted.some(row => row.data.kind === "context_pause"), !failPause);
+        aborts.push(options);
+      },
+    };
+    const stop = loaded.extensions[0].handlers.get("context")[0]({ messages: [] }, ctx);
+    try {
+      if (failPause) await assert.rejects(stop, /pause storage failed/);
+      else await stop;
+    } finally {
+      h.runtime.appendEntry = appendEntry;
+    }
+    assert.equal(aborts.length, 1);
+    assert.equal(aborts[0].kind, "context");
+    assert.match(aborts[0].reason, /upper boundary/);
+  }
+});
+
+test("typed context stops retain pauses while every terminal source wins exactly once", async t => {
+  for (const phase of ["context", "pending", "parked"]) for (const source of [undefined, "escape", "task_cancel", "extension"]) {
+    const h = await harness(t);
+    await h.call("task_outcomes_consumer", contract(h.dir, "typed", "A"));
+    h.manager.pauseForContext("guard at 271925", 256000);
+    const lease = phase === "context" ? undefined : h.manager.beginMaintenance();
+    if (phase === "parked") h.manager.parkMaintenance(lease);
+    const interruption = source
+      ? { kind: "cancel", source, reason: "terminal" }
+      : { kind: "context", source: "context", reason: "guard at 271925" };
+    await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }], interruption });
+    await h.emit("agent_settled");
+    await h.emit("agent_settled");
+    assert.equal(h.persisted.filter(e => e.data.kind === "context_pause").length, 1);
+    assert.equal(h.persisted.filter(e => e.data.kind === "cancellation_requested").length, source ? 1 : 0);
+    const finals = h.manager.snapshot().outcomes.filter((o: any) => o.final);
+    assert.equal(finals.length, source ? 1 : 0);
+    if (source) {
+      assert.equal(finals[0].source, "technical");
+      assert.equal(finals[0].outcome, "failed");
+      if (lease) {
+        assert.throws(() => h.manager.resumeMaintenance(lease), /cancelled/);
+        assert.throws(() => h.manager.beginMaintenance(), /cancellation/);
+      }
+    }
+    assert.equal(h.messages.length, 0);
+  }
 });
 
 test("pending-work maintenance rejects before persistence and preserves later child/background results", async t => {
