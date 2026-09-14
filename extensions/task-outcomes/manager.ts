@@ -99,6 +99,7 @@ interface Runtime {
   sessionFile?: string;
   sessionOwner: object;
   isIdle?: () => boolean;
+  hasPendingMessages?: () => boolean;
   branchEntries: () => readonly any[];
   leafId: () => string | null;
   reloadSession?: (fallbackLeafId?: string | null, eventId?: string) => void;
@@ -151,6 +152,7 @@ interface PersistedEvent {
   contextPause?: TaskContractSnapshot["contextPause"];
   maintenance?: MaintenanceHandoff & { phase: MaintenancePhase; previousState?: Exclude<TaskContractSnapshot["state"], "maintenance_pending">; error?: string };
   cancellation?: { reason: string; source: "escape" | "task_cancel" | "extension" };
+  releasedCancellationEventId?: string;
   at: string;
   contract?: TaskLaunchContract & {
     ownerSessionId: string;
@@ -277,7 +279,7 @@ export class TaskOutcomeManager {
   private lastAssistant: any;
   private lastRunFailure: string | undefined;
   private maintenanceOutgoingOwner?: object;
-  private lastInterruption?: { kind: "cancel" | "maintenance" | "lifecycle"; source: string; reason: string; operationId?: string };
+  private lastInterruption?: { kind: "cancel" | "context" | "maintenance" | "lifecycle"; source: string; reason: string; operationId?: string };
   private maintenanceState?: MaintenanceLease & {
     previousState: Exclude<TaskContractSnapshot["state"], "maintenance_pending">;
     pausedNotified: boolean;
@@ -763,7 +765,11 @@ The declaration is provisional until clean settlement. Do not start more work af
   }
 
   private prepareMaintenance(sessionFile?: string): MaintenanceLease {
-    if (this.cancellation) throw new Error("cancellation is already committed; maintenance is rejected");
+    const owned = [...this.contracts.values()].filter(contract => contract.ownerSessionId === this.runtime.sessionId);
+    const cancelled = owned.find(contract => contract.cancellation?.eventId === this.cancellation?.eventId && contract.cancellation);
+    if (this.cancellation && (this.activeContract() || (cancelled && cancelled.state !== "final") || this.maintenanceState)) {
+      throw new Error("cancellation is already committed; maintenance is rejected");
+    }
     const existing = this.maintenanceState;
     if (existing) {
       if (existing.phase !== "pending") throw new Error(existing.error ?? "maintenance ownership has already transferred");
@@ -774,17 +780,17 @@ The declaration is provisional until clean settlement. Do not start more work af
       return { ...existing };
     }
     const current = this.activeContract();
-    const latestOwned = [...this.contracts.values()]
-      .filter(contract => contract.ownerSessionId === this.runtime.sessionId)
-      .at(-1);
-    if (current?.state === "final" || (!current && latestOwned?.state === "final")) {
+    if (current?.state === "final") {
       throw new Error("cannot take over a finalized task attempt");
     }
     if (sessionFile !== undefined && this.runtime.sessionFile !== undefined &&
         resolve(sessionFile) !== resolve(this.runtime.sessionFile)) {
       throw new Error("maintenance target is not the current session file");
     }
-    if ((current && this.pendingWork(current).length > 0) || this.background().stats().running > 0) {
+    if (!current && (this.runtime.isIdle?.() !== true || this.runtime.hasPendingMessages?.() !== false)) {
+      throw new Error("session-only maintenance requires idle execution and no queued messages");
+    }
+    if (owned.some(contract => this.pendingWork(contract).length > 0) || this.background().stats().running > 0) {
       throw new Error("cannot maintain while child/background work is pending");
     }
     const maintenanceId = randomUUID();
@@ -800,12 +806,15 @@ The declaration is provisional until clean settlement. Do not start more work af
       phase: "pending" as const,
     };
     const previousState = (current?.state ?? "active") as Exclude<TaskContractSnapshot["state"], "maintenance_pending">;
+    const releasedCancellationEventId = this.cancellation?.eventId;
     this.persist({
       kind: "maintenance_begin",
       jobId: current?.jobId,
       attemptId: current?.attemptId,
       maintenance: { ...lease, previousState },
+      releasedCancellationEventId,
     }, `task-outcome:maintenance_begin:${maintenanceId}`);
+    if (this.cancellation?.eventId === releasedCancellationEventId) this.cancellation = undefined;
     // appendEntry advances the selected leaf. The persisted intent records its
     // source; the live lease must instead name the durable marker just written.
     lease.branchAnchor = this.runtime.leafId();
@@ -869,7 +878,7 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (this.cancellation) return;
     const eventId = contract
       ? this.operationEventId("cancellation_requested", contract, source)
-      : `task-outcome:cancellation_requested:${this.runtime.sessionId}:${source}`;
+      : `task-outcome:cancellation_requested:${this.runtime.sessionId}:${source}:${randomUUID()}`;
     this.persist({
       kind: "cancellation_requested",
       jobId: contract?.jobId,
@@ -879,7 +888,6 @@ The declaration is provisional until clean settlement. Do not start more work af
     this.cancellation = { source, reason, eventId };
     if (contract) contract.cancellation = this.cancellation;
     if (this.maintenanceState && this.runtime.isIdle?.() && contract && contract.state !== "final") {
-      this.maintenanceState = undefined;
       this.finalize(contract, "failed", "technical", `cancelled: ${reason}`);
     }
   }
@@ -998,13 +1006,13 @@ The declaration is provisional until clean settlement. Do not start more work af
 
   onAgentEnd(
     messages: readonly any[],
-    interruption?: { kind: "cancel" | "maintenance" | "lifecycle"; source: string; reason: string; operationId?: string },
+    interruption?: { kind: "cancel" | "context" | "maintenance" | "lifecycle"; source: string; reason: string; operationId?: string },
   ): void {
     const assistant = [...messages].reverse().find(message => message?.role === "assistant");
     this.lastAssistant = assistant;
     this.lastInterruption = interruption;
     const contract = this.activeContract();
-    if (interruption?.kind === "cancel" && contract && contract.state !== "final") {
+    if (interruption?.kind === "cancel" && contract?.state !== "final") {
       this.requestCancellation(
         interruption.source === "escape" || interruption.source === "task_cancel" || interruption.source === "extension"
           ? interruption.source
@@ -1030,7 +1038,6 @@ The declaration is provisional until clean settlement. Do not start more work af
   async onAgentSettled(hasPendingMessages: boolean): Promise<void> {
     const contract = this.activeContract();
     if (this.cancellation && contract && contract.state !== "final") {
-      this.maintenanceState = undefined;
       this.finalize(contract, "failed", "technical", `cancelled: ${this.cancellation.reason}`);
       return;
     }
@@ -1064,6 +1071,13 @@ The declaration is provisional until clean settlement. Do not start more work af
       // Maintenance checks idle/queue state separately before changing anything.
       this.emitOutcome({ contract, outcome: "context_paused", source: "technical",
         summary: contract.contextPause.reason, final: false });
+      return;
+    }
+    if (this.lastInterruption?.kind === "context") {
+      // A failed pause save must not turn an aborted policy stop into a
+      // missing-declaration correction/model turn. The normal saved pause won above.
+      if (contract) this.finalize(contract, "failed", "technical",
+        `context stop has no saved recoverable pause: ${this.lastInterruption.reason}`);
       return;
     }
     if (!contract || contract.state !== "active" || hasPendingMessages) return;
@@ -1758,10 +1772,18 @@ The declaration is provisional until clean settlement. Do not start more work af
         cancellation: previous?.cancellation,
       };
       this.contracts.set(key, contract);
+      if (!previous && contract.ownerSessionId === this.runtime.sessionId) {
+        if (this.cancellation?.eventId.includes(`:${key}:`)) contract.cancellation = this.cancellation;
+        else this.cancellation = undefined;
+      }
       return;
     }
     if (event.jobId && event.attemptId && this.contracts.get(this.key(event.jobId, event.attemptId))?.state === "final") return;
     if (event.kind === "maintenance_begin" && event.maintenance) {
+      if (!event.jobId && !event.attemptId && !event.maintenance.jobId && !event.maintenance.attemptId &&
+          !event.maintenance.reportPath && event.releasedCancellationEventId === this.cancellation?.eventId) {
+        this.cancellation = undefined;
+      }
       this.maintenanceState = {
         ...event.maintenance,
         previousState: event.maintenance.previousState ?? "active",
@@ -1909,7 +1931,7 @@ const dialogueSummary = (text: string): string => {
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-type SessionOwnerContext = Pick<ExtensionContext, "sessionManager" | "isIdle">;
+type SessionOwnerContext = Pick<ExtensionContext, "sessionManager" | "isIdle" | "hasPendingMessages">;
 type TaskOutcomeAPI = Pick<ExtensionAPI, "appendEntry" | "sendUserMessage" | "events">;
 const registryKey = Symbol.for("pi.task-outcomes.manager-registry");
 const handoffKey = Symbol.for("pi.task-outcomes.maintenance-handoffs");
@@ -1930,6 +1952,7 @@ const runtimeFor = (pi: TaskOutcomeAPI, ctx: SessionOwnerContext): Runtime => {
     sessionFile: ctx.sessionManager.getSessionFile(),
     sessionOwner: owner,
     isIdle: ctx.isIdle,
+    hasPendingMessages: ctx.hasPendingMessages,
     branchEntries: () => ctx.sessionManager.getBranch(),
     leafId: () => ctx.sessionManager.getLeafId(),
     reloadSession: (fallbackLeafId, eventId) => {
