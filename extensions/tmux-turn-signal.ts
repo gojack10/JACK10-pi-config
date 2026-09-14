@@ -8,6 +8,8 @@ import type { MaintenanceHandoff } from "./_shared/maintenance.ts";
 
 type TaskOutcomeEvent = {
 	sessionId: string;
+	eventId?: string;
+	revision?: number;
 	sessionFile?: string;
 	outcome: string;
 	jobId: string;
@@ -68,6 +70,7 @@ interface SignalState {
 	pendingOutcomes: unknown[];
 	outcomeQueue: Promise<void>;
 	pendingOutcomePublication?: Promise<boolean>;
+	publishedOutcomes?: Map<string, string>;
 }
 
 const handoffKey = Symbol.for("pi.tmux-turn-signal.maintenance-handoffs");
@@ -171,6 +174,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			const receipt = {
 				version: 1,
+				event_id: payload.eventId,
+				revision: payload.revision,
 				session_id: payload.sessionId,
 				job_id: payload.jobId,
 				attempt_id: payload.attemptId,
@@ -179,6 +184,9 @@ export default function (pi: ExtensionAPI) {
 				source: payload.source,
 				final: payload.final,
 				pause_id: payload.pauseId,
+				maintenance_id: payload.maintenanceId,
+				owner_epoch: payload.ownerEpoch,
+				phase: payload.phase,
 				summary: payload.summary,
 				report: payload.reportPath,
 				session_file: payload.sessionFile,
@@ -188,6 +196,8 @@ export default function (pi: ExtensionAPI) {
 			};
 			receiptArtifact = await writeArtifact("pi-subagent-outcome", JSON.stringify(receipt));
 			const outcome = JSON.stringify({
+				event_id: payload.eventId,
+				revision: payload.revision,
 				session_id: payload.sessionId,
 				job_id: payload.jobId,
 				attempt_id: payload.attemptId,
@@ -200,13 +210,12 @@ export default function (pi: ExtensionAPI) {
 			});
 			await execTmux(["set-option", "-q", "-t", pane, OUTCOME_OPTION, outcome]);
 			published = true;
-			// Generation is the commit point. A signal failure must not make the
-			// monitor mistake a partially delivered outcome for a successful one.
-			await execTmux(["wait-for", "-S", channel]);
+			// Generation commits publication; wake is only a best-effort hint.
 			await execTmux([
 				"set-option", "-q", "-t", pane, OUTCOME_GENERATION_OPTION,
 				String(Number.isSafeInteger(generation) ? generation + 1 : 1),
 			]);
+			try { await execTmux(["wait-for", "-S", channel]); } catch {}
 		} catch (error) {
 			try {
 				recordError({
@@ -232,7 +241,17 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const deliverOutcome = (payload: TaskOutcomeEvent): Promise<boolean> => {
-		const publication = signalState.outcomeQueue.then(() => publishOutcome(payload));
+		const publication = signalState.outcomeQueue.then(async () => {
+			const key = payload.eventId && `${payload.sessionId}:${payload.jobId}:${payload.attemptId}:${payload.eventId}`;
+			const serialized = JSON.stringify({ ...payload, revision: undefined });
+			const published = signalState.publishedOutcomes ??= new Map();
+			if (key && published.has(key)) {
+				if (published.get(key) !== serialized) throw new Error("conflicting outcome event payload");
+				return;
+			}
+			await publishOutcome(payload);
+			if (key) published.set(key, serialized);
+		});
 		signalState.outcomeQueue = publication.catch(error => {
 			console.error(`[tmux-turn-signal] outcome publication failed: ${errorMessage(error)}`);
 		});

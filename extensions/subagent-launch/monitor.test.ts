@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { lstat, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
+import { publishMonitorReceipt, readMonitorReceipt, receiptPath, parsePaneHealth, observePaneHealth } from "../task-outcomes/monitor-receipt.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -208,11 +210,17 @@ test("monitor turns a published receipt read failure into visible transport evid
       attempt_id: "receipt-failure-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
       receipt_path: join(dir, "missing-receipt"), receipt_identity: { dev: "1", ino: "1" } }));
     await set("@pi_outcome_generation", "1");
+    await until(() => markers.some(marker => marker.kind === "evidence" && /cannot read published outcome/.test(marker.summary)));
+    assert.equal(markers.filter(marker => marker.kind === "final").length, 0);
+    // Repair the pointer without changing generation: a transient failure must not consume it.
+    await set("@pi_outcome", JSON.stringify({ session_id: "receipt-failure-session", job_id: "receipt-failure-job",
+      attempt_id: "receipt-failure-attempt", mode: "dialogue", outcome: "dialogue_settled", source: "model", final: true,
+      report_text: "recovered" }));
     await until(() => markers.some(marker => marker.kind === "final"));
-    const final = markers.find(marker => marker.kind === "final");
-    assert.equal(final.outcome, "transport_lost");
-    assert.equal(final.source, "transport");
-    assert.match(final.summary, /cannot read published outcome/);
+    const finals = markers.filter(marker => marker.kind === "final");
+    assert.equal(finals.length, 1);
+    assert.equal(finals[0].outcome, "completed");
+    assert.equal(finals[0].reportText, "recovered");
   } finally {
     child?.kill("SIGTERM");
     await tmux(["kill-session", "-t", session]).catch(() => {});
@@ -490,4 +498,154 @@ test("monitor binds manifest identity and allows same-identity replacement", { t
       await rm(dir, { recursive: true, force: true });
     }
   }
+});
+
+async function fakeMonitor(t: any) {
+  const dir = await mkdtemp(join(tmpdir(), "monitor-durable-"));
+  const file = join(dir, "session.jsonl"), manifest = join(dir, "manifest.json");
+  const control = join(dir, "control.json"), queries = join(dir, "queries");
+  const identity = { sessionId: "pi-session", jobId: "job", attemptId: "attempt", mode: "dialogue" };
+  const rows: any[] = [{ type: "session", id: identity.sessionId }];
+  const branch: any[] = [];
+  const save = () => writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+  const add = (data: any, customType = "task-outcome/v1") => {
+    const entry = { type: "custom", id: `entry-${branch.length}`, parentId: branch.at(-1)?.id ?? null,
+      customType, data: { version: 1, eventId: `event-${branch.length}`, ...data } };
+    rows.push(entry); branch.push(entry); save(); return entry;
+  };
+  add({ kind: "contract", contract: { ...identity, ownerSessionId: identity.sessionId } });
+  await writeFile(manifest, JSON.stringify({ version: 1, ...identity, sessionId: "transport-session",
+    startChannel: "start", startGeneration: 0, outcomeGeneration: 0 }));
+  const options = { "@pi_subagent_manifest": manifest, "@pi_start_generation": "1",
+    "@pi_session_file": file, "@pi_session_id": identity.sessionId, "@pi_subagent_job_id": identity.jobId };
+  const set = (health: string, metadata = true) => writeFileSync(control, JSON.stringify({ health, metadata, options }));
+  set("live");
+  await writeFile(join(dir, "tmux"), `#!${process.execPath}\nconst fs = require('node:fs');
+const c = JSON.parse(fs.readFileSync(${JSON.stringify(control)}, 'utf8'));
+const args = process.argv.slice(2);
+if (args[0] === 'list-panes') {
+ fs.appendFileSync(${JSON.stringify(queries)}, c.health + '\\n');
+ if (c.health === 'error') process.exit(23);
+ if (c.health !== 'empty') console.log(c.health === 'absent' ? '%999\\t0' : '%123\\t' + (c.health === 'dead' ? '1' : '0'));
+} else if (args[0] === 'show-options' && c.metadata) console.log(c.options[args.at(-1)] || '');
+`, { mode: 0o700 });
+  const child = spawn(process.execPath, [monitorPath, monitorConfig("%123", "job", "attempt", 3000, "transport-session", "dialogue")],
+    { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` }, stdio: ["ignore", "pipe", "pipe"] });
+  const markers: any[] = []; let buffer = "", stderr = "";
+  child.stderr!.on("data", chunk => stderr += chunk);
+  child.stdout!.on("data", chunk => {
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      markers.push(JSON.parse(buffer.slice(0, newline))); buffer = buffer.slice(newline + 1);
+    }
+  });
+  const closed = new Promise(resolve => child.once("close", resolve));
+  t.after(async () => { child.kill(); await closed; await rm(dir, { recursive: true, force: true }); assert.equal(stderr, ""); });
+  await until(() => markers.some(m => m.kind === "start"));
+  const publish = () => publishMonitorReceipt(file, identity, branch, branch.at(-1).id);
+  const pause = () => { add({ kind: "context_pause", jobId: "job", attemptId: "attempt", contextPause: { id: "pause", reason: "clean context", limit: 100 } }); return publish(); };
+  const countQueries = async () => (await readFile(queries, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).length;
+  return { dir, file, identity, rows, branch, add, save, set, markers, publish, pause, countQueries, closed };
+}
+
+for (const health of ["error", "empty"]) {
+  test(`fake tmux ${health}: bounded re-query, durable pause beats missing metadata and stored publication error`, { timeout: 10000 }, async t => {
+    const h = await fakeMonitor(t);
+    const before = await h.countQueries();
+    h.set(health, false);
+    h.pause();
+    h.rows.push({ type: "custom", id: "error-entry", parentId: h.branch.at(-1).id, customType: "pi-error/v1",
+      data: { version: 1, source: "subagent", operation: "outcome_publication", message: "tmux failed",
+        correlation: { session_id: "pi-session", job_id: "job", attempt_id: "attempt" } } }); h.save();
+    await until(async () => (await h.countQueries()) >= before + 3);
+    assert.equal(h.markers.filter(m => m.kind === "context_paused").length, 1);
+    assert.equal(h.markers.filter(m => m.kind === "final").length, 0);
+  });
+}
+for (const paused of [false, true]) {
+  test(`fake tmux confirmed death remains terminal (paused=${paused})`, { timeout: 10000 }, async t => {
+    const h = await fakeMonitor(t);
+    if (paused) { h.pause(); await until(() => h.markers.some(m => m.kind === "context_paused")); }
+    h.set("dead", false);
+    await h.closed;
+    const finals = h.markers.filter(m => m.kind === "final");
+    assert.equal(finals.length, 1); assert.equal(finals[0].outcome, "transport_lost");
+  });
+}
+for (const reportText of ["exact response", "😀".repeat(11000)]) test(`fake tmux durable final wins over loss and duplicate receipts (${reportText.length} chars)`, { timeout: 10000 }, async t => {
+  const h = await fakeMonitor(t);
+  h.set("error", false);
+  h.add({ kind: "outcome", jobId: "job", attemptId: "attempt", outcome: "dialogue_settled", source: "model", summary: "done", reportText });
+  const first = h.publish();
+  assert.equal(h.publish().revision, first.revision);
+  h.set("dead", false);
+  await h.closed;
+  const finals = h.markers.filter(m => m.kind === "final");
+  assert.equal(finals.length, 1); assert.equal(finals[0].outcome, "completed");
+  assert.equal(finals[0].reportText ?? await readFile(finals[0].dialogueReportPath, "utf8"), reportText);
+});
+for (const mismatch of ["attemptId", "sessionId", "mode", "entryId", "branchLeafId"]) {
+  test(`fake tmux ignores durable ${mismatch} mismatch`, { timeout: 10000 }, async t => {
+    const h = await fakeMonitor(t);
+    const receipt = h.pause();
+    writeFileSync(receiptPath(h.file, "attempt"), JSON.stringify({ ...receipt, [mismatch]: "foreign" }));
+    h.set("dead", false);
+    await h.closed;
+    assert.equal(h.markers.filter(m => m.kind === "context_paused").length, 0);
+    assert.equal(h.markers.find(m => m.kind === "final").outcome, "transport_lost");
+  });
+}
+test("health reducer never confirms mixed observations and bounds unknown to two queries", async () => {
+  assert.equal(parsePaneHealth("", "%1").kind, "unknown");
+  assert.equal(parsePaneHealth("bad", "%1").kind, "unknown");
+  assert.equal(parsePaneHealth("%1\t1", "%1").kind, "dead");
+  for (const pair of [["unknown", "dead"], ["dead", "unknown"], ["dead", "live"], ["unknown", "unknown"], ["dead", "dead"]]) {
+    let queries = 0, reads = 0, sleeps = 0;
+    const result = await observePaneHealth(async () => ({ kind: pair[queries++], evidence: "test" }),
+      async () => { sleeps++; }, async () => { reads++; }, 1);
+    assert.equal(queries, 2); assert.equal(reads, 2); assert.equal(sleeps, 1);
+    assert.equal(result.kind === "dead", pair.every(kind => kind === "dead"));
+  }
+});
+
+test("projection rejects sidecar-only, inactive ancestry, conflicting payloads, and truncated session evidence", { timeout: 10000 }, async t => {
+  const h = await fakeMonitor(t);
+  h.set("error", false);
+  const pause = h.pause();
+  assert.equal(readMonitorReceipt(h.file, h.identity).state, "context_paused");
+  const path = receiptPath(h.file, "attempt");
+  for (const changed of [
+    { ...pause, payload: { ...pause.payload, pause_id: "foreign" } },
+    { ...pause, branchLeafId: h.branch[0].id },
+    { ...pause, entryId: "sidecar-only" },
+  ]) {
+    writeFileSync(path, JSON.stringify(changed));
+    assert.throws(() => readMonitorReceipt(h.file, h.identity));
+  }
+  writeFileSync(path, JSON.stringify(pause));
+  writeFileSync(h.file, JSON.stringify(h.rows[0]) + '\n{"type":');
+  assert.throws(() => readMonitorReceipt(h.file, h.identity));
+  h.save();
+  const same = h.publish(); assert.equal(same.revision, pause.revision);
+  h.branch.at(-1).data.contextPause.reason = "conflict"; h.save();
+  assert.throws(() => h.publish(), /conflicting same-event/);
+});
+
+test("pause then resume cannot be resurrected by a delayed older projection", { timeout: 10000 }, async t => {
+  const h = await fakeMonitor(t);
+  h.set("error", false);
+  const old = h.pause();
+  await until(() => h.markers.some(m => m.kind === "context_paused"));
+  h.add({ kind: "context_resume", jobId: "job", attemptId: "attempt", contextPause: { id: "pause" } });
+  const resumed = h.publish();
+  assert.ok(resumed.revision > old.revision);
+  await until(() => h.markers.some(m => m.kind === "active"));
+  const before = await h.countQueries();
+  writeFileSync(receiptPath(h.file, "attempt"), JSON.stringify(old));
+  await until(async () => (await h.countQueries()) >= before + 2);
+  assert.equal(h.markers.filter(m => m.kind === "context_paused").length, 1);
+  h.set("dead", false);
+  await h.closed;
+  assert.equal(h.markers.filter(m => m.kind === "final").length, 1);
 });
