@@ -1971,9 +1971,9 @@ export function parkTaskOutcomeManager(ctx: SessionOwnerContext, lease: Maintena
   const owner = ctx.sessionManager as object;
   const manager = managers.get(owner);
   if (!manager) throw new Error("task outcome manager is unavailable for maintenance");
+  manager.parkMaintenance(lease);
   // Task outcomes owns both halves, even without the background tool extension.
   parkBackgroundJobManager(ctx, lease);
-  manager.parkMaintenance(lease);
   handoffs.set(lease.maintenanceId, { manager, lease: { ...lease } });
 }
 
