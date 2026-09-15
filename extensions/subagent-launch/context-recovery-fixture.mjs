@@ -45,7 +45,7 @@ async function bind() {
   loaded.runtime.sendUserMessage = text => { throw new Error(`unexpected model request: ${text}`); };
   ctx = {
     cwd: process.cwd(), mode: 'tui', hasUI: false, sessionManager: sm,
-    model: { provider: 'openai-test', id: 'fake', contextWindow: 272000, cost: {} },
+    model: { provider: 'openai-test', id: friendly ? 'gpt-5.6-sol' : 'fake', contextWindow: 272000, cost: {} },
     ui: { setStatus() {}, notify() {} },
     isIdle: () => idle, waitForIdle: async () => { if (!idle) throw new Error('not idle'); },
     hasPendingMessages: () => process.env.PI_TEST_RECOVERY_CASE === 'queued', abort: () => { aborted = true; },
@@ -112,7 +112,7 @@ started = true;
 idle = false;
 await emit('agent_start');
 if (friendly) {
-  if (process.env.PI_RLM_FRIENDLY_STOP_TOKENS !== undefined || process.env.PI_RLM_FRIENDLY_STOP_MODEL !== 'fake' ||
+  if (process.env.PI_RLM_FRIENDLY_STOP_TOKENS !== undefined || process.env.PI_RLM_FRIENDLY_STOP_MODEL !== 'gpt-5.6-sol' ||
       process.env.PI_RLM_FRIENDLY_STOP_PERCENT !== '40') throw new Error('launcher opt-in environment is wrong');
   await emit('turn_end', {});
   await emit('context', { messages: [] });
