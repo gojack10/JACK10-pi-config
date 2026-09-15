@@ -215,7 +215,9 @@ fi
     const replacementOwner = { getSessionId: () => "session" };
     const registry = (globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")];
     registry.set(owner, {
-      snapshot: () => ({ active: { ...request, state: "context_paused", pendingWork: [], contextPause: { id: "pause", limit: 100 } } }),
+      // Non-empty pending work must not intercept the recovery handler: every
+      // phase below still has to fail for its own reason, not the removed guard.
+      snapshot: () => ({ active: { ...request, state: "context_paused", pendingWork: ["child:child"], contextPause: { id: "pause", limit: 100 } } }),
       beginMaintenance: () => ({ maintenanceId: "lease", ownerEpoch: "epoch", sessionId: "session", phase: "pending" }),
       failMaintenance() { assert.equal(invalidated, false, "outgoing failure owner used"); },
       resumeMaintenance() { assert.equal(invalidated, false, "outgoing resume owner used"); },

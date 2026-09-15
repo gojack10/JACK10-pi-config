@@ -1,6 +1,6 @@
 // No-provider interactive child used ONLY by context-recovery.test.ts.
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
@@ -33,7 +33,12 @@ let resumed = false;
 let started = false;
 let idle = true;
 let aborted = false;
+// Lifecycle emissions are journaled so the test can prove the in-place recovery
+// refresh emits no session lifecycle events.
+const lifecyclePath = join(process.cwd(), 'lifecycle.jsonl');
+const lifecycleNames = ['session_start', 'session_shutdown', 'session_tree'];
 const emit = async (name, event = {}) => {
+  if (lifecycleNames.includes(name)) appendFileSync(lifecyclePath, `${name}\n`);
   for (const ext of loaded.extensions) for (const handler of ext.handlers.get(name) ?? []) await handler(event, ctx);
 };
 const task = () => globalThis[Symbol.for('pi.task-outcomes.manager-registry')].get(sm);
@@ -89,6 +94,12 @@ async function bind() {
 async function finish() {
   const active = task().snapshot().active;
   if (active?.attemptId !== manifest.attemptId || active.state !== 'active') throw new Error('assignment was lost');
+  if (process.env.PI_TEST_RECOVERY_CASE === 'drain') {
+    // The pending child delivers during the recovered turn, before completion;
+    // a duplicate delivery must not duplicate the durable row.
+    task().recordChildOutcome(active.jobId, 'pending-grandchild', 'completed', 'grandchild done');
+    task().recordChildOutcome(active.jobId, 'pending-grandchild', 'completed', 'grandchild done');
+  }
   idle = false;
   aborted = false;
   await emit('agent_start');
@@ -109,6 +120,11 @@ async function finish() {
 await bind();
 await emit('session_start', { reason: 'startup' });
 started = true;
+if (process.env.PI_TEST_RECOVERY_CASE === 'drain') {
+  // The guard pauses this assignment while a child job is still pending; the
+  // child delivers during the recovered turn, after the parent-driven clean.
+  task().registerChild(task().snapshot().active.jobId, 'pending-grandchild');
+}
 idle = false;
 await emit('agent_start');
 if (friendly) {

@@ -7,7 +7,7 @@ When the parent receives that pause, call `subagent_clean_and_continue` with its
 The operation:
 
 1. Validates the monitored paused attempt and waits for a command-specific acknowledgement (up to 30 seconds).
-2. Requires an idle worker with no queued messages or outstanding child/background jobs. Refuses before cleaning if those prerequisites are missing, rather than discarding queued input.
+2. Requires an idle worker with no queued messages. Refuses before cleaning if that prerequisite is missing, rather than discarding queued input. Outstanding child/background work no longer refuses the clean: the refresh is in place, and completion still gates on drained work.
 3. Reuses `/tool-call-clean`'s backup, atomic rewrite and tool-output clearing. Thinking, assistant messages, custom state, report reservation, session and attempt identity are preserved.
 4. Reloads the same session and checks the replacement runtime's context estimate. If there is insufficient space or reload is cancelled, the assignment stays paused.
 5. Requests continuation under the same contract and monitor. The tool returns `resume_requested`; that is not task completion. The eventual report/outcome still goes through normal validation.
@@ -29,7 +29,7 @@ env -u TMUX -u TMUX_PANE -u PI_SUBAGENT_MANIFEST PI_OFFLINE=1 \
   node --test extensions/subagent-launch/context-recovery.test.ts
 ```
 
-The test owns a disposable tmux socket and uses a fake interactive child with real extension handlers, session storage, guard, monitor and parent tools. It supplies synthetic context usage rather than making a provider request. Coverage includes same-attempt completion, backup/content preservation, stale IDs, insufficient cleanup, busy workers, queued input, cancelled reload, pending children, pause restoration and unchanged ordinary abort behavior. This verifies extension integration, not the complete real-provider/TUI lifecycle.
+The test owns a disposable tmux socket and uses a fake interactive child with real extension handlers, session storage, guard, monitor and parent tools. It supplies synthetic context usage rather than making a provider request. Coverage includes same-attempt completion, backup/content preservation, stale IDs, insufficient cleanup, busy workers, queued input, cancelled reload, pending children resumed through recovery, pause restoration and unchanged ordinary abort behavior. This verifies extension integration, not the complete real-provider/TUI lifecycle.
 
 ## Live qualification
 
@@ -45,6 +45,6 @@ Omitted opt-in means **no friendly limit**. Canonical launches scrub inherited f
 
 Saved friendly settings are immutable for follow-ups, just like the saved model route: omit to inherit or repeat the saved values; changing or adding a limit requires a fresh launch. Reload the parent to expose the new launch-tool fields.
 
-A saved checkpoint produces a nonfinal pause carrying its receipt path; it is not task completion. Parent cleanup resumes the same contract. Friendly monitoring resets only after that assignment's durable resume, and remains armed for a later crossing. A missing checkpoint at grace exhaustion produces an honest forced-stop pause/receipt instead of success or an unexplained abort. Pending messages/child work still prevent cleanup; fresh-worker transfer remains unimplemented.
+A saved checkpoint produces a nonfinal pause carrying its receipt path; it is not task completion. Parent cleanup resumes the same contract. Friendly monitoring resets only after that assignment's durable resume, and remains armed for a later crossing. A missing checkpoint at grace exhaustion produces an honest forced-stop pause/receipt instead of success or an unexplained abort. Pending messages still prevent cleanup; fresh-worker transfer remains unimplemented.
 
 Latest verification: **109 combined regression tests plus 3 argument-boundary tests passed**, including configured boot environment, no inherited opt-in, 40/50/65/80 on distinct windows and model IDs, nonfinal checkpoint transport, cleanup/re-arm, follow-up after a final task outcome, immutable follow-ups, forced-stop cause and existing recovery regressions. Normal discovery passed. Live Luna canaries at **50%, 65% and 80%, thinking off, all passed** with same-attempt checkpoint/cleanup/re-arm and final reports; independent `verify-cases.mjs` passed. GLM Flash was rejected before launch because Pi's current model definition does not support thinking `off`; no GLM provider request was made and cross-provider qualification remains blocked. Evidence and the partial table are in `/Users/jack/.cache/pi-friendly-stop-matrix.ZCTroH/`. These are synthetic-padding control-plane checks, not naturally full-context recall benchmarks.

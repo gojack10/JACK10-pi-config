@@ -15,7 +15,7 @@ test.after(restoreLauncherEnvironment);
 
 // Every descendant, including the launcher's monitor and fake interactive child,
 // uses this disposable socket. No default or inherited live tmux server is used.
-for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 'friendly'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
+for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 'friendly', 'drain'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
   const env = { ...process.env };
   const dir = await mkdtemp(join(tmpdir(), 'context-recovery-'));
   const bin = join(dir, 'bin');
@@ -78,9 +78,12 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   await assert.rejects(call('subagent_clean_and_continue', { ...ids, attempt_id: 'stale-attempt' }), /no monitored context-paused/);
   await until(async () => { try { await readFile(join(dir, 'paused.json')); return true; } catch { return false; } });
   const paused = JSON.parse(await readFile(join(dir, 'paused.json'), 'utf8'));
+  if (scenario === 'drain') {
+    assert.deepEqual(paused.pendingWork, ['child:pending-grandchild'], 'the guard paused the assignment while a child job was still pending');
+  }
   const original = await readFile(paused.sessionFile, 'utf8');
   const pauseMessageCount = messages.length;
-  if (scenario !== 'complete' && scenario !== 'friendly') {
+  if (scenario !== 'complete' && scenario !== 'friendly' && scenario !== 'drain') {
     const reason = { insufficient: /cannot free enough context/, cancel: /reload cancelled/,
       queued: /queued messages remain/, busy: /worker is not idle/ }[scenario];
     await assert.rejects(call('subagent_clean_and_continue', ids), reason);
@@ -99,12 +102,20 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.equal(background.getBatchStatus(launch.batch_id).complete, true);
   assert.equal(messages.filter(text => text.includes('recovered assignment completed')).length, 1);
   assert.equal(messages.slice(pauseMessageCount).some(text => /Operation aborted|transport_lost/.test(text)), false);
+  // The in-place recovery refresh emits no session lifecycle events.
+  assert.equal(await readFile(join(dir, 'lifecycle.jsonl'), 'utf8'), 'session_start\n');
   assert.match(await readFile(report, 'utf8'), new RegExp(job.attempt_id));
   assert.match(await readFile(report, 'utf8'), new RegExp(paused.piSessionId));
   const cleaned = await readFile(paused.sessionFile, 'utf8');
   assert.match(cleaned, /retained progress/);
   assert.match(cleaned, /tool result cleared by \/tool-call-clean/);
   assert.doesNotMatch(cleaned, /large output large output/);
+  const childRows = cleaned.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(childRows.filter((row: any) => row.type === 'custom' && row.data?.kind === 'transport_lost').length, 0, 'no false transport loss in the child branch');
+  if (scenario === 'drain') {
+    // The pending child delivered during the recovered turn, exactly once.
+    assert.equal(childRows.filter((row: any) => row.type === 'custom' && row.data?.kind === 'child_outcome').length, 1);
+  }
   const backup = (await readdir(dir)).find(name => name.includes('.tool-call-clean.') && name.endsWith('.bak'));
   assert.ok(backup);
   // In-place maintenance persists ownership before cleanup takes its backup.
@@ -121,7 +132,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   await assert.rejects(call('subagent_clean_and_continue', ids), /no monitored context-paused/);
 });
 
-test('paused state rejects insufficient context and pending children; normal abort semantics are unchanged', async t => {
+test('paused state rejects insufficient context; pending children survive restart and resume through recovery; normal abort semantics are unchanged', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'context-recovery-state-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const packageDir = join(homedir(), '.local/share/pi-mono/packages/coding-agent');
@@ -151,15 +162,25 @@ test('paused state rejects insufficient context and pending children; normal abo
   await assert.rejects(manager.declare('completed', 'wrong'), /not active/);
   assert.throws(() => manager.resumeAfterContextClean('job', 'wrong', pauseId, 1), /does not match|no longer matches/);
   assert.throws(() => manager.resumeAfterContextClean('job', 'attempt', pauseId, 101), /still over the limit/);
-  assert.throws(() => manager.resumeAfterContextClean('job', 'attempt', pauseId, 50), /work is pending/);
-  manager.recordChildOutcome('job', 'child', 'completed', 'done');
+  // The restart happens while the child's result is still pending: the paused
+  // assignment and its live child work must survive together.
   manager.shutdown('session resume');
   (globalThis as any)[Symbol.for('pi.task-outcomes.manager-registry')].delete(sm);
   manager = await restore();
   assert.equal(manager.snapshot().active.contextPause.id, pauseId);
   assert.equal(manager.snapshot().active.attemptId, 'attempt');
+  // Recovery succeeds while the child's result is still pending, and fabricates
+  // no lifecycle outcome records.
   manager.resumeAfterContextClean('job', 'attempt', pauseId, 50);
   assert.equal(manager.snapshot().active.state, 'active');
+  assert.deepEqual(manager.snapshot().outcomes, [], 'recovery fabricated no lifecycle outcome');
+  // The child's result is delivered exactly once afterwards; a duplicate delivery
+  // must not duplicate the durable row, and no transport_lost appears.
+  manager.recordChildOutcome('job', 'child', 'completed', 'done');
+  manager.recordChildOutcome('job', 'child', 'completed', 'done');
+  assert.equal(sm.getBranch().filter((row: any) => row.data?.kind === 'child_outcome').length, 1);
+  assert.deepEqual(manager.snapshot().active.pendingWork, []);
+  assert.equal(manager.snapshot().outcomes.filter((row: any) => row.outcome === 'transport_lost').length, 0);
   assert.throws(() => manager.resumeAfterContextClean('job', 'attempt', pauseId, 50), /no longer matches/);
   manager.onAgentStart();
   manager.onAgentEnd([{ role: 'assistant', stopReason: 'aborted', errorMessage: 'user cancelled', content: [] }]);

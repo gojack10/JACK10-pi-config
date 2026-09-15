@@ -1110,7 +1110,7 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_clean_and_continue",
     label: "subagent_clean_and_continue",
-    description: "Clean tool outputs and request continuation of a monitored context-paused subagent. Use the IDs from its pause notification. Preserves the same session, attempt, report and monitor; this is maintenance, not a fresh assignment. Requires an idle worker with no queued messages or pending children/background jobs. Refuses if cleaning cannot free enough context. No automatic retries; resume_requested is not task completion.",
+    description: "Clean tool outputs and request continuation of a monitored context-paused subagent. Use the IDs from its pause notification. Preserves the same session, attempt, report and monitor; this is maintenance, not a fresh assignment. Requires an idle worker with no queued messages; live child/background work no longer refuses the clean because the refresh is in place, and completion still gates on drained work. Refuses if cleaning cannot free enough context. No automatic retries; resume_requested is not task completion.",
     parameters: Type.Object({
       job_id: Type.String({ minLength: 1, maxLength: 128 }),
       session_id: Type.String({ minLength: 1, maxLength: 128 }),
