@@ -57,7 +57,8 @@ export function registerContextRecovery(pi: ExtensionAPI): void {
         maintenanceManager = taskManager;
         const liveSession = (await exec("tmux", ["show-options", "-qv", "-t", pane, "@pi_subagent_session_id"])).stdout.trim();
         if (liveSession !== request.sessionId) throw new Error("saved subagent session changed");
-        if (snapshot.pendingWork.length) throw new Error("child/background work remains pending; no cleanup performed");
+        // Pending child/background work no longer refuses cleanup: the refresh is
+        // in place (same manager/runtime), and completion still gates on drained work.
         const file = ctx.sessionManager.getSessionFile();
         const sessionId = ctx.sessionManager.getSessionId();
         const modelId = ctx.model?.id;

@@ -936,7 +936,8 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (!Number.isFinite(tokens) || tokens < 0 || tokens >= contract.contextPause.limit) {
       throw new Error("cleaned context is still over the limit; assignment remains paused");
     }
-    if (this.pendingWork(contract).length > 0) throw new Error("cannot reload while child/background work is pending");
+    // Pending child/background work no longer blocks the resume: the clean was an
+    // in-place refresh, and settlement still refuses a final while work is pending.
     this.persist({ kind: "context_resume", jobId, attemptId, contextPause: contract.contextPause }, this.operationEventId("context_resume", contract, pauseId));
     contract.contextPause = undefined;
     contract.state = "active";
