@@ -28,6 +28,7 @@ type Env = Record<string, string | undefined>;
 
 type Config = { threshold?: number; model?: string; percent?: number; directory: string; graceTurns: number };
 const PRODUCTION_MODEL = "gpt-6-astra";
+const FRIENDLY_STOP_MODELS = new Set([PRODUCTION_MODEL, "gpt-5.6-sol"]);
 const LOWER_PERCENT = 40;
 const UPPER_PERCENT = 80;
 
@@ -41,6 +42,7 @@ function positiveInteger(value: string | undefined): number | undefined {
 function config(env: Env): Config | undefined {
 	const legacyThreshold = positiveInteger(env.PI_RLM_FRIENDLY_STOP_TOKENS);
 	const model = env.PI_RLM_FRIENDLY_STOP_MODEL;
+	if (model && !FRIENDLY_STOP_MODELS.has(model)) return;
 	const parsedPercent = positiveInteger(env.PI_RLM_FRIENDLY_STOP_PERCENT);
 	const percent = parsedPercent !== undefined && parsedPercent >= 40 && parsedPercent <= 80 ? parsedPercent : undefined;
 	const directory = env.PI_RLM_ROLLOVER_DIR;
@@ -48,7 +50,7 @@ function config(env: Env): Config | undefined {
 	if (!directory || !isAbsolute(directory)) return;
 	if (legacyThreshold) return { threshold: legacyThreshold, directory, graceTurns };
 	if (env.PI_RLM_FRIENDLY_STOP_PERCENT !== undefined && percent === undefined) return;
-	if (model && (percent !== undefined || model === PRODUCTION_MODEL)) return { model, percent, directory, graceTurns };
+	if (model && (percent !== undefined || FRIENDLY_STOP_MODELS.has(model))) return { model, percent, directory, graceTurns };
 	return;
 }
 
@@ -112,7 +114,8 @@ export function registerFriendlyStop(pi: ExtensionAPI, env: Env = process.env): 
 			? friendlyStopThreshold(current.contextWindow, enabled.percent ?? LOWER_PERCENT) : undefined);
 		const upperThreshold = current && Number.isFinite(current.contextWindow) && current.contextWindow > 0
 			? friendlyStopThreshold(current.contextWindow, UPPER_PERCENT) : undefined;
-		if (state || threshold === undefined || upperThreshold === undefined || threshold < 1 || (enabled.model && enabled.model !== identity) ||
+		if (state || threshold === undefined || upperThreshold === undefined || threshold < 1 || !FRIENDLY_STOP_MODELS.has(identity) ||
+			(enabled.model && enabled.model !== identity) ||
 			current?.tokens === null || current === null || current.tokens < threshold) return false;
 		state = { version: STATE_VERSION, phase: "armed", threshold, upperThreshold, usage: current, wrapupTurns: 0 };
 		persist();
