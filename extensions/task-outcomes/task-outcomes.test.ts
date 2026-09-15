@@ -504,7 +504,8 @@ test("friendly forceStop saves before typed abort and still aborts if pause stor
     const aborts: any[] = [];
     if (failPause) h.runtime.appendEntry = () => { throw new Error("pause storage failed"); };
     const ctx: any = {
-      sessionManager: h.sm, getContextUsage: () => ({ tokens: 90, contextWindow: 100, percent: 90 }),
+      sessionManager: h.sm, model: { provider: "openai-codex-personal", id: "gpt-5.6-sol" },
+      getContextUsage: () => ({ tokens: 90, contextWindow: 100, percent: 90 }),
       abort: (options: any) => {
         assert.equal(h.persisted.some(row => row.data.kind === "context_pause"), !failPause);
         aborts.push(options);
