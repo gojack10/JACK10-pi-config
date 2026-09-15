@@ -115,9 +115,9 @@ sleep .5
       mode: "tui",
       sessionManager: SessionManager.inMemory(dir),
       modelRegistry: {
-        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "gpt-6-astra"
           ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } } : undefined,
-        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+        getAvailable: () => [{ provider: "fake-provider", id: "gpt-6-astra", reasoning: true,
           thinkingLevelMap: { xhigh: "xhigh", max: "max" } }],
       },
     };
@@ -127,13 +127,17 @@ sleep .5
     const report = join(dir, "report.md");
     await writeFile(mission, "Do the fake task.\n");
     const result: any = await owner.tools.get("subagent_launch")!.definition.execute("test", {
-      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+      jobs: [{ provider: "fake-provider", model: "gpt-6-astra", thinking: "xhigh", mission_file: mission,
         cwd: dir, session_label: "single", mode: "task", report_file: report }],
     }, undefined, undefined, ctx);
     if (result.details.jobs[0].status !== "running") console.error("DEBUG LAUNCH", result.details.jobs[0]);
     assert.equal(result.details.jobs[0].status, "running");
     childSession = result.details.jobs[0].session_label;
     assert.ok(result.details.jobs[0].manifest_file);
+    const manifest = JSON.parse(await readFile(result.details.jobs[0].manifest_file, "utf8"));
+    assert.equal(manifest.model, "gpt-6-astra");
+    assert.equal(manifest.friendlyStopPercent, undefined);
+    assert.ok(manifest.friendlyStopDirectory);
     const childPane = await tmux(["list-panes", "-t", childSession!, "-F", "#{pane_id}"]);
     const parentId = await tmux(["display-message", "-p", "-t", parentPane, "#{session_id}"]);
     const childId = await tmux(["display-message", "-p", "-t", childPane, "#{session_id}"]);
@@ -397,9 +401,9 @@ done
       mode: "tui",
       sessionManager: SessionManager.inMemory(dir),
       modelRegistry: {
-        find: (provider: string, model: string) => provider === "fake-provider" && model === "fake-model"
+        find: (provider: string, model: string) => provider === "fake-provider" && model === "gpt-5.6-sol"
           ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
-        getAvailable: () => [{ provider: "fake-provider", id: "fake-model", reasoning: true,
+        getAvailable: () => [{ provider: "fake-provider", id: "gpt-5.6-sol", reasoning: true,
           thinkingLevelMap: { xhigh: "xhigh" } }],
       },
     };
@@ -412,7 +416,7 @@ done
     await writeFile(mission, "Ask for input.\n");
     await writeFile(followupMission, "Continue after input.\n");
     const first: any = await launch.execute("test", {
-      jobs: [{ provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: mission,
+      jobs: [{ provider: "fake-provider", model: "gpt-5.6-sol", thinking: "xhigh", mission_file: mission,
         cwd: dir, session_label: "dialogue", mode: "dialogue", friendly_stop_percent: 65, friendly_stop_directory: dir }],
     }, undefined, undefined, ctx);
     const firstJob = first.details.jobs[0];
@@ -420,7 +424,7 @@ done
     childSession = firstJob.session_label;
     await until(() => messages.some(message => /need a continuation/.test(message.text)));
     const continuation = { job_id: firstJob.job, session_id: firstJob.session_id, provider: "fake-provider",
-      model: "fake-model", thinking: "xhigh", mission_file: followupMission, cwd: dir, session_label: "dialogue", mode: "dialogue" };
+      model: "gpt-5.6-sol", thinking: "xhigh", mission_file: followupMission, cwd: dir, session_label: "dialogue", mode: "dialogue" };
     await assert.rejects(followup.execute("test", { ...continuation, friendly_stop_percent: 50 }, undefined, undefined, ctx), /must match the saved launch/);
     await assert.rejects(followup.execute("test", { ...continuation, friendly_stop_percent: 65, friendly_stop_directory: join(dir, "other") }, undefined, undefined, ctx), /must match the saved launch/);
     const second: any = await followup.execute("test", continuation, undefined, undefined, ctx);
@@ -462,9 +466,15 @@ test("subagent_launch rejects an explicitly unsupported thinking level before tm
       sessionManager: SessionManager.inMemory(dir),
       modelRegistry: {
         find: (provider: string, model: string) => provider === "fake-provider" && model === "unsupported-model"
-          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: null, max: null } } : undefined,
-        getAvailable: () => [{ provider: "fake-provider", id: "unsupported-model", reasoning: true,
-          thinkingLevelMap: { xhigh: null, max: null } }],
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: null, max: null } }
+          : provider === "fake-provider" && model === "gpt-5.6-sol"
+            ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
+        getAvailable: () => [
+          { provider: "fake-provider", id: "unsupported-model", reasoning: true,
+            thinkingLevelMap: { xhigh: null, max: null } },
+          { provider: "fake-provider", id: "gpt-5.6-sol", reasoning: true,
+            thinkingLevelMap: { xhigh: "xhigh" } },
+        ],
       },
     };
     const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
@@ -481,11 +491,59 @@ test("subagent_launch rejects an explicitly unsupported thinking level before tm
     );
     for (const percent of [39, 81, 65.5]) {
       await assert.rejects(owner.tools.get("subagent_launch")!.definition.execute("test", {
-        jobs: [{ provider: "fake-provider", model: "unsupported-model", thinking: "off", mission_file: mission,
+        jobs: [{ provider: "fake-provider", model: "gpt-5.6-sol", thinking: "off", mission_file: mission,
           cwd: dir, session_label: "invalid-limit", mode: "task", report_file: report, friendly_stop_percent: percent }],
       }, undefined, undefined, ctx), /integer from 40 through 80/);
     }
     assert.equal(execCalls, 0);
+  } finally {
+    if (oldPane === undefined) delete process.env.TMUX_PANE;
+    else process.env.TMUX_PANE = oldPane;
+    await tmux(["kill-session", "-t", parentSession]).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("subagent_launch rejects friendly stop for non-allowlisted models before setup", { timeout: 5000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "subagent-friendly-allowlist-test-"));
+  const parentSession = `pi-subagent-friendly-allowlist-${process.pid}-${Date.now()}`;
+  const oldPane = process.env.TMUX_PANE;
+  await tmux(["new-session", "-d", "-s", parentSession, "-c", dir]);
+  const parentPane = await tmux(["list-panes", "-t", parentSession, "-F", "#{pane_id}"]);
+  process.env.TMUX_PANE = parentPane;
+  try {
+    const { extensions, errors, runtime } = await loadExtensions([extensionPath], dir);
+    assert.deepEqual(errors, []);
+    let execCalls = 0;
+    runtime.exec = async () => {
+      execCalls++;
+      throw new Error("tmux must not run for a rejected friendly-stop route");
+    };
+    const ctx: any = {
+      cwd: dir,
+      mode: "tui",
+      sessionManager: SessionManager.inMemory(dir),
+      modelRegistry: {
+        find: (provider: string, model: string) => provider === "fake-provider" &&
+          ["gpt-5.6-luna", "gpt-5.6-terra"].includes(model)
+          ? { provider, id: model, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } } : undefined,
+        getAvailable: () => ["gpt-5.6-luna", "gpt-5.6-terra"].map(id => ({
+          provider: "fake-provider", id, reasoning: true, thinkingLevelMap: { xhigh: "xhigh" },
+        })),
+      },
+    };
+    const owner = extensions.find(extension => extension.tools.has("subagent_launch"));
+    assert.ok(owner);
+    const mission = join(dir, "mission.md");
+    await writeFile(mission, "Do not start this route.\n");
+    for (const model of ["gpt-5.6-luna", "gpt-5.6-terra"]) {
+      await assert.rejects(owner.tools.get("subagent_launch")!.definition.execute("test", {
+        jobs: [{ provider: "fake-provider", model, thinking: "xhigh", mission_file: mission,
+          cwd: dir, session_label: "rejected", mode: "dialogue", friendly_stop_percent: 65, friendly_stop_directory: dir }],
+      }, undefined, undefined, ctx), /friendly stop is only available for gpt-6-astra and gpt-5.6-sol/);
+    }
+    assert.equal(execCalls, 0);
+    assert.equal(await tmux(["list-sessions", "-F", "#{session_name}"]), parentSession);
   } finally {
     if (oldPane === undefined) delete process.env.TMUX_PANE;
     else process.env.TMUX_PANE = oldPane;
