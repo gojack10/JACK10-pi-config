@@ -38,6 +38,7 @@ const START_CHANNEL_OPTION = "@pi_start_channel";
 const DONE_CHANNEL_OPTION = "@pi_done_channel";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
 const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
+const FRIENDLY_STOP_MODELS = new Set(["gpt-6-astra", "gpt-5.6-sol"]);
 const FRIENDLY_PRODUCTION_MODEL = "gpt-6-astra";
 
 const admissionAccepted = (result: unknown): boolean => {
@@ -658,14 +659,15 @@ export class SubagentLauncher {
       if (!SAFE_ID.test(provider.replaceAll("/", "_")) || /[\s]/.test(provider)) throw new Error("provider is not a safe route identifier");
       if (input.thinking === undefined || !THINKING_LEVELS.includes(input.thinking)) throw new Error("thinking must be explicit and valid");
       if (input.mode !== "task" && input.mode !== "dialogue") throw new Error("mode must be task or dialogue");
+      const friendlyStopRequested = input.friendly_stop_percent !== undefined || input.friendly_stop_directory !== undefined;
+      if (friendlyStopRequested && !FRIENDLY_STOP_MODELS.has(modelId)) {
+        throw new Error("friendly stop is only available for gpt-6-astra and gpt-5.6-sol");
+      }
       if (input.friendly_stop_percent !== undefined &&
           (!Number.isInteger(input.friendly_stop_percent) || input.friendly_stop_percent < 40 || input.friendly_stop_percent > 80)) {
         throw new Error("friendly_stop_percent must be an integer from 40 through 80");
       }
       if (input.friendly_stop_directory !== undefined) asPath(input.friendly_stop_directory, "friendly_stop_directory");
-      if (input.friendly_stop_directory !== undefined && input.friendly_stop_percent === undefined && input.model !== FRIENDLY_PRODUCTION_MODEL) {
-        throw new Error("friendly_stop_directory requires a friendly-stop percentage unless launching Astra");
-      }
       if (!this.ctx.modelRegistry) throw new Error("model registry is unavailable; route cannot be verified");
       const model = this.ctx.modelRegistry.find(provider, modelId);
       const available = this.ctx.modelRegistry.getAvailable().some(candidate => candidate.provider === provider && candidate.id === modelId);
@@ -695,7 +697,8 @@ export class SubagentLauncher {
     extensions: string[],
   ): Promise<StoredState> {
     let friendlyDirectory: string | undefined;
-    const friendlyOptIn = item.input.friendly_stop_percent !== undefined || item.input.model === FRIENDLY_PRODUCTION_MODEL;
+    const friendlyOptIn = item.input.friendly_stop_percent !== undefined ||
+      item.input.friendly_stop_directory !== undefined || item.input.model === FRIENDLY_PRODUCTION_MODEL;
     if (friendlyOptIn) {
       const configured = item.input.friendly_stop_directory ?? process.env.PI_RLM_ROLLOVER_DIR ?? join(tmpdir(), `pi-friendly-stop-${item.jobId}`);
       friendlyDirectory = asPath(configured, "friendly_stop_directory");

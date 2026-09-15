@@ -51,7 +51,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.deepEqual(loaded.errors, []);
   const messages: string[] = [];
   loaded.runtime.sendUserMessage = (text: string) => { messages.push(text); };
-  const model = { provider: 'openai-test', id: 'fake', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } };
+  const model = { provider: 'openai-test', id: scenario === 'friendly' ? 'gpt-5.6-sol' : 'fake', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } };
   const ctx = { cwd: dir, mode: 'tui', sessionManager: SessionManager.inMemory(dir),
     modelRegistry: { find: () => model, getAvailable: () => [model] } };
   const call = (name: string, args: unknown) => loaded.extensions.find((e: any) => e.tools.has(name))
