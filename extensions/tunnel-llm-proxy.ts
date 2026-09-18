@@ -19,66 +19,11 @@ const BASE_URL = (process.env.TUNNEL_PROXY_URL || "http://127.0.0.1:8002/v1").re
 const API_KEY = process.env.TUNNEL_PROXY_API_KEY || process.env.LOCAL_LLM_PROXY_API_KEY
 	|| readFileSync(join(homedir(), ".pi", "agent", ".proxy-key"), "utf8").trim();
 
-const GEMMA_ID = "tunnel-model";
-const GEMMA_26_ID = "tunnel-model";
-const GEMMA_31_ID = "tunnel-model";
-const QWEN_27_ID = "tunnel-model";
-const QWEN_35_ID = "tunnel-model";
-const DEEPSEEK_ID = "tunnel-model";
-
-type ProxyModel = {
-	id: string;
-	name: string;
-	reasoning: boolean;
-	input: ("text" | "image")[];
-	contextWindow: number;
-	maxTokens: number;
-	compat: { maxTokensField: "max_tokens" };
-};
-
-const FALLBACK_MODELS: ProxyModel[] = [
-	{ id: GEMMA_ID, name: "Gemma 4 12B (tunnel)", reasoning: false, input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
-	{ id: GEMMA_26_ID, name: "Gemma 4 26B A4B (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } },
-	{ id: GEMMA_31_ID, name: "Gemma 4 31B (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } },
-	{ id: QWEN_27_ID, name: "Qwen3.6 27B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 130000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
-	{ id: QWEN_35_ID, name: "Qwen3.6 35B-A3B UD Q4_K_XL MLX (tunnel)", reasoning: true, input: ["text", "image"], contextWindow: 85000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } },
-	{ id: DEEPSEEK_ID, name: "DeepSeek V4 Flash (tunnel)", reasoning: true, input: ["text"], contextWindow: 524288, maxTokens: 393216, compat: { maxTokensField: "max_tokens" } },
-];
-
 function displayName(id: string, name?: string): string {
-	if (id === GEMMA_ID) return "Gemma 4 12B (tunnel)";
-	if (id === GEMMA_26_ID) return name && name !== id ? name : "Gemma 4 26B A4B (tunnel)";
-	if (id === GEMMA_31_ID) return name && name !== id ? name : "Gemma 4 31B (tunnel)";
-	if (id === QWEN_27_ID) return name && name !== id ? name : "Qwen3.6 27B UD Q4_K_XL MLX (tunnel)";
-	if (id === QWEN_35_ID) return name && name !== id ? name : "Qwen3.6 35B-A3B UD Q4_K_XL MLX (tunnel)";
-	if (id === DEEPSEEK_ID) return name && name !== id ? name : "DeepSeek V4 Flash (tunnel)";
 	return name && name !== id ? name : id;
 }
 
-function metaFor(id: string): Omit<ProxyModel, "id" | "name"> {
-	if (id === GEMMA_ID) return { reasoning: false, input: ["text"], contextWindow: 131072, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
-	if (id === GEMMA_26_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } };
-	if (id === GEMMA_31_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 262000, maxTokens: 131071, compat: { maxTokensField: "max_tokens" } };
-	if (id === QWEN_27_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 130000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
-	if (id === QWEN_35_ID) return { reasoning: true, input: ["text", "image"], contextWindow: 85000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
-	if (id === DEEPSEEK_ID) return { reasoning: true, input: ["text"], contextWindow: 524288, maxTokens: 393216, compat: { maxTokensField: "max_tokens" } };
-	return { reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 16384, compat: { maxTokensField: "max_tokens" } };
-}
-
-function fallbackModels(): Model<Api>[] {
-	return FALLBACK_MODELS.map((model) => ({
-		id: model.id,
-		name: model.name,
-		api: API,
-		provider: PROVIDER,
-		baseUrl: BASE_URL,
-		reasoning: model.reasoning,
-		input: model.input,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: model.contextWindow,
-		maxTokens: model.maxTokens,
-	}));
-}
+const num = (value: unknown, fallback: number) => (typeof value === "number" && value > 0 ? value : fallback);
 
 async function proxyModels(): Promise<Model<Api>[]> {
 	try {
@@ -92,30 +37,26 @@ async function proxyModels(): Promise<Model<Api>[]> {
 			.filter((m) => typeof m.id === "string" && m.id.length > 0)
 			.map((m) => {
 				const id = String(m.id);
-				const meta = metaFor(id);
 				return {
 					id,
 					name: displayName(id, typeof m.name === "string" ? m.name : undefined),
 					api: API,
 					provider: PROVIDER,
 					baseUrl: BASE_URL,
-					reasoning: meta.reasoning,
-					input: meta.input,
+					reasoning: m.reasoning === true,
+					input: Array.isArray(m.input) && m.input.length ? (m.input as ("text" | "image")[]) : ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: meta.contextWindow,
-					maxTokens: meta.maxTokens,
-					compat: meta.compat,
+					contextWindow: num(m.context_length ?? m.contextWindow, 128000),
+					maxTokens: num(m.max_completion_tokens ?? m.maxTokens, 16384),
+					compat: { maxTokensField: "max_tokens" },
 				};
 			})
-			.sort((a, b) => {
-				const order = (id: string) => (id === GEMMA_ID ? 0 : id === GEMMA_26_ID ? 1 : id === GEMMA_31_ID ? 2 : id === QWEN_27_ID ? 3 : id === QWEN_35_ID ? 4 : id === DEEPSEEK_ID ? 5 : 6);
-				return order(a.id) - order(b.id) || a.id.localeCompare(b.id);
-			});
+			.sort((a, b) => a.id.localeCompare(b.id));
 		if (models.length > 0) return models;
 	} catch {
-		// Fall through to static fallback; the SSH tunnel may still be coming up.
+		// The tunnel may still be coming up; pi re-lists models later.
 	}
-	return fallbackModels();
+	return [];
 }
 
 export function requestHeaders() {
