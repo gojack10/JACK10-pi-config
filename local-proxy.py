@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import subprocess
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -45,7 +46,8 @@ QWEN_FLASH_MODEL_ID = "qwen36-35b-a3b-flash-moe"
 DS4_FLASH_MODEL_ID = "tunnel-model"
 DS4_PRO_MODEL_ID = "deepseek-v4-pro"
 GLM_FLASH_MODEL_ID = "glm-5.3-flash"
-DS4_MODEL_IDS = {DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID, GLM_FLASH_MODEL_ID}
+QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
+DS4_MODEL_IDS = {GLM_FLASH_MODEL_ID, QWEN_NEXT_MODEL_ID}
 DS4_SERVICE_LABEL = "com.dsv4.server"
 DS4_DESIRED_FILE = Path.home() / ".dsv4" / "desired-model"
 DS4_SWITCH_TIMEOUT = 600
@@ -74,15 +76,23 @@ DS4_MODEL_METADATA = {
         "context_length": 1048576,
         "max_completion_tokens": 1048576,
     },
+    QWEN_NEXT_MODEL_ID: {
+        "name": "Qwen3.8 Flash Next",
+        "context_length": 500000,
+        "max_completion_tokens": 500000,
+    },
     GLM_FLASH_MODEL_ID: {
         "name": "GLM 5.3 Flash",
-        "context_length": 1048576,
+        "context_length": 500000,
         "max_completion_tokens": 393216,
     },
 }
 DS4_LOADED_MODEL_ID = None
 DS4_LOADED_CHECK_AT = 0.0
 DS4_SWITCH_LOCK = asyncio.Lock()
+REQUEST_CONDITION = asyncio.Condition(DS4_SWITCH_LOCK)
+ACTIVE_MODEL_ID = None
+ACTIVE_REQUESTS = 0
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -127,9 +137,8 @@ BACKENDS = {
 # Static routes let hot local models route correctly immediately after the proxy
 # starts, even before the first successful /v1/models discovery.
 STATIC_MODEL_BACKENDS = {
-    DS4_FLASH_MODEL_ID: "ds4",
-    DS4_PRO_MODEL_ID: "ds4",
     GLM_FLASH_MODEL_ID: "ds4",
+    QWEN_NEXT_MODEL_ID: "ds4",
     QWEN_FLASH_MODEL_ID: "flash_moe",
 }
 MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
@@ -172,7 +181,8 @@ async def discover_models():
             continue
         backend_name, ids = pair
         for model_id in ids:
-            discovered[model_id] = backend_name
+            if backend_name != "ds4" or model_id in DS4_MODEL_IDS:
+                discovered[model_id] = backend_name
 
     discovered.update(STATIC_MODEL_BACKENDS)
     MODEL_BACKENDS = discovered
@@ -189,9 +199,15 @@ async def periodic_discover():
 
 def get_backend_name(model_id):
     """Return backend name for a model ID."""
-    if model_id in STATIC_MODEL_BACKENDS:
-        return STATIC_MODEL_BACKENDS[model_id]
-    return MODEL_BACKENDS.get(model_id, DEFAULT_BACKEND)
+    if isinstance(model_id, str):
+        if model_id in STATIC_MODEL_BACKENDS:
+            return STATIC_MODEL_BACKENDS[model_id]
+        if model_id in MODEL_BACKENDS and model_id not in (DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID):
+            return MODEL_BACKENDS[model_id]
+    raise web.HTTPBadRequest(
+        text=json.dumps({"error": {"type": "unknown_model", "message": f"Unknown model ID: {model_id!r}"}}),
+        content_type="application/json",
+    )
 
 
 def get_backend_v1(model_id):
@@ -219,7 +235,7 @@ def normalize_ds4_chat_body(backend_name, body):
     payload, err = parse_json_body(body)
     if err or not isinstance(payload, dict):
         return body
-    if payload.get("model") not in DS4_MODEL_IDS:
+    if payload.get("model") not in (GLM_FLASH_MODEL_ID, DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID):
         return body
 
     changed = False
@@ -522,6 +538,7 @@ async def stop_dsv4():
     uid = os.getuid()
     domain = f"gui/{uid}"
     log.info("stopping dsv4")
+    deadline = time.monotonic() + 90
     try:
         proc = await asyncio.create_subprocess_exec(
             "/bin/launchctl", "bootout", f"gui/{uid}/{DS4_SERVICE_LABEL}",
@@ -530,9 +547,13 @@ async def stop_dsv4():
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
         if proc.returncode != 0 and b"Could not find service" not in stderr:
-            log.warning(f"launchctl bootout: {stderr.decode()[:200]}")
+            raise RuntimeError(f"launchctl bootout: {stderr.decode()[:200]}")
+        while await detect_ds4_loaded_model(refresh=True) is not None:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("DS4 process still present after graceful bootout; refusing another model")
+            await asyncio.sleep(0.25)
     except Exception as e:
-        log.warning(f"stop_dsv4 error: {e}")
+        raise web.HTTPServiceUnavailable(text=f"DS4 shutdown failed; no replacement started: {e}") from e
     global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
     DS4_LOADED_MODEL_ID = None
     DS4_LOADED_CHECK_AT = 0.0
@@ -656,15 +677,13 @@ def _model_id_from_mode(value):
         return DS4_PRO_MODEL_ID
     if value in ("glm", GLM_FLASH_MODEL_ID):
         return GLM_FLASH_MODEL_ID
+    if value in ("qwen", QWEN_NEXT_MODEL_ID):
+        return QWEN_NEXT_MODEL_ID
     return None
 
 
 def _mode_from_model_id(model_id):
-    if model_id == DS4_PRO_MODEL_ID:
-        return "pro"
-    if model_id == GLM_FLASH_MODEL_ID:
-        return "glm"
-    return "flash"
+    return {GLM_FLASH_MODEL_ID: "glm", QWEN_NEXT_MODEL_ID: "qwen"}[model_id]
 
 
 def _detect_ds4_loaded_model_sync():
@@ -674,28 +693,34 @@ def _detect_ds4_loaded_model_sync():
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError("Cannot inspect DS4 processes; refusing lifecycle action") from e
 
     ds4_lines = []
     for line in out.splitlines():
-        if "/ds4-server" not in line:
+        fields = line.split(None, 2)
+        if len(fields) < 2 or Path(fields[1]).name != "ds4-server":
             continue
-        if "--port 8001" not in line and "--port" not in line:
+        args = shlex.split(line)
+        if "--port" not in args or args[args.index("--port") + 1:][:1] != [str(DS4_PORT)]:
             continue
         ds4_lines.append(line)
 
     if not ds4_lines:
         return None
 
-    cmd = ds4_lines[-1]
+    if len(ds4_lines) != 1:
+        raise RuntimeError("Multiple DS4 processes on port 8001; refusing lifecycle action")
+    cmd = ds4_lines[0]
+    if "Qwen3.8-Flash-Next-Q4.gguf" in cmd:
+        return QWEN_NEXT_MODEL_ID
     if "GLM-5.3-Flash-Q2.gguf" in cmd:
         return GLM_FLASH_MODEL_ID
     if "DeepSeek-V4-Pro" in cmd:
         return DS4_PRO_MODEL_ID
     if "DeepSeek-V4-Flash" in cmd or "ds4flash.gguf" in cmd:
         return DS4_FLASH_MODEL_ID
-    return None
+    raise RuntimeError("Unrecognized DS4 process; refusing lifecycle action")
 
 
 async def detect_ds4_loaded_model(refresh=False):
@@ -714,21 +739,6 @@ def _write_ds4_desired_model_sync(model_id):
     DS4_DESIRED_FILE.write_text(f"{model_id}\n")
 
 
-def _kickstart_ds4_sync():
-    target = f"gui/{os.getuid()}/{DS4_SERVICE_LABEL}"
-    try:
-        subprocess.run(
-            ["/bin/launchctl", "kickstart", "-k", target],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError((e.stderr or e.stdout or str(e)).strip()) from e
-
-
 async def ds4_v1_ready():
     try:
         async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
@@ -743,12 +753,15 @@ async def ds4_is_busy():
         async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
             async with sess.get(f"{BACKENDS['ds4']['admin']}/api/stats", headers=AUTH_HEADERS) as r:
                 if r.status != 200:
-                    return False
+                    return True  # Unknown activity is not permission to stop.
                 data = await r.json()
+        models = data["active_models"]["models"]
+        if not isinstance(models, list):
+            return True
     except Exception:
-        return False
+        return True
 
-    for model in data.get("active_models", {}).get("models", []):
+    for model in models:
         if model.get("prefilling") or model.get("generating"):
             return True
     return False
@@ -764,67 +777,69 @@ async def wait_for_ds4_model(model_id):
     return False
 
 
+async def wait_for_ds4_idle():
+    # Also account for work left running after a client disconnect or proxy restart.
+    while await detect_ds4_loaded_model(refresh=True) is not None and await ds4_is_busy():
+        await asyncio.sleep(1)
+
+
 async def ensure_ds4_model(model_id):
-    if model_id not in DS4_MODEL_IDS:
+    """Called with REQUEST_CONDITION held and no admitted requests."""
+    mode = _mode_from_model_id(model_id)
+    loaded = await detect_ds4_loaded_model(refresh=True)
+    if loaded == model_id and await ds4_v1_ready():
         return
 
-    async with DS4_SWITCH_LOCK:
-        loaded = await detect_ds4_loaded_model(refresh=True)
-        if loaded == model_id and await ds4_v1_ready():
-            return
+    await wait_for_ds4_idle()
+    await omlx_unload_all()
+    log.info(f"switching ds4 backend to {model_id}")
+    if await detect_ds4_loaded_model(refresh=True) is not None:
+        await stop_dsv4()
 
-        if loaded and loaded != model_id and await ds4_is_busy():
-            raise web.HTTPConflict(
-                text=json.dumps({
-                    "error": {
-                        "message": "DSV4 is busy with another request; try again when the current generation finishes.",
-                        "type": "model_switch_busy",
-                    }
-                }),
-                content_type="application/json",
-            )
-
-        # Pre-emptively free omlx memory before loading dsv4.
-        await omlx_unload_all()
-
-        mode = _mode_from_model_id(model_id)
-        log.info(f"switching ds4 backend to {model_id}")
-
-        if loaded is not None:
-            await stop_dsv4()
-            await asyncio.sleep(3)
-
-        await asyncio.to_thread(_write_ds4_desired_model_sync, mode)
-        await start_dsv4()
-
-        global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
-        DS4_LOADED_MODEL_ID = None
-        DS4_LOADED_CHECK_AT = 0.0
-
-        if not await wait_for_ds4_model(model_id):
-            raise web.HTTPServiceUnavailable(
-                text=json.dumps({
-                    "error": {
-                        "message": f"Timed out waiting for DSV4 to load {model_id} ({mode}).",
-                        "type": "model_switch_timeout",
-                    }
-                }),
-                content_type="application/json",
-            )
-        log.info(f"ds4 backend ready: {model_id}")
+    await asyncio.to_thread(_write_ds4_desired_model_sync, mode)
+    await start_dsv4()
+    if not await wait_for_ds4_model(model_id):
+        raise web.HTTPServiceUnavailable(
+            text=json.dumps({"error": {
+                "message": f"Failed to load {model_id} ({mode}); no fallback or automatic restore was attempted.",
+                "type": "model_switch_timeout",
+            }}),
+            content_type="application/json",
+        )
+    log.info(f"ds4 backend ready: {model_id}")
 
 
-def finish_ds4_request(started):
-    global DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT
-    if not started:
-        return
-    DS4_ACTIVE_REQUESTS = max(0, DS4_ACTIVE_REQUESTS - 1)
-    DS4_LAST_REQUEST_AT = time.monotonic()
+async def begin_request(backend_name, model_id):
+    global ACTIVE_MODEL_ID, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS
+    # Same-model batching stays available. Different selections wait for the
+    # complete response lifetime, not merely for model startup.
+    # ponytail: one admission gate also serializes remote model changes;
+    # split independent backend gates only if that limits real throughput.
+    async with REQUEST_CONDITION:
+        await REQUEST_CONDITION.wait_for(lambda: not ACTIVE_REQUESTS or ACTIVE_MODEL_ID == model_id)
+        if not ACTIVE_REQUESTS:
+            if backend_name == "ds4":
+                await ensure_ds4_model(model_id)
+            else:
+                await prepare_non_ds4_backend(backend_name, model_id)
+        ACTIVE_MODEL_ID = model_id
+        ACTIVE_REQUESTS += 1
+        if backend_name == "ds4":
+            DS4_ACTIVE_REQUESTS += 1
+
+
+async def finish_request(backend_name):
+    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT
+    async with REQUEST_CONDITION:
+        ACTIVE_REQUESTS -= 1
+        if backend_name == "ds4":
+            DS4_ACTIVE_REQUESTS -= 1
+            DS4_LAST_REQUEST_AT = time.monotonic()
+        REQUEST_CONDITION.notify_all()
 
 
 async def unload_ds4_if_idle(reason):
-    if DS4_ACTIVE_REQUESTS > 0:
-        return
+    await wait_for_ds4_idle()
     if await detect_ds4_loaded_model(refresh=True) is not None:
         log.info(f"unloading dsv4 before {reason} request")
         await stop_dsv4()
@@ -864,12 +879,12 @@ async def handle_models(request):
     # DSV4 advertises switchable IDs regardless of which GGUF is actually loaded.
     # The proxy owns their lifecycle, so expose accurate static metadata here and
     # ignore DSV4's misleading duplicate model records below.
-    for model_id in (DS4_FLASH_MODEL_ID, DS4_PRO_MODEL_ID, GLM_FLASH_MODEL_ID):
+    for model_id in sorted(DS4_MODEL_IDS):
         merged.append(ds4_static_model(model_id))
         seen.add(model_id)
 
-    for result in results:
-        if isinstance(result, Exception):
+    for name, result in zip(BACKENDS, results):
+        if name == "ds4" or isinstance(result, Exception):
             continue
         for model in result:
             model_id = model.get("id")
@@ -895,15 +910,10 @@ async def handle_chat(request):
         is_stream = bool(payload.get("stream", False))
 
     backend_name = get_backend_name(model_id)
-    is_ds4 = backend_name == "ds4" and model_id in DS4_MODEL_IDS
-    ds4_started = False
+    started = False
     try:
-        if is_ds4:
-            DS4_ACTIVE_REQUESTS += 1
-            ds4_started = True
-            await ensure_ds4_model(model_id)
-        else:
-            await prepare_non_ds4_backend(backend_name, model_id)
+        await begin_request(backend_name, model_id)
+        started = True
 
         backend = BACKENDS[backend_name]["v1"]
         body = maybe_prepare_chat_body(backend_name, body)
@@ -992,7 +1002,8 @@ async def handle_chat(request):
                     log.info("client disconnected during non-stream read; backend closed")
                 return web.Response(status=resp.status, body=data, content_type=resp.content_type)
     finally:
-        finish_ds4_request(ds4_started)
+        if started:
+            await finish_request(backend_name)
 
 
 # ── /admin/api/login (forward to omlx) ──────────────────────────────────────
@@ -1025,11 +1036,19 @@ async def handle_admin_stats(request):
         if cookie:
             headers["Cookie"] = cookie
         try:
+            # DS4 advertises aliases, not the resident GGUF. Bracket the poll
+            # with fresh residency checks; omit uncertain/switching telemetry.
+            resident = await detect_ds4_loaded_model(refresh=True) if name == "ds4" else None
             async with sess.get(f"{backend['admin']}/api/stats", headers=headers) as r:
                 if r.status != 200:
                     return []
                 data = await r.json()
-                return data.get("active_models", {}).get("models", [])
+                models = data.get("active_models", {}).get("models", [])
+            if name == "ds4":
+                if not resident or resident != await detect_ds4_loaded_model(refresh=True):
+                    return []
+                models = [dict(m, id=resident) for m in models]
+            return models
         except Exception:
             return []
 
@@ -1039,16 +1058,12 @@ async def handle_admin_stats(request):
             return_exceptions=True,
         )
 
-    ds4_loaded_model_id = await detect_ds4_loaded_model()
     merged = {"active_models": {"models": []}}
     seen_ids = set()
     for models in results:
         if isinstance(models, Exception):
             continue
         for m in models:
-            if m.get("id") in DS4_MODEL_IDS:
-                m = dict(m)
-                m["id"] = ds4_loaded_model_id or DS4_FLASH_MODEL_ID
             # Skip idle models so the extension's findBestMatch latches
             # onto whichever backend is actually doing work.
             if not m.get("prefilling") and not m.get("generating"):
@@ -1074,23 +1089,16 @@ async def handle_other(request):
     body = await request.read() if request.method in ("POST", "PUT") else None
 
     model_id = ""
-    backend_name = DEFAULT_BACKEND
     if body:
         payload, err = parse_json_body(body)
         if not err and isinstance(payload, dict):
             model_id = payload.get("model", "")
-            if model_id:
-                backend_name = get_backend_name(model_id)
-    is_ds4 = backend_name == "ds4" and model_id in DS4_MODEL_IDS
-    ds4_started = False
+    backend_name = get_backend_name(model_id)
+    started = False
 
     try:
-        if is_ds4:
-            DS4_ACTIVE_REQUESTS += 1
-            ds4_started = True
-            await ensure_ds4_model(model_id)
-        else:
-            await prepare_non_ds4_backend(backend_name, model_id)
+        await begin_request(backend_name, model_id)
+        started = True
         if body:
             body = maybe_prepare_flash_body(backend_name, body)
 
@@ -1110,7 +1118,8 @@ async def handle_other(request):
                 data = await resp.read()
                 return web.Response(status=resp.status, body=data, content_type=resp.content_type)
     finally:
-        finish_ds4_request(ds4_started)
+        if started:
+            await finish_request(backend_name)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
