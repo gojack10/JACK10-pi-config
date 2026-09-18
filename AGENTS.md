@@ -17,3 +17,13 @@ pi --list-models '<provider/model>'
 ```
 
 Do not validate only with `pi --no-extensions -e <entrypoint>`: that bypasses normal discovery and will miss accidental top-level helper/test files.
+
+## New machine
+
+Six extensions read `~/.pi/agent/codex-accounts.json`, which names your Codex accounts and is never committed. Start from the tracked template and edit it:
+
+```bash
+cp codex-accounts.example.json codex-accounts.json
+```
+
+The shape enforced by `parseRegistry` in `extensions/codex-quota-extension/store.ts`: unique `accountKey` per account, `providerId` starting with `openai-codex`, matching `credentialRef`, a `label`, `policyClass` of `stable-weekly` | `perishable` | `unknown`, and `supportedModels` as model-id strings. Also create the two local-only secrets: `~/.pi/agent/.proxy-key` (localhost proxy key) and `~/.vega-url` (VEGA endpoint).
