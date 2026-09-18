@@ -3,12 +3,16 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const BASE_URL = "https://vega.redacted.invalid";
+// VEGA endpoint lives outside the repo, like ~/.vega-auth.
+function readHomeFile(name: string): string {
+  try { return readFileSync(`${homedir()}/${name}`, "utf8").trim(); } catch { return ""; }
+}
+
+const BASE_URL = readHomeFile(".vega-url");
 const POLL_MS = 2000;
 
 function authHeader(): string {
-  try { return readFileSync(`${homedir()}/.vega-auth`, "utf8").trim(); }
-  catch { return ""; }
+  return readHomeFile(".vega-auth");
 }
 
 function lastAssistantText(messages: readonly any[]): string {
