@@ -54,7 +54,7 @@ handoffs/
 skills/browser-harness/
 prompt-stashes.jsonl
 
-# Private run artifacts / local identity (kept on tunnel only)
+# Private run artifacts / local identity (local-only)
 ideation-runs/
 codex-accounts.json
 transcript-*.md
