@@ -7,14 +7,14 @@
  * On cache hit: tools load instantly (<50ms). On cache miss/expiry: ~2s connect.
  * No background refresh — cache invalidation is time-based only.
  *
- * Auth: set SIFTTEXT_API_KEY env var (sk-... key from SiftText API key management)
+ * Auth: SIFTTEXT_API_KEY env var, or ~/.pi/agent/.sifttext-key (read, never written)
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { execFileSync } from "node:child_process";
 import { callMcpTool, initializeMcp, listMcpTools, mcpTextContent } from "../_shared/mcp-http";
+import { siftTextKey } from "../_shared/sifttext-key";
 
 const MCP_URL = "https://app.sifttext.com/mcp";
 const CONNECT_TIMEOUT_MS = 2_000;
@@ -24,40 +24,6 @@ const AUTH_ERROR_RE = /MCP HTTP 401|Invalid or expired (?:API key|access token)/
 
 let workingTokenCache: string | undefined;
 
-function singleKey(seed?: string): string[] {
-	const candidates: string[] = [];
-	const seen = new Set<string>();
-	const add = (token: string | undefined) => {
-		const trimmed = token?.trim();
-		if (!trimmed || seen.has(trimmed)) return;
-		seen.add(trimmed);
-		candidates.push(trimmed);
-	};
-
-	add(seed);
-	add(process.env.SIFTTEXT_API_KEY);
-
-	try {
-		const out = execFileSync("tmux", ["show-environment", "-g", "SIFTTEXT_API_KEY"], {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
-		const [, value] = out.split("=", 2);
-		add(value);
-	} catch {}
-
-	try {
-		const out = execFileSync("ps", [""], {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		const re = /(?:^|\s)SIFTTEXT_API_KEY=([^\s]+)/g;
-		let match: RegExpExecArray | null;
-		while ((match = re.exec(out))) add(match[1]);
-	} catch {}
-
-	return candidates;
-}
 
 async function tokenWorks(token: string): Promise<boolean> {
 	const controller = new AbortController();
@@ -72,28 +38,17 @@ async function tokenWorks(token: string): Promise<boolean> {
 	}
 }
 
-function syncToken(token: string) {
-	try {
-		execFileSync("tmux", ["set-environment", "-g", "SIFTTEXT_API_KEY", token], {
-			stdio: ["ignore", "ignore", "ignore"],
-		});
-	} catch {}
-}
 
 async function getWorkingToken(seed?: string): Promise<string | undefined> {
 	if (workingTokenCache && (await tokenWorks(workingTokenCache))) return workingTokenCache;
 
-	for (const token of singleKey(seed)) {
-		if (await tokenWorks(token)) {
-			workingTokenCache = token;
-			process.env.SIFTTEXT_API_KEY = token;
-			syncToken(token);
-			return token;
-		}
+	const candidate = seed ?? siftTextKey();
+	if (!candidate || !(await tokenWorks(candidate))) {
+		workingTokenCache = undefined;
+		return undefined;
 	}
-
-	workingTokenCache = undefined;
-	return seed ?? process.env.SIFTTEXT_API_KEY;
+	workingTokenCache = candidate;
+	return candidate;
 }
 
 function isAuthError(err: unknown): boolean {
@@ -241,7 +196,7 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 export default async function (pi: ExtensionAPI) {
 	const token = await getWorkingToken(process.env.SIFTTEXT_API_KEY);
 	if (!token) {
-		console.warn("[sifttext-mcp] SIFTTEXT_API_KEY not set — skipping SiftText tools");
+		console.warn("[sifttext-mcp] no working SiftText key (bad key or unreachable endpoint) — skipping SiftText tools");
 		return;
 	}
 
