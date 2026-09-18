@@ -10,24 +10,11 @@
  * Auth: set SIFTTEXT_API_KEY env var (sk-... key from SiftText API key management)
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { callMcpTool, initializeMcp, listMcpTools, mcpTextContent } from "../_shared/mcp-http";
-import {
-	hasSiftTextPullDone,
-	inputIncludesSiftTextIdeationWrite,
-	isKnownToolWrapper,
-	isSiftTextIdeationWriteTool,
-	normNodeId,
-	rememberSiftTextPullRead,
-	requiredSiftTextPullNode,
-	siftTextPullBlockReason,
-	siftTextToolTargetNodeId,
-	SIFTTEXT_COMMIT_PULL_NODES,
-	SIFTTEXT_IDEATION_READ_TOOLS,
-} from "../_shared/sifttext-pull-gate";
 
 const MCP_URL = "https://app.sifttext.com/mcp";
 const CONNECT_TIMEOUT_MS = 2_000;
@@ -119,87 +106,18 @@ type CachedTool = {
 	inputSchema: Record<string, unknown>;
 };
 
-type SiftTextPullGateState = {
-	pullNodeIds: Set<string>;
-};
-
-const PULL_STATE_STATE_ENTRY = "sifttext-pull-gate-state";
-
-function freshPullGateState(): SiftTextPullGateState {
-	return { pullNodeIds: new Set() };
-}
-
-function restorePullGateState(ctx: ExtensionContext, state: SiftTextPullGateState) {
-	state.pullNodeIds = new Set();
-	const entries = ctx.sessionManager.getEntries();
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i] as { type?: string; customType?: string; data?: Record<string, unknown> };
-		if (entry.type !== "custom" || entry.customType !== PULL_STATE_STATE_ENTRY || !entry.data) continue;
-		const ids = Array.isArray(entry.data.pullNodeIds)
-			? (entry.data.pullNodeIds as unknown[])
-			: [];
-		state.pullNodeIds = new Set(
-			ids
-				.filter((id): id is string => typeof id === "string")
-				.map(normNodeId)
-				.filter((id) => Boolean(requiredSiftTextPullNode(id))),
-		);
-		return;
-	}
-}
-
-function persistPullGateState(pi: ExtensionAPI, state: SiftTextPullGateState) {
-	pi.appendEntry(PULL_STATE_STATE_ENTRY, {
-		pullDone: hasSiftTextPullDone(state),
-		pullNodeIds: [...state.pullNodeIds],
-	});
-}
-
-export function registerSiftTextPullGate(pi: ExtensionAPI) {
-	const state = freshPullGateState();
-
-	pi.on("session_start", async (_event, ctx) => {
-		restorePullGateState(ctx, state);
-	});
-
-	pi.on("tool_call", async (event) => {
-		const input = (event.input ?? {}) as Record<string, unknown>;
-
-		// Witness the PULL: any read tool that names a required node ID counts.
-		if (SIFTTEXT_IDEATION_READ_TOOLS.has(event.toolName) && event.toolName !== "sifttext_sql") {
-			const beforeSize = state.pullNodeIds.size;
-			const beforeDone = hasSiftTextPullDone(state);
-			const read = rememberSiftTextPullRead(state, siftTextToolTargetNodeId(input));
-			if (read && (state.pullNodeIds.size !== beforeSize || read.done !== beforeDone)) {
-				persistPullGateState(pi, state);
-			}
-			return;
-		}
-		if (event.toolName === "sifttext_sql") {
-			const query = String((input as { query?: unknown }).query ?? "").toLowerCase();
-			let changed = false;
-			for (const node of SIFTTEXT_COMMIT_PULL_NODES) {
-				const id = normNodeId(node.id);
-				if (!state.pullNodeIds.has(id) && query.includes(id)) {
-					state.pullNodeIds.add(id);
-					changed = true;
-				}
-			}
-			if (changed) persistPullGateState(pi, state);
-			return;
-		}
-
-		const directWrite = isSiftTextIdeationWriteTool(event.toolName);
-		const wrappedWrite = isKnownToolWrapper(event.toolName) && inputIncludesSiftTextIdeationWrite(input);
-		if (
-			(directWrite || wrappedWrite) &&
-			pi.getFlag("rlm-writer") !== true &&
-			!hasSiftTextPullDone(state)
-		) {
-			return { block: true, reason: siftTextPullBlockReason(state, "sifttext") };
-		}
-	});
-}
+// Exposed MCP surface: node/outline/sql reads plus ideation writes.
+const IDEATION_READ_TOOLS = new Set(["sifttext_get_node", "sifttext_get_outline", "sifttext_sql"]);
+const IDEATION_WRITE_TOOLS = new Set([
+	"sifttext_create_tree", "sifttext_create_node", "sifttext_crystallize_append",
+	"sifttext_crystallize_replace", "sifttext_edit_crystallization", "sifttext_edit_section",
+	"sifttext_edit_scope", "sifttext_set_scope", "sifttext_mark_stuck", "sifttext_resolve",
+	"sifttext_discard", "sifttext_defer", "sifttext_activate", "sifttext_set_priority",
+	"sifttext_add_warning", "sifttext_add_ruled_out", "sifttext_set_vitals", "sifttext_rename_node",
+	"sifttext_move_node", "sifttext_move_cross_tree", "sifttext_delete_node",
+	"sifttext_duplicate_node", "sifttext_promote_to_root", "sifttext_link_by_name",
+	"sifttext_reorder_children",
+]);
 
 // ── Lazy imports ────────────────────────────────────────────────────────────
 
@@ -237,7 +155,7 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 
 	for (const tool of tools) {
 		// ponytail: only expose node/outline/sql reads plus ideation writes.
-		if (!SIFTTEXT_IDEATION_READ_TOOLS.has(tool.name) && !isSiftTextIdeationWriteTool(tool.name)) continue;
+		if (!IDEATION_READ_TOOLS.has(tool.name) && !IDEATION_WRITE_TOOLS.has(tool.name)) continue;
 		const rawSchema = tool.inputSchema;
 		const properties = (rawSchema?.properties ?? {}) as Record<string, unknown>;
 		const required = (rawSchema?.required ?? []) as string[];
@@ -321,12 +239,6 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
-	pi.registerFlag("rlm-writer", {
-		description: "Only for an already-approved Commit RLM Persistence writer",
-		type: "boolean",
-		default: false,
-	});
-
 	const token = await getWorkingToken(process.env.SIFTTEXT_API_KEY);
 	if (!token) {
 		console.warn("[sifttext-mcp] SIFTTEXT_API_KEY not set — skipping SiftText tools");
@@ -363,8 +275,7 @@ export default async function (pi: ExtensionAPI) {
 		} catch {}
 	}
 
-	// 3. Register the global write gate, then tools from cache (instant — TypeBox import only)
-	registerSiftTextPullGate(pi);
+	// 3. Register tools from cache (instant — TypeBox import only)
 	const registered = await registerTools(pi, tools, token);
 	console.log(`[sifttext-mcp] Registered ${registered} SiftText tools`);
 }

@@ -55,7 +55,7 @@ skills/browser-harness/
 prompt-stashes.jsonl
 
 # Private run artifacts / local identity (local-only)
-ideation-runs/
+run-packets/
 codex-accounts.json
 transcript-*.md
 
