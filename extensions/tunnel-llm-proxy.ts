@@ -7,13 +7,17 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { streamSimple as baseStreamSimple } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const PROVIDER = "tunnel";
 const API = "tunnel-openai-completions" as Api;
 const BASE_URL = (process.env.TUNNEL_PROXY_URL || "http://127.0.0.1:8002/v1").replace(/\/+$/, "");
-const API_KEY = process.env.TUNNEL_PROXY_API_KEY || process.env.LOCAL_LLM_PROXY_API_KEY || "REDACTED-LOCAL-KEY";
+const API_KEY = process.env.TUNNEL_PROXY_API_KEY || process.env.LOCAL_LLM_PROXY_API_KEY
+	|| readFileSync(join(homedir(), ".pi", "agent", ".proxy-key"), "utf8").trim();
 
 const GEMMA_ID = "tunnel-model";
 const GEMMA_26_ID = "tunnel-model";
