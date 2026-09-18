@@ -8,14 +8,15 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { callMcpTool, mcpTextContent } from "../_shared/mcp-http";
+import { siftTextKey } from "../_shared/sifttext-key";
 
 const NODE_ID = "d36f646c-f719-4383-843b-e4458e76465a";
 const MCP_URL = "https://app.sifttext.com/mcp";
 
 async function fetchNodeContent(): Promise<string> {
-  const token = process.env.SIFTTEXT_API_KEY;
+  const token = siftTextKey();
   if (!token) {
-    throw new Error("SIFTTEXT_API_KEY environment variable is not set");
+    throw new Error("SiftText key not found (set SIFTTEXT_API_KEY or write ~/.pi/agent/.sifttext-key)");
   }
 
   const result = await callMcpTool(
