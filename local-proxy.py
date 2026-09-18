@@ -92,7 +92,10 @@ DS4_IDLE_TASK = None
 OMLX_ADMIN_COOKIE = None
 OMLX_LOGIN_LOCK = asyncio.Lock()
 
-AUTH_HEADERS = {"Authorization": "Bearer REDACTED-LOCAL-KEY"}
+# Localhost-only proxy key: env override, then the gitignored .proxy-key next to this file.
+PROXY_API_KEY = (os.getenv("LOCAL_LLM_PROXY_API_KEY")
+                 or (Path(__file__).resolve().parent / ".proxy-key").read_text().strip())
+AUTH_HEADERS = {"Authorization": f"Bearer {PROXY_API_KEY}"}
 
 BACKENDS = {
     "ds4": {
@@ -438,7 +441,7 @@ async def omlx_admin_login():
         try:
             jar = CookieJar()
             async with ClientSession(timeout=DISCOVERY_TIMEOUT, cookie_jar=jar) as sess:
-                payload = {"api_key": "REDACTED-LOCAL-KEY"}
+                payload = {"api_key": PROXY_API_KEY}
                 async with sess.post(
                     f"{BACKENDS['omlx']['admin']}/api/login",
                     json=payload,
