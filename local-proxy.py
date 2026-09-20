@@ -926,6 +926,10 @@ async def handle_chat(request):
         for name in ("X-Pi-Request-Id", "X-Pi-Origin"):
             if value := request.headers.get(name):
                 headers[name] = value
+        # Pi's own requests ask ds4-server to stream plain answers live instead of
+        # holding them behind the second-reasoning guard (see X-Pi-Live-Answer).
+        if headers.get("X-Pi-Request-Id") or headers.get("X-Pi-Origin"):
+            headers["X-Pi-Live-Answer"] = "1"
         log.debug("request provenance id=%s origin=%s", headers.get("X-Pi-Request-Id"), headers.get("X-Pi-Origin"))
 
         async with ClientSession(timeout=CHAT_TIMEOUT) as sess:
