@@ -7,7 +7,7 @@ type Handler = (event: unknown, ctx: any) => Promise<void> | void;
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const MODEL = "deepseek-v4.1-flash";
 
-test("decode odometer ticks once per streamed token and snaps up to the server", async (t) => {
+test("decode odometer ticks once per streamed token and never re-snaps", async (t) => {
   const handlers = new Map<string, Handler>();
   const messages: string[] = [];
   const originalFetch = globalThis.fetch;
@@ -49,7 +49,7 @@ test("decode odometer ticks once per streamed token and snaps up to the server",
   await handlers.get("agent_start")?.({}, ctx);
   await wait(300);
   assert.ok(
-    messages.some((m) => m.includes("Generating") && m.includes("- 3 tokens")),
+    messages.some((m) => m.includes("Decoding") && m.includes("- 3 tokens")),
     "server count should seed the odometer",
   );
 
@@ -66,5 +66,9 @@ test("decode odometer ticks once per streamed token and snaps up to the server",
   assert.ok(messages.some((m) => m.includes("- 6 tokens")));
 
   await wait(300);
-  assert.ok(messages.some((m) => m.includes("- 50 tokens")), "server count should snap the odometer up");
+  assert.ok(!messages.some((m) => m.includes("- 50 tokens")), "a later server count must not jump the odometer");
+  assert.ok(
+    messages.some((m) => m.includes("Decoding") && m.includes("- 6 tokens")),
+    "count stays at the last streamed token",
+  );
 });

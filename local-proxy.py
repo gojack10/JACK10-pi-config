@@ -942,12 +942,14 @@ async def handle_chat(request):
             "Authorization": request.headers.get("Authorization", AUTH_HEADERS["Authorization"]),
             "Content-Type": "application/json",
         }
-        for name in ("X-Pi-Request-Id", "X-Pi-Origin"):
+        for name in ("X-Pi-Request-Id", "X-Pi-Origin", "X-Pi-Live-Answer"):
             if value := request.headers.get(name):
                 headers[name] = value
-        # Pi's own requests ask ds4-server to stream plain answers live instead of
-        # holding them behind the second-reasoning guard (see X-Pi-Live-Answer).
-        if headers.get("X-Pi-Request-Id") or headers.get("X-Pi-Origin"):
+        # Pi marks its own requests with X-Pi-Live-Answer; the tunnel-style
+        # headers stay a fallback marker for clients that only send those.
+        if "X-Pi-Live-Answer" not in headers and (
+            headers.get("X-Pi-Request-Id") or headers.get("X-Pi-Origin")
+        ):
             headers["X-Pi-Live-Answer"] = "1"
         log.debug("request provenance id=%s origin=%s", headers.get("X-Pi-Request-Id"), headers.get("X-Pi-Origin"))
 

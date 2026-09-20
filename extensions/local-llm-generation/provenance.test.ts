@@ -13,6 +13,6 @@ test("progress labels only non-user origins per activity", () => {
   assert.doesNotMatch(prefill(), /USER|REWRITER/);
   assert.doesNotMatch(prefill("user"), /USER|REWRITER/);
   assert.match(prefill("vega-rewriter"), /Prefill \(VEGA-REWRITER\)/);
-  assert.match(decode("vega-rewriter"), /Generating \(VEGA-REWRITER\)/);
+  assert.match(decode("vega-rewriter"), /Decoding \(VEGA-REWRITER\)/);
   assert.equal([prefill("user"), prefill("vega-rewriter")].filter((line) => line.includes("REWRITER")).length, 1);
 });
