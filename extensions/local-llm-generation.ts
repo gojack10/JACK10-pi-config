@@ -292,7 +292,7 @@ export function formatDecode(data: ProgressData): string {
   const speed = formatTokS(data.tok_s);
   const clbl = (data.count != null && data.count > 1) ? ` (${data.count})` : "";
   const sp = speed ? `  (${speed})` : "";
-  return `Generating${originLabel(data.origin)}${clbl} - ${data.tokens} tokens${sp}`;
+  return `Decoding${originLabel(data.origin)}${clbl} - ${data.tokens} tokens${sp}`;
 }
 
 export function formatPrefillChunks(data: {
@@ -393,6 +393,12 @@ export default function (pi: ExtensionAPI) {
       count: decodeCount,
     });
   }
+
+  // Mark Pi's local requests so ds4-server streams a plain answer live instead
+  // of holding it behind its second-reasoning guard.
+  pi.on("before_provider_headers", (event, _ctx: ExtensionContext) => {
+    if (isLocalModel) event.headers["X-Pi-Live-Answer"] = "1";
+  });
 
   // Pi stream events: one delta per generated token. They tick the decode
   // counter at the real token cadence.
@@ -596,9 +602,11 @@ export default function (pi: ExtensionAPI) {
             decodeSpeed = getItemSpeed(g);
             decodeOrigin = g.origin;
             decodeCount = gen.length;
-            // The stream count leads the poll; snap up when the server is ahead.
-            const authoritative = numeric(g.generated_tokens ?? g.tokens);
-            if (authoritative > decodeTokens) decodeTokens = authoritative;
+            // Seed once before the stream starts ticking; never re-snap, so the
+            // count advances one token at a time instead of jumping each poll.
+            if (decodeTokens === 0) {
+              decodeTokens = numeric(g.generated_tokens ?? g.tokens);
+            }
             ctx.ui.setWorkingMessage(renderDecode());
           }
         }
