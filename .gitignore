@@ -14,6 +14,7 @@ codex-usage-state.json*
 probe-schedule.json*
 codex-*observability.jsonl
 traffic-state.json*
+local-llm-bites.json
 .traffic-key
 *.log
 
