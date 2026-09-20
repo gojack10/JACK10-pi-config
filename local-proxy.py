@@ -47,7 +47,8 @@ DS4_FLASH_MODEL_ID = "tunnel-model"
 DS4_PRO_MODEL_ID = "deepseek-v4-pro"
 GLM_FLASH_MODEL_ID = "glm-5.3-flash"
 QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
-DS4_MODEL_IDS = {GLM_FLASH_MODEL_ID, QWEN_NEXT_MODEL_ID}
+DS41_MODEL_ID = "deepseek-v4.1-flash"
+DS4_MODEL_IDS = {QWEN_NEXT_MODEL_ID, DS41_MODEL_ID}
 DS4_SERVICE_LABEL = "com.dsv4.server"
 DS4_DESIRED_FILE = Path.home() / ".dsv4" / "desired-model"
 DS4_SWITCH_TIMEOUT = 600
@@ -85,6 +86,13 @@ DS4_MODEL_METADATA = {
         "name": "GLM 5.3 Flash",
         "context_length": 500000,
         "max_completion_tokens": 393216,
+    },
+    # Must match the wrapper's --ctx for the ds41 case; a mismatch desyncs Pi's
+    # view from the resident engine.
+    DS41_MODEL_ID: {
+        "name": "DeepSeek V4.1 Flash",
+        "context_length": 500000,
+        "max_completion_tokens": 500000,
     },
 }
 DS4_LOADED_MODEL_ID = None
@@ -139,6 +147,9 @@ BACKENDS = {
 STATIC_MODEL_BACKENDS = {
     GLM_FLASH_MODEL_ID: "ds4",
     QWEN_NEXT_MODEL_ID: "ds4",
+    # DSV4 only advertises the model it currently holds, so V4.1 needs a static
+    # backend entry or it becomes unroutable while another model is resident.
+    DS41_MODEL_ID: "ds4",
     QWEN_FLASH_MODEL_ID: "flash_moe",
 }
 MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
@@ -683,7 +694,11 @@ def _model_id_from_mode(value):
 
 
 def _mode_from_model_id(model_id):
-    return {GLM_FLASH_MODEL_ID: "glm", QWEN_NEXT_MODEL_ID: "qwen"}[model_id]
+    return {
+        GLM_FLASH_MODEL_ID: "glm",
+        QWEN_NEXT_MODEL_ID: "qwen",
+        DS41_MODEL_ID: "ds41",
+    }[model_id]
 
 
 def _detect_ds4_loaded_model_sync():
@@ -712,6 +727,10 @@ def _detect_ds4_loaded_model_sync():
     if len(ds4_lines) != 1:
         raise RuntimeError("Multiple DS4 processes on port 8001; refusing lifecycle action")
     cmd = ds4_lines[0]
+    # Checked before the V4-Flash fallback: the V4.1 filename does not contain
+    # the V4-Flash substring, but keep the specific match first regardless.
+    if "DeepSeek-V4.1-Flash" in cmd:
+        return DS41_MODEL_ID
     if "Qwen3.8-Flash-Next-Q4.gguf" in cmd:
         return QWEN_NEXT_MODEL_ID
     if "GLM-5.3-Flash-Q2.gguf" in cmd:
