@@ -17,8 +17,8 @@
  * Supported admin stats shape:
  *   { active_models: { models: [{ id, prefilling: [...], generating: [...] }] } }
  *
- * oMLX: logs in through /admin/api/login and polls /admin/api/stats.
- * ds4-server: polls /admin/api/stats directly.
+ * mlx-lm (:8000) has no admin API; ds4-server polls /admin/api/stats directly.
+ * /admin/api/login answers 204 because no local backend needs a session.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";

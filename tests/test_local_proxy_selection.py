@@ -56,7 +56,8 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             "start_dsv4": start,
             "_write_ds4_desired_model_sync": desired,
             "wait_for_ds4_model": wait,
-            "omlx_unload_all": AsyncMock(),
+            "stop_mlx": AsyncMock(),
+            "mlx_resident_model": AsyncMock(return_value=None),
         }
         for name, value in mocks.items():
             self.enterContext(patch.object(p, name, value))
@@ -76,6 +77,73 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.ds4_static_model(p.GLM_FLASH_MODEL_ID)["context_length"], 500000)
         body = json.dumps({"model": p.QWEN_NEXT_MODEL_ID, "reasoning_effort": "xhigh"}).encode()
         self.assertEqual(p.maybe_prepare_chat_body("ds4", body), body)
+
+    async def test_all_mlx_checkpoints_route_and_rewrite(self):
+        p = self.p
+        self.assertEqual(set(p.MLX_MODEL_PATHS), set(p.MLX_MODEL_METADATA))
+        for mid in p.MLX_MODEL_IDS:
+            self.assertEqual(p.get_backend_name(mid), "mlx")
+            body = json.dumps({"model": mid, "messages": []}).encode()
+            self.assertEqual(json.loads(p.maybe_prepare_chat_body("mlx", body))["model"],
+                             p.mlx_model_path(mid))
+        # Native context on every checkpoint; no YaRN scaling anywhere.
+        self.assertEqual({c["context_length"] for c in p.MLX_MODEL_METADATA.values()}, {262144})
+        # An unknown id must never fall through to the mlx backend.
+        with self.assertRaises(p.web.HTTPBadRequest):
+            p.mlx_model_path("qwen3.8-27b-uncensored-typo")
+        with self.assertRaises(p.web.HTTPBadRequest):
+            p.get_backend_name("qwen3.8-27b-uncensored-typo")
+
+    async def test_mlx_switch_evicts_then_publishes_one_checkpoint(self):
+        p = self.p
+        events, desired = [], []
+        resident = {"id": "gemma-4-31b-mlx"}
+
+        async def fake_resident():
+            return resident["id"]
+
+        async def fake_stop():
+            events.append("stop")
+            resident["id"] = None
+
+        def fake_desired(path):
+            events.append("desired")
+            desired.append(path)
+
+        async def fake_start():
+            events.append("start")
+            resident["id"] = next(m for m in p.MLX_MODEL_IDS
+                                  if p.mlx_model_path(m) == desired[-1])
+
+        with patch.object(p, "mlx_resident_model", fake_resident), \
+             patch.object(p, "stop_mlx", fake_stop), \
+             patch.object(p, "start_mlx", fake_start), \
+             patch.object(p, "_write_mlx_desired_sync", fake_desired):
+            await p.ensure_mlx_model("qwen3.8-27b-uncensored")
+            self.assertEqual(events, ["stop", "desired", "start"])
+            self.assertEqual(resident["id"], "qwen3.8-27b-uncensored")
+            # Already resident: a second request must not disturb the job.
+            await p.ensure_mlx_model("qwen3.8-27b-uncensored")
+            self.assertEqual(events, ["stop", "desired", "start"])
+
+    async def test_mlx_switch_fails_loud_on_wrong_resident_checkpoint(self):
+        p = self.p
+        with patch.object(p, "mlx_resident_model", AsyncMock(return_value=None)), \
+             patch.object(p, "stop_mlx", AsyncMock()), \
+             patch.object(p, "start_mlx", AsyncMock()), \
+             patch.object(p, "_write_mlx_desired_sync", lambda path: None):
+            with self.assertRaises(p.web.HTTPServiceUnavailable):
+                await p.ensure_mlx_model("qwen3.8-27b-uncensored")
+
+    async def test_mlx_lifecycle_is_owned_by_the_proxy(self):
+        p = self.p
+        ensure = AsyncMock()
+        with patch.object(p, "ensure_mlx_model", ensure):
+            await p.prepare_non_ds4_backend("mlx", "gemma-4-31b-mlx")
+        ensure.assert_awaited_with("gemma-4-31b-mlx")
+        self.assertEqual(p.stop_mlx.await_count, 0)
+        await p.prepare_non_ds4_backend("tunnel", p.DS4_FLASH_MODEL_ID)
+        p.stop_mlx.assert_awaited()
 
     async def test_batching_and_switch_waits_for_entire_request(self):
         p = self.p
@@ -153,6 +221,34 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
                 await p.ds4_idle_check_loop()
         self.assertEqual(self.events, ["stop"])
         self.assertIsNone(self.loaded)
+
+    async def test_mlx_idle_unload_waits_for_quiescence(self):
+        p = self.p
+        resident = {"id": "gemma-4-31b-mlx"}
+        ticks = 0
+
+        async def fake_resident():
+            return resident["id"]
+
+        async def fake_stop():
+            # Real stop_mlx() owns this timer reset.
+            resident["id"] = None
+            p.MLX_LAST_REQUEST_AT = 0.0
+
+        async def tick(_):
+            nonlocal ticks
+            ticks += 1
+            if ticks > 1:
+                raise asyncio.CancelledError
+
+        p.MLX_LAST_REQUEST_AT = p.time.monotonic() - p.MLX_IDLE_TIMEOUT - 1
+        with patch.object(p, "mlx_resident_model", fake_resident), \
+             patch.object(p, "stop_mlx", fake_stop), \
+             patch.object(p.asyncio, "sleep", tick):
+            with self.assertRaises(asyncio.CancelledError):
+                await p.mlx_idle_check_loop()
+        self.assertIsNone(resident["id"])
+        self.assertEqual(p.MLX_LAST_REQUEST_AT, 0.0)
 
     async def test_handler_keeps_reservation_until_backend_response(self):
         p = self.p
@@ -249,7 +345,7 @@ class TelemetryTests(unittest.IsolatedAsyncioTestCase):
                 pass
             def get(self, url, **kwargs):
                 return Response(rows if url == p.BACKENDS['ds4']['admin'] + '/api/stats'
-                                else [other] if url == p.BACKENDS['omlx']['admin'] + '/api/stats' else [])
+                                else [other] if url == p.BACKENDS['tunnel']['admin'] + '/api/stats' else [])
 
         detector = AsyncMock(side_effect=resident if isinstance(resident, Exception)
                              else [resident, resident if after is None else after])
@@ -290,13 +386,47 @@ class TelemetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WrapperTests(unittest.TestCase):
+    def test_mlx_wrapper_argv_without_model_load(self):
+        source = Path.home() / ".mlx-lm/mlx-server.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".mlx-lm").mkdir()
+            (home / ".local/bin").mkdir(parents=True)
+            checkpoint = home / ".mlx-lm/models/Qwen3.8-27B-Uncensored-8bit"
+            checkpoint.mkdir(parents=True)
+            fake = home / ".local/bin/mlx_lm.server"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            fake.chmod(0o755)
+            env = {"HOME": str(home), "PATH": "/bin:/usr/bin"}
+            desired = home / ".mlx-lm/desired-model"
+            desired.write_text(str(checkpoint) + "\n")
+            result = subprocess.run(["/bin/sh", str(source)], capture_output=True,
+                                    text=True, check=True, env=env)
+            args = result.stdout.splitlines()
+            self.assertEqual(args[args.index("--model") + 1], str(checkpoint))
+            self.assertEqual(args[args.index("--port") + 1], "8000")
+            # Memory-only posture: the wrapper adds no cache or vision flags.
+            for flag in ("--kv-disk-dir", "--paged-ssd-cache-dir", "--vision", "--kv-bits"):
+                self.assertNotIn(flag, args)
+            for bad in ("", "typo", str(home / ".mlx-lm/models/Missing")):
+                desired.write_text(bad + "\n")
+                refused = subprocess.run(["/bin/sh", str(source)], capture_output=True,
+                                         text=True, env=env)
+                with self.subTest(desired=bad):
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertEqual(refused.stdout, "")
+            desired.unlink()
+            refused = subprocess.run(["/bin/sh", str(source)], capture_output=True,
+                                     text=True, env=env)
+            self.assertNotEqual(refused.returncode, 0)
+
     def test_wrapper_argv_without_exec_or_model_load(self):
         source = Path('/Users/jack/.dsv4/dsv4-server-wrapper.sh').read_text()
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / '.dsv4').mkdir()
             script = 'mock_exec() { printf "%s\\n" "$@"; exit 0; }\n' + source.replace('HOME_DIR="/Users/jack"', f'HOME_DIR="{home}"').replace('exec "', 'mock_exec "')
-            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '500000'), ('glm', 'glm-5.3-flash', '500000')]:
+            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '500000'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
                 (home / '.dsv4/desired-model').write_text(mode)
                 result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True, check=True)
                 args = result.stdout.splitlines()
