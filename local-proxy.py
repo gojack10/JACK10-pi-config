@@ -580,11 +580,17 @@ async def stop_mlx():
 async def start_mlx():
     uid = os.getuid()
     plist = str(Path.home() / "Library" / "LaunchAgents" / f"{MLX_SERVICE_LABEL}.plist")
+    label = f"gui/{uid}/{MLX_SERVICE_LABEL}"
     log.info("starting mlx-lm")
     try:
+        # The job runs with RunAtLoad=false so no activation or login can load a
+        # checkpoint beside ds4; bootstrap only registers it, so kick it off.
         code, out = await _mlx_launchctl("bootstrap", f"gui/{uid}", plist)
         if code != 0 and b"already bootstrapped" not in out:
             raise RuntimeError(f"launchctl bootstrap: {out.decode()[:200]}")
+        code, out = await _mlx_launchctl("kickstart", label)
+        if code != 0:
+            raise RuntimeError(f"launchctl kickstart: {out.decode()[:200]}")
         deadline = time.monotonic() + MLX_START_TIMEOUT
         while time.monotonic() < deadline:
             if await mlx_resident_model() is not None:

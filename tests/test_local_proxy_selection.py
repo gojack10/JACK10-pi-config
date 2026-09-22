@@ -135,6 +135,37 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(p.web.HTTPServiceUnavailable):
                 await p.ensure_mlx_model("qwen3.8-27b-uncensored")
 
+    async def test_mlx_start_bootstraps_then_kickstarts(self):
+        p = self.p
+        calls = []
+        polls = {"n": 0}
+
+        async def launchctl(*args, timeout=15):
+            calls.append(args[0])
+            return 0, b""
+
+        async def resident():
+            polls["n"] += 1
+            return "gemma-4-31b-mlx" if polls["n"] > 1 else None
+
+        with patch.object(p, "_mlx_launchctl", launchctl), \
+             patch.object(p, "mlx_resident_model", resident), \
+             patch.object(p.asyncio, "sleep", AsyncMock()):
+            await p.start_mlx()
+        # RunAtLoad=false: registration alone must not be mistaken for a start.
+        self.assertEqual(calls, ["bootstrap", "kickstart"])
+
+    async def test_mlx_start_fails_loud_when_kickstart_is_refused(self):
+        p = self.p
+
+        async def launchctl(*args, timeout=15):
+            return (0, b"") if args[0] == "bootstrap" else (1, b"Could not start job")
+
+        with patch.object(p, "_mlx_launchctl", launchctl), \
+             patch.object(p, "mlx_resident_model", AsyncMock(return_value=None)):
+            with self.assertRaises(p.web.HTTPServiceUnavailable):
+                await p.start_mlx()
+
     async def test_mlx_lifecycle_is_owned_by_the_proxy(self):
         p = self.p
         ensure = AsyncMock()
