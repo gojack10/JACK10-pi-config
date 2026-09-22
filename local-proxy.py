@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local LLM proxy: merges ds4-server (:8001), omlx (:8000), the tunnel
+Local LLM proxy: merges ds4-server (:8001), mlx-lm (:8000), the tunnel
 SSH tunnel (:8003), and local Flash-MoE llama-server (:8004) under one
 endpoint.
 
@@ -20,7 +20,7 @@ import shlex
 import time
 import uuid
 from pathlib import Path
-from aiohttp import ClientSession, ClientTimeout, CookieJar, web
+from aiohttp import ClientSession, ClientTimeout, web
 
 CHAT_TIMEOUT = ClientTimeout(total=None, sock_connect=10, sock_read=None)
 DISCOVERY_TIMEOUT = ClientTimeout(total=5, sock_connect=2, sock_read=5)
@@ -37,7 +37,7 @@ class _AccessNoiseFilter(logging.Filter):
 logging.getLogger("aiohttp.access").addFilter(_AccessNoiseFilter())
 
 DS4_PORT = 8001
-OMLX_PORT = 8000
+MLX_PORT = 8000
 TUNNEL_PORT = 8003
 FLASH_MOE_PORT = 8004
 LISTEN_PORT = 8002
@@ -47,6 +47,28 @@ DS4_FLASH_MODEL_ID = "tunnel-model"
 DS4_PRO_MODEL_ID = "deepseek-v4-pro"
 GLM_FLASH_MODEL_ID = "glm-5.3-flash"
 QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
+# mlx-lm serves exactly one checkpoint per process and has no admin API, so the
+# proxy owns its lifecycle the way it owns dsv4: the desired checkpoint goes in a
+# file, bootout frees the whole footprint, and only one model is ever resident.
+# Native context for all three checkpoints is 262,144; no YaRN scaling anywhere.
+MLX_SERVICE_LABEL = "com.mlx-lm.server"
+MLX_DESIRED_FILE = Path.home() / ".mlx-lm" / "desired-model"
+MLX_MODEL_PATHS = {
+    "qwen3.8-27b-uncensored": ".mlx-lm/models/Qwen3.8-27B-Uncensored-8bit",
+    "gemma-4-31b-mlx": ".mlx-lm/models/mlx-community/gemma-4-31b-it-8bit",
+}
+MLX_MODEL_IDS = set(MLX_MODEL_PATHS)
+MLX_MODEL_METADATA = {
+    "qwen3.8-27b-uncensored": {"name": "Qwen3.8 27B Uncensored (MLX 8-bit)", "context_length": 262144},
+    "gemma-4-31b-mlx": {"name": "Gemma 4 31B IT (MLX 8-bit)", "context_length": 262144},
+}
+MLX_SUPPORTED_PARAMETERS = [
+    "tools", "tool_choice", "max_tokens", "temperature", "top_p", "top_k",
+    "min_p", "stop", "seed", "stream",
+]
+MLX_START_TIMEOUT = 900
+MLX_IDLE_TIMEOUT = 30 * 60
+MLX_LAST_REQUEST_AT = 0.0
 DS41_MODEL_ID = "deepseek-v4.1-flash"
 DS4_MODEL_IDS = {QWEN_NEXT_MODEL_ID, DS41_MODEL_ID}
 DS4_SERVICE_LABEL = "com.dsv4.server"
@@ -107,8 +129,6 @@ DS4_ACTIVE_REQUESTS = 0
 DS4_LAST_REQUEST_AT = 0.0
 DS4_IDLE_TASK = None
 
-OMLX_ADMIN_COOKIE = None
-OMLX_LOGIN_LOCK = asyncio.Lock()
 
 # Localhost-only proxy key: env override, then the gitignored .proxy-key next to this file.
 PROXY_API_KEY = (os.getenv("LOCAL_LLM_PROXY_API_KEY")
@@ -122,10 +142,10 @@ BACKENDS = {
         "admin": f"http://127.0.0.1:{DS4_PORT}/admin",
         "models": set(),
     },
-    "omlx": {
-        "label": "omlx",
-        "v1": f"http://127.0.0.1:{OMLX_PORT}/v1",
-        "admin": f"http://127.0.0.1:{OMLX_PORT}/admin",
+    "mlx": {
+        "label": "mlx-lm",
+        "v1": f"http://127.0.0.1:{MLX_PORT}/v1",
+        "admin": None,
         "models": set(),
     },
     "tunnel": {
@@ -152,8 +172,8 @@ STATIC_MODEL_BACKENDS = {
     DS41_MODEL_ID: "ds4",
     QWEN_FLASH_MODEL_ID: "flash_moe",
 }
+STATIC_MODEL_BACKENDS.update({mid: "mlx" for mid in MLX_MODEL_IDS})
 MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
-DEFAULT_BACKEND = "omlx"
 
 # Active Flash-MoE requests, populated by proxied streaming SSE chunks.
 FLASH_ACTIVE = {}
@@ -302,7 +322,19 @@ def maybe_prepare_flash_body(backend_name, body):
 def maybe_prepare_chat_body(backend_name, body):
     body = normalize_ds4_chat_body(backend_name, body)
     body = maybe_prepare_flash_body(backend_name, body)
+    body = maybe_prepare_mlx_body(backend_name, body)
     return body
+
+
+def maybe_prepare_mlx_body(backend_name, body):
+    """mlx-lm takes a checkpoint path in `model`; the proxy owns that mapping."""
+    if backend_name != "mlx" or not body:
+        return body
+    payload, err = parse_json_body(body)
+    if err or not isinstance(payload, dict):
+        return body
+    payload["model"] = mlx_model_path(payload.get("model"))
+    return json.dumps(payload).encode()
 
 
 # ── Flash-MoE progress tracking ─────────────────────────────────────────────
@@ -460,111 +492,186 @@ def build_flash_admin_models():
 # ── Memory cop: pre-emptive unload coordination ─────────────────────────────
 
 
-async def omlx_admin_login():
-    global OMLX_ADMIN_COOKIE
-    async with OMLX_LOGIN_LOCK:
-        if OMLX_ADMIN_COOKIE:
-            return OMLX_ADMIN_COOKIE
-        try:
-            jar = CookieJar()
-            async with ClientSession(timeout=DISCOVERY_TIMEOUT, cookie_jar=jar) as sess:
-                payload = {"api_key": PROXY_API_KEY}
-                async with sess.post(
-                    f"{BACKENDS['omlx']['admin']}/api/login",
-                    json=payload,
-                ) as r:
-                    if r.status != 200:
-                        log.warning(f"omlx admin login failed: HTTP {r.status}")
-                        return None
-                    for cookie in jar:
-                        if cookie.key == "session":
-                            OMLX_ADMIN_COOKIE = f"session={cookie.value}"
-                            log.info("omlx admin session obtained")
-                            return OMLX_ADMIN_COOKIE
-        except Exception as e:
-            log.warning(f"omlx admin login error: {e}")
-        return None
+async def _mlx_launchctl(*args, timeout=15):
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/launchctl", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return proc.returncode, (stdout or b"") + (stderr or b"")
 
 
-def _omlx_admin_headers():
-    h = {"Authorization": AUTH_HEADERS["Authorization"]}
-    if OMLX_ADMIN_COOKIE:
-        h["Cookie"] = OMLX_ADMIN_COOKIE
-    return h
+def _mlx_unavailable(message):
+    return web.HTTPServiceUnavailable(
+        text=json.dumps({"error": {
+            "type": "mlx_unavailable",
+            "message": f"{message}; no fallback or automatic restore was attempted.",
+        }}),
+        content_type="application/json",
+    )
 
 
-async def omlx_loaded_model_ids():
-    await omlx_admin_login()
+def mlx_model_path(model_id):
+    """Absolute checkpoint path for a proxy model ID, resolving symlinks."""
+    if model_id not in MLX_MODEL_PATHS:
+        raise web.HTTPBadRequest(
+            text=json.dumps({"error": {"type": "unknown_model", "message": f"Unknown mlx model ID: {model_id!r}"}}),
+            content_type="application/json",
+        )
+    return str((Path.home() / MLX_MODEL_PATHS[model_id]).resolve())
+
+
+def _write_mlx_desired_sync(path):
+    # Atomic publication: the wrapper either sees the old path or the new one.
+    MLX_DESIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MLX_DESIRED_FILE.with_name("desired-model.tmp")
+    tmp.write_text(path + "\n")
+    tmp.replace(MLX_DESIRED_FILE)
+
+
+async def mlx_resident_model():
+    """Model ID whose checkpoint the loaded job reports, or None.
+
+    mlx-lm lists the resolved --model path among /v1/models ids, which is the
+    only residency signal it offers (it has no admin API).
+    """
     try:
         async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
             async with sess.get(
-                f"{BACKENDS['omlx']['admin']}/api/stats",
-                headers=_omlx_admin_headers(),
+                f"{BACKENDS['mlx']['v1']}/models", headers=AUTH_HEADERS,
             ) as r:
                 if r.status != 200:
-                    return []
-                data = await r.json()
+                    return None
+                ids = {m.get("id") for m in (await r.json()).get("data", [])}
     except Exception:
-        return []
-    ids = set()
-    for model in data.get("active_models", {}).get("models", []):
-        mid = model.get("id")
-        if mid:
-            ids.add(mid)
-    return list(ids)
+        return None
+    for model_id in MLX_MODEL_IDS:
+        if mlx_model_path(model_id) in ids:
+            return model_id
+    return None
 
 
-async def omlx_unload_ids(ids):
-    ids = list(ids)
-    if not ids:
+async def mlx_service_loaded():
+    code, _ = await _mlx_launchctl("print", f"gui/{os.getuid()}/{MLX_SERVICE_LABEL}")
+    return code == 0
+
+
+async def stop_mlx():
+    """Free the whole mlx-lm footprint by booting its job out. Idempotent."""
+    global MLX_LAST_REQUEST_AT
+    label = f"gui/{os.getuid()}/{MLX_SERVICE_LABEL}"
+    if not await mlx_service_loaded():
         return
-    log.info(f"unloading omlx models: {ids}")
-    await omlx_admin_login()
-    async with ClientSession(timeout=ClientTimeout(total=30)) as sess:
-        for mid in ids:
-            try:
-                async with sess.post(
-                    f"{BACKENDS['omlx']['admin']}/api/models/{mid}/unload",
-                    headers=_omlx_admin_headers(),
-                ) as r:
-                    if r.status in (200, 204):
-                        log.info(f"omlx unloaded: {mid}")
-                    else:
-                        log.warning(f"omlx unload {mid}: HTTP {r.status}")
-            except Exception as e:
-                log.warning(f"omlx unload {mid}: {e}")
-    await asyncio.sleep(2)
+    log.info("stopping mlx-lm")
+    try:
+        async with asyncio.timeout(90):
+            code, out = await _mlx_launchctl("bootout", label)
+            if code != 0 and b"Could not find service" not in out:
+                raise RuntimeError(f"launchctl bootout: {out.decode()[:200]}")
+            # The Metal footprint is only gone once launchd reports the job gone.
+            while await mlx_service_loaded():
+                await asyncio.sleep(0.25)
+    except Exception as e:
+        raise _mlx_unavailable(f"mlx-lm shutdown failed: {e!r}") from e
+    MLX_LAST_REQUEST_AT = 0.0
 
 
-async def omlx_unload_all():
-    await omlx_unload_ids(await omlx_loaded_model_ids())
+async def start_mlx():
+    uid = os.getuid()
+    plist = str(Path.home() / "Library" / "LaunchAgents" / f"{MLX_SERVICE_LABEL}.plist")
+    log.info("starting mlx-lm")
+    try:
+        code, out = await _mlx_launchctl("bootstrap", f"gui/{uid}", plist)
+        if code != 0 and b"already bootstrapped" not in out:
+            raise RuntimeError(f"launchctl bootstrap: {out.decode()[:200]}")
+        deadline = time.monotonic() + MLX_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if await mlx_resident_model() is not None:
+                log.info("mlx-lm backend ready")
+                return
+            await asyncio.sleep(1)
+        raise RuntimeError(f"mlx-lm served no known checkpoint within {MLX_START_TIMEOUT}s")
+    except Exception as e:
+        raise _mlx_unavailable(f"failed to start mlx-lm: {e!r}") from e
 
 
-async def omlx_unload_except(model_id):
-    ids = [mid for mid in await omlx_loaded_model_ids() if mid != model_id]
-    await omlx_unload_ids(ids)
+async def ensure_mlx_model(model_id):
+    """Called under the admission gate: make model_id the one resident checkpoint."""
+    global MLX_LAST_REQUEST_AT
+    if await mlx_resident_model() == model_id:
+        MLX_LAST_REQUEST_AT = time.monotonic()
+        return
+    # One model at a time: evict whatever is resident before publishing the next.
+    await stop_mlx()
+    await asyncio.to_thread(_write_mlx_desired_sync, mlx_model_path(model_id))
+    await start_mlx()
+    resident = await mlx_resident_model()
+    if resident != model_id:
+        raise _mlx_unavailable(f"mlx-lm reports {resident!r} instead of {model_id!r}")
+    MLX_LAST_REQUEST_AT = time.monotonic()
+
+
+async def mlx_idle_check_loop():
+    global MLX_LAST_REQUEST_AT
+    while True:
+        await asyncio.sleep(30)
+        try:
+            if ACTIVE_REQUESTS > 0:
+                continue
+            now = time.monotonic()
+            if MLX_LAST_REQUEST_AT == 0.0:
+                if await mlx_resident_model() is not None:
+                    MLX_LAST_REQUEST_AT = now
+                continue
+            if now - MLX_LAST_REQUEST_AT < MLX_IDLE_TIMEOUT:
+                continue
+            # Same shared admission lock as ds4 switching: no lifecycle action can
+            # overlap an admitted request on either backend.
+            async with DS4_SWITCH_LOCK:
+                if ACTIVE_REQUESTS > 0:
+                    MLX_LAST_REQUEST_AT = time.monotonic()
+                    continue
+                if await mlx_resident_model() is None:
+                    MLX_LAST_REQUEST_AT = 0.0
+                    continue
+                log.info(f"mlx-lm idle {now - MLX_LAST_REQUEST_AT:.0f}s; stopping")
+                await stop_mlx()
+        except Exception as e:
+            log.warning(f"mlx idle loop: {e}")
 
 
 async def stop_dsv4():
     uid = os.getuid()
-    domain = f"gui/{uid}"
+    label = f"gui/{uid}/{DS4_SERVICE_LABEL}"
     log.info("stopping dsv4")
-    deadline = time.monotonic() + 90
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/launchctl", "bootout", f"gui/{uid}/{DS4_SERVICE_LABEL}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
-        if proc.returncode != 0 and b"Could not find service" not in stderr:
-            raise RuntimeError(f"launchctl bootout: {stderr.decode()[:200]}")
-        while await detect_ds4_loaded_model(refresh=True) is not None:
-            if time.monotonic() >= deadline:
-                raise RuntimeError("DS4 process still present after graceful bootout; refusing another model")
-            await asyncio.sleep(0.25)
+        async with asyncio.timeout(90):
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/launchctl", "bootout", label,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0 and b"Could not find service" not in stderr:
+                raise RuntimeError(f"launchctl bootout: {stderr.decode()[:200]}")
+            # Process exit can precede launchd removing the old service. Starting
+            # then can address that dying registration instead of a new job.
+            while True:
+                proc = await asyncio.create_subprocess_exec(
+                    "/bin/launchctl", "print", label,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode != 0:
+                    if b"Could not find service" not in stderr:
+                        raise RuntimeError(f"launchctl print: {stderr.decode()[:200]}")
+                    if await detect_ds4_loaded_model(refresh=True) is None:
+                        break
+                await asyncio.sleep(0.25)
     except Exception as e:
-        raise web.HTTPServiceUnavailable(text=f"DS4 shutdown failed; no replacement started: {e}") from e
+        raise web.HTTPServiceUnavailable(text=f"DS4 shutdown failed; no replacement started: {str(e) or type(e).__name__}") from e
     global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
     DS4_LOADED_MODEL_ID = None
     DS4_LOADED_CHECK_AT = 0.0
@@ -658,6 +765,24 @@ async def ds4_idle_check_loop():
 
 
 # ── DS4 model switching ──────────────────────────────────────────────────────
+
+
+def mlx_static_model(model_id, cfg):
+    ctx = cfg["context_length"]
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 1767225600,
+        "owned_by": "mlx-lm",
+        "name": cfg["name"],
+        "context_length": ctx,
+        "top_provider": {
+            "context_length": ctx,
+            "max_completion_tokens": ctx,
+            "is_moderated": False,
+        },
+        "supported_parameters": MLX_SUPPORTED_PARAMETERS,
+    }
 
 
 def ds4_static_model(model_id):
@@ -810,7 +935,7 @@ async def ensure_ds4_model(model_id):
         return
 
     await wait_for_ds4_idle()
-    await omlx_unload_all()
+    await stop_mlx()
     log.info(f"switching ds4 backend to {model_id}")
     if await detect_ds4_loaded_model(refresh=True) is not None:
         await stop_dsv4()
@@ -866,10 +991,10 @@ async def unload_ds4_if_idle(reason):
 
 async def prepare_non_ds4_backend(backend_name, model_id):
     await unload_ds4_if_idle(backend_name)
-    if backend_name == "omlx":
-        await omlx_unload_except(model_id)
+    if backend_name == "mlx":
+        await ensure_mlx_model(model_id)
     else:
-        await omlx_unload_all()
+        await stop_mlx()
 
 
 # ── /v1/models (merge) ───────────────────────────────────────────────────────
@@ -902,8 +1027,14 @@ async def handle_models(request):
         merged.append(ds4_static_model(model_id))
         seen.add(model_id)
 
+    # mlx-lm serves one checkpoint and reports its path as the model id, so the
+    # proxy advertises the stable ID whether or not the job is currently loaded.
+    for model_id, cfg in MLX_MODEL_METADATA.items():
+        merged.append(mlx_static_model(model_id, cfg))
+        seen.add(model_id)
+
     for name, result in zip(BACKENDS, results):
-        if name == "ds4" or isinstance(result, Exception):
+        if name in ("ds4", "mlx") or isinstance(result, Exception):
             continue
         for model in result:
             model_id = model.get("id")
@@ -1031,21 +1162,13 @@ async def handle_chat(request):
             await finish_request(backend_name)
 
 
-# ── /admin/api/login (forward to omlx) ──────────────────────────────────────
+# ── /admin/api/login (no backend requires it) ───────────────────────────────
 
 async def handle_admin_login(request):
-    """Forward login to omlx (ds4/llama.cpp do not need auth)."""
-    body = await request.read()
-    headers = {
-        "Content-Type": request.headers.get("Content-Type", "application/json"),
-    }
-    async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
-        async with sess.post(f"{BACKENDS['omlx']['admin']}/api/login", data=body, headers=headers) as resp:
-            data = await resp.read()
-            response = web.Response(status=resp.status, body=data, content_type=resp.content_type)
-            if resp.headers.get("Set-Cookie"):
-                response.headers["Set-Cookie"] = resp.headers["Set-Cookie"]
-            return response
+    """No backend needs a login session any more (mlx-lm/ds4/llama.cpp are
+    static-bearer or unauthenticated); 204 keeps clients that still try."""
+    await request.read()
+    return web.Response(status=204)
 
 
 # ── /admin/api/stats (merge from backends) ──────────────────────────────────
@@ -1079,7 +1202,7 @@ async def handle_admin_stats(request):
 
     async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
         results = await asyncio.gather(
-            *(fetch_admin_models(sess, name) for name in ("ds4", "omlx", "tunnel")),
+            *(fetch_admin_models(sess, name) for name in ("ds4", "tunnel")),
             return_exceptions=True,
         )
 
@@ -1156,6 +1279,7 @@ async def main():
     await discover_models()
     asyncio.create_task(periodic_discover())
     asyncio.create_task(ds4_idle_check_loop())
+    asyncio.create_task(mlx_idle_check_loop())
 
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
