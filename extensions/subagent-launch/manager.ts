@@ -207,6 +207,7 @@ const extensionPaths = (): string[] => {
   return [
     join(extensionsDir, "codex-workspaces.ts"),
     join(extensionsDir, "background-jobs.ts"),
+    join(extensionsDir, "local-llm-generation.ts"),
     join(extensionsDir, "task-outcomes.ts"),
     // task-outcomes emits task-outcome synchronously from agent_settled;
     // tmux-turn-signal must run afterward to await its publication.

@@ -15,12 +15,14 @@
  * authoritative count at each poll.
  *
  * Supported admin stats shape:
- *   { active_models: { models: [{ id, prefilling: [...], generating: [...] }] } }
+ *   { active_models: { models: [{ id, prefilling: [...], generating: [...] }] },
+ *     queue_depth: number, queue_position: number | null, request_state: string }
  *
  * mlx-lm (:8000) has no admin API; ds4-server polls /admin/api/stats directly.
  * /admin/api/login answers 204 because no local backend needs a session.
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -295,6 +297,13 @@ export function formatDecode(data: ProgressData): string {
   return `Decoding${originLabel(data.origin)}${clbl} - ${data.tokens} tokens${sp}`;
 }
 
+export function formatQueued(position: number): string {
+  const mod100 = position % 100;
+  const suffix = mod100 >= 11 && mod100 <= 13 ? "th"
+    : position % 10 === 1 ? "st" : position % 10 === 2 ? "nd" : position % 10 === 3 ? "rd" : "th";
+  return `Queued (${position}${suffix})`;
+}
+
 export function formatPrefillChunks(data: {
   processed: number;
   total: number;
@@ -325,6 +334,8 @@ export default function (pi: ExtensionAPI) {
   let sessionToken: {} | null = null;
   let abortedToken: {} | null = null;
   let phase: "prefill" | "decode" | null = null;
+  let requestId: string | undefined;
+  let chatRequest: { url: string; chat_id: string; request_id: string } | undefined;
   const biteGuesses = loadBiteGuesses();
 
   function rememberBite(modelId: string, bite: number) {
@@ -341,14 +352,35 @@ export default function (pi: ExtensionAPI) {
     phase = null;
   }
 
-  async function fetchJSON(url: string, headers: Record<string, string> = {}): Promise<any> {
+  async function fetchJSON(url: string, headers: Record<string, string> = {}, init: RequestInit = {}): Promise<any> {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 2000);
     try {
-      const resp = await fetch(url, { headers, signal: ctl.signal });
+      const resp = await fetch(url, { ...init, headers, signal: ctl.signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       return resp.json();
     } finally { clearTimeout(t); }
+  }
+
+  async function releaseChat(ctx: ExtensionContext) {
+    const target = chatRequest;
+    if (!target) return;
+    try {
+      const key = process.env.LOCAL_LLM_PROXY_API_KEY
+        || readFileSync(`${process.env.HOME}/.pi/agent/.proxy-key`, "utf8").trim();
+      await fetchJSON(target.url, {
+        Authorization: `Bearer ${key}`, "Content-Type": "application/json",
+      }, { method: "POST", body: JSON.stringify(target) });
+      if (chatRequest === target) chatRequest = undefined;
+    } catch (error) {
+      // Expired/released/replaced ownership is already safe. Other failures keep
+      // the target for shutdown retry; the server lease/operator action remain.
+      if (String(error).includes("HTTP 409")) {
+        if (chatRequest === target) chatRequest = undefined;
+      } else {
+        ctx.ui.notify?.(`Chat release failed: ${error}; lease/operator release remains available`, "warning");
+      }
+    }
   }
 
   function chunkDisplayProcessed(now: number): number {
@@ -397,7 +429,21 @@ export default function (pi: ExtensionAPI) {
   // Mark Pi's local requests so ds4-server streams a plain answer live instead
   // of holding it behind its second-reasoning guard.
   pi.on("before_provider_headers", (event, _ctx: ExtensionContext) => {
-    if (isLocalModel) event.headers["X-Pi-Live-Answer"] = "1";
+    const monitor = loadMonitorConfig(_ctx);
+    if (!monitor) return;
+    // Fresh request correlation, stable saved-session identity across tool calls.
+    for (const name of Object.keys(event.headers)) {
+      if (["x-pi-request-id", "x-pi-chat-id", "x-pi-chat-label"].includes(name.toLowerCase())) delete event.headers[name];
+    }
+    requestId = randomUUID();
+    const chatId = _ctx.sessionManager.getSessionId();
+    event.headers["X-Pi-Chat-Id"] = chatId;
+    event.headers["X-Pi-Chat-Label"] = (_ctx.sessionManager.getSessionName() || chatId).replace(/[^\x20-\x7e]/g, "?").slice(0, 160);
+    chatRequest = { url: monitor.statsUrl.replace(/\/stats$/, "/release-chat"), chat_id: chatId, request_id: requestId };
+    reset(); phase = null;
+    _ctx.ui.setWorkingMessage(undefined);
+    event.headers["X-Pi-Request-Id"] = requestId;
+    event.headers["X-Pi-Live-Answer"] = "1";
   });
 
   // Pi stream events: one delta per generated token. They tick the decode
@@ -426,6 +472,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(STOPPING_STATUS, undefined);
     ctx.ui.setWorkingMessage(undefined);
     isLocalModel = false;
+    requestId = undefined;
 
     const monitor = loadMonitorConfig(ctx);
     if (!monitor) return;
@@ -487,11 +534,26 @@ export default function (pi: ExtensionAPI) {
 
     const authHeaders = cookieValue ? { Cookie: cookieValue } : {};
 
+    let polling = false;
     pollTimer = setInterval(async () => {
-      if (sessionToken !== myToken) return;
+      if (sessionToken !== myToken || polling) return;
+      const polledId = requestId;
+      polling = true;
       try {
-        const stats = await fetchJSON(monitor.statsUrl, authHeaders);
-        if (sessionToken !== myToken) return;
+        const headers = polledId ? { ...authHeaders, "X-Pi-Request-Id": polledId } : authHeaders;
+        const stats = await fetchJSON(monitor.statsUrl, headers);
+        if (sessionToken !== myToken || polledId !== requestId) return;
+        const queuePosition = numeric(stats?.queue_position);
+        if (queuePosition > 0) {
+          reset(); phase = null;
+          ctx.ui.setWorkingMessage(formatQueued(queuePosition));
+          return;
+        }
+        if (stats?.request_state !== undefined && stats.request_state !== "active") {
+          reset(); phase = null;
+          ctx.ui.setWorkingMessage(undefined);
+          return;
+        }
         const models: LoadedModel[] = stats?.active_models?.models || [];
         if (updateStopping(models)) return;
         if (!models.length) { ctx.ui.setWorkingMessage(undefined); reset(); phase = null; return; }
@@ -612,6 +674,8 @@ export default function (pi: ExtensionAPI) {
         }
       } catch {
         if (abortedToken === myToken && Date.now() >= stoppingDeadline) clearStopping();
+      } finally {
+        polling = false;
       }
     }, POLL_MS);
 
@@ -637,7 +701,12 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(STOPPING_STATUS, undefined);
   });
 
+  // agent_end may be followed by automatic continuation. Only settlement is
+  // the explicit end of the whole run, including all local tool round trips.
+  pi.on("agent_settled", async (_event, ctx) => { await releaseChat(ctx); });
+
   pi.on("session_shutdown", async (_event, ctx) => {
+    await releaseChat(ctx);
     sessionToken = null;
     abortedToken = null;
     stopTimers();
