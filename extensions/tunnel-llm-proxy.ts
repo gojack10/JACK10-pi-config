@@ -6,7 +6,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
+import { buildRequestHeaders } from "./local-llm-generation/request-headers.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -59,12 +59,7 @@ async function proxyModels(): Promise<Model<Api>[]> {
 	return [];
 }
 
-export function requestHeaders() {
-	return {
-		"X-Pi-Request-Id": randomUUID(),
-		"X-Pi-Origin": process.env.PI_REQUEST_ORIGIN || "user",
-	};
-}
+export const requestHeaders = buildRequestHeaders;
 
 export default async function tunnelProxy(pi: ExtensionAPI) {
 	pi.registerProvider("local", {
@@ -72,7 +67,7 @@ export default async function tunnelProxy(pi: ExtensionAPI) {
 		streamSimple: (model, context, options) => baseStreamSimple(
 			{ ...model, api: "openai-completions" as const },
 			context,
-			{ ...options, headers: { ...options?.headers, ...requestHeaders() } },
+			{ ...options, headers: requestHeaders(options?.headers) },
 		),
 	});
 	pi.registerProvider(PROVIDER, {
@@ -84,7 +79,7 @@ export default async function tunnelProxy(pi: ExtensionAPI) {
 		streamSimple: (model, context, options) => {
 			return baseStreamSimple({ ...model, api: "openai-completions" as Api }, context, {
 				...options,
-				headers: { ...options?.headers, ...requestHeaders() },
+				headers: requestHeaders(options?.headers),
 				maxTokens: Math.min(options?.maxTokens ?? model.maxTokens ?? 8192, model.maxTokens ?? 8192),
 			});
 		},
