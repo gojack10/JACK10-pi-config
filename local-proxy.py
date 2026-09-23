@@ -123,6 +123,9 @@ DS4_SWITCH_LOCK = asyncio.Lock()
 REQUEST_CONDITION = asyncio.Condition(DS4_SWITCH_LOCK)
 ACTIVE_MODEL_ID = None
 ACTIVE_REQUESTS = 0
+ACTIVE_TICKET = None
+REQUEST_QUEUE = []
+CHAT_OWNER = None
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -623,7 +626,7 @@ async def mlx_idle_check_loop():
     while True:
         await asyncio.sleep(30)
         try:
-            if ACTIVE_REQUESTS > 0:
+            if ACTIVE_REQUESTS > 0 or live_chat_owner():
                 continue
             now = time.monotonic()
             if MLX_LAST_REQUEST_AT == 0.0:
@@ -635,7 +638,7 @@ async def mlx_idle_check_loop():
             # Same shared admission lock as ds4 switching: no lifecycle action can
             # overlap an admitted request on either backend.
             async with DS4_SWITCH_LOCK:
-                if ACTIVE_REQUESTS > 0:
+                if ACTIVE_REQUESTS > 0 or live_chat_owner():
                     MLX_LAST_REQUEST_AT = time.monotonic()
                     continue
                 if await mlx_resident_model() is None:
@@ -699,7 +702,7 @@ async def start_dsv4():
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode != 0:
                 err = (stderr or stdout).decode()[:300]
-                log.debug(f"launchctl bootstrap note: {err}")
+                log.warning(f"launchctl bootstrap note: {err}")
             proc2 = await asyncio.create_subprocess_exec(
                 "/bin/launchctl", "kickstart", label,
                 stdout=asyncio.subprocess.PIPE,
@@ -730,7 +733,8 @@ async def start_dsv4():
         if attempt == 0:
             await asyncio.sleep(1)
 
-    log.warning("dsv4 failed to load after 2 attempts; will timeout in caller")
+    log.error("dsv4 failed to load after 2 attempts")
+    raise web.HTTPServiceUnavailable(text="DS4 launch failed after 2 attempts; no fallback was attempted")
 
 
 async def ds4_idle_check_loop():
@@ -739,7 +743,7 @@ async def ds4_idle_check_loop():
         await asyncio.sleep(30)
         try:
             now = time.monotonic()
-            if DS4_ACTIVE_REQUESTS > 0:
+            if DS4_ACTIVE_REQUESTS > 0 or live_chat_owner():
                 continue
             if DS4_LAST_REQUEST_AT == 0.0:
                 if await detect_ds4_loaded_model(refresh=True) is not None:
@@ -759,7 +763,7 @@ async def ds4_idle_check_loop():
                 loaded2 = await detect_ds4_loaded_model(refresh=True)
                 if loaded2 is None:
                     continue
-                if DS4_ACTIVE_REQUESTS > 0 or await ds4_is_busy():
+                if DS4_ACTIVE_REQUESTS > 0 or live_chat_owner() or await ds4_is_busy():
                     DS4_LAST_REQUEST_AT = time.monotonic()
                     continue
                 if time.monotonic() - DS4_LAST_REQUEST_AT < DS4_IDLE_TIMEOUT:
@@ -936,11 +940,10 @@ async def wait_for_ds4_idle():
 async def ensure_ds4_model(model_id):
     """Called with REQUEST_CONDITION held and no admitted requests."""
     mode = _mode_from_model_id(model_id)
+    await wait_for_ds4_idle()
     loaded = await detect_ds4_loaded_model(refresh=True)
     if loaded == model_id and await ds4_v1_ready():
         return
-
-    await wait_for_ds4_idle()
     await stop_mlx()
     log.info(f"switching ds4 backend to {model_id}")
     if await detect_ds4_loaded_model(refresh=True) is not None:
@@ -959,29 +962,136 @@ async def ensure_ds4_model(model_id):
     log.info(f"ds4 backend ready: {model_id}")
 
 
-async def begin_request(backend_name, model_id):
-    global ACTIVE_MODEL_ID, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS
-    # Same-model batching stays available. Different selections wait for the
-    # complete response lifetime, not merely for model startup.
-    # ponytail: one admission gate also serializes remote model changes;
-    # split independent backend gates only if that limits real throughput.
-    async with REQUEST_CONDITION:
-        await REQUEST_CONDITION.wait_for(lambda: not ACTIVE_REQUESTS or ACTIVE_MODEL_ID == model_id)
-        if not ACTIVE_REQUESTS:
+def client_disconnected(request):
+    if request is None:
+        return False
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
+# Cancel means cancel. Measured 2026-09-22 on the live ds4 engine: closing the
+# upstream connection aborts decode in the same second
+# (`request aborted; restoring clean abort checkpoint ... reason="cancelled
+# during generation"`), so a cancelled request stops working instead of draining
+# to EOF. The queue still never overlaps: the successor waits until the engine
+# is proven idle below. Backends with no verified abort path keep draining.
+ABORT_CONFIRMED_BACKENDS = {"ds4"}
+
+
+def live_chat_owner():
+    """Reuse the RAM-idle clock; never expire an in-flight request."""
+    global CHAT_OWNER
+    if CHAT_OWNER and not ACTIVE_REQUESTS and time.monotonic() - CHAT_OWNER["last_request_at"] >= DS4_IDLE_TIMEOUT:
+        log.info("chat lease expired chat=%s", CHAT_OWNER["chat_id"])
+        CHAT_OWNER = None
+    return CHAT_OWNER
+
+
+def admission_order():
+    owner = live_chat_owner()
+    if not owner or owner.get("release_pending"):
+        return REQUEST_QUEUE
+    # ponytail: sort pending requests (O(n log n)); index by chat only if queue
+    # size becomes material. Ownership is a reservation, not a priority class.
+    return sorted(REQUEST_QUEUE, key=lambda t: t["chat_id"] != owner["chat_id"])
+
+
+def check_inference_certainty():
+    if ACTIVE_TICKET and ACTIVE_TICKET.get("uncertain"):
+        raise web.HTTPServiceUnavailable(text="Backend completion unknown; admission closed pending operator recovery")
+
+
+async def begin_request(backend_name, model_id, request=None):
+    global ACTIVE_MODEL_ID, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_TICKET, CHAT_OWNER
+    check_inference_certainty()
+    if request is not None and request.headers.get("X-Pi-Origin") == "vega-rewriter" and (
+        ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or DS4_SWITCH_LOCK.locked()
+    ):
+        raise web.HTTPConflict(text="local inference busy; VEGA must reroute")
+    request_id = request.headers.get("X-Pi-Request-Id") if request is not None else None
+    for existing in [*REQUEST_QUEUE, ACTIVE_TICKET]:
+        if request_id and existing and existing["request_id"] == request_id:
+            # The ID can no longer identify either caller's progress reliably.
+            existing["ambiguous"] = True
+            raise web.HTTPConflict(text="X-Pi-Request-Id already in use; send a fresh ID")
+    chat_id = request.headers.get("X-Pi-Chat-Id") if request is not None else None
+    if chat_id and (len(chat_id) > 128 or not all(c.isascii() and (c.isalnum() or c in "-_") for c in chat_id)):
+        raise web.HTTPBadRequest(text="Invalid X-Pi-Chat-Id")
+    ticket = {
+        "chat_id": chat_id,
+        "chat_label": request.headers.get("X-Pi-Chat-Label", "")[:160] if request is not None else "",
+        "identity": object(),  # list.remove must not equate anonymous requests
+        "backend": backend_name,
+        "model": model_id,
+        "request_id": request_id,
+    }
+    # Appending before the first await preserves arrival order even while the
+    # head holds DS4_SWITCH_LOCK for a safe backend transition.
+    REQUEST_QUEUE.append(ticket)
+    log.info("queued request id=%s model=%s position=%d", request_id or "-", model_id, len(REQUEST_QUEUE))
+    try:
+        async with REQUEST_CONDITION:
+            # Track all pending IDs for collision/poll safety. An owner's next
+            # request bypasses FIFO, but never an in-flight request.
+            while (ACTIVE_REQUESTS or admission_order()[0] is not ticket or
+                   (live_chat_owner() and CHAT_OWNER["chat_id"] != chat_id)):
+                check_inference_certainty()
+                if client_disconnected(request):
+                    raise ConnectionResetError("client disconnected while queued")
+                try:
+                    await asyncio.wait_for(REQUEST_CONDITION.wait(), 0.1)
+                except asyncio.TimeoutError:
+                    pass
+            if client_disconnected(request):
+                raise ConnectionResetError("client disconnected while queued")
             if backend_name == "ds4":
                 await ensure_ds4_model(model_id)
             else:
                 await prepare_non_ds4_backend(backend_name, model_id)
-        ACTIVE_MODEL_ID = model_id
-        ACTIVE_REQUESTS += 1
-        if backend_name == "ds4":
-            DS4_ACTIVE_REQUESTS += 1
+            if client_disconnected(request):
+                raise ConnectionResetError("client disconnected while queued")
+            REQUEST_QUEUE.remove(ticket)
+            if chat_id:
+                now = time.monotonic()
+                if not CHAT_OWNER:
+                    CHAT_OWNER = {"chat_id": chat_id, "label": ticket["chat_label"], "held_since": now}
+                CHAT_OWNER.update(last_request_at=now, request_id=request_id)
+            log.info("admitted request id=%s chat=%s model=%s", request_id or "-", chat_id or "-", model_id)
+            ACTIVE_MODEL_ID = model_id
+            ACTIVE_TICKET = ticket
+            ACTIVE_REQUESTS = 1
+            if backend_name == "ds4":
+                DS4_ACTIVE_REQUESTS += 1
+    except BaseException:
+        if ticket in REQUEST_QUEUE:
+            REQUEST_QUEUE.remove(ticket)
+        if CHAT_OWNER and CHAT_OWNER["chat_id"] == chat_id:
+            # A continuation can fail/cancel during preparation, before its new
+            # ID is admitted. Do not strand the previous request's reservation.
+            if ACTIVE_REQUESTS:
+                CHAT_OWNER["release_pending"] = True
+            else:
+                CHAT_OWNER = None
+        # ponytail: disconnect detection polls at 100 ms; replace with an
+        # aiohttp transport callback only if queued cancellation latency matters.
+        raise
 
 
-async def finish_request(backend_name):
-    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT
+async def finish_request(backend_name, uncertain=False, release_chat=False):
+    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT, ACTIVE_TICKET, CHAT_OWNER
     async with REQUEST_CONDITION:
+        if uncertain:
+            # ponytail: no portable backend completion API. Retain the owner on
+            # upstream failure; only operator-verified recovery may reopen admission.
+            ACTIVE_TICKET["uncertain"] = True
+            REQUEST_CONDITION.notify_all()
+            return
         ACTIVE_REQUESTS -= 1
+        ACTIVE_TICKET = None
+        if CHAT_OWNER:
+            CHAT_OWNER["last_request_at"] = time.monotonic()
+            if release_chat or CHAT_OWNER.get("release_pending"):
+                CHAT_OWNER = None
         if backend_name == "ds4":
             DS4_ACTIVE_REQUESTS -= 1
             DS4_LAST_REQUEST_AT = time.monotonic()
@@ -1066,9 +1176,9 @@ async def handle_chat(request):
         is_stream = bool(payload.get("stream", False))
 
     backend_name = get_backend_name(model_id)
-    started = False
+    started = forwarded = complete = cancelled = False
     try:
-        await begin_request(backend_name, model_id)
+        await begin_request(backend_name, model_id, request)
         started = True
 
         backend = BACKENDS[backend_name]["v1"]
@@ -1091,6 +1201,7 @@ async def handle_chat(request):
         log.debug("request provenance id=%s origin=%s", headers.get("X-Pi-Request-Id"), headers.get("X-Pi-Origin"))
 
         async with ClientSession(timeout=CHAT_TIMEOUT) as sess:
+            forwarded = True
             async with sess.post(f"{backend}/chat/completions", data=body, headers=headers) as resp:
                 if is_stream and resp.content_type == "text/event-stream":
                     response = web.StreamResponse(
@@ -1101,71 +1212,86 @@ async def handle_chat(request):
                             "Connection": "keep-alive",
                         },
                     )
-                    await response.prepare(request)
-
-                    client_gone = False
+                    client_gone = client_disconnected(request)
+                    if not client_gone:
+                        try:
+                            await response.prepare(request)
+                        except (ConnectionResetError, ConnectionAbortedError):
+                            client_gone = True
                     flash_req_id = flash_start(model_id) if backend_name == "flash_moe" else None
                     flash_buf = ""
-
-                    async def watchdog():
-                        nonlocal client_gone
-                        while not client_gone:
-                            await asyncio.sleep(0.5)
-                            t = request.transport
-                            if t is None or t.is_closing():
-                                client_gone = True
-                                log.info("client disconnected during stream; closing backend connection")
-                                resp.close()
-                                return
-
-                    watchdog_task = asyncio.create_task(watchdog())
+                    abort_on_cancel = backend_name in ABORT_CONFIRMED_BACKENDS
                     try:
                         async for chunk in resp.content.iter_any():
+                            if client_gone and abort_on_cancel:
+                                # Stop forwarding and close upstream now; the engine
+                                # aborts on close. Proven quiescence in the outer
+                                # finally gates the next owner, so requests still
+                                # never share it.
+                                cancelled = True
+                                break
                             if flash_req_id:
                                 flash_buf = flash_observe_chunk(flash_req_id, flash_buf, chunk)
-                            try:
-                                await response.write(chunk)
-                            except (ConnectionResetError, ConnectionAbortedError):
-                                client_gone = True
-                                log.info("client write failed; closing backend connection")
-                                resp.close()
-                                break
+                            if not client_gone:
+                                try:
+                                    await response.write(chunk)
+                                except (ConnectionResetError, ConnectionAbortedError):
+                                    client_gone = True
+                                    if abort_on_cancel:
+                                        cancelled = True
+                                        break
+                        complete = True
                         if not client_gone:
                             await response.write_eof()
-                    except Exception as e:
-                        if not client_gone:
-                            raise
-                        log.info(f"backend read aborted after client disconnect: {e!r}")
                     finally:
-                        watchdog_task.cancel()
                         flash_finish(flash_req_id)
                     return response
 
-                async def read_or_abort():
-                    nonlocal_client_gone = {"v": False}
-
-                    async def watchdog():
-                        while not nonlocal_client_gone["v"]:
-                            await asyncio.sleep(0.5)
-                            t = request.transport
-                            if t is None or t.is_closing():
-                                nonlocal_client_gone["v"] = True
-                                resp.close()
-                                return
-
-                    wd = asyncio.create_task(watchdog())
-                    try:
-                        return await resp.read(), nonlocal_client_gone["v"]
-                    finally:
-                        wd.cancel()
-
-                data, gone = await read_or_abort()
-                if gone:
-                    log.info("client disconnected during non-stream read; backend closed")
+                if backend_name in ABORT_CONFIRMED_BACKENDS and client_disconnected(request):
+                    # Already cancelled: do not start reading a response nobody wants.
+                    cancelled = True
+                    return web.Response(status=499, text="client cancelled")
+                data = await resp.read()
+                complete = True
                 return web.Response(status=resp.status, body=data, content_type=resp.content_type)
+    except ConnectionResetError:
+        if not started:
+            return web.Response(status=499, text="client cancelled before admission")
+        raise
     finally:
         if started:
-            await finish_request(backend_name)
+            if cancelled:
+                # Reuse the same quiescence wait model switching already uses: the
+                # next owner is admitted only once the engine reports it stopped.
+                await wait_for_ds4_idle()
+            await finish_request(backend_name, uncertain=forwarded and not complete and not cancelled,
+                                 release_chat=cancelled or client_disconnected(request))
+
+
+async def handle_release_chat(request):
+    """Authenticated explicit handoff, never preemption of running inference."""
+    global CHAT_OWNER
+    if request.headers.get("Authorization") != AUTH_HEADERS["Authorization"]:
+        raise web.HTTPUnauthorized()
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        raise web.HTTPBadRequest(text="Expected JSON object")
+    if not isinstance(body, dict) or not isinstance(body.get("chat_id"), str):
+        raise web.HTTPBadRequest(text="chat_id required")
+    async with REQUEST_CONDITION:
+        check_inference_certainty()
+        owner = live_chat_owner()
+        if not owner or owner["chat_id"] != body["chat_id"]:
+            raise web.HTTPConflict(text="Chat no longer owns the engine")
+        if body.get("operator") is not True and (not body.get("request_id") or body["request_id"] != owner["request_id"]):
+            raise web.HTTPConflict(text="Stale chat release")
+        if ACTIVE_REQUESTS:
+            owner["release_pending"] = True
+        else:
+            CHAT_OWNER = None
+        REQUEST_CONDITION.notify_all()
+        return web.json_response({"released": CHAT_OWNER is None, "release_pending": CHAT_OWNER is not None})
 
 
 # ── /admin/api/login (no backend requires it) ───────────────────────────────
@@ -1181,6 +1307,7 @@ async def handle_admin_login(request):
 
 async def handle_admin_stats(request):
     """Poll admin/stats and merge results with synthesized Flash-MoE activity."""
+    owner = ACTIVE_TICKET
     cookie = request.headers.get("Cookie", "")
     auth = request.headers.get("Authorization", AUTH_HEADERS["Authorization"])
 
@@ -1212,7 +1339,33 @@ async def handle_admin_stats(request):
             return_exceptions=True,
         )
 
-    merged = {"active_models": {"models": []}}
+    request_id = request.headers.get("X-Pi-Request-Id")
+    ticket = next((item for item in [*REQUEST_QUEUE, ACTIVE_TICKET]
+                   if request_id and item and item["request_id"] == request_id), None)
+    state = "unknown"
+    queue_position = None
+    if ticket:
+        if ticket.get("ambiguous"):
+            state = "ambiguous"
+        elif ticket.get("uncertain"):
+            state = "uncertain"
+        elif ticket is ACTIVE_TICKET:
+            state = "active"
+        else:
+            state = "queued"
+            queue_position = admission_order().index(ticket) + 1
+    merged = {
+        "active_models": {"models": []},
+        "queue_depth": len(REQUEST_QUEUE),
+        "queue_position": queue_position,
+        "request_state": state,
+        "chat_owner": (dict(CHAT_OWNER, held_seconds=time.monotonic() - CHAT_OWNER["held_since"])
+                       if live_chat_owner() else None),
+    }
+    # No correlated poll may display another owner, including a turnover during
+    # the backend poll. Uncorrelated admin clients retain the global view.
+    if request_id and (state != "active" or owner is not ACTIVE_TICKET):
+        return web.json_response(merged)
     seen_ids = set()
     for models in results:
         if isinstance(models, Exception):
@@ -1248,10 +1401,10 @@ async def handle_other(request):
         if not err and isinstance(payload, dict):
             model_id = payload.get("model", "")
     backend_name = get_backend_name(model_id)
-    started = False
+    started = forwarded = complete = False
 
     try:
-        await begin_request(backend_name, model_id)
+        await begin_request(backend_name, model_id, request)
         started = True
         if body:
             body = maybe_prepare_flash_body(backend_name, body)
@@ -1268,12 +1421,19 @@ async def handle_other(request):
 
         async with ClientSession(timeout=CHAT_TIMEOUT) as sess:
             meth = getattr(sess, request.method.lower())
+            forwarded = True
             async with meth(f"{backend}{path}", data=body, headers=headers) as resp:
                 data = await resp.read()
+                complete = True
                 return web.Response(status=resp.status, body=data, content_type=resp.content_type)
+    except ConnectionResetError:
+        if not started:
+            return web.Response(status=499, text="client cancelled before admission")
+        raise
     finally:
         if started:
-            await finish_request(backend_name)
+            await finish_request(backend_name, uncertain=forwarded and not complete,
+                                 release_chat=client_disconnected(request))
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -1292,6 +1452,7 @@ async def main():
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post("/admin/api/login", handle_admin_login)
     app.router.add_get("/admin/api/stats", handle_admin_stats)
+    app.router.add_post("/admin/api/release-chat", handle_release_chat)
     app.router.add_route("*", "/v1/{tail:.*}", handle_other)
     app.router.add_get("/health", lambda r: web.json_response({
         "status": "ok",
@@ -1306,7 +1467,8 @@ async def main():
     }))
 
     log.info(f"local-proxy listening on :{LISTEN_PORT}")
-    runner = web.AppRunner(app)
+    # Keep draining admitted work after client disconnect; never cancel its owner.
+    runner = web.AppRunner(app, handler_cancellation=False)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", LISTEN_PORT)
     await site.start()

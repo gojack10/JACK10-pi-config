@@ -146,6 +146,7 @@ sleep .5
     const boot = await readFile(await tmux(["show-options", "-qv", "-t", childPane, "@pi_subagent_boot_file"]), "utf8");
     assert.doesNotMatch(boot, /--no-extensions/);
     assert.match(boot, /--extension/);
+    assert.match(boot, /local-llm-generation\.ts/);
     assert.equal(await readFile(mission, "utf8"), "Do the fake task.\n");
     await until(() => messages.length === 1);
     assert.equal(messages[0].options.deliverAs, "steer");

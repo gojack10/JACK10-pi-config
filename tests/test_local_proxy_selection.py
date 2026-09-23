@@ -1,6 +1,6 @@
 """Offline only: no server, sockets, launchctl, or real model operations.
-Run with any interpreter that has aiohttp, from the repo root:
-  python -m unittest discover -s tests -p test_local_proxy_selection.py -v
+Run from the repo root:
+  uv run --with aiohttp python -m unittest discover -s tests -p test_local_proxy_selection.py -v
 """
 import asyncio
 import importlib.util
@@ -38,7 +38,8 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
 
         def desired(mode):
             self.events.append("desired:" + mode)
-            self.desired = p._model_id_from_mode(mode)
+            self.desired = {"glm": p.GLM_FLASH_MODEL_ID, "qwen": p.QWEN_NEXT_MODEL_ID,
+                            "ds41": p.DS41_MODEL_ID}[mode]
 
         async def start():
             self.events.append("start")
@@ -68,7 +69,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_exact_routes_and_unknowns(self):
         p = self.p
-        for mid in (p.GLM_FLASH_MODEL_ID, p.QWEN_NEXT_MODEL_ID):
+        for mid in (p.GLM_FLASH_MODEL_ID, p.QWEN_NEXT_MODEL_ID, p.DS41_MODEL_ID):
             self.assertEqual(p.get_backend_name(mid), "ds4")
         for mid in ("typo", "", None, [], "qwen", p.DS4_FLASH_MODEL_ID, p.DS4_PRO_MODEL_ID):
             with self.assertRaises(p.web.HTTPBadRequest):
@@ -176,19 +177,23 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         await p.prepare_non_ds4_backend("tunnel", p.DS4_FLASH_MODEL_ID)
         p.stop_mlx.assert_awaited()
 
-    async def test_batching_and_switch_waits_for_entire_request(self):
+    async def test_strict_serialization_and_switch_waits_for_entire_request(self):
         p = self.p
         await p.begin_request("ds4", p.GLM_FLASH_MODEL_ID)
-        await p.begin_request("ds4", p.GLM_FLASH_MODEL_ID)
+        same = asyncio.create_task(p.begin_request("ds4", p.GLM_FLASH_MODEL_ID))
         pending = asyncio.create_task(p.begin_request("ds4", p.QWEN_NEXT_MODEL_ID))
         await asyncio.sleep(0)
+        self.assertFalse(same.done())
         self.assertFalse(pending.done())
+        self.assertEqual(p.ACTIVE_REQUESTS, 1)
         self.assertEqual(self.events, [])
         await p.finish_request("ds4")
-        await asyncio.sleep(0)
+        await asyncio.wait_for(same, 2)
         self.assertFalse(pending.done())
+        self.assertEqual(p.ACTIVE_REQUESTS, 1)
+        self.assertEqual(self.events, [])
         await p.finish_request("ds4")
-        await pending
+        await asyncio.wait_for(pending, 2)
         self.assertEqual(self.events, ["stop", "desired:qwen", "start"])
         await p.finish_request("ds4")
         self.assertEqual(self.loaded, p.QWEN_NEXT_MODEL_ID)  # No automatic restore.
@@ -200,10 +205,19 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         await p.finish_request("ds4")
         self.assertEqual(self.events[-3:], ["stop", "desired:glm", "start"])
 
+    async def test_qwen_deepseek_round_trip(self):
+        p = self.p
+        self.loaded = p.QWEN_NEXT_MODEL_ID
+        for model, mode in ((p.DS41_MODEL_ID, "ds41"), (p.QWEN_NEXT_MODEL_ID, "qwen")):
+            await p.begin_request("ds4", model)
+            self.assertEqual(self.loaded, model)
+            self.assertEqual(self.events[-3:], ["stop", "desired:" + mode, "start"])
+            await p.finish_request("ds4")
+
     async def test_failed_qwen_never_forwards_or_restores(self):
         p = self.p
         self.fail_start = True
-        request = type("Request", (), {"read": AsyncMock(return_value=json.dumps({"model": p.QWEN_NEXT_MODEL_ID}).encode())})()
+        request = type("Request", (), {"headers": {}, "transport": type("Transport", (), {"is_closing": lambda self: False})(), "read": AsyncMock(return_value=json.dumps({"model": p.QWEN_NEXT_MODEL_ID}).encode())})()
         with self.assertRaises(p.web.HTTPServiceUnavailable) as error:
             await p.handle_chat(request)
         self.assertIn("no fallback", error.exception.text)
@@ -223,6 +237,22 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.DS4_ACTIVE_REQUESTS, 1)
         self.assertEqual(self.events, [])
         await p.finish_request("ds4")
+
+    async def test_same_model_checks_engine_idle_before_admission(self):
+        p = self.p
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def idle():
+            entered.set()
+            await release.wait()
+        with patch.object(p, "wait_for_ds4_idle", idle):
+            task = asyncio.create_task(p.begin_request("ds4", self.loaded))
+            await asyncio.wait_for(entered.wait(), 2)
+            self.assertEqual(p.ACTIVE_REQUESTS, 0)
+            self.assertFalse(task.done())
+            release.set()
+            await asyncio.wait_for(task, 2)
+        await p.finish_request("ds4")
+        self.assertEqual(self.events, [])
 
     async def test_external_busy_waits_without_stop(self):
         p = self.p
@@ -326,6 +356,66 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events, ["stop", "desired:qwen", "start"])
 
 
+class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_waits_for_service_removal_and_process_exit(self):
+        for registered, resident in ((True, False), (False, True)):
+            with self.subTest(registered=registered, resident=resident):
+                p = load_proxy()
+                calls = []
+                prints = 0
+
+                async def launchctl(*args, **kwargs):
+                    nonlocal prints
+                    calls.append(args[1])
+                    present = args[1] == "print" and registered and prints == 0
+                    if args[1] == "print":
+                        prints += 1
+                    missing = args[1] == "print" and not present
+                    return type("Process", (), {
+                        "returncode": 113 if missing else 0,
+                        "communicate": AsyncMock(return_value=(b"", b"Could not find service" if missing else b"")),
+                    })()
+
+                detector = AsyncMock(side_effect=[p.QWEN_NEXT_MODEL_ID, None] if resident else [None])
+                with patch.object(p.asyncio, "create_subprocess_exec", launchctl), \
+                     patch.object(p, "detect_ds4_loaded_model", detector), \
+                     patch.object(p.asyncio, "sleep", AsyncMock()) as sleep:
+                    await p.stop_dsv4()
+                self.assertEqual(calls, ["bootout", "print", "print"])
+                sleep.assert_awaited_once_with(0.25)
+                self.assertIsNone(p.DS4_LOADED_MODEL_ID)
+
+    async def test_shutdown_keeps_90_second_bound(self):
+        p = load_proxy()
+        proc = type("Process", (), {"returncode": 0, "communicate": AsyncMock(return_value=(b"", b""))})()
+        timeout = asyncio.timeout
+        with patch.object(p.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)), \
+             patch.object(p.asyncio, "timeout", side_effect=lambda _: timeout(0.01)) as bound:
+            with self.assertRaises(p.web.HTTPServiceUnavailable) as error:
+                await p.stop_dsv4()
+        bound.assert_called_once_with(90)
+        self.assertIn("TimeoutError", error.exception.text)
+
+    async def test_unreadable_service_state_prevents_replacement(self):
+        p = load_proxy()
+        ok = type("Process", (), {"returncode": 0, "communicate": AsyncMock(return_value=(b"", b""))})()
+        denied = type("Process", (), {"returncode": 1, "communicate": AsyncMock(return_value=(b"", b"denied"))})()
+        with patch.object(p.asyncio, "create_subprocess_exec", AsyncMock(side_effect=[ok, denied])), \
+             patch.object(p, "detect_ds4_loaded_model", AsyncMock(return_value=None)):
+            with self.assertRaises(p.web.HTTPServiceUnavailable) as error:
+                await p.stop_dsv4()
+        self.assertIn("shutdown failed; no replacement started", error.exception.text)
+        self.assertIn("denied", error.exception.text)
+
+    async def test_failed_start_does_not_wait_for_model_timeout(self):
+        p = load_proxy()
+        proc = type("Process", (), {"returncode": 1, "communicate": AsyncMock(return_value=(b"", b"not loaded"))})()
+        with patch.object(p.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)), \
+             patch.object(p.asyncio, "sleep", AsyncMock()):
+            with self.assertRaises(p.web.HTTPServiceUnavailable):
+                await p.start_dsv4()
+
+
 class FailClosedTests(unittest.IsolatedAsyncioTestCase):
     async def test_unreadable_stats_are_busy(self):
         p = load_proxy()
@@ -343,7 +433,9 @@ class FailClosedTests(unittest.IsolatedAsyncioTestCase):
         p = load_proxy()
         prefix = "123 /Users/jack/dsv4-qwen38-integration/ds4-server -m /tmp/Qwen3.8-Flash-Next-Q4.gguf --port "
         glm = "124 /Users/jack/dsv4-glm-metal/ds4-server -m /tmp/GLM-5.3-Flash-Q2.gguf --port 8001"
-        for text, expected in ((prefix + "8001", p.QWEN_NEXT_MODEL_ID), (prefix + "8009", None), (glm, p.GLM_FLASH_MODEL_ID)):
+        ds41 = "125 /Users/jack/dsv4-v41-engram/ds4-server -m /tmp/DeepSeek-V4.1-Flash-Q2.gguf --port 8001"
+        for text, expected in ((prefix + "8001", p.QWEN_NEXT_MODEL_ID), (prefix + "8009", None),
+                               (glm, p.GLM_FLASH_MODEL_ID), (ds41, p.DS41_MODEL_ID)):
             with patch.object(p.subprocess, "check_output", return_value=text):
                 self.assertEqual(p._detect_ds4_loaded_model_sync(), expected)
         with patch.object(p.subprocess, "check_output", return_value="123 /tmp/ds4-server -m unknown --port 8001"):
@@ -465,14 +557,23 @@ class WrapperTests(unittest.TestCase):
                 self.assertEqual((home / '.dsv4/active-model.intent').read_text().strip(), model)
                 self.assertNotIn('--kv-disk-dir', args)
                 self.assertNotIn('--vision', args)
-                self.assertNotIn('--ssd-streaming', args)
                 if mode == 'qwen':
+                    self.assertNotIn('--ssd-streaming', args)
                     self.assertEqual(args[0], str(home / 'dsv4-qwen38-integration/ds4-server'))
                     self.assertIn(str(home / 'projects/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf'), args)
+                    # V4.1 steering is model-bound; Qwen must never receive DS41DIR flags.
+                    self.assertNotIn('--dir-steering-file', args)
+                    self.assertNotIn('--dir-steering-strength', args)
                 else:
-                    self.assertEqual(args[0], str(home / 'dsv4-glm-metal/ds4-server'))
-                    self.assertIn('--mtp', args)
-                    self.assertEqual(args[args.index('--batched-session') + 1], '4')
+                    # Production executes from the canonical ~/ds4 checkout, and shaders
+                    # load relative to cwd, so chdir must name the same tree.
+                    self.assertEqual(args[0], str(home / 'ds4/ds4-server'))
+                    self.assertEqual(args[args.index('--chdir') + 1], str(home / 'ds4'))
+                    self.assertIn(str(home / 'dsv4-qwen38-integration/gguf/DeepSeek-V4.1-Flash-Q2.gguf'), args)
+                    self.assertIn('--ssd-streaming', args)
+                    self.assertEqual(args[args.index('--ssd-streaming-cache-experts') + 1], '64GB')
+                    self.assertIn('--dir-steering-file', args)
+                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '1')
             (home / '.dsv4/desired-model').write_text('typo')
             result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
