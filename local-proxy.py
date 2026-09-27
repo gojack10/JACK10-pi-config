@@ -16,11 +16,13 @@ import json
 import logging
 import os
 import subprocess
+import hashlib
 import shlex
 import time
 import uuid
 from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
+import reservation_body
 
 CHAT_TIMEOUT = ClientTimeout(total=None, sock_connect=10, sock_read=None)
 DISCOVERY_TIMEOUT = ClientTimeout(total=5, sock_connect=2, sock_read=5)
@@ -36,11 +38,17 @@ class _AccessNoiseFilter(logging.Filter):
 
 logging.getLogger("aiohttp.access").addFilter(_AccessNoiseFilter())
 
-DS4_PORT = 8001
+DS4_PORT = int(os.getenv('LOCAL_PROXY_DS4_PORT', '8001')) if os.getenv('LOCAL_PROXY_RESERVATION') == '1' else 8001
 MLX_PORT = 8000
 TUNNEL_PORT = 8003
 FLASH_MOE_PORT = 8004
-LISTEN_PORT = 8002
+LISTEN_PORT = int(os.getenv('LOCAL_PROXY_PORT', '8002')) if os.getenv('LOCAL_PROXY_RESERVATION') == '1' else 8002
+# Default OFF. This build has no live native adapter; never advertise a grant
+# based on an HTTP stream, an old pause file, or a process-exit observation.
+RESERVATION_TRIAL = os.getenv("LOCAL_PROXY_RESERVATION", "0") == "1"
+DUAL_MODELS = RESERVATION_TRIAL and os.getenv('LOCAL_PROXY_DUAL_MODELS') == '1'
+COORDINATOR = Path("/Users/jack/research/bend/coordinator/liveness-evidence-20260925/coordinator-cpu")
+COORDINATOR_SHA256 = "eac1a3d92d1e55c0545549dfaaa41d00298a77c4ceff953aec3b563985dd86bd"
 
 QWEN_FLASH_MODEL_ID = "qwen36-35b-a3b-flash-moe"
 DS4_FLASH_MODEL_ID = "tunnel-model"
@@ -180,6 +188,115 @@ MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
 
 # Active Flash-MoE requests, populated by proxied streaming SSE chunks.
 FLASH_ACTIVE = {}
+
+
+class CheckedReservation:
+    """CPU-only checked-core continuation. No HTTP/client data can supply an ack.
+
+    The engine adapters must establish the host facts in HOST_CONTRACT before
+    wiring any action to hardware. Until then this record is deliberately not
+    adoptable by live traffic. Effects are never inferred from core state.
+    """
+
+    MAX_NAT = 281474976410654
+
+    def __init__(self, owner, journal):
+        if len(owner) != 4 or owner[0] not in (0, 1) or any(
+            type(n) is not int or not 0 <= n <= self.MAX_NAT for n in owner
+        ):
+            raise ValueError("invalid owner binding")
+        if hashlib.sha256(COORDINATOR.read_bytes()).hexdigest() != COORDINATOR_SHA256:
+            raise RuntimeError("unqualified coordinator binary")
+        self.owner = "/".join(map(str, owner))
+        self.journal = Path(journal)
+        self.state = None
+        self.version = 0
+        self.blocked = None
+        self.dispatched = set()
+        self.calls = {}
+        self.returned = set()
+        self.lifecycle = "active"
+        self.apply(None)
+
+    def apply(self, event, effect_id=None):
+        """Serialize externally; an effect ID must remain unique across retries.
+
+        Events are internal, constructed only from identity-bound host evidence.
+        A bad CLI reply freezes this record; it cannot reset/re-begin ownership.
+        """
+        if self.blocked:
+            raise RuntimeError(f"reservation blocked: {self.blocked}")
+        if event is not None:
+            fields = event.split("/")
+            if len(event) > 4096 or not fields or any(
+                not f.isascii() or not f.isdecimal() or int(f) > self.MAX_NAT for f in fields
+            ):
+                raise ValueError("invalid private coordinator event")
+        args = [self.owner] if event is None and self.state is None else [self.state, event]
+        try:
+            new_call = int(event.split("/")[1]) if event and event.startswith("0/") else None
+            if new_call is not None and new_call in self.calls:
+                raise ValueError("duplicate accepted call")
+            result = subprocess.run([str(COORDINATOR), "--gpu", "off", *args],
+                                    capture_output=True, check=True, timeout=5)
+            text = result.stdout.decode("ascii")
+            if result.stderr or not text.endswith("\n") or text.count("\n") != 1:
+                raise ValueError("invalid coordinator framing")
+            parts = text[:-1].split(" ")
+            if len(parts) != 3 or parts[0] != "OK":
+                raise ValueError("invalid coordinator reply")
+            state, action = parts[1:]
+            for field in (state, action):
+                if len(field) > 4096 or not field or any(
+                    not f.isascii() or not f.isdecimal() or int(f) > self.MAX_NAT
+                    for f in field.split("/")
+                ):
+                    raise ValueError("invalid coordinator fields")
+            if not state.startswith(self.owner + "/") or action.split("/")[0] not in map(str, range(9)):
+                raise ValueError("foreign coordinator reply")
+            if effect_id is not None and effect_id in self.dispatched:
+                raise ValueError("reused physical effect")
+            action_fields = list(map(int, action.split("/")))
+            returned = action_fields[6:] if action_fields[0] == 7 else (
+                action_fields[1:] if action_fields[0] == 8 else []
+            )
+            if action_fields[0] == 7 and action_fields[1:5] != list(map(int, self.owner.split("/"))):
+                raise ValueError("foreign closed owner")
+            if any(call not in self.calls and call != new_call or call in self.returned for call in returned):
+                raise ValueError("foreign or reused returned call")
+            with self.journal.open("a") as output:
+                output.write(json.dumps({"version": self.version, "input": args,
+                                         "state": state, "action": action, "effect": effect_id}) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+            self.state, self.version = state, self.version + 1
+            if new_call is not None:
+                self.calls[new_call] = "accepted"
+            for call in returned:
+                self.calls[call] = "returned"
+                self.returned.add(call)
+            if effect_id is not None:
+                self.dispatched.add(effect_id)
+            if action.startswith("7/"):
+                self.lifecycle = "retiring"  # Closed is not physical release.
+            if action.startswith("6/"):
+                self.lifecycle = "blocked"
+            return action
+        except Exception as exc:
+            self.blocked = f"checked core/journal unavailable: {exc!r}"
+            self.lifecycle = "blocked"
+            raise
+
+
+def reservation_unavailable(request, backend_name):
+    """No qualified physical owner/borrower mapping exists on this build."""
+    if RESERVATION_TRIAL and (DUAL_MODELS or backend_name in ("ds4", "mlx")):
+        request_id = request.headers.get("X-Pi-Request-Id") or str(uuid.uuid4())
+        raise web.HTTPServiceUnavailable(
+            text=json.dumps({"admitted": False, "request_id": request_id,
+                             "reason": "native_reservation_adapter_unavailable"}),
+            content_type="application/json",
+        )
 
 
 async def fetch_backend_models(sess, backend_name):
@@ -849,7 +966,8 @@ def _detect_ds4_loaded_model_sync():
     ds4_lines = []
     for line in out.splitlines():
         fields = line.split(None, 2)
-        if len(fields) < 2 or Path(fields[1]).name != "ds4-server":
+        if len(fields) < 2 or (Path(fields[1]).name != "ds4-server" and
+                              fields[1] != '/Users/jack/ds4/ds4-server-v41-reservation'):
             continue
         args = shlex.split(line)
         if "--port" not in args or args[args.index("--port") + 1:][:1] != [str(DS4_PORT)]:
@@ -1001,8 +1119,11 @@ def check_inference_certainty():
         raise web.HTTPServiceUnavailable(text="Backend completion unknown; admission closed pending operator recovery")
 
 
-async def begin_request(backend_name, model_id, request=None):
+async def begin_request(backend_name, model_id, request=None, managed=False):
     global ACTIVE_MODEL_ID, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_TICKET, CHAT_OWNER
+    global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
+    if request is not None and not managed:
+        reservation_unavailable(request, backend_name)
     check_inference_certainty()
     if request is not None and request.headers.get("X-Pi-Origin") == "vega-rewriter" and (
         ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or DS4_SWITCH_LOCK.locked()
@@ -1024,11 +1145,13 @@ async def begin_request(backend_name, model_id, request=None):
         "backend": backend_name,
         "model": model_id,
         "request_id": request_id,
+        "managed": managed,
     }
     # Appending before the first await preserves arrival order even while the
     # head holds DS4_SWITCH_LOCK for a safe backend transition.
     REQUEST_QUEUE.append(ticket)
     log.info("queued request id=%s model=%s position=%d", request_id or "-", model_id, len(REQUEST_QUEUE))
+    engine = None
     try:
         async with REQUEST_CONDITION:
             # Track all pending IDs for collision/poll safety. An owner's next
@@ -1044,7 +1167,13 @@ async def begin_request(backend_name, model_id, request=None):
                     pass
             if client_disconnected(request):
                 raise ConnectionResetError("client disconnected while queued")
-            if backend_name == "ds4":
+            if managed:
+                # Switch/verify/rebind while no main is admitted and the same
+                # condition still excludes every queued request and idle task.
+                engine = await reservation_body.prepare_main(model_id)
+                DS4_LOADED_MODEL_ID = model_id
+                DS4_LOADED_CHECK_AT = time.monotonic()
+            elif backend_name == "ds4":
                 await ensure_ds4_model(model_id)
             else:
                 await prepare_non_ds4_backend(backend_name, model_id)
@@ -1062,7 +1191,10 @@ async def begin_request(backend_name, model_id, request=None):
             ACTIVE_REQUESTS = 1
             if backend_name == "ds4":
                 DS4_ACTIVE_REQUESTS += 1
+            return engine
     except BaseException:
+        if engine is not None and reservation_body.MANAGED_ENGINE_RELEASER:
+            reservation_body.MANAGED_ENGINE_RELEASER()
         if ticket in REQUEST_QUEUE:
             REQUEST_QUEUE.remove(ticket)
         if CHAT_OWNER and CHAT_OWNER["chat_id"] == chat_id:
@@ -1086,6 +1218,8 @@ async def finish_request(backend_name, uncertain=False, release_chat=False):
             ACTIVE_TICKET["uncertain"] = True
             REQUEST_CONDITION.notify_all()
             return
+        if ACTIVE_TICKET.get('managed') and reservation_body.MANAGED_ENGINE_RELEASER:
+            reservation_body.MANAGED_ENGINE_RELEASER()
         ACTIVE_REQUESTS -= 1
         ACTIVE_TICKET = None
         if CHAT_OWNER:
@@ -1164,6 +1298,11 @@ async def handle_models(request):
 
 # ── /v1/chat/completions (route by model) ───────────────────────────────────
 
+def mark_reservation_blocked():
+    if ACTIVE_TICKET:
+        ACTIVE_TICKET['uncertain'] = True
+
+
 async def handle_chat(request):
     """Route /v1/chat/completions to the right backend, streaming passthrough."""
     global DS4_ACTIVE_REQUESTS
@@ -1176,6 +1315,10 @@ async def handle_chat(request):
         is_stream = bool(payload.get("stream", False))
 
     backend_name = get_backend_name(model_id)
+    if RESERVATION_TRIAL and backend_name in ('ds4', 'mlx'):
+        return await reservation_body.handle_main(request, body, backend_name, model_id,
+            CheckedReservation, begin_request, finish_request, REQUEST_CONDITION,
+            BACKENDS[backend_name]['v1'], mark_reservation_blocked)
     started = forwarded = complete = cancelled = False
     try:
         await begin_request(backend_name, model_id, request)
@@ -1362,6 +1505,10 @@ async def handle_admin_stats(request):
         "chat_owner": (dict(CHAT_OWNER, held_seconds=time.monotonic() - CHAT_OWNER["held_since"])
                        if live_chat_owner() else None),
     }
+    # Only authenticated, matching request IDs may see retained-owner telemetry.
+    if RESERVATION_TRIAL and request.headers.get('Authorization') == AUTH_HEADERS['Authorization'] and request_id:
+        if detail := reservation_body.status(request_id):
+            merged['reservation'] = detail
     # No correlated poll may display another owner, including a turnover during
     # the backend poll. Uncorrelated admin clients retain the global view.
     if request_id and (state != "active" or owner is not ACTIVE_TICKET):
@@ -1440,16 +1587,25 @@ async def handle_other(request):
 
 async def main():
     global DS4_LAST_REQUEST_AT
+    if DUAL_MODELS:
+        from managed_switch import ManagedSwitch
+        manager = ManagedSwitch()
+        reservation_body.MANAGED_ENGINE_PREPARER = manager.prepare
+        reservation_body.MANAGED_ENGINE_RELEASER = manager.release
     if await detect_ds4_loaded_model(refresh=True) is not None:
         DS4_LAST_REQUEST_AT = time.monotonic()
     await discover_models()
     asyncio.create_task(periodic_discover())
-    asyncio.create_task(ds4_idle_check_loop())
-    asyncio.create_task(mlx_idle_check_loop())
+    if not (RESERVATION_TRIAL and os.getenv('LOCAL_PROXY_PRIVATE_LEASE') == '1'):
+        asyncio.create_task(ds4_idle_check_loop())
+        asyncio.create_task(mlx_idle_check_loop())
 
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat)
+    if RESERVATION_TRIAL:
+        app.router.add_post('/v1/systemone', reservation_body.handle_kev)
+        app.router.add_get('/v1/systemone/models', reservation_body.handle_kev_models)
     app.router.add_post("/admin/api/login", handle_admin_login)
     app.router.add_get("/admin/api/stats", handle_admin_stats)
     app.router.add_post("/admin/api/release-chat", handle_release_chat)
