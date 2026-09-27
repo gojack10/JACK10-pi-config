@@ -392,7 +392,8 @@ class FileEngine:
 
 class KevHTTP:
     """One qualified, one-shot private service process per checked StartKev."""
-    SOURCE = Path('/Users/jack/research/bend/kev-service-work/serve_gated.py')
+    SOURCE = Path(__file__).parent / 'kev-service/serve_gated.py'
+    SOURCE_SHA256 = '59a62a7adba0ba4d31686541629eeb92dc74487ed983a11fcd1bbf137c189d3f'
     VENV = Path('/Users/jack/research/bend/kev-service-work/venv/bin/python')
     ROOT = Path('/Users/jack/research/bend')
 
@@ -409,7 +410,7 @@ class KevHTTP:
         self.ready = asyncio.Event()
         self.port = None
         self.key = None
-        pinned = ((self.SOURCE, '46564a5c50c0fe160afc3b8e8266b7621dd32760caf8ea77745cebee06b6c7db'),
+        pinned = ((self.SOURCE, self.SOURCE_SHA256),
                   (self.VENV.parent.parent / 'lib/python3.13/site-packages/mlx/core.cpython-313-darwin.so',
                    'ffe1b55ee5537069606996085ef414a92f0a5fb9ddf80082f475a508e198a913'),
                   (self.VENV.parent.parent / 'lib/python3.13/site-packages/mlx/lib/libmlx.dylib',
@@ -456,7 +457,8 @@ class KevHTTP:
             port.bind(('127.0.0.1', 0))
             self.port = port.getsockname()[1]
         env = dict(os.environ, HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
-                   MLX_NATIVE_GATE='1', KEV_TRIAL_LEASE='1', KEV_API_KEY=self.api_key,
+                   MLX_NATIVE_GATE='1', KEV_TRIAL_LEASE='1', KEV_SOURCE_SHA256=self.SOURCE_SHA256,
+                   KEV_API_KEY=self.api_key,
                    KEV_CONTROL_KEY=self.control_key,
                    MLX_NATIVE_GATE_LOG=str(self.directory / 'native.jsonl'),
                    PYTHONPATH=str(self.ROOT / 'two-gaps-work/kev') + ':' +
@@ -479,7 +481,7 @@ class KevHTTP:
                     status, identity, _ = await self.http('GET', '/_kev/identity', control=True)
                     if status == 200 and identity.get('kind') == 'hello' and identity.get('ticket') == 418 and \
                         identity.get('key') == 'private-kev-http' and type(identity.get('pid')) is int and \
-                        identity['pid'] == self.process.pid:
+                        identity['pid'] == self.process.pid and identity.get('source_sha256') == self.SOURCE_SHA256:
                         self.identity = identity
                         self.previous = identity['baseline']
                         self.ready.set()
