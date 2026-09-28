@@ -12,6 +12,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from aiohttp import ClientSession, ClientTimeout, web
 
 MAX_WAIT = 90
@@ -442,8 +443,9 @@ class KevHTTP:
                     ticket=self.identity['ticket'], challenge=n, action=action)
 
     async def score(self, key, payload, reservation, request_id=None):
-        if self.process is not None or reservation.engine.hold is None or not reservation.engine.alive():
-            raise RuntimeError('borrower already dispatched or main native hold/identity lost')
+        engine = reservation.engine
+        if self.process is not None or not engine.alive() or not (engine.hold or getattr(engine, 'terminal_ticket', None)):
+            raise RuntimeError('borrower already dispatched or native hold/identity lost')
         self.key = key
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=False)
         # Recovery metadata is private and journaled before GPU-capable launch;
@@ -874,6 +876,9 @@ class Reservation:
 # continues through its original admission and finalizer when the flag is OFF.
 LIVE = None
 MAIN_TASK = None
+INDEPENDENT_ADMITTER = None  # installed by the proxy's shared admission arbiter
+INDEPENDENT_RELEASER = None
+INDEPENDENT_TASKS = set()  # supervisor survives an HTTP waiter cancellation
 CALL_COUNTER = secrets.randbits(40)
 
 
@@ -1050,6 +1055,51 @@ async def handle_main(request, body, backend_name, model_id, checked,
     # admission, including when its HTTP reader was cancelled above.
 
 
+async def independent_kev(request, call, payload, requested_id, engine):
+    borrower = None
+    launched = stopped = released = False
+    answer = response_id = error = None
+    key = str(call)
+    try:
+        borrower = KevHTTP(engine.control / ('borrow-idle-' + key))
+        score = asyncio.create_task(borrower.score(key, payload, SimpleNamespace(engine=engine), requested_id))
+        launched = True
+        try:
+            deadline = time.monotonic() + 300  # no retained main; bound this independent seat
+            while not score.done():
+                if request.transport is None or request.transport.is_closing():
+                    score.cancel()
+                    await asyncio.gather(score, return_exceptions=True)
+                    raise RuntimeError('borrower_client_disconnected')
+                if time.monotonic() >= deadline:
+                    score.cancel()
+                    await asyncio.gather(score, return_exceptions=True)
+                    raise RuntimeError('borrower timed out')
+                await asyncio.sleep(.1)
+            answer, response_id = await score
+        except BaseException as exc:
+            error = exc
+            if not score.done():
+                score.cancel()
+                await asyncio.gather(score, return_exceptions=True)
+        # Logical completion, cancellation, or failure is not native stop evidence.
+        proof = await borrower.stop(key)
+        eligible(engine.core, proof['facts'])
+        stopped = True
+    except BaseException as exc:
+        error = exc
+    finally:
+        try:
+            released = await INDEPENDENT_RELEASER(engine, stopped or not launched)
+        except BaseException as exc:
+            error = exc
+    if error:
+        raise web.HTTPServiceUnavailable(text=json.dumps(dict(admitted=True, call=call,
+            reason=str(error), awaiting_stop=launched and not stopped,
+            awaiting_release=not released)), content_type='application/json')
+    return web.json_response(answer, headers={'x-typesafe-request-id': response_id or requested_id or ''})
+
+
 async def handle_kev(request):
     global CALL_COUNTER
     if request.headers.get('Authorization') != 'Bearer ' + (
@@ -1064,14 +1114,34 @@ async def handle_kev(request):
     if not isinstance(payload, dict) or payload.get('model', 'jev-latest') not in ('jev-latest', 'kev-latest') or \
        not isinstance(payload.get('state'), dict):
         raise web.HTTPBadRequest(text='Unsupported TypeSafe scoring request')
+    requested_id = request.headers.get('x-typesafe-request-id')
+    if requested_id and (len(requested_id) > 128 or not all(c.isascii() and (c.isalnum() or c in '-_') for c in requested_id)):
+        raise web.HTTPBadRequest(text='Invalid TypeSafe request ID')
     reservation = LIVE
+    if reservation is None:
+        if INDEPENDENT_ADMITTER is None or INDEPENDENT_RELEASER is None:
+            unavailable(request, 'native_independent_adapter_unavailable')
+        try:
+            engine = await INDEPENDENT_ADMITTER(request)
+        except web.HTTPException:
+            raise
+        except Exception as exc:
+            unavailable(request, str(exc))
+        if engine is not None:
+            CALL_COUNTER += 1
+            task = asyncio.create_task(independent_kev(request, CALL_COUNTER, payload, requested_id, engine))
+            INDEPENDENT_TASKS.add(task)
+            def settled(done):
+                INDEPENDENT_TASKS.discard(done)
+                if not done.cancelled():
+                    done.exception()  # a disconnected HTTP waiter cannot consume its error
+            task.add_done_callback(settled)
+            return await asyncio.shield(task)
+        reservation = LIVE  # a main bound while this call waited for its seat
     if reservation is None or reservation.blocked or reservation.lifecycle in ('retiring','retired'):
         unavailable(request, 'retained_owner_unavailable')
     CALL_COUNTER += 1
     call = CALL_COUNTER
-    requested_id = request.headers.get('x-typesafe-request-id')
-    if requested_id and (len(requested_id) > 128 or not all(c.isascii() and (c.isalnum() or c in '-_') for c in requested_id)):
-        raise web.HTTPBadRequest(text='Invalid TypeSafe request ID')
     task = asyncio.create_task(reservation.enqueue(call, payload, requested_id))
     try:
         while not task.done():

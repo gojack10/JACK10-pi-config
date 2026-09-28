@@ -134,6 +134,7 @@ ACTIVE_REQUESTS = 0
 ACTIVE_TICKET = None
 REQUEST_QUEUE = []
 CHAT_OWNER = None
+INDEPENDENT_SWITCH = None
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -1209,6 +1210,83 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
         raise
 
 
+async def begin_independent_kev(request):
+    """Borrow the ordinary seat without switching/evicting the idle main model."""
+    global ACTIVE_TICKET, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_MODEL_ID
+    if not DUAL_MODELS or INDEPENDENT_SWITCH is None:
+        raise RuntimeError('native_independent_adapter_unavailable')
+    check_inference_certainty()
+    if ACTIVE_REQUESTS and (not ACTIVE_TICKET or not ACTIVE_TICKET.get('independent')) and reservation_body.LIVE is None:
+        raise RuntimeError('main_native_binding_pending_or_unsupported_owner')
+    ticket = dict(chat_id=None, request_id=str(uuid.uuid4()), backend='ds4',
+                  managed=True, independent=True, identity=object())
+    REQUEST_QUEUE.append(ticket)
+    manager = INDEPENDENT_SWITCH
+    try:
+        async with REQUEST_CONDITION:
+            while ACTIVE_REQUESTS or admission_order()[0] is not ticket:
+                check_inference_certainty()
+                if reservation_body.LIVE is not None:
+                    return None  # take the existing checked pause path instead
+                if client_disconnected(request):
+                    raise ConnectionResetError('borrower_client_disconnected')
+                try:
+                    await asyncio.wait_for(REQUEST_CONDITION.wait(), .1)
+                except asyncio.TimeoutError:
+                    pass
+            if reservation_body.LIVE is not None:
+                return None
+            if client_disconnected(request):
+                raise ConnectionResetError('borrower_client_disconnected')
+            # A running MLX job can submit without this DS4 terminal gate.
+            code, output = await _mlx_launchctl('print', f'gui/{os.getuid()}/{MLX_SERVICE_LABEL}')
+            lines = [line.strip() for line in output.splitlines()]
+            if code == 0 and (any(line.startswith(b'pid = ') for line in lines) or
+                              b'state = waiting' not in lines):
+                raise RuntimeError('mlx_native_gate_not_qualified_for_independent_kev')
+            if code != 0 and b'Could not find service' not in output:
+                raise RuntimeError('mlx_process_state_unknown')
+            if manager.blocked:
+                raise RuntimeError('managed_native_owner_blocked')
+            # ponytail: lease wait holds the admission lock for up to 90s; split it if contention matters.
+            await asyncio.wait_for(manager.acquire(), 90)
+            try:
+                manager.adopt()  # existing pinned Qwen/V4.1 only; never start/switch a model
+                engine = manager.engine
+            except BaseException:
+                manager.release()  # no native control issued yet
+                raise
+            ACTIVE_TICKET = ticket
+            ACTIVE_REQUESTS = 1
+            DS4_ACTIVE_REQUESTS += 1
+            ACTIVE_MODEL_ID = manager.model
+            try:
+                # This native close/status proves idle ownership, not HTTP-idle telemetry.
+                await engine.terminal()
+            except BaseException as exc:
+                ticket['uncertain'] = True
+                manager.blocked = repr(exc)
+                REQUEST_CONDITION.notify_all()
+                raise
+            return engine
+    finally:
+        if ticket in REQUEST_QUEUE:
+            REQUEST_QUEUE.remove(ticket)
+
+
+async def finish_independent_kev(engine, stopped):
+    if not stopped:
+        await finish_request('ds4', uncertain=True)
+        return False  # native borrower stop unknown: keep seat, closed terminal and lease
+    try:
+        await engine.release_terminal()
+    except BaseException:
+        await finish_request('ds4', uncertain=True)
+        raise
+    await finish_request('ds4')
+    return True
+
+
 async def finish_request(backend_name, uncertain=False, release_chat=False):
     global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT, ACTIVE_TICKET, CHAT_OWNER
     async with REQUEST_CONDITION:
@@ -1221,11 +1299,12 @@ async def finish_request(backend_name, uncertain=False, release_chat=False):
         if ACTIVE_TICKET.get('managed') and reservation_body.MANAGED_ENGINE_RELEASER:
             reservation_body.MANAGED_ENGINE_RELEASER()
         ACTIVE_REQUESTS -= 1
-        ACTIVE_TICKET = None
         if CHAT_OWNER:
-            CHAT_OWNER["last_request_at"] = time.monotonic()
+            if not ACTIVE_TICKET.get('independent'):
+                CHAT_OWNER["last_request_at"] = time.monotonic()
             if release_chat or CHAT_OWNER.get("release_pending"):
                 CHAT_OWNER = None
+        ACTIVE_TICKET = None
         if backend_name == "ds4":
             DS4_ACTIVE_REQUESTS -= 1
             DS4_LAST_REQUEST_AT = time.monotonic()
@@ -1586,12 +1665,14 @@ async def handle_other(request):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    global DS4_LAST_REQUEST_AT
+    global DS4_LAST_REQUEST_AT, INDEPENDENT_SWITCH
     if DUAL_MODELS:
         from managed_switch import ManagedSwitch
-        manager = ManagedSwitch()
+        manager = INDEPENDENT_SWITCH = ManagedSwitch()
         reservation_body.MANAGED_ENGINE_PREPARER = manager.prepare
         reservation_body.MANAGED_ENGINE_RELEASER = manager.release
+        reservation_body.INDEPENDENT_ADMITTER = begin_independent_kev
+        reservation_body.INDEPENDENT_RELEASER = finish_independent_kev
     if await detect_ds4_loaded_model(refresh=True) is not None:
         DS4_LAST_REQUEST_AT = time.monotonic()
     await discover_models()
