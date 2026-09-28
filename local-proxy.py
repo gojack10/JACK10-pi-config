@@ -1253,6 +1253,8 @@ async def begin_independent_kev(request):
             try:
                 manager.adopt()  # existing pinned Qwen/V4.1 only; never start/switch a model
                 engine = manager.engine
+                if hashlib.sha256(engine.core.read_bytes()).hexdigest() != COORDINATOR_SHA256:
+                    raise RuntimeError('unqualified coordinator binary')
             except BaseException:
                 manager.release()  # no native control issued yet
                 raise
