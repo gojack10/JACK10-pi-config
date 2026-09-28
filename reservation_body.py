@@ -394,8 +394,8 @@ class KevHTTP:
     """One qualified, one-shot private service process per checked StartKev."""
     SOURCE = Path(__file__).parent / 'kev-service/serve_gated.py'
     SOURCE_SHA256 = '59a62a7adba0ba4d31686541629eeb92dc74487ed983a11fcd1bbf137c189d3f'
-    VENV = Path('/Users/jack/research/bend/kev-service-work/venv/bin/python')
-    ROOT = Path('/Users/jack/research/bend')
+    VENV = Path('/Users/jack/kev/venv/bin/python')
+    ROOT = Path('/Users/jack/kev')
 
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -461,8 +461,7 @@ class KevHTTP:
                    KEV_API_KEY=self.api_key,
                    KEV_CONTROL_KEY=self.control_key,
                    MLX_NATIVE_GATE_LOG=str(self.directory / 'native.jsonl'),
-                   PYTHONPATH=str(self.ROOT / 'two-gaps-work/kev') + ':' +
-                              str(self.ROOT / 'kev-handoff/upstream-kev'))
+                   PYTHONPATH=str(self.ROOT / 'service') + ':' + str(self.ROOT / 'upstream'))
         log = (self.directory / 'service.log').open('wb')
         self.process = await asyncio.create_subprocess_exec(str(self.VENV), str(self.SOURCE),
             '--port', str(self.port),
