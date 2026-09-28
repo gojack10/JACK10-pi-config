@@ -25,6 +25,8 @@ test("Pi tool admission blocks plain Kev launch and direct :8009 calls before ex
 		["bash", "curl -X POST http://127.0.0.1:8009/v1/systemone"],
 		["bash_bg", "curl http://localhost:8009/v1/models"],
 		["powershell", "Invoke-RestMethod http://[::1]:8009/v1/systemone"],
+		["bash", "rg -n 'kev.serve' ~/kev; uv run python -m kev.serve"],
+		["bash_bg", "printf 'kev.serve' && curl http://localhost:8009/v1/systemone"],
 	]) {
 		assert.equal(boundary.call(tool, command)?.block, true, command);
 	}
@@ -37,8 +39,12 @@ test("managed :8002 route and unrelated development pass through", () => {
 		["bash", "curl -X POST http://127.0.0.1:8002/v1/systemone"],
 		["bash_bg", "uv run python tests/test_kev_source_pin.py"],
 		["bash", "node --test extensions/kev-entry-guard/*.test.ts"],
+		["bash", "rg -n 'kev.serve' ~/kev"],
+		["bash", "git grep 'kev.serve'"],
+		["bash_bg", "printf 'kev.serve'"],
+		["bash", "rg -n ':8009' ~/kev"],
 	]) {
 		assert.equal(boundary.call(tool, command)?.block, undefined, command);
 	}
-	assert.equal(boundary.executed.length, 3);
+	assert.equal(boundary.executed.length, 7);
 });
