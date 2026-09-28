@@ -14,6 +14,12 @@ class KevSourcePinTest(unittest.TestCase):
     def test_committed_source_matches_launch_pin(self):
         self.assertEqual(hashlib.sha256(KevHTTP.SOURCE.read_bytes()).hexdigest(), KevHTTP.SOURCE_SHA256)
 
+    def test_moved_runtime_is_qualified_before_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            KevHTTP(Path(directory) / 'borrower')
+        self.assertTrue((KevHTTP.ROOT / 'service/gate_bridge.py').is_file())
+        self.assertTrue((KevHTTP.ROOT / 'upstream/kev/serve.py').is_file())
+
     def test_changed_source_is_rejected_before_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'serve_gated.py'
