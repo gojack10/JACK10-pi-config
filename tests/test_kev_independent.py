@@ -403,6 +403,21 @@ class KevHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.releases, 1)
         self.assertIsNone(proxy.ACTIVE_TICKET)
 
+    async def test_unpinned_coordinator_denies_both_idle_model_paths_before_native_control(self):
+        bad_core = Path(self.directory, 'unqualified-core')
+        bad_core.write_text('#!/bin/sh\necho "ELIGIBLE 1"\n')
+        bad_core.chmod(0o700)
+        self.engine.core = bad_core
+        for releases, model in enumerate(('qwen3.8-flash-next', 'deepseek-v4.1-flash'), 1):
+            self.manager.model = model
+            async with self.scoring() as response:
+                self.assertEqual(response.status, 503)
+                self.assertIn('unqualified coordinator binary', (await response.json())['reason'])
+            self.assertEqual(self.engine.terminal_count, 0)
+            self.assertEqual(self.manager.releases, releases)
+            self.assertIsNone(proxy.ACTIVE_TICKET)
+            self.assertFalse(FakeKev.instances)
+
     async def test_terminal_receipt_failure_blocks_without_starting_kev(self):
         self.engine.fail_terminal = True
         async with self.scoring() as response:
