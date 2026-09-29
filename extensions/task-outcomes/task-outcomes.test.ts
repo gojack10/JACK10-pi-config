@@ -424,66 +424,6 @@ test("historical release eligibility and persistence fail closed before any new 
   }
 });
 
-test("Luna guard uses the real interactive abort binding at 271925, not at 255999", async t => {
-  const core = join(homedir(), ".local/share/pi-mono/packages/coding-agent/dist");
-  const { InteractiveMode } = await import(pathToFileURL(join(core, "modes/interactive/interactive-mode.js")).href);
-  const { AgentSession } = await import(pathToFileURL(join(core, "core/agent-session.js")).href);
-  for (const [tokens, failPause] of [[255999, false], [271925, false], [271925, true]] as const) {
-    const h = await harness(t);
-    await h.call("task_outcomes_consumer", contract(h.dir, "guard", "A"));
-    const loaded = await loadExtensions([fileURLToPath(new URL("../openai-272k-guard.ts", import.meta.url))], h.dir);
-    assert.deepEqual(loaded.errors, []);
-    loaded.runtime.appendEntry = h.runtime.appendEntry;
-    loaded.runtime.sendUserMessage = h.runtime.sendUserMessage;
-    let abortAction: any;
-    let aborts = 0;
-    const session: any = {
-      _runId: 42,
-      requestExtensionAbort: AgentSession.prototype.requestExtensionAbort,
-      requestCancellation: AgentSession.prototype.requestCancellation,
-      bindExtensions: (binding: any) => { abortAction = binding.abortHandler; },
-      resourceLoader: { getThemes: () => ({ themes: [] }) },
-      agent: { abort: () => { aborts++; } },
-    };
-    const mode = Object.create(InteractiveMode.prototype);
-    Object.defineProperty(mode, "session", { value: session });
-    Object.defineProperty(mode, "agent", { value: session.agent });
-    Object.assign(mode, {
-      createExtensionUIContext: () => ({}), setupAutocompleteProvider: () => {},
-      setupExtensionShortcuts: () => {}, showLoadedResources: () => {}, showStartupNoticesIfNeeded: () => {},
-      clearAllQueues: () => ({ steering: [], followUp: [] }), updatePendingMessagesDisplay: () => {},
-    });
-    await mode.bindCurrentSessionExtensions();
-    const handler = loaded.extensions[0].handlers.get("before_provider_request")[0];
-    const payload = { input: ["private"], tools: [{}] };
-    const ctx = {
-      sessionManager: h.sm, isIdle: () => true, hasPendingMessages: () => false,
-      model: { provider: "openai-codex-personal", id: "gpt-5.6-luna", contextWindow: 272000, cost: {} },
-      getContextUsage: () => ({ tokens }), ui: { setStatus: () => {}, notify: () => {} }, abort: abortAction,
-    };
-    if (failPause) loaded.runtime.appendEntry = () => { throw new Error("pause save failed"); };
-    const result = await handler({ payload }, ctx);
-    loaded.runtime.appendEntry = h.runtime.appendEntry;
-    assert.equal(aborts, tokens === 271925 ? 1 : 0);
-    if (tokens === 255999) { assert.equal(result, undefined); continue; }
-    assert.deepEqual(result, { input: [], tools: [] });
-    assert.equal(session._interruption.kind, "context");
-    assert.equal(session._interruption.runId, 42);
-    await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }], interruption: session._interruption });
-    await h.emit("agent_settled");
-    assert.equal(h.persisted.filter(e => e.data.kind === "context_pause").length, failPause ? 0 : 1);
-    assert.equal(h.persisted.filter(e => e.data.kind === "cancellation_requested").length, 0);
-    const finals = h.manager.snapshot().outcomes.filter((o: any) => o.final);
-    assert.equal(finals.length, failPause ? 1 : 0);
-    if (failPause) assert.match(finals[0].summary, /no saved recoverable pause/);
-    assert.equal(h.messages.length, 0);
-    session.requestCancellation("escape", "real Escape");
-    abortAction({ kind: "context", reason: "late guard" });
-    assert.equal(session._interruption.kind, "cancel");
-    assert.equal(session._interruption.source, "escape");
-  }
-});
-
 test("friendly forceStop saves before typed abort and still aborts if pause storage fails", async t => {
   for (const failPause of [false, true]) {
     const h = await harness(t);

@@ -137,13 +137,17 @@ sleep .5
     const manifest = JSON.parse(await readFile(result.details.jobs[0].manifest_file, "utf8"));
     assert.equal(manifest.model, "gpt-6-astra");
     assert.equal(manifest.friendlyStopPercent, undefined);
-    assert.ok(manifest.friendlyStopDirectory);
+    // No model opts into friendly stop by itself, gpt-6-astra included.
+    assert.equal(manifest.friendlyStopDirectory, undefined);
     const childPane = await tmux(["list-panes", "-t", childSession!, "-F", "#{pane_id}"]);
     const parentId = await tmux(["display-message", "-p", "-t", parentPane, "#{session_id}"]);
     const childId = await tmux(["display-message", "-p", "-t", childPane, "#{session_id}"]);
     const rows = await tmux(["list-sessions", "-F", "#{session_id}|#{@pi_subagent_parent_id}"]);
     assert.ok(rows.split("\n").includes(`${childId}|${parentId}`));
     const boot = await readFile(await tmux(["show-options", "-qv", "-t", childPane, "@pi_subagent_boot_file"]), "utf8");
+    // Scrubbing inherited variables with -u is expected; arming any of them is not.
+    assert.doesNotMatch(boot, /PI_RLM_[A-Z_]+=/);
+    assert.doesNotMatch(boot, /openai-272k-guard/);
     assert.doesNotMatch(boot, /--no-extensions/);
     assert.match(boot, /--extension/);
     assert.match(boot, /local-llm-generation\.ts/);
