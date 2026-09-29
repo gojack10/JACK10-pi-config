@@ -2,5 +2,6 @@
   "app.session.toggleSort": ["ctrl+shift+s"],
   "app.thinking.cycle": [],
   "app.thinking.save": [],
-  "app.models.save": []
+  "app.models.save": [],
+  "tui.altScreen.bottom": "down"
 }
