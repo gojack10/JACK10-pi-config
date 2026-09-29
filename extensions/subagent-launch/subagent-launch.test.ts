@@ -679,7 +679,7 @@ done
   }
 });
 
-test("follow-ups reject busy panes and allow finished panes", { timeout: 20000 }, async t => {
+test("idle follow-ups continue needs_input and finished panes", { timeout: 20000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), "subagent-followup-preflight-test-"));
   const parentSession = `pi-subagent-preflight-${process.pid}-${Date.now()}`;
   const oldPath = process.env.PATH;
@@ -783,12 +783,7 @@ done
     await until(async () => {
       try { await lstat(publicationReady); return true; } catch { return false; }
     });
-    await assert.rejects(
-      followup.execute("test", { job_id: firstJob.job, session_id: firstJob.session_id,
-        provider: "fake-provider", model: "fake-model", thinking: "xhigh", mission_file: retryMission,
-        cwd: dir, session_label: "preflight", mode: "task", report_file: busyReport }, undefined, undefined, ctx),
-      /still handling its current turn/,
-    );
+    // Busy admission is covered with real Pi lifecycle hooks in busy-followup.test.ts.
     await absent(busyReport);
     await absent(reservation(busyReport));
     await writeFile(publicationRelease, "");
