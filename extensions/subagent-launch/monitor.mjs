@@ -102,8 +102,7 @@ const confirmedDead = async () => {
   if (health.kind === "unknown") evidence(`pane health unknown: ${health.evidence}`);
   return health.kind === "dead";
 };
-const readManifest = async () => {
-  const path = await show(config.manifestOption);
+const readManifestFile = async path => {
   if (!path) return undefined;
   try {
     const value = JSON.parse(await readFile(path, "utf8"));
@@ -113,6 +112,14 @@ const readManifest = async () => {
         !Number.isSafeInteger(value.startGeneration) || !Number.isSafeInteger(value.outcomeGeneration)) return undefined;
     return value;
   } catch { return undefined; }
+};
+const readManifest = async () => {
+  const livePath = await show(config.manifestOption);
+  if (config.manifestPath && config.manifestPath !== livePath) {
+    const own = await readManifestFile(config.manifestPath);
+    if (own?.dispatchState === "queued" || own?.dispatchError || own?.supersededBy) return own;
+  }
+  return readManifestFile(livePath);
 };
 const generation = async () => {
   const value = Number.parseInt(await show(config.outcomeGenerationOption) ?? "", 10);
@@ -189,7 +196,7 @@ const bindManifest = manifest => {
   return matchesExpected(manifest);
 };
 
-const manifestDeadline = Date.now() + config.startTimeoutMs;
+let manifestDeadline = Date.now() + config.startTimeoutMs;
 let lastGeneration;
 let activeKey;
 let startedKey;
@@ -308,6 +315,20 @@ while (true) {
     protocolFailure("protocol_incomplete: launcher manifest identity changed");
     process.exit(0);
   }
+  if (manifest.dispatchError) {
+    protocolFailure(`follow-up admission failed: ${manifest.dispatchError}`);
+    process.exit(0);
+  }
+  if (manifest.dispatchState === "queued") {
+    // Delivery waits in Pi's native idle primitive, not in this health monitor.
+    if (await confirmedDead()) {
+      transportFailure("transport_lost: child pane disappeared with a queued follow-up", manifest);
+      process.exit(0);
+    }
+    manifestDeadline = Date.now() + config.startTimeoutMs;
+    await sleep(config.pollMs);
+    continue;
+  }
   if (activeKey === undefined && Date.now() >= manifestDeadline) {
     protocolFailure("protocol_incomplete: launcher manifest arrived after the start deadline");
     process.exit(0);
@@ -342,7 +363,7 @@ while (true) {
             startedSessionId = liveIdentity;
             startedKey = key;
             emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
-              sessionId: startedSessionId, sessionFile: file, channel: false });
+              sessionId: startedSessionId, sessionFile: file, channel: false, generation: manifest.startGeneration + 1 });
             break;
           }
         } else if (identity.value) {
@@ -356,7 +377,7 @@ while (true) {
           sessionFileReady = true;
           startedKey = key;
           emit({ kind: "start", jobId: manifest.jobId, attemptId: manifest.attemptId,
-            sessionId: startedSessionId, sessionFile: file, channel: false });
+            sessionId: startedSessionId, sessionFile: file, channel: false, generation: manifest.startGeneration + 1 });
           break;
         }
       }
@@ -375,6 +396,10 @@ while (true) {
   }
 
   await reconcileDurable();
+  if (manifest.supersededBy && ["awaiting_input", "transport_lost"].includes(manifest.supersededState)) {
+    emit({ kind: "superseded", jobId: expected.jobId, attemptId: expected.attemptId });
+    process.exit(0);
+  }
   const currentGeneration = await generation();
   if (currentGeneration > lastGeneration) {
     const currentManifest = await readManifest();

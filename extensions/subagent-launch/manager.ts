@@ -21,6 +21,7 @@ import {
 } from "../task-outcomes/manager.ts";
 
 import { RECOVERY_COMMAND, RECOVERY_OPTION, registerContextRecovery } from "./recovery.ts";
+import { FOLLOWUP_CAPABILITY_OPTION, FOLLOWUP_COMMAND, registerQueuedFollowup } from "./followup.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -95,13 +96,15 @@ interface StoredState {
   receiptRevision?: number;
   piSessionId?: string;
   recoveryPending?: string;
+  queued?: boolean;
+  startGeneration?: number;
   parentJobId?: string;
   failureStatus?: "setup_failed" | "monitor_setup_failed" | "release_failed";
 }
 
 interface Receipt {
   job: string;
-  status: "running" | "start_timeout" | "setup_failed" | "monitor_setup_failed" | "release_failed";
+  status: "queued" | "running" | "start_timeout" | "setup_failed" | "monitor_setup_failed" | "release_failed";
   attempt_id: string;
   session_id: string;
   session_label: string;
@@ -218,6 +221,7 @@ const extensionPaths = (): string[] => {
 
 export class SubagentLauncher {
   private readonly states = new Map<string, StoredState>();
+  private readonly queued = new Map<string, StoredState>();
   private pi: ExtensionAPI;
   private ctx: ExtensionContext;
   private background: BackgroundJobManager;
@@ -515,11 +519,15 @@ export class SubagentLauncher {
     if (knownState?.contextPauseId || knownState?.recoveryPending) {
       throw new Error("attempt is context-paused or recovering; use subagent_clean_and_continue, not a fresh follow-up");
     }
-    if (!knownState?.finished && await this.paneIsBusy(paneId)) {
-      throw new Error(`subagent ${jobId} is still handling its current turn; follow-up was not pasted`);
-    }
+    const busy = [...this.queued.values()].some(state => state.jobId === jobId) || await this.paneIsBusy(paneId);
+    const liveSession = await this.show(paneId, "@pi_session_id");
+    const nativeFollowup = !!liveSession && await this.show(paneId, FOLLOWUP_CAPABILITY_OPTION) === liveSession;
+    if (busy && !nativeFollowup) throw new Error("saved worker lacks native queued follow-up support; reload its extensions before retrying");
+    // Also use native admission when apparently idle: pane settlement publication
+    // can precede the last Pi settlement handler. Retain the legacy idle fallback.
+    const queued = nativeFollowup || busy;
     const reservation = input.mode === "task" ? await requireFreshReport(reportPath!, new Set()) : undefined;
-    const replaceMonitor = knownState?.monitorJobId !== undefined && !knownState.finished;
+    const replaceMonitor = !queued && knownState?.monitorJobId !== undefined && !knownState.finished;
     const currentStartGeneration = Number.parseInt(await this.show(paneId, START_GENERATION_OPTION) ?? "0", 10);
     const currentOutcomeGeneration = Number.parseInt(await this.show(paneId, OUTCOME_GENERATION_OPTION) ?? "0", 10);
     const attemptId = unique("subagent-attempt");
@@ -554,16 +562,19 @@ export class SubagentLauncher {
         startChannel: unique("pi-subagent-start"),
         startGeneration: Number.isSafeInteger(currentStartGeneration) ? currentStartGeneration : 0,
         outcomeGeneration: Number.isSafeInteger(currentOutcomeGeneration) ? currentOutcomeGeneration : 0,
+        ...(queued ? { dispatchState: "queued", missionFile } : {}),
       });
       const followupManifest = await this.readManifest(manifestPath);
       const startChannel = followupManifest.startChannel;
       if (!startChannel) throw new Error("follow-up manifest has no start channel");
-      await this.set(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
-      await this.verify(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
-      await this.set(paneId, START_CHANNEL_OPTION, startChannel);
-      await this.verify(paneId, START_CHANNEL_OPTION, startChannel);
-      await this.set(paneId, "@pi_subagent_attempt_id", attemptId);
-      await this.set(paneId, "@pi_subagent_mode", input.mode);
+      if (!queued) {
+        await this.set(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
+        await this.verify(paneId, TASK_LAUNCH_MANIFEST_OPTION, manifestPath);
+        await this.set(paneId, START_CHANNEL_OPTION, startChannel);
+        await this.verify(paneId, START_CHANNEL_OPTION, startChannel);
+        await this.set(paneId, "@pi_subagent_attempt_id", attemptId);
+        await this.set(paneId, "@pi_subagent_mode", input.mode);
+      }
 
       state = {
         jobId,
@@ -586,16 +597,25 @@ export class SubagentLauncher {
         friendlyStopPercent: savedFriendlyPercent,
         friendlyStopDirectory: savedFriendlyDirectory,
         parentJobId: old.parentJobId,
+        queued,
       };
       await this.armMonitor(state, batch);
-      this.states.set(jobId, state);
-      const startPromise = this.waitForStart(state, attemptId);
-      await this.paste(paneId, missionFile, state);
-      const started = await Promise.race([startPromise, this.timeout(START_WAIT_MS)]);
+      let started = false;
+      if (queued) {
+        this.queued.set(attemptId, state);
+        const commandFile = `${manifestPath}.command`;
+        await writeFile(commandFile, `/${FOLLOWUP_COMMAND} ${manifestPath}`, { flag: "wx", mode: 0o600 });
+        await this.paste(paneId, commandFile, state);
+      } else {
+        this.states.set(jobId, state);
+        const startPromise = this.waitForStart(state, attemptId);
+        await this.paste(paneId, missionFile, state);
+        started = await Promise.race([startPromise, this.timeout(START_WAIT_MS)]);
+      }
       batch.close();
       return {
         job: jobId,
-        status: started ? "running" : "start_timeout",
+        status: queued ? "queued" : started ? "running" : "start_timeout",
         attempt_id: attemptId,
         session_id: sessionId,
         session_label: state.sessionLabel,
@@ -605,10 +625,11 @@ export class SubagentLauncher {
         report_file: reportPath,
         session_file: await this.show(paneId, SESSION_FILE_OPTION),
         monitor_log: state.monitorLogPath,
-        error: started ? undefined : "START/session-file receipt timed out; saved pane and monitor evidence were preserved",
+        error: queued || started ? undefined : "START/session-file receipt timed out; saved pane and monitor evidence were preserved",
       };
     } catch (error) {
-      this.cleanupFollowupFailure(batch, state, knownState, jobId, old.parentJobId, attemptId, error);
+      this.queued.delete(attemptId);
+      this.cleanupFollowupFailure(batch, state, queued ? undefined : knownState, jobId, old.parentJobId, attemptId, error);
       throw error;
     }
   }
@@ -639,7 +660,7 @@ export class SubagentLauncher {
       failedState.finished = true;
       failedState.monitorUnsubscribe = undefined;
       failedState.monitorJobId = undefined;
-      this.states.set(jobId, failedState);
+      if (!failedState.queued) this.states.set(jobId, failedState);
     }
     const status = this.background.getBatchStatus(batch.id);
     const shouldRecord = status !== undefined && !status.complete &&
@@ -802,6 +823,7 @@ export class SubagentLauncher {
     const config = JSON.stringify({
       paneId: state.paneId,
       manifestOption: TASK_LAUNCH_MANIFEST_OPTION,
+      manifestPath: state.manifestPath,
       outcomeOption: OUTCOME_OPTION,
       outcomeGenerationOption: OUTCOME_GENERATION_OPTION,
       startGenerationOption: START_GENERATION_OPTION,
@@ -836,6 +858,7 @@ export class SubagentLauncher {
     state.monitorLogPath = monitorJob.job.logPath;
     state.monitorUnsubscribe = this.background.onJobSettled(monitorJob.job.id, (_job, completion) => {
       state.finished = true;
+      this.queued.delete(state.attemptId);
       state.monitorUnsubscribe = undefined;
       if (state.parentJobId && completion.status) {
         this.recordParent(state.parentJobId, state.jobId, completion.summary, completion.status, completion.source, state.attemptId);
@@ -875,7 +898,20 @@ export class SubagentLauncher {
         state.contextPauseId = undefined;
         continue;
       }
+      if (marker.kind === "superseded") {
+        state.monitorUnsubscribe?.();
+        state.monitorUnsubscribe = undefined;
+        state.finished = true;
+        if (state.monitorJobId !== undefined) this.background.retireExternal(state.monitorJobId);
+        continue;
+      }
       if (marker.kind === "start" && marker.jobId === state.jobId && marker.attemptId === state.attemptId) {
+        state.startGeneration = marker.generation;
+        if (state.queued) {
+          this.queued.delete(state.attemptId);
+          if ((this.states.get(state.jobId)?.startGeneration ?? 0) < marker.generation) this.states.set(state.jobId, state);
+          state.queued = false;
+        }
         this.resolveStart(state, marker.attemptId, true);
       } else if (marker.kind === "context_paused" && marker.jobId === state.jobId && marker.attemptId === state.attemptId &&
           typeof marker.pauseId === "string" && SAFE_ID.test(marker.pauseId)) {
@@ -1076,6 +1112,7 @@ const launchers = launcherGlobal[launcherRegistryKey] ??= new WeakMap();
 
 export function registerSubagentTools(pi: ExtensionAPI): void {
   registerContextRecovery(pi);
+  registerQueuedFollowup(pi);
   let launcher: SubagentLauncher | undefined;
   let launcherOwner: object | undefined;
   const forContext = (ctx: ExtensionContext): SubagentLauncher => {
@@ -1125,7 +1162,7 @@ export function registerSubagentTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "subagent_followup",
     label: "subagent_followup",
-    description: "Continue a saved subagent by returned job_id/session_id. Supply the route explicitly again; it must match the saved route. Follow-ups create a fresh attempt and, in task mode, require a fresh report file. Dialogue reports return automatically at clean settlement, verbatim when small or through a readable artifact when large. The contract and monitor are armed before the mission file is pasted into the interactive pane.",
+    description: "Continue a saved subagent by returned job_id/session_id. Supply the route explicitly again; it must match the saved route. Follow-ups create a fresh attempt and, in task mode, require a fresh report file. Dialogue reports return automatically at clean settlement, verbatim when small or through a readable artifact when large. Busy agents accept queued follow-ups: native idle admission waits for settlement without replacing the active contract. A queued receipt is not a START receipt; the new attempt remains monitored until its outcome.",
     parameters: followupSchema,
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await forContext(ctx).followup(args as SubagentFollowupInput);
