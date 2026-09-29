@@ -70,7 +70,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.equal(job.status, 'running', job.status === 'running' ? undefined :
     `${JSON.stringify(job)}\n${await readFile(join(tmpdir(), `${job.job}.tmux.log`), 'utf8').catch(() => '(no child log)')}`);
   await until(() => messages.some(text => text.includes('paused for context')));
-  assert.match(messages[0], scenario === 'friendly' ? /Friendly checkpoint saved:/ : /Blocked OpenAI request at ~259,495 context tokens/);
+  assert.match(messages[0], scenario === 'friendly' ? /Friendly checkpoint saved:/ : /synthetic context guard reason/);
   assert.doesNotMatch(messages[0], /Operation aborted/);
   const background = (globalThis as any)[Symbol.for('pi.background-jobs.manager-registry')].get(ctx.sessionManager);
   assert.equal(background.getBatchStatus(launch.batch_id).complete, false);
