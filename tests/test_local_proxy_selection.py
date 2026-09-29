@@ -74,7 +74,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         for mid in ("typo", "", None, [], "qwen", p.DS4_FLASH_MODEL_ID, p.DS4_PRO_MODEL_ID):
             with self.assertRaises(p.web.HTTPBadRequest):
                 p.get_backend_name(mid)
-        self.assertEqual(p.ds4_static_model(p.QWEN_NEXT_MODEL_ID)["context_length"], 500000)
+        self.assertEqual(p.ds4_static_model(p.QWEN_NEXT_MODEL_ID)["context_length"], 262144)
         self.assertEqual(p.ds4_static_model(p.GLM_FLASH_MODEL_ID)["context_length"], 500000)
         body = json.dumps({"model": p.QWEN_NEXT_MODEL_ID, "reasoning_effort": "xhigh"}).encode()
         self.assertEqual(p.maybe_prepare_chat_body("ds4", body), body)
@@ -549,7 +549,7 @@ class WrapperTests(unittest.TestCase):
             home = Path(directory)
             (home / '.dsv4').mkdir()
             script = 'mock_exec() { printf "%s\\n" "$@"; exit 0; }\n' + source.replace('HOME_DIR="/Users/jack"', f'HOME_DIR="{home}"').replace('exec "', 'mock_exec "')
-            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '500000'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
+            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '262144'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
                 (home / '.dsv4/desired-model').write_text(mode)
                 result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True, check=True)
                 args = result.stdout.splitlines()
@@ -559,7 +559,8 @@ class WrapperTests(unittest.TestCase):
                 self.assertNotIn('--vision', args)
                 if mode == 'qwen':
                     self.assertNotIn('--ssd-streaming', args)
-                    self.assertEqual(args[0], str(home / 'dsv4-qwen38-integration/ds4-server'))
+                    self.assertEqual(args[0], str(home / 'ds4/ds4-server'))
+                    self.assertIn('unset DS4_QWEN4_YARN_FACTOR', source)
                     self.assertIn(str(home / 'projects/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf'), args)
                     # V4.1 steering is model-bound; Qwen must never receive DS41DIR flags.
                     self.assertNotIn('--dir-steering-file', args)
@@ -567,7 +568,7 @@ class WrapperTests(unittest.TestCase):
                 else:
                     # Production executes from the canonical ~/ds4 checkout, and shaders
                     # load relative to cwd, so chdir must name the same tree.
-                    self.assertEqual(args[0], str(home / 'ds4/ds4-server'))
+                    self.assertEqual(args[0], str(home / 'ds4/ds4-server-v41-reservation'))
                     self.assertEqual(args[args.index('--chdir') + 1], str(home / 'ds4'))
                     self.assertIn(str(home / 'dsv4-qwen38-integration/gguf/DeepSeek-V4.1-Flash-Q2.gguf'), args)
                     self.assertIn('--ssd-streaming', args)

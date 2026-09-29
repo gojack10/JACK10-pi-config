@@ -109,8 +109,8 @@ DS4_MODEL_METADATA = {
     },
     QWEN_NEXT_MODEL_ID: {
         "name": "Qwen3.8 Flash Next",
-        "context_length": 500000,
-        "max_completion_tokens": 500000,
+        "context_length": 262144,
+        "max_completion_tokens": 262144,
     },
     GLM_FLASH_MODEL_ID: {
         "name": "GLM 5.3 Flash",
@@ -121,8 +121,8 @@ DS4_MODEL_METADATA = {
     # view from the resident engine.
     DS41_MODEL_ID: {
         "name": "DeepSeek V4.1 Flash",
-        "context_length": 500000,
-        "max_completion_tokens": 500000,
+        "context_length": 1000000,
+        "max_completion_tokens": 1000000,
     },
 }
 DS4_LOADED_MODEL_ID = None
