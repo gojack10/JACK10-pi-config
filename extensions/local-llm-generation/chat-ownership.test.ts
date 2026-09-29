@@ -3,7 +3,7 @@ import test from "node:test";
 import activate from "../local-llm-generation.ts";
 import { buildRequestHeaders } from "./request-headers.ts";
 
-test("session identity survives provider wrapper and releases only at settlement/shutdown", async (t) => {
+test("session identity survives provider wrapper and releases at model exit/settlement/shutdown", async (t) => {
   const handlers = new Map<string, (event: any, ctx: any) => any>();
   const posts: { url: string; body: any }[] = [];
   const originalFetch = globalThis.fetch;
@@ -47,7 +47,17 @@ test("session identity survives provider wrapper and releases only at settlement
   assert.equal(posts.length, 1);
   sessionId = "chat-b";
   handlers.get("before_provider_headers")!(event, ctx);
-  await handlers.get("session_shutdown")!({}, ctx);
+  await handlers.get("model_select")!({ model: { provider: "local", id: "deepseek-v4.1-flash" } }, ctx);
+  assert.equal(posts.length, 1);
+  await handlers.get("model_select")!({ model: { provider: "openai-codex", id: "gpt-6-luna" } }, ctx);
   assert.equal(posts.length, 2);
   assert.equal(posts[1].body.chat_id, "chat-b");
+  assert.equal(posts[1].body.request_id, event.headers["X-Pi-Request-Id"]);
+  await handlers.get("agent_settled")!({}, ctx);
+  assert.equal(posts.length, 2);
+  sessionId = "chat-c";
+  handlers.get("before_provider_headers")!(event, ctx);
+  await handlers.get("session_shutdown")!({}, ctx);
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].body.chat_id, "chat-c");
 });

@@ -701,6 +701,11 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(STOPPING_STATUS, undefined);
   });
 
+  // Switching to a non-local provider ends this chat's claim on the local engine.
+  pi.on("model_select", async (event, ctx) => {
+    if (event.model.provider !== "local") await releaseChat(ctx);
+  });
+
   // agent_end may be followed by automatic continuation. Only settlement is
   // the explicit end of the whole run, including all local tool round trips.
   pi.on("agent_settled", async (_event, ctx) => { await releaseChat(ctx); });
