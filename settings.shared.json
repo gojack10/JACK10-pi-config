@@ -17,5 +17,8 @@
   "enableInstallTelemetry": false,
   "defaultProjectTrust": "always",
   "treeFilterMode": "default",
-  "httpIdleTimeoutMs": 0
+  "httpIdleTimeoutMs": 0,
+  "showCacheMissNotices": true,
+  "collapseChangelog": true,
+  "tuiMode": "fullscreen"
 }
