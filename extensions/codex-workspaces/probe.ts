@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const MODEL = "gpt-5.6-luna";
+import { parseRegistry } from "../codex-quota-extension/store.ts";
 const TIMEOUT_MS = 30_000;
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 
@@ -41,14 +42,20 @@ export const launchLoginProbe = (
 	provider: string,
 	observe: ProbeObservation,
 	launch: SpawnProbe = spawn as unknown as SpawnProbe,
+	registryPath = join(AGENT_DIR, "codex-accounts.json"),
 ): void => {
+	let model: string | undefined;
 	try {
+		const registry = parseRegistry(JSON.parse(readFileSync(registryPath, "utf8")));
+		const models = registry.accounts.find((account) => account.providerId === provider)?.supportedModels;
+		model = models?.find((id) => id.endsWith("-luna")) ?? models?.[0];
+		if (!model) throw new Error(`No configured probe model for ${provider}`);
 		const child = launch(process.env.PI_CODEX_PI_BIN ?? "pi", [
 			"--no-extensions",
 			"--extension", join(AGENT_DIR, "extensions", "codex-workspaces.ts"),
 			"--extension", join(AGENT_DIR, "extensions", "codex-quota-extension", "index.ts"),
 			"--provider", provider,
-			"--model", MODEL,
+			"--model", model,
 			"--thinking", "off",
 			"--system-prompt", "",
 			"--no-context-files",
@@ -67,7 +74,7 @@ export const launchLoginProbe = (
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
-			observe(outcome, { model: MODEL, thinking: "off", ...details });
+			observe(outcome, { model, thinking: "off", ...details });
 		};
 		const timeout = setTimeout(() => {
 			child.kill("SIGKILL");
@@ -82,7 +89,7 @@ export const launchLoginProbe = (
 		child.unref();
 	} catch (error) {
 		observe("error", {
-			model: MODEL,
+			model,
 			thinking: "off",
 			error: error instanceof Error ? error.message : String(error),
 		});
@@ -90,7 +97,7 @@ export const launchLoginProbe = (
 };
 
 export const scheduleLoginProbe = (provider: string, observe: ProbeObservation): void => {
-	observe("success", { model: MODEL, thinking: "off", status: "scheduled" });
+	observe("success", { thinking: "off", status: "scheduled" });
 	const timer = setTimeout(() => launchLoginProbe(provider, observe), 250);
 	timer.unref();
 };
