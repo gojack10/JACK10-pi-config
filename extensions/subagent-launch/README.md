@@ -16,6 +16,14 @@ Ordinary follow-ups cannot replace a paused/recovering attempt. A timed-out or i
 
 A final monitored outcome closes that **attempt**, not the saved agent session. `subagent_followup` may start a fresh same-mode attempt in a still-live saved pane, with a fresh report path and the exact saved route/friendly settings. The child task contract accepts that new attempt too. A missing pane/session is still a transport failure; finality does not justify launching a replacement agent automatically.
 
+## Busy follow-ups
+
+`subagent_followup` accepts busy saved workers with `status: queued`, a fresh attempt, and a reserved fresh task report. This is acceptance, not START or completion. The current manifest and monitor remain authoritative until the old assignment settles. Outstanding task children must drain; a queued follow-up does not bypass context recovery or completion checks.
+
+The local `/subagent-followup` command waits through Pi's native `waitForIdle()` and uses keyed `sendUserMessage` admission in the same session. Plain `deliverAs: "followUp"` alone would run inside the old agent loop, before its settlement, so it cannot safely switch task contracts. Replayed commands do not redeliver. Capable workers use this same admission path when apparently idle, closing the gap between pane status publication and the last native settlement handler; these receipts also say `queued`. Existing monitors still check pane health and durable outcomes; there is no polling-based delivery loop or replacement session. Reload the parent and saved worker to install the command. A busy worker without the session-bound capability advertisement is rejected before anything is pasted; older idle workers retain the legacy path. Crash/reload recovery of queued commands is not qualified.
+
+The offline `node --test extensions/subagent-launch/busy-followup.test.ts` check uses a synthetic provider with real Pi admission, settlement, saved sessions, task/dialogue contracts and monitors on an isolated tmux socket. It is not a live-provider or full TUI-editor qualification.
+
 ## Scope and loading
 
 Reload the parent before launching workers with this change. The launcher explicitly loads the recovery command in new children. Already-finalized failures, lost parent launcher state after restart, arbitrary provider overflows, automatic cleanup, friendly-stop thresholds and checkpoint rollover are **not** implemented by this recovery path. It does not alter ordinary Pi shutdown or cancellation behavior.
