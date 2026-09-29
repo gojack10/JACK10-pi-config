@@ -75,33 +75,4 @@ export default function thinkingPicker(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("thinking", {
-    description: "Pick or set thinking level",
-    getArgumentCompletions: (prefix) => {
-      const items = LEVELS.filter((level) => level.startsWith(prefix)).map((level) => ({
-        value: level,
-        label: level,
-      }));
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      const requested = args.trim() as ThinkingLevel | "";
-      if (!requested) {
-        await openThinkingPicker(pi, ctx);
-        return;
-      }
-
-      if (!LEVELS.includes(requested as ThinkingLevel)) {
-        ctx.ui.notify(`Invalid thinking level: ${requested}`, "error");
-        return;
-      }
-
-      pi.setThinkingLevel(requested as ThinkingLevel);
-      const actual = pi.getThinkingLevel() as ThinkingLevel;
-      ctx.ui.notify(
-        actual === requested ? `Thinking: ${actual}` : `Thinking: ${requested} → ${actual}`,
-        "info",
-      );
-    },
-  });
 }
