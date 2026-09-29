@@ -14,7 +14,7 @@ if (!friendly && Object.keys(process.env).some(key => key.startsWith('PI_RLM_FRI
 const pane = process.env.TMUX_PANE;
 const tmux = args => execFileSync('tmux', args, { encoding: 'utf8' }).trim();
 const manifest = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile(tmux(['show-options', '-qv', '-t', pane, '@pi_subagent_manifest']), 'utf8')));
-const paths = ['task-outcomes.ts', 'tmux-turn-signal.ts', 'subagent-launch.ts', 'openai-272k-guard.ts']
+const paths = ['task-outcomes.ts', 'tmux-turn-signal.ts', 'subagent-launch.ts']
   .map(name => join(process.env.PI_TEST_EXTENSIONS, name));
 if (friendly) paths.push(join(process.env.PI_TEST_EXTENSIONS, '../optional-extensions/rlm-friendly-stop.ts'));
 let sm = SessionManager.create(process.cwd(), process.cwd());
@@ -138,8 +138,12 @@ if (friendly) {
     symbolicUuidBindings: {}, failures: [], receiptPaths: [], notes: 'retained progress' }, undefined, undefined, ctx);
   if (!result.terminate) throw new Error('checkpoint must terminate the model turn');
 } else {
-  await emit('before_provider_request', { payload: { input: ['not transmitted'], tools: [{}] } });
-  if (!aborted) throw new Error('real guard did not block synthetic context');
+  // No provider-side context guard exists any more. A synthetic context pause is
+  // produced the way any real one reaches the manager: retain the pause, then
+  // abort the turn.
+  if (!task().pauseForContext('synthetic context guard reason', 256000)) throw new Error('synthetic pause was not retained');
+  ctx.abort({ kind: 'context', reason: 'synthetic context guard reason' });
+  if (!aborted) throw new Error('synthetic pause did not abort the turn');
 }
 const abortedMessage = { role: 'assistant', stopReason: friendly ? 'toolUse' : 'aborted',
   ...(friendly ? {} : { errorMessage: 'Operation aborted' }), content: [], usage, timestamp: Date.now() };
@@ -148,7 +152,7 @@ await emit('agent_end', { messages: [abortedMessage] });
 idle = true;
 await emit('agent_settled');
 const paused = task().snapshot().active;
-if (paused?.state !== 'context_paused') throw new Error('guard did not retain paused assignment');
+if (paused?.state !== 'context_paused') throw new Error('synthetic pause did not retain the assignment');
 writeFileSync(join(process.cwd(), 'paused.json'), JSON.stringify({ ...paused, sessionFile, piSessionId: sm.getSessionId() }));
 if (process.env.PI_TEST_RECOVERY_CASE === 'busy') idle = false;
 for await (const line of createInterface({ input: process.stdin })) {

@@ -39,7 +39,6 @@ const DONE_CHANNEL_OPTION = "@pi_done_channel";
 const SETTLED_CHANNEL_OPTION = "@pi_settled_channel";
 const SETTLED_GENERATION_OPTION = "@pi_settled_generation";
 const FRIENDLY_STOP_MODELS = new Set(["gpt-6-astra", "gpt-5.6-sol"]);
-const FRIENDLY_PRODUCTION_MODEL = "gpt-6-astra";
 
 const admissionAccepted = (result: unknown): boolean => {
   if (result === undefined || typeof result !== "object" || result === null) return true;
@@ -213,7 +212,6 @@ const extensionPaths = (): string[] => {
     // tmux-turn-signal must run afterward to await its publication.
     join(extensionsDir, "tmux-turn-signal.ts"),
     join(extensionsDir, "subagent-launch.ts"),
-    join(extensionsDir, "openai-272k-guard.ts"),
     join(dirname(extensionsDir), "optional-extensions", "rlm-friendly-stop.ts"),
   ];
 };
@@ -697,9 +695,11 @@ export class SubagentLauncher {
     parentPane: string,
     extensions: string[],
   ): Promise<StoredState> {
+    // Friendly stop is never implied by the model. It exists only when this
+    // launch explicitly supplies the human-requested opt-in fields.
     let friendlyDirectory: string | undefined;
     const friendlyOptIn = item.input.friendly_stop_percent !== undefined ||
-      item.input.friendly_stop_directory !== undefined || item.input.model === FRIENDLY_PRODUCTION_MODEL;
+      item.input.friendly_stop_directory !== undefined;
     if (friendlyOptIn) {
       const configured = item.input.friendly_stop_directory ?? process.env.PI_RLM_ROLLOVER_DIR ?? join(tmpdir(), `pi-friendly-stop-${item.jobId}`);
       friendlyDirectory = asPath(configured, "friendly_stop_directory");
@@ -1057,8 +1057,8 @@ export const launchJobSchema = Type.Object({
   session_label: Type.String({ minLength: 1, maxLength: 64 }),
   mode: StringEnum(["task", "dialogue"] as const),
   report_file: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
-  friendly_stop_percent: Type.Optional(Type.Integer({ minimum: 40, maximum: 80 })),
-  friendly_stop_directory: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+  friendly_stop_percent: Type.Optional(Type.Integer({ minimum: 40, maximum: 80, description: "Friendly stop is off unless the human explicitly asks for it. Supply this only as that explicit request; no model opts in by itself. Integer 40-80." })),
+  friendly_stop_directory: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, description: "Checkpoint directory for an explicitly requested friendly stop. Omit both fields for no friendly limit." })),
 }, { additionalProperties: false });
 
 export const launchSchema = Type.Object({ jobs: Type.Array(launchJobSchema, { minItems: 1, maxItems: MAX_JOBS }) }, { additionalProperties: false });

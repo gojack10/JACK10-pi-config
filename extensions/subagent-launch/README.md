@@ -18,7 +18,7 @@ A final monitored outcome closes that **attempt**, not the saved agent session. 
 
 ## Scope and loading
 
-Reload the parent before launching workers with this change. The launcher explicitly loads the guard and recovery command in new children. Already-finalized failures, lost parent launcher state after restart, arbitrary provider overflows, automatic cleanup, friendly-stop thresholds and checkpoint rollover are **not** implemented by this recovery path. It does not alter ordinary Pi shutdown or cancellation behavior.
+Reload the parent before launching workers with this change. The launcher explicitly loads the recovery command in new children. Already-finalized failures, lost parent launcher state after restart, arbitrary provider overflows, automatic cleanup, friendly-stop thresholds and checkpoint rollover are **not** implemented by this recovery path. It does not alter ordinary Pi shutdown or cancellation behavior.
 
 Cleanup uses Pi's context estimator, not a promise about exact provider tokens; a subsequent oversized request can pause again. The parent chooses whether to clean, compact manually, or checkpoint into a fresh session. Cleaning cannot remove retained thinking or large user inputs.
 
@@ -39,9 +39,11 @@ Evidence and runnable receipt check: `/Users/jack/.cache/pi-context-recovery-liv
 
 ## Opt-in friendly checkpoints
 
-The launcher now explicitly loads the existing `optional-extensions/rlm-friendly-stop.ts`. Friendly stopping uses one shared **40–80%** band: checkpoint wrapping begins at 40% of the effective runtime context window, and the upper boundary at 80% takes control so ordinary work does not continue past it. These are estimator/tool-boundary bands, not exact provider-token promises. `gpt-6-astra` is the first automatic production opt-in; launching it needs no percentage argument. Its run/attempt-scoped checkpoint directory is created automatically when none is supplied. Other models remain unconfigured unless a run explicitly supplies the temporary `friendly_stop_percent` (integer **40–80**) opt-in and directory. Account-wrapper resolution does not change model identity.
+The launcher explicitly loads the existing `optional-extensions/rlm-friendly-stop.ts`. **Default: no friendly stop, for any model, including `gpt-6-astra`.** No model opts in by itself and no inherited environment variable can arm a child. Friendly stopping exists only when the human explicitly asks for it and the launching run passes both `friendly_stop_percent` (integer **40–80**) and `friendly_stop_directory` on that job. Account-wrapper resolution does not change model identity.
 
-Omitted opt-in means **no friendly limit**. Canonical launches scrub inherited friendly-stop variables, including legacy token limits, to prevent accidental propagation. Explicit legacy token mode still works when the optional extension is used standalone. The production opt-in list is separate from the shared band: Astra is enabled automatically, while Luna, GLM, and unlisted models are not permanent defaults. Explicit percentage inputs remain compatible as isolated temporary opt-ins and are bounded to 40–80; they do not create separate production policies.
+When explicitly requested, checkpoint wrapping begins at that percentage of the effective runtime context window and the upper boundary at 80% takes control so ordinary work does not continue past it. These are estimator/tool-boundary bands, not exact provider-token promises. The allowlist is `gpt-6-astra` and `gpt-5.6-sol`; any other model is rejected before setup. Explicit legacy token mode still works when the optional extension is used standalone.
+
+Omitted opt-in means **no friendly limit**. Canonical launches scrub inherited friendly-stop variables, including legacy token limits, to prevent accidental propagation. A worker left without an explicit request runs to the provider's own context handling; nothing here caps or blocks an OpenAI request. `subagent_clean_and_continue` remains available for a pause that actually occurred, and produces nothing when none did.
 
 Saved friendly settings are immutable for follow-ups, just like the saved model route: omit to inherit or repeat the saved values; changing or adding a limit requires a fresh launch. Reload the parent to expose the new launch-tool fields.
 
