@@ -54,6 +54,11 @@ export type PaneCacheEntry = {
 	lastSeenAt: number;
 };
 
+// Which agent published a pane snapshot. Snapshots from Pi builds that predate
+// the field carry none and count as Pi.
+export type AgentKind = "pi" | "claude";
+const AGENT_KINDS: readonly AgentKind[] = ["pi", "claude"];
+
 export type PaneCacheSnapshot = {
 	version: 1;
 	updatedAt: number;
@@ -65,6 +70,7 @@ export type PaneCacheSnapshot = {
 	totalCost: number;
 	busyStartedAt?: number;
 	agentDone: boolean;
+	agent?: AgentKind;
 };
 
 type PaneRecord = PaneCacheSnapshot & { paneId: string; windowId: string };
@@ -87,6 +93,7 @@ export type SessionCacheState = {
 	entries: PaneCacheEntry[];
 	busyStartedAt?: number;
 	agentDone: boolean;
+	agents: AgentKind[];
 };
 
 type TmuxExec = (args: string[]) => Promise<{ stdout: string; code: number }>;
@@ -246,6 +253,9 @@ export const getSessionCacheState = (
 		})),
 		...(summary.busyStartedAt === undefined ? {} : { busyStartedAt: summary.busyStartedAt }),
 		agentDone: summary.agentDone,
+		agents: AGENT_KINDS.filter((kind) =>
+			snapshots.some((snapshot) => (snapshot.agent ?? "pi") === kind),
+		),
 	};
 };
 
@@ -615,38 +625,17 @@ export class CacheStatus {
 			totalCost: getSessionUsage(ctx.sessionManager.getEntries(), sessionStartedAt).cost,
 			...(this.busyStartedAt === undefined ? {} : { busyStartedAt: this.busyStartedAt }),
 			agentDone: this.agentDone,
+			agent: "pi",
 		};
 	}
 
 	async publish(exec: TmuxExec, paneId: string): Promise<void> {
 		const snapshot = this.getSnapshot();
-		if (!snapshot) return;
-		await option(exec, ["-p", "-t", paneId, "@pi_cache_data", encodeSnapshot(snapshot)]);
-		await option(exec, [
-			"-p",
-			"-t",
-			paneId,
-			"@pi_cache_pane",
-			formatPaneCacheStatus(snapshot),
-		]);
-		const sessionId = await getSessionId(exec, paneId);
-		if (sessionId) await publishAggregates(exec, sessionId, Date.now());
+		if (snapshot) await publishPaneSnapshot(exec, paneId, snapshot);
 	}
 
 	async clear(exec: TmuxExec, paneId: string): Promise<void> {
-		await exec(["set-option", "-q", "-u", "-p", "-t", paneId, "@pi_cache_data"]);
-		await exec([
-			"set-option",
-			"-q",
-			"-u",
-			"-p",
-			"-t",
-			paneId,
-			"@pi_cache_pane",
-		]);
-		await exec(["set-option", "-q", "-u", "-w", "-t", paneId, "@pi_cache_window"]);
-		const sessionId = await getSessionId(exec, paneId);
-		if (sessionId) await publishAggregates(exec, sessionId, Date.now());
+		await clearPaneSnapshot(exec, paneId);
 	}
 
 	hasActiveFlash(now: number = Date.now()): boolean {
@@ -684,10 +673,46 @@ export class CacheStatus {
 
 export const cacheStatus = new CacheStatus();
 
+// Shared with ~/.claude/hooks/tmux-status.mjs, which publishes Claude Code
+// snapshots through the same pane/window/session options.
+export const publishPaneSnapshot = async (
+	exec: TmuxExec,
+	paneId: string,
+	snapshot: PaneCacheSnapshot,
+): Promise<void> => {
+	await option(exec, ["-p", "-t", paneId, "@pi_cache_data", encodeSnapshot(snapshot)]);
+	await option(exec, [
+		"-p",
+		"-t",
+		paneId,
+		"@pi_cache_pane",
+		formatPaneCacheStatus(snapshot),
+	]);
+	const sessionId = await getSessionId(exec, paneId);
+	if (sessionId) await publishAggregates(exec, sessionId, Date.now());
+};
+
+export const clearPaneSnapshot = async (exec: TmuxExec, paneId: string): Promise<void> => {
+	await exec(["set-option", "-q", "-u", "-p", "-t", paneId, "@pi_cache_data"]);
+	await exec([
+		"set-option",
+		"-q",
+		"-u",
+		"-p",
+		"-t",
+		paneId,
+		"@pi_cache_pane",
+	]);
+	await exec(["set-option", "-q", "-u", "-w", "-t", paneId, "@pi_cache_window"]);
+	const sessionId = await getSessionId(exec, paneId);
+	if (sessionId) await publishAggregates(exec, sessionId, Date.now());
+};
+
 export const tmuxNotice = async (
 	exec: TmuxExec,
 	paneId: string,
 	message: string,
+	label = "pi",
 ): Promise<void> => {
 	const sessionId = await getSessionId(exec, paneId);
 	if (!sessionId) return;
@@ -707,6 +732,6 @@ export const tmuxNotice = async (
 		"5000",
 		"-t",
 		paneId,
-		`[pi] (${index >= 0 ? index : "?"}) ${name}: ${message}`,
+		`[${label}] (${index >= 0 ? index : "?"}) ${name}: ${message}`,
 	]);
 };
