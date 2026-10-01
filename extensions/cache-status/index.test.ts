@@ -98,7 +98,7 @@ test("publishes pane and session cache options through tmux", async (t) => {
 	);
 	assert.deepEqual(
 		JSON.parse(options.get(optionKey("session", "$1", "@pi_cache_state")) ?? ""),
-		{ version: 1, entries: [], agentDone: false },
+		{ version: 1, entries: [], agentDone: false, agents: ["pi"] },
 	);
 	assert.match(
 		options.get(optionKey("window", "@1", "@pi_cache_window")) ?? "",

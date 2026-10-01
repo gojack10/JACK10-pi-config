@@ -200,5 +200,19 @@ test("session state aggregates the earliest warm cache and oldest busy pane", ()
 		],
 		busyStartedAt: 150,
 		agentDone: false,
+		agents: ["pi"],
 	});
+});
+
+test("session state lists each agent kind once, legacy snapshots counting as pi", () => {
+	assert.deepEqual(getSessionCacheState([snapshot()]).agents, ["pi"]);
+	assert.deepEqual(getSessionCacheState([snapshot({ agent: "claude" })]).agents, ["claude"]);
+	assert.deepEqual(
+		getSessionCacheState([
+			snapshot({ agent: "claude" }),
+			snapshot(),
+			snapshot({ agent: "pi" }),
+		]).agents,
+		["pi", "claude"],
+	);
 });
