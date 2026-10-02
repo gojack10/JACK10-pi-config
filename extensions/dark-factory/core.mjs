@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { appendFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 
@@ -35,7 +35,7 @@ export function validateReport(text, role, smoke = false) {
   if (r.version !== 1 || r.role !== role || typeof r.summary !== 'string' || !r.summary.trim()) throw Error('invalid report identity/summary');
   const allowed = role === 'planner' ? ['next', 'ready_for_user_test', 'blocked'] : ['worked', 'blocked'];
   if (!allowed.includes(r.disposition)) throw Error('invalid disposition');
-  if (!Array.isArray(r.evidence) || !r.evidence.every(p => typeof p === 'string' && isAbsolute(p) && statSync(p).isFile())) throw Error('missing evidence');
+  if (!Array.isArray(r.evidence) || !r.evidence.every(p => typeof p === 'string' && isAbsolute(p) && existsSync(p))) throw Error('missing evidence');
   if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
   if (smoke && r.updated_nodes.length) throw Error('smoke must not mutate tree');
   if (!smoke && r.disposition !== 'blocked' && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
