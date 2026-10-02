@@ -6,6 +6,7 @@ Runs one fresh local Qwen planner and one fresh local Qwen worker at a time thro
 cd ~/.pi/agent
 node extensions/dark-factory/run.mjs smoke --wait  # two read-only agents
 node extensions/dark-factory/run.mjs start         # detached overnight run
+node extensions/dark-factory/run.mjs status        # current/last state, error and live metadata
 node extensions/dark-factory/run.mjs stop          # stop after active bounded attempt; also clears a proven-stale lock
 node extensions/dark-factory/run.mjs recover       # clear an interrupted lock only when no factory process/session exists
 ```

@@ -80,6 +80,9 @@ export default function (pi: ExtensionAPI) {
             return { text: readFileSync(reportPath, 'utf8'), receipt };
           } });
       } catch (error) {
+        const prior = existsSync(join(directory, 'state.json'))
+          ? JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')) : {};
+        save(join(directory, 'state.json'), { ...prior, status: 'error', error: String(error) });
         save(join(directory, 'error.json'), { error: String(error), safe, notices });
         throw error;
       } finally {
