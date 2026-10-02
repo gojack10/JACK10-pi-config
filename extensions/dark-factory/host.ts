@@ -28,14 +28,18 @@ export default function (pi: ExtensionAPI) {
             if (existsSync(join(directory, 'STOP'))) throw Error('stop requested');
             const missionPath = join(directory, `${step}-${role}.md`);
             writeFileSync(missionPath, mission({ role, reportPath, previous, task, smoke: config.smoke, directory, contract: config.contract, project }));
-            const policyFile = join(directory, `${step}-policy.ts`);
-            const policy = { smoke: config.smoke, task: project.name, directory, route: project.route,
-              report: reportPath, reads: [join(directory, 'fixture.txt'), ...(previous ? [previous] : [])] };
-            writeFileSync(policyFile, `import { installGuard } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), 'guard.ts'))};\nexport default pi => installGuard(pi, ${JSON.stringify(policy)});\n`);
+            const extensionFiles: string[] = [];
+            if (config.smoke || project.name === 'bf2') {
+              const policyFile = join(directory, `${step}-policy.ts`);
+              const policy = { smoke: config.smoke, route: project.route, report: reportPath,
+                reads: [join(directory, 'fixture.txt'), ...(previous ? [previous] : [])] };
+              writeFileSync(policyFile, `import { installGuard } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), 'guard.ts'))};\nexport default pi => installGuard(pi, ${JSON.stringify(policy)});\n`);
+              extensionFiles.push(policyFile);
+            }
             safe = false; // A crash or ambiguous launch must retain this task's lock.
             const launched = await launcher.launch([{ ...project.route, mode: 'task', cwd: config.cwd,
               session_label: `${project.name}-${role}-${step}`, mission_file: missionPath, report_file: reportPath,
-              extension_files: [policyFile] }]);
+              extension_files: extensionFiles }]);
             const receipt = launched.jobs[0];
             save(join(directory, `${step}-launch.json`), launched);
             save(join(directory, 'active.json'), { step, role, receipt });
