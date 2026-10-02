@@ -45,5 +45,8 @@ test('sequential planner/worker handoff, STOP, invalid reports and repeat detect
     assert.deepEqual(factoryActivity(['ordinary', 'bf2-worker-4-x'], ['node dark-factory/run.mjs controller /run'], '/run'),
       { sessions: ['bf2-worker-4-x'], controller: true });
     assert.deepEqual(factoryActivity(['ordinary'], ['node elsewhere'], '/run'), { sessions: [], controller: false });
+    assert.equal(validateReport(JSON.stringify({ version: 1, role: 'worker', disposition: 'worked',
+      summary: 'directory evidence', evidence: [root], updated_nodes: ['00000000-0000-0000-0000-000000000000'] }), 'worker').summary,
+      'directory evidence');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, rmdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, unlinkSync, rmdirSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -76,6 +76,7 @@ if (command === 'controller') {
   const directory = join(runs, new Date().toISOString().replaceAll(':', '-') + (command === 'smoke' ? '-smoke' : '-bf2'));
   mkdirSync(directory);
   writeFileSync(join(lock, 'run'), directory + '\n');
+  writeFileSync(join(runs, 'LAST'), directory + '\n');
   save(join(directory, 'config.json'), { smoke: command === 'smoke', cwd: homedir(),
     contract: readFileSync(join(here, 'bf2-contract.md'), 'utf8') });
   writeFileSync(join(directory, 'fixture.txt'), 'FACTORY_READ_ONLY_OK\n');
@@ -100,6 +101,18 @@ if (command === 'controller') {
     console.log(JSON.stringify(result));
     process.exitCode = result.ok ? 0 : 1;
   }
+} else if (command === 'status') {
+  const candidates = readdirSync(runs, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && entry.name !== 'LOCK').map(entry => join(runs, entry.name)).sort();
+  const directory = existsSync(join(lock, 'run')) ? readFileSync(join(lock, 'run'), 'utf8').trim()
+    : existsSync(join(runs, 'LAST')) ? readFileSync(join(runs, 'LAST'), 'utf8').trim() : candidates.at(-1);
+  if (!directory) console.log(JSON.stringify({ status: 'never_started' }, null, 2));
+  else {
+    const readJson = name => existsSync(join(directory, name)) ? JSON.parse(readFileSync(join(directory, name), 'utf8')) : undefined;
+    console.log(JSON.stringify({ directory, locked: existsSync(join(lock, 'run')),
+      activity: activity(directory), state: readJson('state.json'), error: readJson('error.json'),
+      finished: readJson('finished.json') }, null, 2));
+  }
 } else if (command === 'stop' || command === 'recover') {
   if (!existsSync(join(lock, 'run'))) {
     console.log('Factory already stopped; no lock exists.');
@@ -113,6 +126,6 @@ if (command === 'controller') {
     } else console.log(`Stopped and released stale lock: ${directory}`);
   }
 } else {
-  console.log('Usage: node run.mjs smoke [--wait] | start | stop | recover');
+  console.log('Usage: node run.mjs smoke [--wait] | start | status | stop | recover');
   process.exitCode = 2;
 }
