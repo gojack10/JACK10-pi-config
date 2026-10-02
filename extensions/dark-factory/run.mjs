@@ -4,13 +4,38 @@ import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { save, ROUTE } from './core.mjs';
+import { factoryActivity, save, ROUTE } from './core.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const runs = join(home, 'factory-runs');
 const lock = join(runs, 'LOCK');
 const [command, argument] = process.argv.slice(2);
 const quote = x => `'${x.replaceAll("'", "'\\''")}'`;
+const lines = (file, args) => {
+  try { return execFileSync(file, args, { encoding: 'utf8' }).trim().split('\n').filter(Boolean); }
+  catch { return []; }
+};
+const activity = directory => factoryActivity(
+  lines('tmux', ['list-sessions', '-F', '#{session_name}']),
+  lines('ps', ['-axo', 'command=']),
+  directory,
+);
+const releaseQuiescent = (directory, reason) => {
+  const found = activity(directory);
+  if (found.controller || found.sessions.length) return found;
+  const active = existsSync(join(directory, 'active.json'))
+    ? JSON.parse(readFileSync(join(directory, 'active.json'), 'utf8')) : undefined;
+  save(join(directory, 'interrupted.json'), {
+    reason,
+    orphan_report: !!active && existsSync(join(directory, `${active.step}-${active.role}.json`)),
+    note: 'An orphan report has no durable successful outcome receipt and is not credited as a completed attempt.',
+  });
+  writeFileSync(join(directory, 'QUIESCENT'), 'No active factory controller or worker remains; stale lock recovered.\n');
+  if (existsSync(join(lock, 'run')) && readFileSync(join(lock, 'run'), 'utf8').trim() === directory) {
+    unlinkSync(join(lock, 'run')); rmdirSync(lock);
+  }
+  return found;
+};
 
 if (command === 'controller') {
   const directory = resolve(argument);
@@ -75,11 +100,19 @@ if (command === 'controller') {
     console.log(JSON.stringify(result));
     process.exitCode = result.ok ? 0 : 1;
   }
-} else if (command === 'stop') {
-  const directory = readFileSync(join(lock, 'run'), 'utf8').trim();
-  writeFileSync(join(directory, 'STOP'), 'Stop after the active bounded attempt.\n');
-  console.log(`Stop requested: ${directory}`);
+} else if (command === 'stop' || command === 'recover') {
+  if (!existsSync(join(lock, 'run'))) {
+    console.log('Factory already stopped; no lock exists.');
+  } else {
+    const directory = readFileSync(join(lock, 'run'), 'utf8').trim();
+    writeFileSync(join(directory, 'STOP'), 'Stop after the active bounded attempt.\n');
+    const found = releaseQuiescent(directory, command === 'recover' ? 'explicit stale-run recovery' : 'stop found an already-quiescent interrupted run');
+    if (found.controller || found.sessions.length) {
+      if (command === 'recover') throw Error(`Cannot recover an active factory: controller=${found.controller}, sessions=${found.sessions.join(',')}`);
+      console.log(`Stop requested after the active attempt: ${directory}`);
+    } else console.log(`Stopped and released stale lock: ${directory}`);
+  }
 } else {
-  console.log('Usage: node run.mjs smoke [--wait] | start | stop');
+  console.log('Usage: node run.mjs smoke [--wait] | start | stop | recover');
   process.exitCode = 2;
 }

@@ -40,20 +40,30 @@ export default function (pi: ExtensionAPI) {
             if (!['running', 'start_timeout'].includes(receipt.status)) throw Error(`launch failed: ${JSON.stringify(receipt)}`);
             // Completion notification is event-driven; no model or pane-text polling.
             await new Promise<void>((resolve, reject) => {
+              let timer: NodeJS.Timeout | undefined;
+              const done = () => { if (timer) clearTimeout(timer); wake = () => {}; };
               const inspect = () => {
                 const result = background.getReport(launched.batch_id);
-                if (result) { clearTimeout(timer); wake = () => {}; resolve(); return; }
+                if (result) { done(); resolve(); return; }
                 const notice = notices.find(n => /paused for context|needs input|maintenance error|human maintenance/.test(n));
-                if (notice) { clearTimeout(timer); wake = () => {}; reject(Error(notice)); }
+                if (notice) { done(); reject(Error(notice)); }
               };
-              const timer = setTimeout(() => { wake = () => {}; reject(Error('attempt deadline reached; child retained, no successor launched')); }, config.smoke ? 300000 : 7200000);
+              // Real work waits for its durable outcome. Per-command limits and explicit stop/abort own intervention.
+              if (config.smoke) timer = setTimeout(() => { done(); reject(Error('smoke attempt deadline reached')); }, 300000);
               wake = inspect;
               inspect();
             });
             const batch = background.getReport(launched.batch_id)!;
             save(join(directory, `${step}-batch.json`), batch);
             const final = batch.completions[0];
-            if (batch.completions.length !== 1 || final.id !== receipt.job || final.status !== 'completed' || final.source !== 'model') throw Error(`non-successful attempt: ${JSON.stringify(batch)}`);
+            if (batch.completions.length !== 1 || final.id !== receipt.job || final.status !== 'completed' || final.source !== 'model') {
+              if (existsSync(join(directory, 'STOP'))) {
+                const closed = await pi.exec('tmux', ['kill-session', '-t', receipt.session_label]);
+                if (closed.code !== 0) throw Error(`cannot close stopped worker: ${closed.stderr}`);
+                safe = true;
+              }
+              throw Error(`non-successful attempt: ${JSON.stringify(batch)}`);
+            }
             const manifest = JSON.parse(readFileSync(receipt.manifest_file!, 'utf8'));
             const markers = readFileSync(receipt.monitor_log!, 'utf8').trim().split('\n').map(line => { try { return JSON.parse(line); } catch { return {}; } });
             const marker = markers.find(m => m.kind === 'final' && m.jobId === receipt.job && m.attemptId === receipt.attempt_id);
