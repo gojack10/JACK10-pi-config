@@ -20,9 +20,15 @@ export function taskSettings(name = 'task', projects = existsSync(LOCAL_PROJECTS
       (project.root !== undefined && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(project.root))) throw Error('Invalid factory project configuration');
   return { ...project, name };
 }
-export function factoryActivity(sessionNames, processCommands, directory) {
+export function taskRuns(base, name = 'bf2') {
+  taskSettings(name);
+  // Keep the live legacy BF2 controller's LOCK/LAST paths unchanged.
+  return name === 'bf2' ? base : join(base, name);
+}
+export function factoryActivity(sessionNames, processCommands, directory, name = 'bf2') {
+  taskSettings(name);
   return {
-    sessions: sessionNames.filter(name => /^bf2-(factory|planner|worker)-/.test(name)),
+    sessions: sessionNames.filter(session => new RegExp(`^${name}-(factory|planner|worker)-`).test(session)),
     controller: processCommands.some(command => command.includes('dark-factory/run.mjs controller') && command.includes(directory)),
   };
 }
@@ -30,22 +36,26 @@ export function save(path, value) {
   writeFileSync(`${path}.tmp`, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
 }
-export function validateReport(text, role, smoke = false) {
+export function validateReport(text, role, smoke = false, project = taskSettings()) {
   const r = JSON.parse(text);
   if (r.version !== 1 || r.role !== role || typeof r.summary !== 'string' || !r.summary.trim()) throw Error('invalid report identity/summary');
-  const allowed = role === 'planner' ? ['next', 'ready_for_user_test', 'blocked'] : ['worked', 'blocked'];
+  const allowed = role === 'planner' ? ['next', project.ready, 'blocked'] : ['worked', 'blocked'];
   if (!allowed.includes(r.disposition)) throw Error('invalid disposition');
   if (!Array.isArray(r.evidence) || !r.evidence.every(p => typeof p === 'string' && isAbsolute(p) && existsSync(p))) throw Error('missing evidence');
   if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
   if (smoke && r.updated_nodes.length) throw Error('smoke must not mutate tree');
-  if (!smoke && r.disposition !== 'blocked' && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
+  if (!smoke && r.disposition !== 'blocked') {
+    if (project.name === 'bf2' && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
+    if (project.name !== 'bf2' && r.evidence.length === 0) throw Error('completed project work requires evidence');
+  }
   if (r.disposition === 'next' && (!r.task || typeof r.task.instruction !== 'string' || !r.task.instruction.trim() || typeof r.task.acceptance !== 'string' || !r.task.acceptance.trim())) throw Error('next requires bounded task and acceptance');
   if (r.disposition === 'ready_for_user_test' && (smoke || r.evidence.length < 2 || typeof r.launch_command !== 'string' || !r.launch_command.trim())) throw Error('ready requires launch command and launch/UI evidence');
+  if (r.disposition === 'complete' && (smoke || r.evidence.length < 2 || !r.updated_nodes.length)) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
   return r;
 }
 
 // The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
-export async function runLoop({ directory, smoke, runStep, maxSteps = smoke ? 2 : 10000 }) {
+export async function runLoop({ directory, smoke, runStep, project = taskSettings(), maxSteps = smoke ? 2 : 10000 }) {
   const statePath = join(directory, 'state.json');
   if (existsSync(statePath)) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
   let previous = null, task = null;
@@ -56,12 +66,12 @@ export async function runLoop({ directory, smoke, runStep, maxSteps = smoke ? 2 
     save(statePath, { status: 'running', step, role, previous });
     const reportPath = join(directory, `${step}-${role}.json`);
     const result = await runStep({ step, role, reportPath, previous, task });
-    const report = validateReport(result.text, role, smoke);
+    const report = validateReport(result.text, role, smoke, project);
     const completed = { step, role, reportPath, receipt: result.receipt, report };
     appendFileSync(join(directory, 'history.jsonl'), JSON.stringify(completed) + '\n');
     save(statePath, { status: 'checkpoint', ...completed });
     previous = reportPath;
-    if (report.disposition === 'blocked' || report.disposition === 'ready_for_user_test') {
+    if (report.disposition === 'blocked' || report.disposition === project.ready) {
       save(statePath, { status: report.disposition, ...completed }); return;
     }
     if (role === 'planner') {

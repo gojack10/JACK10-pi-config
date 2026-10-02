@@ -1,16 +1,20 @@
-# BF2 dark factory
+# Dark Factory
 
-Runs one fresh local Qwen planner and one fresh local Qwen worker at a time through the canonical tmux subagent transport. Advancement requires a structured task outcome, a readable JSON report, a durable receipt, and closed tmux session before the successor launches.
+## Sequential dark factory
+
+Runs fresh agents through the canonical tmux subagent transport. The repository owns generic scheduling, locks, route guards, report delivery and continuation. SiftText owns project instructions and completion conditions; no project contract Markdown is shipped or read from this repository.
+
+A local `~/.pi/agent/factory-projects.local.json` maps task names to a `root` instruction-node UUID, explicit `route` (`provider`, `model`, `thinking`) and `ready` disposition. This file is ignored. A prepared `--config` may supply the same `project` object. Non-smoke work refuses to start without an instruction entry; workers read its current authority in SiftText. The default `task` supports read-only smoke without any project identity.
 
 ```sh
-cd ~/.pi/agent
-node extensions/dark-factory/run.mjs smoke --wait  # two read-only agents
-node extensions/dark-factory/run.mjs start         # detached overnight run
-node extensions/dark-factory/run.mjs status        # current/last state, error and live metadata
-node extensions/dark-factory/run.mjs stop          # stop after active bounded attempt; also clears a proven-stale lock
-node extensions/dark-factory/run.mjs recover       # clear an interrupted lock only when no factory process/session exists
+node extensions/dark-factory/run.mjs smoke task --wait
+node extensions/dark-factory/run.mjs start sample --config /private/path/run.json
+node extensions/dark-factory/run.mjs status sample
+node extensions/dark-factory/run.mjs stop sample
+node extensions/dark-factory/run.mjs resume sample
 ```
 
-Runs and evidence live in `factory-runs/` and are ignored by Git. `factory-runs/LOCK/run` identifies the only admitted run. A crash retains the lock deliberately. `stop`/`recover` release it only after metadata proves no factory controller or worker session remains; an orphan report is retained but never credited without a successful durable task receipt. Never delete an ambiguous lock manually.
+Each named task has its own lock and ignored run directory. Planner/worker lanes can coexist with fixed-assignment readers under bounded admission. Reader packets remain separate from aggregate writes. Suite status reports prerequisite, aggregate and reader states with exact assigned/read/excluded/merged counts; exclusions require explicit authority and cannot count as reads.
 
-The loop stops at `ready_for_user_test`, `blocked`, an invalid report/receipt, repeated assignment, explicit `STOP`, or a technical failure. Real attempts have no factory wall-clock deadline; foreground commands have the global 120-second limit and longer commands use tracked `bash_bg`, whose completion gates `report_outcome`. It never treats pane exit, prose, process survival, or completed decomposition as game success.
+Advancement requires a structured task outcome, valid JSON report, durable receipt and a closed worker session. Context handoffs retain the role, assignment, report and spent work. Graceful stop admits no successor; interrupted or ambiguous attempts retain their evidence and locks until quiescence is proven. The route guard bounds provider-error retries and never overrides human/policy stops or pending work. Resume never credits an orphan report merely because its file exists. Real attempts have no factory wall-clock deadline, and transport settlement is not project completion.
+
