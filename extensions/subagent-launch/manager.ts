@@ -55,6 +55,8 @@ export interface SubagentJobInput {
   session_label: string;
   mode: TaskMode;
   report_file?: string;
+  /** Trusted programmatic controllers may load additional worker policy extensions. */
+  extension_files?: string[];
   /** Run-scoped friendly-stop opt-in; omitted means disabled. */
   friendly_stop_percent?: number;
   friendly_stop_directory?: string;
@@ -315,7 +317,9 @@ export class SubagentLauncher {
     // Create every pane, option, manifest, and log before any monitor or child is released.
     for (const item of prepared) {
       try {
-        const state = await this.prepare(item, parentPane, extensions);
+        const extra = item.input.extension_files ?? [];
+        for (const path of extra) await requireMission(asPath(path, "extension_files"));
+        const state = await this.prepare(item, parentPane, [...extensions, ...extra]);
         item.state = state;
         viable.push(item);
       } catch (error) {

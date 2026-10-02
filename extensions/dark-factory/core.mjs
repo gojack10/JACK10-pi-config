@@ -1,0 +1,59 @@
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { isAbsolute, join } from 'node:path';
+
+export const ROUTE = { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' };
+export const ROOT = 'ef189bb9-0df0-4ee8-950f-12f3c4ee243c';
+export function save(path, value) {
+  writeFileSync(`${path}.tmp`, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+  renameSync(`${path}.tmp`, path);
+}
+export function validateReport(text, role, smoke = false) {
+  const r = JSON.parse(text);
+  if (r.version !== 1 || r.role !== role || typeof r.summary !== 'string' || !r.summary.trim()) throw Error('invalid report identity/summary');
+  const allowed = role === 'planner' ? ['next', 'ready_for_user_test', 'blocked'] : ['worked', 'blocked'];
+  if (!allowed.includes(r.disposition)) throw Error('invalid disposition');
+  if (!Array.isArray(r.evidence) || !r.evidence.every(p => typeof p === 'string' && isAbsolute(p) && statSync(p).isFile())) throw Error('missing evidence');
+  if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
+  if (smoke && r.updated_nodes.length) throw Error('smoke must not mutate tree');
+  if (!smoke && r.disposition !== 'blocked' && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
+  if (r.disposition === 'next' && (!r.task || typeof r.task.instruction !== 'string' || !r.task.instruction.trim() || typeof r.task.acceptance !== 'string' || !r.task.acceptance.trim())) throw Error('next requires bounded task and acceptance');
+  if (r.disposition === 'ready_for_user_test' && (smoke || r.evidence.length < 2 || typeof r.launch_command !== 'string' || !r.launch_command.trim())) throw Error('ready requires launch command and launch/UI evidence');
+  return r;
+}
+
+// The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
+export async function runLoop({ directory, smoke, runStep, maxSteps = smoke ? 2 : 10000 }) {
+  const statePath = join(directory, 'state.json');
+  if (existsSync(statePath)) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
+  let previous = null, task = null;
+  const fingerprints = new Set();
+  for (let step = 1; step <= maxSteps; step++) {
+    if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step }); return; }
+    const role = step % 2 ? 'planner' : 'worker';
+    save(statePath, { status: 'running', step, role, previous });
+    const reportPath = join(directory, `${step}-${role}.json`);
+    const result = await runStep({ step, role, reportPath, previous, task });
+    const report = validateReport(result.text, role, smoke);
+    const completed = { step, role, reportPath, receipt: result.receipt, report };
+    appendFileSync(join(directory, 'history.jsonl'), JSON.stringify(completed) + '\n');
+    save(statePath, { status: 'checkpoint', ...completed });
+    previous = reportPath;
+    if (report.disposition === 'blocked' || report.disposition === 'ready_for_user_test') {
+      save(statePath, { status: report.disposition, ...completed }); return;
+    }
+    if (role === 'planner') {
+      const fingerprint = createHash('sha256').update(JSON.stringify(report.task)).digest('hex');
+      if (fingerprints.has(fingerprint)) throw Error('identical task repeated: stopping instead of blind retry');
+      fingerprints.add(fingerprint);
+      task = report.task;
+    }
+  }
+  save(statePath, { status: smoke ? 'smoke_passed' : 'step_limit', steps: maxSteps, previous });
+}
+
+export function mission({ role, reportPath, previous, task, smoke, directory, contract }) {
+  const schema = `Write ONLY a JSON object into ${reportPath} (the launcher has reserved this file; write in place, do not rename it). Fields: version:1, role:${JSON.stringify(role)}, disposition, summary:string, evidence:absolute-file-path[], updated_nodes:UUID[]. Planner dispositions: next (requires task:{instruction:string,acceptance:string}), ready_for_user_test (requires launch_command:string and at least two evidence files: actual launch log and actual game UI evidence), blocked. Worker dispositions: worked or blocked. Use completed in report_outcome after the valid report is written, even for a disproved hypothesis or a completed blocked-status report. A technical inability to finish the report is failed. End the turn after report_outcome. Do not launch child agents or untracked background processes. Do not change model/provider/thinking. No human dialogue is available.`;
+  if (smoke) return `Read-only transport smoke, not BF2 research. Do not read SiftText or methodology nodes: this is a bounded file-reading fixture. No bash, network, game launch, code edits, or tree writes. Use read on ${join(directory, 'fixture.txt')}${previous ? ` and preceding report ${previous}` : ''}. ${role === 'planner' ? 'Return next with a tiny task asking the worker to report the fixture text, acceptance exact fixture text.' : 'Report the fixture text and whether the preceding planner report was readable; return worked.'} Evidence lists the fixture path. updated_nodes is []. Your only write is your reserved report. ${schema}`;
+  return `${contract}\n\nROLE: ${role}. BF2 owner: ${ROOT}. Run directory: ${directory}. Previous report: ${previous ?? 'none (initial entry)'}.\n${role === 'planner' ? 'Read the current tree and required project entry rules. Review the previous report and load-bearing evidence, if any. Choose exactly one bounded next assignment. Reuse an existing node where possible. A reconciliation of stale/contradicted nodes is a legitimate worker assignment. Commit and read back the assignment before returning next. Do not perform the research assignment yourself. Review evidence, not just PASS claims. Never declare the game ready based on model progress or process survival.' : `Execute only the assigned bounded task: ${JSON.stringify(task)}. Read its owner, prerequisites and required rules. Verify inputs; perform the work and checks, commit results and affected corrections, and read back the changed nodes. Do not select the next task. Record failures truthfully; a failed experiment is a result, not permission to abandon the game outcome.`}\n${schema}`;
+}
