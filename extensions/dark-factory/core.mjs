@@ -4,6 +4,12 @@ import { isAbsolute, join } from 'node:path';
 
 export const ROUTE = { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' };
 export const ROOT = 'ef189bb9-0df0-4ee8-950f-12f3c4ee243c';
+export function factoryActivity(sessionNames, processCommands, directory) {
+  return {
+    sessions: sessionNames.filter(name => /^bf2-(factory|planner|worker)-/.test(name)),
+    controller: processCommands.some(command => command.includes('dark-factory/run.mjs controller') && command.includes(directory)),
+  };
+}
 export function save(path, value) {
   writeFileSync(`${path}.tmp`, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
   renameSync(`${path}.tmp`, path);

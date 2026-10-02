@@ -7,13 +7,13 @@ export function allowedTool(name: string, input: any, policy: { smoke: boolean; 
     if (name === 'read') return policy.reads.includes(resolve(input.path ?? ''));
     return name === 'write' && resolve(input.path ?? '') === policy.report;
   }
-  return !['subagent_launch', 'subagent_followup', 'bash_bg'].includes(name);
+  return !['subagent_launch', 'subagent_followup'].includes(name);
 }
 export function installGuard(pi: ExtensionAPI, policy: { smoke: boolean; report: string; reads: string[] }) {
   pi.on('session_start', () => {
     pi.setActiveTools(pi.getActiveTools().filter(name => policy.smoke
       ? ['read', 'write', 'report_outcome'].includes(name)
-      : !['subagent_launch', 'subagent_followup', 'bash_bg'].includes(name)));
+      : !['subagent_launch', 'subagent_followup'].includes(name)));
   });
   pi.on('tool_call', event => allowedTool(event.toolName, event.input, policy)
     ? undefined : { block: true, reason: 'Factory policy: this tool/path is outside the assigned authority.' });
