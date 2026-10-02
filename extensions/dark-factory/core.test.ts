@@ -42,12 +42,6 @@ test('sequential planner/worker handoff, STOP, invalid reports and repeat detect
     const real = { ...policy, smoke: false };
     assert.ok(allowedTool('bash_bg', {}, real));
     assert.equal(allowedTool('subagent_launch', {}, real), false);
-    const ycPolicy = { ...real, task: 'yc', directory: root };
-    assert.equal(allowedTool('bash', {}, ycPolicy), false);
-    assert.equal(allowedTool('sifttext_create_tree', {}, ycPolicy), false);
-    assert.ok(allowedTool('sifttext_create_node', {}, ycPolicy));
-    assert.ok(allowedTool('write', { path: join(root, 'artifact.md') }, ycPolicy));
-    assert.equal(allowedTool('write', { path: '/tmp/outside.md' }, ycPolicy), false);
     assert.deepEqual(factoryActivity(['ordinary', 'bf2-worker-4-x', 'yc-worker-2-x'], ['node dark-factory/run.mjs controller /run'], '/run'),
       { sessions: ['bf2-worker-4-x'], controller: true });
     assert.deepEqual(factoryActivity(['bf2-worker-4-x', 'yc-worker-2-x'], ['node elsewhere'], '/run', 'yc'),

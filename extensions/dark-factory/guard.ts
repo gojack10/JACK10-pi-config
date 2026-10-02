@@ -4,15 +4,7 @@ import { routeEntry, type RoutePin } from '../codex-personal/resolution.ts';
 import { ROUTE } from './core.mjs';
 
 type Route = { provider: string; model: string; thinking: string };
-type Policy = { smoke: boolean; report: string; reads: string[]; route?: Route; task?: string; directory?: string };
-const destructiveTreeTools = new Set([
-  'sifttext_create_tree', 'sifttext_delete_node', 'sifttext_duplicate_node', 'sifttext_move_node',
-  'sifttext_move_cross_tree', 'sifttext_promote_to_root', 'sifttext_reorder_children',
-]);
-const inside = (path: string, directory: string) => {
-  const target = resolve(path), root = resolve(directory);
-  return target === root || target.startsWith(root + '/');
-};
+type Policy = { smoke: boolean; report: string; reads: string[]; route?: Route };
 
 export function allowedRoute(model: { provider: string; id: string } | undefined, thinking: string, expected: Route, pin?: RoutePin) {
   if (!model || model.id !== expected.model || thinking !== expected.thinking) return false;
@@ -26,11 +18,7 @@ export function allowedTool(name: string, input: any, policy: Policy) {
     if (name === 'read') return policy.reads.includes(resolve(input.path ?? ''));
     return name === 'write' && resolve(input.path ?? '') === policy.report;
   }
-  if (['subagent_launch', 'subagent_followup'].includes(name)) return false;
-  if (policy.task !== 'yc') return true;
-  if (['bash', 'bash_bg', 'edit'].includes(name) || destructiveTreeTools.has(name)) return false;
-  if (name === 'write') return !!policy.directory && inside(input.path ?? '', policy.directory);
-  return true;
+  return !['subagent_launch', 'subagent_followup'].includes(name);
 }
 export function installGuard(pi: ExtensionAPI, policy: Policy) {
   pi.on('session_start', () => {
