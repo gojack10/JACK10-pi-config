@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { BackgroundJobManager } from '../background-jobs/manager.ts';
 import { SubagentLauncher } from '../subagent-launch/manager.ts';
 import { readMonitorReceipt } from '../task-outcomes/monitor-receipt.mjs';
-import { ROUTE, runLoop, save, mission } from './core.mjs';
+import { taskSettings, runLoop, save, mission } from './core.mjs';
 
 export default function (pi: ExtensionAPI) {
   // The controller has no model turns. All reasoning belongs to the sequential workers.
@@ -14,6 +14,7 @@ export default function (pi: ExtensionAPI) {
     description: 'Run the deterministic factory controller (programmatic entry only)',
     handler: async (directory, ctx) => {
       const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
+      const project = config.project ?? taskSettings();
       const notices: string[] = [];
       let wake = () => {};
       const notify = (text: string) => { notices.push(text); wake(); };
@@ -22,17 +23,18 @@ export default function (pi: ExtensionAPI) {
       const launcher = new SubagentLauncher(transportPi, ctx, background);
       let safe = true;
       try {
-        await runLoop({ directory, smoke: config.smoke,
+        await runLoop({ directory, smoke: config.smoke, project,
           runStep: async ({ step, role, reportPath, previous, task }) => {
             if (existsSync(join(directory, 'STOP'))) throw Error('stop requested');
             const missionPath = join(directory, `${step}-${role}.md`);
-            writeFileSync(missionPath, mission({ role, reportPath, previous, task, smoke: config.smoke, directory, contract: config.contract }));
+            writeFileSync(missionPath, mission({ role, reportPath, previous, task, smoke: config.smoke, directory, contract: config.contract, project }));
             const policyFile = join(directory, `${step}-policy.ts`);
-            const policy = { smoke: config.smoke, report: reportPath, reads: [join(directory, 'fixture.txt'), ...(previous ? [previous] : [])] };
+            const policy = { smoke: config.smoke, task: project.name, directory, route: project.route,
+              report: reportPath, reads: [join(directory, 'fixture.txt'), ...(previous ? [previous] : [])] };
             writeFileSync(policyFile, `import { installGuard } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), 'guard.ts'))};\nexport default pi => installGuard(pi, ${JSON.stringify(policy)});\n`);
-            safe = false; // A crash or ambiguous launch must leave the global lock in place.
-            const launched = await launcher.launch([{ ...ROUTE, mode: 'task', cwd: config.cwd,
-              session_label: `bf2-${role}-${step}`, mission_file: missionPath, report_file: reportPath,
+            safe = false; // A crash or ambiguous launch must retain this task's lock.
+            const launched = await launcher.launch([{ ...project.route, mode: 'task', cwd: config.cwd,
+              session_label: `${project.name}-${role}-${step}`, mission_file: missionPath, report_file: reportPath,
               extension_files: [policyFile] }]);
             const receipt = launched.jobs[0];
             save(join(directory, `${step}-launch.json`), launched);

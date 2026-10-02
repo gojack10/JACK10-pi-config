@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { factoryActivity, runLoop, validateReport } from './core.mjs';
-import { allowedTool } from './guard.ts';
+import { factoryActivity, runLoop, taskRuns, taskSettings, validateReport } from './core.mjs';
+import { allowedRoute, allowedTool } from './guard.ts';
 
 const report = role => ({ version: 1, role, summary: 'checked', evidence: [], updated_nodes: [],
   disposition: role === 'planner' ? 'next' : 'worked', ...(role === 'planner' ? { task: { instruction: 'read fixture', acceptance: 'exact value' } } : {}) });
@@ -42,11 +42,37 @@ test('sequential planner/worker handoff, STOP, invalid reports and repeat detect
     const real = { ...policy, smoke: false };
     assert.ok(allowedTool('bash_bg', {}, real));
     assert.equal(allowedTool('subagent_launch', {}, real), false);
-    assert.deepEqual(factoryActivity(['ordinary', 'bf2-worker-4-x'], ['node dark-factory/run.mjs controller /run'], '/run'),
+    const ycPolicy = { ...real, task: 'yc', directory: root };
+    assert.equal(allowedTool('bash', {}, ycPolicy), false);
+    assert.equal(allowedTool('sifttext_create_tree', {}, ycPolicy), false);
+    assert.ok(allowedTool('sifttext_create_node', {}, ycPolicy));
+    assert.ok(allowedTool('write', { path: join(root, 'artifact.md') }, ycPolicy));
+    assert.equal(allowedTool('write', { path: '/tmp/outside.md' }, ycPolicy), false);
+    assert.deepEqual(factoryActivity(['ordinary', 'bf2-worker-4-x', 'yc-worker-2-x'], ['node dark-factory/run.mjs controller /run'], '/run'),
       { sessions: ['bf2-worker-4-x'], controller: true });
+    assert.deepEqual(factoryActivity(['bf2-worker-4-x', 'yc-worker-2-x'], ['node elsewhere'], '/run', 'yc'),
+      { sessions: ['yc-worker-2-x'], controller: false });
     assert.deepEqual(factoryActivity(['ordinary'], ['node elsewhere'], '/run'), { sessions: [], controller: false });
     assert.equal(validateReport(JSON.stringify({ version: 1, role: 'worker', disposition: 'worked',
       summary: 'directory evidence', evidence: [root], updated_nodes: ['00000000-0000-0000-0000-000000000000'] }), 'worker').summary,
       'directory evidence');
+    const yc = taskSettings('yc');
+    assert.deepEqual(yc.route, { provider: 'openai-codex-personal', model: 'gpt-6-sol', thinking: 'xhigh' });
+    assert.equal(taskRuns('/runs', 'bf2'), '/runs');
+    assert.equal(taskRuns('/runs', 'yc'), '/runs/yc');
+    assert.throws(() => taskSettings('unknown'), /Unknown factory task/);
+    assert.equal(validateReport(JSON.stringify({ version: 1, role: 'worker', disposition: 'worked',
+      summary: 'artifact only', evidence: [root], updated_nodes: [] }), 'worker', false, yc).summary, 'artifact only');
+    assert.throws(() => validateReport(JSON.stringify({ version: 1, role: 'planner', disposition: 'ready_for_interview',
+      summary: 'not ready', evidence: [root], updated_nodes: [] }), 'planner', false, yc), /ready requires/);
+    assert.equal(validateReport(JSON.stringify({ version: 1, role: 'planner', disposition: 'ready_for_interview',
+      summary: 'ready', evidence: [root, dir], updated_nodes: ['00000000-0000-0000-0000-000000000000'] }),
+      'planner', false, yc).disposition, 'ready_for_interview');
+    const expected = { provider: 'openai-codex-personal', model: 'gpt-6-sol', thinking: 'xhigh' };
+    const pin = { umbrella: expected.provider, accountKey: 'personal', model: expected.model,
+      actualProviderId: 'openai-codex-primary', feedGeneration: 1, routedAt: Date.now(), workClass: 'long' as const };
+    assert.ok(allowedRoute({ provider: pin.actualProviderId, id: expected.model }, 'xhigh', expected, pin));
+    assert.equal(allowedRoute({ provider: pin.actualProviderId, id: expected.model }, 'high', expected, pin), false);
+    assert.equal(allowedRoute({ provider: 'openai-codex-other', id: expected.model }, 'xhigh', expected, pin), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
