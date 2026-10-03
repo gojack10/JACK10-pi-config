@@ -424,44 +424,25 @@ test("historical release eligibility and persistence fail closed before any new 
   }
 });
 
-test("friendly forceStop saves before typed abort and still aborts if pause storage fails", async t => {
-  for (const failPause of [false, true]) {
-    const h = await harness(t);
-    await h.call("task_outcomes_consumer", contract(h.dir, "friendly", "A"));
-    const savedEnv = { PI_RLM_FRIENDLY_STOP_TOKENS: process.env.PI_RLM_FRIENDLY_STOP_TOKENS, PI_RLM_ROLLOVER_DIR: process.env.PI_RLM_ROLLOVER_DIR };
-    let loaded: any;
-    try {
-      Object.assign(process.env, { PI_RLM_FRIENDLY_STOP_TOKENS: "40", PI_RLM_ROLLOVER_DIR: h.dir });
-      loaded = await loadExtensions([fileURLToPath(new URL("../../optional-extensions/rlm-friendly-stop.ts", import.meta.url))], h.dir);
-    } finally {
-      for (const [key, value] of Object.entries(savedEnv)) {
-        if (value === undefined) delete process.env[key]; else process.env[key] = value;
-      }
-    }
-    assert.deepEqual(loaded.errors, []);
-    const appendEntry = h.runtime.appendEntry;
-    loaded.runtime.appendEntry = appendEntry;
-    const aborts: any[] = [];
-    if (failPause) h.runtime.appendEntry = () => { throw new Error("pause storage failed"); };
-    const ctx: any = {
-      sessionManager: h.sm, model: { provider: "openai-codex-personal", id: "gpt-5.6-sol" },
-      getContextUsage: () => ({ tokens: 90, contextWindow: 100, percent: 90 }),
-      abort: (options: any) => {
-        assert.equal(h.persisted.some(row => row.data.kind === "context_pause"), !failPause);
-        aborts.push(options);
-      },
-    };
-    const stop = loaded.extensions[0].handlers.get("context")[0]({ messages: [] }, ctx);
-    try {
-      if (failPause) await assert.rejects(stop, /pause storage failed/);
-      else await stop;
-    } finally {
-      h.runtime.appendEntry = appendEntry;
-    }
-    assert.equal(aborts.length, 1);
-    assert.equal(aborts[0].kind, "context");
-    assert.match(aborts[0].reason, /upper boundary/);
-  }
+test("friendly reporting retains an active contract and accepts an uncapped current-progress report", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "friendly", "A"));
+  const loaded = await loadExtensions([fileURLToPath(new URL("../../optional-extensions/rlm-friendly-stop.ts", import.meta.url))], h.dir);
+  assert.deepEqual(loaded.errors, []);
+  loaded.runtime.appendEntry = h.runtime.appendEntry;
+  const ctx: any = {
+    sessionManager: h.sm, model: { provider: "local", id: "qwen3.8-flash-next" },
+    getContextUsage: () => ({ tokens: 80, contextWindow: 100, percent: 80 }),
+    abort: () => assert.fail("friendly reporting must not abort"),
+  };
+  const result = await loaded.extensions[0].handlers.get("context")[0]({ messages: [] }, ctx);
+  assert.match(result.messages.at(-1).content, /report_outcome/);
+  assert.equal(h.manager.snapshot().active.state, "active");
+  const findings = "partial findings and remaining work\n".repeat(1000);
+  await writeFile(join(h.dir, "friendly-A.md"), findings);
+  await h.settle({ outcome: "completed", summary: findings });
+  assert.equal(h.manager.snapshot().outcomes.at(-1).summary, findings);
+  assert.equal(h.persisted.some(row => row.data.kind === "context_pause"), false);
 });
 
 test("typed context stops retain pauses while every terminal source wins exactly once", async t => {

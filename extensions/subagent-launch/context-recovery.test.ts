@@ -15,7 +15,7 @@ test.after(restoreLauncherEnvironment);
 
 // Every descendant, including the launcher's monitor and fake interactive child,
 // uses this disposable socket. No default or inherited live tmux server is used.
-for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 'friendly', 'drain'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
+for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 'drain'] as const) test(`no-provider context recovery: ${scenario}`, { timeout: 30000 }, async t => {
   const env = { ...process.env };
   const dir = await mkdtemp(join(tmpdir(), 'context-recovery-'));
   const bin = join(dir, 'bin');
@@ -51,7 +51,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   assert.deepEqual(loaded.errors, []);
   const messages: string[] = [];
   loaded.runtime.sendUserMessage = (text: string) => { messages.push(text); };
-  const model = { provider: 'openai-test', id: scenario === 'friendly' ? 'gpt-5.6-sol' : 'fake', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } };
+  const model = { provider: 'openai-test', id: 'fake', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } };
   const ctx = { cwd: dir, mode: 'tui', sessionManager: SessionManager.inMemory(dir),
     modelRegistry: { find: () => model, getAvailable: () => [model] } };
   const call = (name: string, args: unknown) => loaded.extensions.find((e: any) => e.tools.has(name))
@@ -64,13 +64,12 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   const report = join(dir, 'report.md');
   await writeFile(mission, 'Synthetic context recovery canary; no model.');
   const launch = (await call('subagent_launch', { jobs: [{ provider: model.provider, model: model.id, thinking: 'xhigh',
-    mission_file: mission, cwd: dir, session_label: 'child', mode: 'task', report_file: report,
-    ...(scenario === 'friendly' ? { friendly_stop_percent: 40, friendly_stop_directory: dir } : {}) }] })).details;
+    mission_file: mission, cwd: dir, session_label: 'child', mode: 'task', report_file: report }] })).details;
   const job = launch.jobs[0];
   assert.equal(job.status, 'running', job.status === 'running' ? undefined :
     `${JSON.stringify(job)}\n${await readFile(join(tmpdir(), `${job.job}.tmux.log`), 'utf8').catch(() => '(no child log)')}`);
   await until(() => messages.some(text => text.includes('paused for context')));
-  assert.match(messages[0], scenario === 'friendly' ? /Friendly checkpoint saved:/ : /synthetic context guard reason/);
+  assert.match(messages[0], /synthetic context guard reason/);
   assert.doesNotMatch(messages[0], /Operation aborted/);
   const background = (globalThis as any)[Symbol.for('pi.background-jobs.manager-registry')].get(ctx.sessionManager);
   assert.equal(background.getBatchStatus(launch.batch_id).complete, false);
@@ -83,7 +82,7 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   }
   const original = await readFile(paused.sessionFile, 'utf8');
   const pauseMessageCount = messages.length;
-  if (scenario !== 'complete' && scenario !== 'friendly' && scenario !== 'drain') {
+  if (scenario !== 'complete' && scenario !== 'drain') {
     const reason = { insufficient: /cannot free enough context/, cancel: /reload cancelled/,
       queued: /queued messages remain/, busy: /worker is not idle/ }[scenario];
     await assert.rejects(call('subagent_clean_and_continue', ids), reason);

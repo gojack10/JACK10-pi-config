@@ -6,17 +6,15 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 const { loadExtensions } = await import(pathToFileURL(`${process.env.PI_TEST_PACKAGE}/dist/core/extensions/loader.js`));
 const { SessionManager, estimateTokens } = await import(pathToFileURL(`${process.env.PI_TEST_PACKAGE}/dist/index.js`));
-const friendly = process.env.PI_TEST_RECOVERY_CASE === 'friendly';
-const initialTokens = friendly ? 140000 : 259495;
-if (!friendly && Object.keys(process.env).some(key => key.startsWith('PI_RLM_FRIENDLY_STOP_') || key === 'PI_RLM_ROLLOVER_DIR')) {
-  throw new Error('unconfigured worker inherited friendly-stop settings');
+const initialTokens = 259495;
+if (Object.keys(process.env).some(key => key.startsWith('PI_RLM_FRIENDLY_STOP_') || key === 'PI_RLM_ROLLOVER_DIR')) {
+  throw new Error('worker inherited obsolete checkpoint settings');
 }
 const pane = process.env.TMUX_PANE;
 const tmux = args => execFileSync('tmux', args, { encoding: 'utf8' }).trim();
 const manifest = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile(tmux(['show-options', '-qv', '-t', pane, '@pi_subagent_manifest']), 'utf8')));
 const paths = ['task-outcomes.ts', 'tmux-turn-signal.ts', 'subagent-launch.ts']
   .map(name => join(process.env.PI_TEST_EXTENSIONS, name));
-if (friendly) paths.push(join(process.env.PI_TEST_EXTENSIONS, '../optional-extensions/rlm-friendly-stop.ts'));
 let sm = SessionManager.create(process.cwd(), process.cwd());
 const sessionFile = sm.getSessionFile();
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: initialTokens,
@@ -30,7 +28,6 @@ sm.appendMessage({ role: 'toolResult', toolCallId: 'large-read', toolName: 'read
   details: { preserve: true }, isError: false, timestamp: Date.now() });
 let loaded, ctx;
 let resumed = false;
-let started = false;
 let idle = true;
 let aborted = false;
 // Lifecycle emissions are journaled so the test can prove the in-place recovery
@@ -50,11 +47,11 @@ async function bind() {
   loaded.runtime.sendUserMessage = text => { throw new Error(`unexpected model request: ${text}`); };
   ctx = {
     cwd: process.cwd(), mode: 'tui', hasUI: false, sessionManager: sm,
-    model: { provider: 'openai-test', id: friendly ? 'gpt-5.6-sol' : 'fake', contextWindow: 272000, cost: {} },
+    model: { provider: 'openai-test', id: 'fake', contextWindow: 272000, cost: {} },
     ui: { setStatus() {}, notify() {} },
     isIdle: () => idle, waitForIdle: async () => { if (!idle) throw new Error('not idle'); },
     hasPendingMessages: () => process.env.PI_TEST_RECOVERY_CASE === 'queued', abort: () => { aborted = true; },
-    getContextUsage: () => ({ tokens: resumed ? sm.buildSessionContext().messages.reduce((n, msg) => n + estimateTokens(msg), 0) : friendly && !started ? 1000 : initialTokens,
+    getContextUsage: () => ({ tokens: resumed ? sm.buildSessionContext().messages.reduce((n, msg) => n + estimateTokens(msg), 0) : initialTokens,
       contextWindow: 272000, percent: null }),
     switchSession: async (file, options) => {
       if (process.env.PI_TEST_RECOVERY_CASE === 'cancel') return { cancelled: true };
@@ -103,9 +100,6 @@ async function finish() {
   idle = false;
   aborted = false;
   await emit('agent_start');
-  if (friendly && !sm.getBranch().some(e => e.customType === 'rlm-friendly-stop-state' && e.data?.phase === 'reset')) {
-    throw new Error('friendly stop did not re-arm after persisted resume');
-  }
   await emit('before_provider_request', { payload: { input: ['safe'], tools: [{}] } });
   if (aborted) throw new Error('cleaned context was blocked again');
   writeFileSync(manifest.reportPath, `same attempt ${active.attemptId}; same session ${sm.getSessionId()}\n`);
@@ -119,7 +113,6 @@ async function finish() {
 }
 await bind();
 await emit('session_start', { reason: 'startup' });
-started = true;
 if (process.env.PI_TEST_RECOVERY_CASE === 'drain') {
   // The guard pauses this assignment while a child job is still pending; the
   // child delivers during the recovered turn, after the parent-driven clean.
@@ -127,26 +120,11 @@ if (process.env.PI_TEST_RECOVERY_CASE === 'drain') {
 }
 idle = false;
 await emit('agent_start');
-if (friendly) {
-  if (process.env.PI_RLM_FRIENDLY_STOP_TOKENS !== undefined || process.env.PI_RLM_FRIENDLY_STOP_MODEL !== 'gpt-5.6-sol' ||
-      process.env.PI_RLM_FRIENDLY_STOP_PERCENT !== '40') throw new Error('launcher opt-in environment is wrong');
-  await emit('turn_end', {});
-  await emit('context', { messages: [] });
-  const checkpoint = loaded.extensions.find(ext => ext.tools.has('rlm_rollover_checkpoint'))?.tools.get('rlm_rollover_checkpoint').definition;
-  if (!checkpoint) throw new Error('friendly extension was not enabled by canonical launch');
-  const result = await checkpoint.execute('checkpoint', { completedOperationIds: ['probe'], nextOperation: 'finish',
-    symbolicUuidBindings: {}, failures: [], receiptPaths: [], notes: 'retained progress' }, undefined, undefined, ctx);
-  if (!result.terminate) throw new Error('checkpoint must terminate the model turn');
-} else {
-  // No provider-side context guard exists any more. A synthetic context pause is
-  // produced the way any real one reaches the manager: retain the pause, then
-  // abort the turn.
-  if (!task().pauseForContext('synthetic context guard reason', 256000)) throw new Error('synthetic pause was not retained');
-  ctx.abort({ kind: 'context', reason: 'synthetic context guard reason' });
-  if (!aborted) throw new Error('synthetic pause did not abort the turn');
-}
-const abortedMessage = { role: 'assistant', stopReason: friendly ? 'toolUse' : 'aborted',
-  ...(friendly ? {} : { errorMessage: 'Operation aborted' }), content: [], usage, timestamp: Date.now() };
+// A real context pause still uses explicit maintenance; friendly reporting no longer creates one.
+if (!task().pauseForContext('synthetic context guard reason', 256000)) throw new Error('synthetic pause was not retained');
+ctx.abort({ kind: 'context', reason: 'synthetic context guard reason' });
+if (!aborted) throw new Error('synthetic pause did not abort the turn');
+const abortedMessage = { role: 'assistant', stopReason: 'aborted', errorMessage: 'Operation aborted', content: [], usage, timestamp: Date.now() };
 sm.appendMessage(abortedMessage);
 await emit('agent_end', { messages: [abortedMessage] });
 idle = true;
