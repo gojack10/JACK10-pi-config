@@ -42,6 +42,9 @@ export default function (pi: ExtensionAPI) {
               lease = config.shared_slots ? await acquireSlot(config.shared_slots, { directory, limit: 3, signal: cancellation.signal }) : undefined;
             } finally { stopWatch?.close(); }
             try {
+            // A queued admission may outlive the packet snapshot; refresh before authoring.
+            if (config.readers && role === 'planner') await waitProfileInputs(directory, config.readers, config.video_dependency);
+            if (existsSync(join(directory, 'STOP'))) throw stopError;
             const missionPath = join(directory, `${step}-${role}.md`);
             writeFileSync(missionPath, mission({ role, reportPath, previous, task, smoke: config.smoke, directory, contract: config.contract, project }));
             const extensionFiles: string[] = [];

@@ -152,18 +152,19 @@ if (command === 'controller') {
     failed = continuationAfterStop(failed, history);
   }
   const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
-  let contextResume = false;
+  let contextResume = false, blockedResume = false;
   const launchPath = join(directory, `${failed.step}-launch.json`);
   if (failed.status !== 'stopped' && existsSync(launchPath)) {
     try {
       const result = readAttemptResult(JSON.parse(readFileSync(launchPath, 'utf8')).jobs[0]);
       const report = validateReport(result.text, failed.role, config.smoke, config.project ?? taskSettings());
       contextResume = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
+      blockedResume = failed.status === 'blocked' && process.argv.includes('--retry-blocked') && report.disposition === 'blocked';
     } catch (error) {
       if (['blocked', 'context_checkpoint'].includes(failed.status)) throw error;
     }
   }
-  if ((!['error', 'paused', 'stopped'].includes(failed.status) && !contextResume) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
+  if ((!['error', 'paused', 'stopped'].includes(failed.status) && !contextResume && !blockedResume) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
     throw Error('Resume requires a stopped/paused/error checkpoint or a verified friendly-stop report.');
   }
   let prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
@@ -181,15 +182,15 @@ if (command === 'controller') {
   const failureDir = join(directory, 'failures', `step-${failed.step}-${Date.now()}`);
   mkdirSync(failureDir, { recursive: true });
   for (const entry of readdirSync(directory)) {
-    if ((!contextResume && entry.startsWith(`${failed.step}-`)) || ['active.json', 'error.json', 'paused.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
+    if ((!contextResume && !blockedResume && entry.startsWith(`${failed.step}-`)) || ['active.json', 'error.json', 'paused.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
       renameSync(join(directory, entry), join(failureDir, entry));
     }
   }
   for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
   const archivedOrphan = join(failureDir, orphanName);
-  const reviewOrphan = !contextResume && failed.status !== 'stopped' && failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
-  const nextStep = contextResume ? failed.step + 1 : failed.status === 'stopped' ? failed.step : reviewOrphan ? failed.step + 1 : failed.step + 2;
-  let previous = contextResume ? join(directory, orphanName) : failed.previous ?? null;
+  const reviewOrphan = !contextResume && !blockedResume && failed.status !== 'stopped' && failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
+  const nextStep = contextResume || blockedResume ? failed.step + 1 : failed.status === 'stopped' ? failed.step : reviewOrphan ? failed.step + 1 : failed.step + 2;
+  let previous = contextResume || blockedResume ? join(directory, orphanName) : failed.previous ?? null;
   let task = failed.role === 'worker' ? failed.task ?? prior.task : null;
   if (reviewOrphan) {
     previous = join(directory, `pause-handoff-${failed.step}.json`);
@@ -214,7 +215,7 @@ if (command === 'controller') {
   }
   console.log(JSON.stringify({ task: project.name, route: project.route, session: label, directory,
     resumed_step: nextStep, role: config.resume.role,
-    strategy: contextResume ? 'fresh agent continues verified context checkpoint' : failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
+    strategy: blockedResume ? 'operator retries resolved blocker from retained report' : contextResume ? 'fresh agent continues verified context checkpoint' : failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
     failure_evidence: failureDir }, null, 2));
 } else if (command === 'suite-status') {
   const suitePath = join(home, 'factory-runs/yc/SUITE');
