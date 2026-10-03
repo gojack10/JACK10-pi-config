@@ -1,10 +1,13 @@
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync, watch } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BackgroundJobManager } from '../background-jobs/manager.ts';
 import { SubagentLauncher } from '../subagent-launch/manager.ts';
 import { readAttemptResult, taskSettings, runLoop, save, mission, validateReport } from './core.mjs';
+import { acquireSlot } from './slots.mjs';
+import { waitProfileInputs } from './parallel.mjs';
+import { closeIdleWatches } from './watch.mjs';
 
 export default function (pi: ExtensionAPI) {
   // The controller has no model turns. All reasoning belongs to the sequential workers.
@@ -24,9 +27,21 @@ export default function (pi: ExtensionAPI) {
       const launcher = new SubagentLauncher(transportPi, ctx, background);
       let safe = true;
       try {
-        await runLoop({ directory, smoke: config.smoke, project, resume,
+        await runLoop({ directory, smoke: config.smoke, project, resume, assignments: config.assignments,
           runStep: async ({ step, role, reportPath, previous, task }) => {
-            if (existsSync(join(directory, 'STOP'))) throw Error('stop requested');
+            if (config.readers && role === 'planner') await waitProfileInputs(directory, config.readers, config.video_dependency);
+            const stopError = Object.assign(Error('stop requested'), { factoryStopped: true });
+            if (existsSync(join(directory, 'STOP'))) throw stopError;
+            const cancellation = new AbortController();
+            const stopWatch = config.shared_slots ? watch(directory, () => {
+              if (existsSync(join(directory, 'STOP'))) cancellation.abort(stopError);
+            }) : undefined;
+            let lease;
+            try {
+              if (existsSync(join(directory, 'STOP'))) throw stopError;
+              lease = config.shared_slots ? await acquireSlot(config.shared_slots, { directory, limit: 3, signal: cancellation.signal }) : undefined;
+            } finally { stopWatch?.close(); }
+            try {
             const missionPath = join(directory, `${step}-${role}.md`);
             writeFileSync(missionPath, mission({ role, reportPath, previous, task, smoke: config.smoke, directory, contract: config.contract, project }));
             const extensionFiles: string[] = [];
@@ -81,6 +96,12 @@ export default function (pi: ExtensionAPI) {
             const result = readAttemptResult(receipt);
             const report = validateReport(result.text, role, config.smoke, project);
             const contextCheckpoint = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
+            if (config.readers && role === 'planner' && report.disposition === 'next') {
+              const inputs = JSON.parse(readFileSync(join(directory, 'reader-inputs.json'), 'utf8'));
+              if (inputs.pending.length && !inputs.pending.some(p => p.tree_id === report.task?.tree_id)) {
+                throw Error('profile assignment must identify one pending tree packet');
+              }
+            }
             if (result.outcome.payload.outcome !== final.status) throw Error('batch and durable outcome disagree');
             if (final.status !== 'completed' && !contextCheckpoint) await pause();
             save(join(directory, `${step}-outcome.json`), result.outcome);
@@ -90,17 +111,29 @@ export default function (pi: ExtensionAPI) {
             safe = true;
             appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ step, role,
               event: contextCheckpoint ? 'verified_context_checkpoint' : 'verified_completed', at: Date.now(), job: receipt.job }) + '\n');
+            if (config.readers && role === 'worker' && report.disposition === 'worked' && task?.tree_id) {
+              const path = join(directory, 'merged-trees.json');
+              const merged = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
+              if (!merged.some(e => e.tree_id === task.tree_id)) {
+                merged.push({ tree_id: task.tree_id, reportPath, evidence: report.evidence, updated_nodes: report.updated_nodes });
+                save(path, merged);
+              }
+            }
             return result;
+            } finally { if (safe) lease?.release(); }
           } });
       } catch (error) {
         const prior = existsSync(join(directory, 'state.json'))
           ? JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')) : {};
+        if ((error as { factoryStopped?: boolean }).factoryStopped) {
+          save(join(directory, 'state.json'), { ...prior, status: 'stopped' }); return;
+        }
         const paused = !!(error as { factoryPaused?: boolean }).factoryPaused;
         save(join(directory, 'state.json'), { ...prior, status: paused ? 'paused' : 'error', error: String(error) });
         save(join(directory, paused ? 'paused.json' : 'error.json'), { error: String(error), safe, notices });
         throw error;
       } finally {
-        if (safe) { background.shutdown(); writeFileSync(join(directory, 'QUIESCENT'), 'No active factory worker remains.\n'); }
+        if (safe) { background.shutdown(); closeIdleWatches(); writeFileSync(join(directory, 'QUIESCENT'), 'No active factory worker remains.\n'); }
       }
     },
   });

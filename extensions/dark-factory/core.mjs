@@ -51,7 +51,7 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   }
   if (r.disposition === 'next' && (!r.task || typeof r.task.instruction !== 'string' || !r.task.instruction.trim() || typeof r.task.acceptance !== 'string' || !r.task.acceptance.trim())) throw Error('next requires bounded task and acceptance');
   if (r.disposition === 'ready_for_user_test' && (smoke || r.evidence.length < 2 || typeof r.launch_command !== 'string' || !r.launch_command.trim())) throw Error('ready requires launch command and launch/UI evidence');
-  if (r.disposition === 'complete' && (smoke || r.evidence.length < 2 || !r.updated_nodes.length)) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
+  if (['complete', 'profile_ready', 'video_ready'].includes(r.disposition) && (smoke || r.evidence.length < 2 || !r.updated_nodes.length)) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
   return r;
 }
 
@@ -87,32 +87,56 @@ export function continuationAfterStop(state, history) {
       (!['next', 'worked'].includes(last.report?.disposition) && !last.contextCheckpoint)) {
     throw Error('Graceful-stop continuation requires the immediately preceding verified checkpoint.');
   }
-  return { ...state, role: last.contextCheckpoint ? last.role : last.role === 'worker' ? 'planner' : 'worker',
+  return { ...state, role: state.role ?? (last.contextCheckpoint ? last.role : last.role === 'worker' ? 'planner' : 'worker'),
     previous: last.reportPath, ...(last.contextCheckpoint ? { task: last.task } : {}) };
 }
 
 // The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
-export async function runLoop({ directory, smoke, runStep, project = taskSettings(), resume, maxSteps = smoke ? 2 : 10000 }) {
+export async function runLoop({ directory, smoke, runStep, project = taskSettings(), resume, assignments, maxSteps = smoke ? 2 : 10000 }) {
   const statePath = join(directory, 'state.json');
   if (existsSync(statePath) && !resume) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
   let previous = resume?.previous ?? null, task = resume?.task ?? null;
-  let role = resume?.role ?? ((resume?.step ?? 1) % 2 ? 'planner' : 'worker');
+  let assignmentIndex = resume?.assignmentIndex ?? 0;
+  let role = assignments ? 'worker' : resume?.role ?? ((resume?.step ?? 1) % 2 ? 'planner' : 'worker');
+  if (assignments && previous && JSON.parse(readFileSync(previous, 'utf8')).tree_id !== assignments[assignmentIndex]?.tree_id) previous = null;
   const fingerprints = new Set();
   for (let step = resume?.step ?? 1; step <= maxSteps; step++) {
-    if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step, role, previous, task }); return; }
-    save(statePath, { status: 'running', step, role, previous, task });
+    if (assignments && assignmentIndex === assignments.length) {
+      save(statePath, { status: 'reads_complete', step, assignmentIndex, previous }); return;
+    }
+    if (assignments) task = assignments[assignmentIndex];
+    if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step, role, previous, task, assignmentIndex }); return; }
+    save(statePath, { status: 'running', step, role, previous, task, assignmentIndex });
     const reportPath = join(directory, `${step}-${role}.json`);
     const result = await runStep({ step, role, reportPath, previous, task });
     const report = validateReport(result.text, role, smoke, project);
     const contextCheckpoint = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
     if (report.disposition === 'continue' && !contextCheckpoint) throw Error('continuation requires a verified friendly-stop event');
-    const completed = { step, role, reportPath, receipt: result.receipt, report, task, contextCheckpoint: !!contextCheckpoint };
+    if (assignments && report.disposition === 'worked') {
+      if (report.tree_id !== task.tree_id || report.updated_nodes.length) throw Error('reader report tree identity/write mismatch');
+      const packet = report.tree_packet;
+      if (typeof packet !== 'string' || !isAbsolute(packet) || !report.evidence.includes(packet)) throw Error('missing reader evidence packet');
+      const data = JSON.parse(readFileSync(packet, 'utf8'));
+      if (data.tree_id !== task.tree_id || data.root_id !== task.root_id || data.outline_complete !== true ||
+          !Array.isArray(data.content_read_ids) || !data.content_read_ids.includes(task.root_id) ||
+          !Array.isArray(data.findings) || !Array.isArray(data.exclusions) ||
+          !Array.isArray(data.remaining_work) || data.remaining_work.length) throw Error('invalid tree coverage packet');
+    }
+    const completed = { step, role, reportPath, receipt: result.receipt, report, task, assignmentIndex, contextCheckpoint: !!contextCheckpoint };
     appendFileSync(join(directory, 'history.jsonl'), JSON.stringify(completed) + '\n');
     save(statePath, { status: contextCheckpoint ? 'context_checkpoint' : 'checkpoint', ...completed });
     previous = reportPath;
     if (contextCheckpoint) continue; // Fresh agent, same role/assignment, retained partial report.
     if (report.disposition === 'blocked' || report.disposition === project.ready) {
       save(statePath, { status: report.disposition, ...completed }); return;
+    }
+    if (assignments) {
+      assignmentIndex++;
+      previous = null;
+      const entries = readFileSync(join(directory, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      save(join(directory, 'completed-trees.json'), entries.filter(e => e.report.disposition === 'worked').map(e =>
+        ({ tree_id: e.task.tree_id, root_id: e.task.root_id, tree_packet: e.report.tree_packet, reportPath: e.reportPath })));
+      continue;
     }
     if (role === 'planner') {
       const fingerprint = createHash('sha256').update(JSON.stringify(report.task)).digest('hex');
