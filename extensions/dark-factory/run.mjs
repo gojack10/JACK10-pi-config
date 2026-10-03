@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { continuationAfterStop, factoryActivity, save, taskRuns, taskSettings } from './core.mjs';
+import { continuationAfterStop, factoryActivity, readAttemptResult, save, taskRuns, taskSettings, validateReport } from './core.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const [command, argument] = process.argv.slice(2);
@@ -133,11 +133,27 @@ if (command === 'controller') {
     const history = readFileSync(join(directory, 'history.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
     failed = continuationAfterStop(failed, history);
   }
-  if (!['error', 'paused', 'stopped'].includes(failed.status) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
-    throw Error('Resume requires a retained stopped/paused/error checkpoint.');
+  const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
+  let contextResume = false;
+  const launchPath = join(directory, `${failed.step}-launch.json`);
+  if (failed.status !== 'stopped' && existsSync(launchPath)) {
+    try {
+      const result = readAttemptResult(JSON.parse(readFileSync(launchPath, 'utf8')).jobs[0]);
+      const report = validateReport(result.text, failed.role, config.smoke, config.project ?? taskSettings());
+      contextResume = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
+    } catch (error) {
+      if (['blocked', 'context_checkpoint'].includes(failed.status)) throw error;
+    }
   }
-  const prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
-  if (failed.role === 'worker' && (prior?.role !== 'planner' || !prior.task)) throw Error('Failed worker has no verified preceding planner assignment.');
+  if ((!['error', 'paused', 'stopped'].includes(failed.status) && !contextResume) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
+    throw Error('Resume requires a stopped/paused/error checkpoint or a verified friendly-stop report.');
+  }
+  let prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
+  if (contextResume && failed.role === 'worker' && !failed.task) {
+    const history = readFileSync(join(directory, 'history.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    prior = history.findLast(entry => entry.step < failed.step && entry.role === 'planner' && entry.report?.disposition === 'next')?.report;
+  }
+  if (failed.role === 'worker' && !failed.task && (prior?.role !== 'planner' || !prior.task)) throw Error('Failed worker has no verified preceding planner assignment.');
   const orphanName = `${failed.step}-${failed.role}.json`;
   let orphan;
   try {
@@ -147,16 +163,16 @@ if (command === 'controller') {
   const failureDir = join(directory, 'failures', `step-${failed.step}-${Date.now()}`);
   mkdirSync(failureDir, { recursive: true });
   for (const entry of readdirSync(directory)) {
-    if (entry.startsWith(`${failed.step}-`) || ['active.json', 'error.json', 'paused.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
+    if ((!contextResume && entry.startsWith(`${failed.step}-`)) || ['active.json', 'error.json', 'paused.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
       renameSync(join(directory, entry), join(failureDir, entry));
     }
   }
   for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
   const archivedOrphan = join(failureDir, orphanName);
-  const reviewOrphan = failed.status !== 'stopped' && failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
-  const nextStep = failed.status === 'stopped' ? failed.step : reviewOrphan ? failed.step + 1 : failed.step + 2;
-  let previous = failed.previous ?? null;
-  let task = failed.role === 'worker' ? prior.task : null;
+  const reviewOrphan = !contextResume && failed.status !== 'stopped' && failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
+  const nextStep = contextResume ? failed.step + 1 : failed.status === 'stopped' ? failed.step : reviewOrphan ? failed.step + 1 : failed.step + 2;
+  let previous = contextResume ? join(directory, orphanName) : failed.previous ?? null;
+  let task = failed.role === 'worker' ? failed.task ?? prior.task : null;
   if (reviewOrphan) {
     previous = join(directory, `pause-handoff-${failed.step}.json`);
     const batch = join(failureDir, `${failed.step}-batch.json`);
@@ -166,8 +182,7 @@ if (command === 'controller') {
       updated_nodes: Array.isArray(orphan.updated_nodes) ? orphan.updated_nodes : [] });
     task = null;
   }
-  const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
-  config.resume = { step: nextStep, previous, task };
+  config.resume = { step: nextStep, role: reviewOrphan ? 'planner' : failed.role, previous, task };
   save(join(directory, 'config.json'), config);
   mkdirSync(lock, { recursive: false });
   writeFileSync(join(lock, 'run'), directory + '\n');
@@ -179,7 +194,8 @@ if (command === 'controller') {
     throw error;
   }
   console.log(JSON.stringify({ task: project.name, route: project.route, session: label, directory,
-    resumed_step: nextStep, strategy: failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
+    resumed_step: nextStep, role: config.resume.role,
+    strategy: contextResume ? 'fresh agent continues verified context checkpoint' : failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
     failure_evidence: failureDir }, null, 2));
 } else if (command === 'status') {
   const candidates = (existsSync(runs) ? readdirSync(runs, { withFileTypes: true }) : [])
