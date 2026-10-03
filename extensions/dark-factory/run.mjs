@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, unlinkSync, rmdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, unlinkSync, rmdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -14,6 +14,11 @@ const project = command === 'controller'
 const runs = taskRuns(join(home, 'factory-runs'), project.name);
 const lock = join(runs, 'LOCK');
 const quote = x => `'${x.replaceAll("'", "'\\''")}'`;
+const launchController = (directory, label) => {
+  const clean = ['env', '-u', 'PI_SUBAGENT_MANIFEST', '-u', 'PI_RLM_FRIENDLY_STOP_TOKENS', '-u', 'PI_RLM_FRIENDLY_STOP_MODEL', '-u', 'PI_RLM_FRIENDLY_STOP_PERCENT', '-u', 'PI_RLM_ROLLOVER_DIR'];
+  const boot = [...clean, process.execPath, fileURLToPath(import.meta.url), 'controller', directory].map(quote).join(' ');
+  execFileSync('tmux', ['new-session', '-d', '-s', label, '-c', home, `${boot} > ${quote(join(directory, 'controller.log'))} 2>&1`]);
+};
 const lines = (file, args) => {
   try { return execFileSync(file, args, { encoding: 'utf8' }).trim().split('\n').filter(Boolean); }
   catch { return []; }
@@ -82,15 +87,13 @@ if (command === 'controller') {
   try { mkdirSync(lock); } catch { throw Error(`Factory ${project.name} locked. Inspect ${join(lock, 'run')}; never remove while its worker may still run.`); }
   const directory = join(runs, new Date().toISOString().replaceAll(':', '-') + (command === 'smoke' ? '-smoke' : `-${project.name}`));
   const label = `${project.name}-factory-${Date.now()}`;
-  const clean = ['env', '-u', 'PI_SUBAGENT_MANIFEST', '-u', 'PI_RLM_FRIENDLY_STOP_TOKENS', '-u', 'PI_RLM_FRIENDLY_STOP_MODEL', '-u', 'PI_RLM_FRIENDLY_STOP_PERCENT', '-u', 'PI_RLM_ROLLOVER_DIR'];
-  const boot = [...clean, process.execPath, fileURLToPath(import.meta.url), 'controller', directory].map(quote).join(' ');
   try {
     mkdirSync(directory, { mode: 0o700 });
     writeFileSync(join(lock, 'run'), directory + '\n');
     writeFileSync(join(runs, 'LAST'), directory + '\n');
     save(join(directory, 'config.json'), { smoke: command === 'smoke', cwd: homedir(), project, contract });
     writeFileSync(join(directory, 'fixture.txt'), 'FACTORY_READ_ONLY_OK\n');
-    execFileSync('tmux', ['new-session', '-d', '-s', label, '-c', home, `${boot} > ${quote(join(directory, 'controller.log'))} 2>&1`]);
+    launchController(directory, label);
   } catch (error) {
     // A failed tmux invocation may still have created a controller: retain ambiguous locks.
     const found = activity(directory);
@@ -114,6 +117,38 @@ if (command === 'controller') {
     console.log(JSON.stringify(result));
     process.exitCode = result.ok ? 0 : 1;
   }
+} else if (command === 'resume') {
+  if (existsSync(join(lock, 'run'))) throw Error(`Factory ${project.name} is locked; stop or recover the inactive attempt first.`);
+  if (!existsSync(join(runs, 'LAST'))) throw Error(`Factory ${project.name} has no retained run to resume.`);
+  const directory = readFileSync(join(runs, 'LAST'), 'utf8').trim();
+  const found = activity(directory);
+  if (found.controller || found.sessions.length) throw Error(`Cannot resume active factory: controller=${found.controller}, sessions=${found.sessions.join(',')}`);
+  const failed = JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8'));
+  if (failed.status !== 'error' || !failed.step || !['planner', 'worker'].includes(failed.role)) throw Error('Resume requires a retained planner/worker error checkpoint.');
+  const prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
+  if (failed.role === 'worker' && (prior?.role !== 'planner' || !prior.task)) throw Error('Failed worker has no verified preceding planner assignment.');
+  const failureDir = join(directory, 'failures', `step-${failed.step}-${Date.now()}`);
+  mkdirSync(failureDir, { recursive: true });
+  for (const entry of readdirSync(directory)) {
+    if (entry.startsWith(`${failed.step}-`) || ['active.json', 'error.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
+      renameSync(join(directory, entry), join(failureDir, entry));
+    }
+  }
+  for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
+  const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
+  config.resume = { step: failed.step, previous: failed.previous ?? null, task: failed.role === 'worker' ? prior.task : null };
+  save(join(directory, 'config.json'), config);
+  mkdirSync(lock, { recursive: false });
+  writeFileSync(join(lock, 'run'), directory + '\n');
+  const label = `${project.name}-factory-resume-${Date.now()}`;
+  try { launchController(directory, label); }
+  catch (error) {
+    const started = activity(directory);
+    if (!started.controller && !started.sessions.length) { unlinkSync(join(lock, 'run')); rmdirSync(lock); }
+    throw error;
+  }
+  console.log(JSON.stringify({ task: project.name, route: project.route, session: label, directory,
+    resumed_step: failed.step, failure_evidence: failureDir }, null, 2));
 } else if (command === 'status') {
   const candidates = (existsSync(runs) ? readdirSync(runs, { withFileTypes: true }) : [])
     .filter(entry => entry.isDirectory() && existsSync(join(runs, entry.name, 'config.json')))
@@ -140,6 +175,6 @@ if (command === 'controller') {
     } else console.log(`Stopped and released stale lock: ${directory}`);
   }
 } else {
-  console.log('Usage: node run.mjs <smoke|start|status|stop|recover> [bf2|yc] [--wait] (default: bf2)');
+  console.log('Usage: node run.mjs <smoke|start|resume|status|stop|recover> [bf2|yc] [--wait] (default: bf2)');
   process.exitCode = 2;
 }

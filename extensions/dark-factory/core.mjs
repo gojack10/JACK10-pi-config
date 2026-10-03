@@ -48,12 +48,12 @@ export function validateReport(text, role, smoke = false, project = taskSettings
 }
 
 // The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
-export async function runLoop({ directory, smoke, runStep, project = taskSettings(), maxSteps = smoke ? 2 : 10000 }) {
+export async function runLoop({ directory, smoke, runStep, project = taskSettings(), resume, maxSteps = smoke ? 2 : 10000 }) {
   const statePath = join(directory, 'state.json');
-  if (existsSync(statePath)) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
-  let previous = null, task = null;
+  if (existsSync(statePath) && !resume) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
+  let previous = resume?.previous ?? null, task = resume?.task ?? null;
   const fingerprints = new Set();
-  for (let step = 1; step <= maxSteps; step++) {
+  for (let step = resume?.step ?? 1; step <= maxSteps; step++) {
     if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step }); return; }
     const role = step % 2 ? 'planner' : 'worker';
     save(statePath, { status: 'running', step, role, previous });
