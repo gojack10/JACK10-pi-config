@@ -1,7 +1,8 @@
 import { homedir } from 'node:os';
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
+import { readMonitorReceipt, sessionBranch } from '../task-outcomes/monitor-receipt.mjs';
 
 export const ROUTE = { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' };
 const LOCAL_PROJECTS = join(homedir(), '.pi/agent/factory-projects.local.json');
@@ -39,12 +40,12 @@ export function save(path, value) {
 export function validateReport(text, role, smoke = false, project = taskSettings()) {
   const r = JSON.parse(text);
   if (r.version !== 1 || r.role !== role || typeof r.summary !== 'string' || !r.summary.trim()) throw Error('invalid report identity/summary');
-  const allowed = role === 'planner' ? ['next', project.ready, 'blocked'] : ['worked', 'blocked'];
+  const allowed = role === 'planner' ? ['next', project.ready, 'blocked', 'continue'] : ['worked', 'blocked', 'continue'];
   if (!allowed.includes(r.disposition)) throw Error('invalid disposition');
   if (!Array.isArray(r.evidence) || !r.evidence.every(p => typeof p === 'string' && isAbsolute(p) && existsSync(p))) throw Error('missing evidence');
   if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
   if (smoke && r.updated_nodes.length) throw Error('smoke must not mutate tree');
-  if (!smoke && r.disposition !== 'blocked') {
+  if (!smoke && !['blocked', 'continue'].includes(r.disposition)) {
     if (project.name === 'bf2' && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
     if (project.name !== 'bf2' && r.evidence.length === 0) throw Error('completed project work requires evidence');
   }
@@ -54,13 +55,40 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   return r;
 }
 
+// Use the monitor-selected ancestry and exact attempt identity, never a prose mention of 80%.
+export function readAttemptResult(receipt) {
+  const manifest = JSON.parse(readFileSync(receipt.manifest_file, 'utf8'));
+  if (manifest.jobId !== receipt.job || manifest.attemptId !== receipt.attempt_id || manifest.reportPath !== receipt.report_file) {
+    throw Error('factory attempt identity mismatch');
+  }
+  const text = readFileSync(receipt.session_file, 'utf8');
+  const sessionId = JSON.parse(text.split('\n')[0]).id;
+  const outcome = readMonitorReceipt(receipt.session_file, { sessionId, jobId: receipt.job, attemptId: receipt.attempt_id,
+    mode: 'task', reportPath: receipt.report_file, reportIdentity: manifest.reportIdentity });
+  if (outcome.state !== 'final' || outcome.payload.source !== 'model' || !['completed', 'blocked'].includes(outcome.payload.outcome)) {
+    throw Error('factory attempt has no settled model report');
+  }
+  const stat = statSync(receipt.report_file);
+  if (!stat.isFile() || !stat.size || String(stat.dev) !== manifest.reportIdentity.dev || String(stat.ino) !== manifest.reportIdentity.ino) {
+    throw Error('factory report identity changed');
+  }
+  const reportText = readFileSync(receipt.report_file, 'utf8');
+  if (outcome.payload.report_text !== undefined && outcome.payload.report_text !== reportText) throw Error('factory report changed after settlement');
+  const contextStopped = sessionBranch(text, sessionId, outcome.branchLeafId).some(entry =>
+    entry.type === 'custom' && entry.customType === 'rlm-friendly-stop-state' && entry.data?.version === 2 &&
+    entry.data.jobId === receipt.job && entry.data.attemptId === receipt.attempt_id);
+  return { text: reportText, receipt, outcome, contextStopped };
+}
+
 export function continuationAfterStop(state, history) {
   const last = history.at(-1);
   if (state.status !== 'stopped' || !last?.receipt || !last.reportPath || last.step + 1 !== state.step ||
-      !['planner', 'worker'].includes(last.role) || !['next', 'worked'].includes(last.report?.disposition)) {
+      !['planner', 'worker'].includes(last.role) ||
+      (!['next', 'worked'].includes(last.report?.disposition) && !last.contextCheckpoint)) {
     throw Error('Graceful-stop continuation requires the immediately preceding verified checkpoint.');
   }
-  return { ...state, role: last.role === 'worker' ? 'planner' : 'worker', previous: last.reportPath };
+  return { ...state, role: last.contextCheckpoint ? last.role : last.role === 'worker' ? 'planner' : 'worker',
+    previous: last.reportPath, ...(last.contextCheckpoint ? { task: last.task } : {}) };
 }
 
 // The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
@@ -68,18 +96,21 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
   const statePath = join(directory, 'state.json');
   if (existsSync(statePath) && !resume) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
   let previous = resume?.previous ?? null, task = resume?.task ?? null;
+  let role = resume?.role ?? ((resume?.step ?? 1) % 2 ? 'planner' : 'worker');
   const fingerprints = new Set();
   for (let step = resume?.step ?? 1; step <= maxSteps; step++) {
-    if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step }); return; }
-    const role = step % 2 ? 'planner' : 'worker';
-    save(statePath, { status: 'running', step, role, previous });
+    if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step, role, previous, task }); return; }
+    save(statePath, { status: 'running', step, role, previous, task });
     const reportPath = join(directory, `${step}-${role}.json`);
     const result = await runStep({ step, role, reportPath, previous, task });
     const report = validateReport(result.text, role, smoke, project);
-    const completed = { step, role, reportPath, receipt: result.receipt, report };
+    const contextCheckpoint = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
+    if (report.disposition === 'continue' && !contextCheckpoint) throw Error('continuation requires a verified friendly-stop event');
+    const completed = { step, role, reportPath, receipt: result.receipt, report, task, contextCheckpoint: !!contextCheckpoint };
     appendFileSync(join(directory, 'history.jsonl'), JSON.stringify(completed) + '\n');
-    save(statePath, { status: 'checkpoint', ...completed });
+    save(statePath, { status: contextCheckpoint ? 'context_checkpoint' : 'checkpoint', ...completed });
     previous = reportPath;
+    if (contextCheckpoint) continue; // Fresh agent, same role/assignment, retained partial report.
     if (report.disposition === 'blocked' || report.disposition === project.ready) {
       save(statePath, { status: report.disposition, ...completed }); return;
     }
@@ -89,6 +120,7 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
       fingerprints.add(fingerprint);
       task = report.task;
     }
+    role = role === 'planner' ? 'worker' : 'planner';
   }
   save(statePath, { status: smoke ? 'smoke_passed' : 'step_limit', steps: maxSteps, previous });
 }
