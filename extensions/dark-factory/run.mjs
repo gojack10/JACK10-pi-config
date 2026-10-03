@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, unlinkSync, rmdirSync, renameSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, unlinkSync, rmdirSync, renameSync, rmSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { continuationAfterStop, factoryActivity, readAttemptResult, save, taskRuns, taskSettings, validateReport } from './core.mjs';
+import { suiteStatus } from './parallel.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const [command, argument] = process.argv.slice(2);
@@ -38,6 +39,16 @@ const releaseQuiescent = (directory, reason) => {
     orphan_report: !!active && existsSync(join(directory, `${active.step}-${active.role}.json`)),
     note: 'An orphan report has no durable successful outcome receipt and is not credited as a completed attempt.',
   });
+  const configPath = join(directory, 'config.json');
+  const sharedSlots = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf8')).shared_slots : undefined;
+  if (sharedSlots && existsSync(sharedSlots)) {
+    for (const entry of readdirSync(sharedSlots).filter(name => /^slot-\d+$/.test(name))) {
+      const ownerPath = join(sharedSlots, entry, 'owner.json');
+      if (!existsSync(ownerPath)) continue;
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8'));
+      if (owner.directory === directory) rmSync(join(sharedSlots, entry), { recursive: true });
+    }
+  }
   writeFileSync(join(directory, 'QUIESCENT'), 'No active factory controller or worker remains; stale lock recovered.\n');
   if (existsSync(join(lock, 'run')) && readFileSync(join(lock, 'run'), 'utf8').trim() === directory) {
     unlinkSync(join(lock, 'run')); rmdirSync(lock);
@@ -72,7 +83,10 @@ if (command === 'controller') {
     if (!existsSync(join(directory, 'QUIESCENT')) || existsSync(join(directory, 'error.json')) || terminal.status === 'paused') {
       throw Error(`factory ${terminal.status ?? 'unknown'}; inspect status/active artifacts`);
     }
-    save(join(directory, 'finished.json'), { ok: true });
+    const completed = [project.ready, 'reads_complete', 'smoke_passed'].includes(terminal.status);
+    save(join(directory, 'finished.json'), { ok: true, completed, status: terminal.status, at: new Date().toISOString() });
+    console.log(JSON.stringify({ event: completed ? 'factory_completed' : 'factory_stopped', task: project.name,
+      status: terminal.status, directory }));
   } catch (error) {
     console.error(error);
     save(join(directory, 'finished.json'), { ok: false, error: String(error) });
@@ -85,16 +99,20 @@ if (command === 'controller') {
     }
   }
 } else if (command === 'smoke' || command === 'start') {
-  const contract = readFileSync(join(here, `${project.name}-contract.md`), 'utf8');
+  const configFlag = process.argv.indexOf('--config');
+  const prepared = configFlag === -1 ? undefined : JSON.parse(readFileSync(resolve(process.argv[configFlag + 1]), 'utf8'));
+  if (prepared && prepared.project?.name !== project.name) throw Error('prepared config task mismatch');
+  const contract = prepared?.contract ?? readFileSync(join(here, `${project.name}-contract.md`), 'utf8');
   mkdirSync(runs, { recursive: true });
   try { mkdirSync(lock); } catch { throw Error(`Factory ${project.name} locked. Inspect ${join(lock, 'run')}; never remove while its worker may still run.`); }
-  const directory = join(runs, new Date().toISOString().replaceAll(':', '-') + (command === 'smoke' ? '-smoke' : `-${project.name}`));
+  const directory = prepared?.directory ? resolve(prepared.directory) : join(runs, new Date().toISOString().replaceAll(':', '-') + (command === 'smoke' ? '-smoke' : `-${project.name}`));
   const label = `${project.name}-factory-${Date.now()}`;
   try {
-    mkdirSync(directory, { mode: 0o700 });
+    mkdirSync(directory, { mode: 0o700, recursive: !!prepared });
+    if (existsSync(join(directory, 'state.json'))) throw Error('prepared run already has state; use resume');
     writeFileSync(join(lock, 'run'), directory + '\n');
     writeFileSync(join(runs, 'LAST'), directory + '\n');
-    save(join(directory, 'config.json'), { smoke: command === 'smoke', cwd: homedir(), project, contract });
+    save(join(directory, 'config.json'), { ...prepared, smoke: command === 'smoke', cwd: homedir(), project: prepared?.project ?? project, contract });
     writeFileSync(join(directory, 'fixture.txt'), 'FACTORY_READ_ONLY_OK\n');
     launchController(directory, label);
   } catch (error) {
@@ -182,7 +200,8 @@ if (command === 'controller') {
       updated_nodes: Array.isArray(orphan.updated_nodes) ? orphan.updated_nodes : [] });
     task = null;
   }
-  config.resume = { step: nextStep, role: reviewOrphan ? 'planner' : failed.role, previous, task };
+  config.resume = { step: nextStep, role: reviewOrphan ? 'planner' : failed.role, previous, task,
+    assignmentIndex: failed.assignmentIndex ?? 0 };
   save(join(directory, 'config.json'), config);
   mkdirSync(lock, { recursive: false });
   writeFileSync(join(lock, 'run'), directory + '\n');
@@ -197,6 +216,10 @@ if (command === 'controller') {
     resumed_step: nextStep, role: config.resume.role,
     strategy: contextResume ? 'fresh agent continues verified context checkpoint' : failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
     failure_evidence: failureDir }, null, 2));
+} else if (command === 'suite-status') {
+  const suitePath = join(home, 'factory-runs/yc/SUITE');
+  if (!existsSync(suitePath)) console.log(JSON.stringify({ status: 'no_parallel_suite' }));
+  else console.log(JSON.stringify(suiteStatus(JSON.parse(readFileSync(readFileSync(suitePath, 'utf8').trim(), 'utf8'))), null, 2));
 } else if (command === 'status') {
   const candidates = (existsSync(runs) ? readdirSync(runs, { withFileTypes: true }) : [])
     .filter(entry => entry.isDirectory() && existsSync(join(runs, entry.name, 'config.json')))
@@ -223,6 +246,6 @@ if (command === 'controller') {
     } else console.log(`Stopped and released stale lock: ${directory}`);
   }
 } else {
-  console.log('Usage: node run.mjs <smoke|start|resume|status|stop|recover> [bf2|yc] [--wait] (default: bf2)');
+  console.log('Usage: node run.mjs <smoke|start|resume|status|suite-status|stop|recover> [task] [--wait] [--config file] (default: bf2)');
   process.exitCode = 2;
 }
