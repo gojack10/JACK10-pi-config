@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { factoryActivity, runLoop, taskRuns, taskSettings, validateReport } from './core.mjs';
+import { continuationAfterStop, factoryActivity, runLoop, taskRuns, taskSettings, validateReport } from './core.mjs';
 import { allowedRoute, allowedTool } from './guard.ts';
 
 const report = role => ({ version: 1, role, summary: 'checked', evidence: [], updated_nodes: [],
@@ -34,6 +34,14 @@ test('sequential planner/worker handoff, STOP, invalid reports and repeat detect
         return { text: JSON.stringify(report(role)), receipt: { job: role } };
       } });
     assert.equal(JSON.parse(readFileSync(join(retry, 'state.json'), 'utf8')).status, 'smoke_passed');
+    for (const role of ['worker', 'planner']) {
+      const step = role === 'worker' ? 2 : 1;
+      const checkpoint = { step, role, reportPath: prior, receipt: { job: role }, report: report(role) };
+      assert.deepEqual(continuationAfterStop({ status: 'stopped', step: step + 1 }, [checkpoint]),
+        { status: 'stopped', step: step + 1, role: role === 'worker' ? 'planner' : 'worker', previous: prior });
+      assert.throws(() => continuationAfterStop({ status: 'stopped', step: step + 2 }, [checkpoint]), /verified checkpoint/);
+    }
+    assert.throws(() => continuationAfterStop({ status: 'stopped', step: 1 }, []), /verified checkpoint/);
     const stop = directory(); writeFileSync(join(stop, 'STOP'), '');
     await runLoop({ directory: stop, smoke: true, runStep: () => assert.fail('ignored STOP') });
     await assert.rejects(runLoop({ directory: directory(), smoke: false, maxSteps: 3,
@@ -61,7 +69,7 @@ test('sequential planner/worker handoff, STOP, invalid reports and repeat detect
       summary: 'directory evidence', evidence: [root], updated_nodes: ['00000000-0000-0000-0000-000000000000'] }), 'worker').summary,
       'directory evidence');
     const yc = taskSettings('yc');
-    assert.deepEqual(yc.route, { provider: 'openai-codex-personal', model: 'gpt-6-sol', thinking: 'xhigh' });
+    assert.deepEqual(yc.route, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'xhigh' });
     assert.equal(taskRuns('/runs', 'bf2'), '/runs');
     assert.equal(taskRuns('/runs', 'yc'), '/runs/yc');
     assert.throws(() => taskSettings('unknown'), /Unknown factory task/);

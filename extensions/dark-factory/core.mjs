@@ -6,7 +6,7 @@ export const ROUTE = { provider: 'local', model: 'qwen3.8-flash-next', thinking:
 export const ROOT = 'ef189bb9-0df0-4ee8-950f-12f3c4ee243c';
 const TASKS = {
   bf2: { name: 'bf2', route: ROUTE, root: ROOT, ready: 'ready_for_user_test' },
-  yc: { name: 'yc', route: { provider: 'openai-codex-personal', model: 'gpt-6-sol', thinking: 'xhigh' },
+  yc: { name: 'yc', route: { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'xhigh' },
     root: '091fb17d-2764-4bfd-9f30-d59d03f6d077', ready: 'ready_for_interview' },
 };
 export function taskSettings(name = 'bf2') {
@@ -45,6 +45,15 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   if (r.disposition === 'ready_for_user_test' && (smoke || r.evidence.length < 2 || typeof r.launch_command !== 'string' || !r.launch_command.trim())) throw Error('ready requires launch command and launch/UI evidence');
   if (r.disposition === 'ready_for_interview' && (smoke || r.evidence.length < 2 || !r.updated_nodes.length)) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
   return r;
+}
+
+export function continuationAfterStop(state, history) {
+  const last = history.at(-1);
+  if (state.status !== 'stopped' || !last?.receipt || !last.reportPath || last.step + 1 !== state.step ||
+      !['planner', 'worker'].includes(last.role) || !['next', 'worked'].includes(last.report?.disposition)) {
+    throw Error('Graceful-stop continuation requires the immediately preceding verified checkpoint.');
+  }
+  return { ...state, role: last.role === 'worker' ? 'planner' : 'worker', previous: last.reportPath };
 }
 
 // The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
