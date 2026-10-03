@@ -54,6 +54,15 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   return r;
 }
 
+export function continuationAfterStop(state, history) {
+  const last = history.at(-1);
+  if (state.status !== 'stopped' || !last?.receipt || !last.reportPath || last.step + 1 !== state.step ||
+      !['planner', 'worker'].includes(last.role) || !['next', 'worked'].includes(last.report?.disposition)) {
+    throw Error('Graceful-stop continuation requires the immediately preceding verified checkpoint.');
+  }
+  return { ...state, role: last.role === 'worker' ? 'planner' : 'worker', previous: last.reportPath };
+}
+
 // The adapter owns canonical tmux START/outcome verification; the loop never infers success from exit.
 export async function runLoop({ directory, smoke, runStep, project = taskSettings(), resume, maxSteps = smoke ? 2 : 10000 }) {
   const statePath = join(directory, 'state.json');

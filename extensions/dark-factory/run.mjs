@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { factoryActivity, save, taskRuns, taskSettings } from './core.mjs';
+import { continuationAfterStop, factoryActivity, save, taskRuns, taskSettings } from './core.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const [command, argument] = process.argv.slice(2);
@@ -128,9 +128,13 @@ if (command === 'controller') {
     if (found.controller || found.sessions.length) throw Error(`Cannot resume active factory: controller=${found.controller}, sessions=${found.sessions.join(',')}`);
     releaseQuiescent(directory, 'resume recovered a proven-quiescent interrupted lock');
   }
-  const failed = JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8'));
-  if (!['error', 'paused'].includes(failed.status) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
-    throw Error('Resume requires a retained paused/error planner or worker checkpoint.');
+  let failed = JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8'));
+  if (failed.status === 'stopped') {
+    const history = readFileSync(join(directory, 'history.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    failed = continuationAfterStop(failed, history);
+  }
+  if (!['error', 'paused', 'stopped'].includes(failed.status) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
+    throw Error('Resume requires a retained stopped/paused/error checkpoint.');
   }
   const prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
   if (failed.role === 'worker' && (prior?.role !== 'planner' || !prior.task)) throw Error('Failed worker has no verified preceding planner assignment.');
@@ -149,8 +153,8 @@ if (command === 'controller') {
   }
   for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
   const archivedOrphan = join(failureDir, orphanName);
-  const reviewOrphan = failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
-  const nextStep = reviewOrphan ? failed.step + 1 : failed.step + 2;
+  const reviewOrphan = failed.status !== 'stopped' && failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
+  const nextStep = failed.status === 'stopped' ? failed.step : reviewOrphan ? failed.step + 1 : failed.step + 2;
   let previous = failed.previous ?? null;
   let task = failed.role === 'worker' ? prior.task : null;
   if (reviewOrphan) {
@@ -175,7 +179,7 @@ if (command === 'controller') {
     throw error;
   }
   console.log(JSON.stringify({ task: project.name, route: project.route, session: label, directory,
-    resumed_step: nextStep, strategy: reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
+    resumed_step: nextStep, strategy: failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
     failure_evidence: failureDir }, null, 2));
 } else if (command === 'status') {
   const candidates = (existsSync(runs) ? readdirSync(runs, { withFileTypes: true }) : [])
