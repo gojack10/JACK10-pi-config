@@ -79,8 +79,7 @@ export function registerQueuedFollowup(pi: ExtensionAPI): void {
               const oldPath = show(TASK_LAUNCH_MANIFEST_OPTION);
               const old = JSON.parse(readFileSync(oldPath, 'utf8'));
               if (old.jobId !== request.jobId || old.sessionId !== request.sessionId || old.mode !== request.mode ||
-                  old.provider !== request.provider || old.model !== request.model || old.thinking !== request.thinking ||
-                  old.friendlyStopPercent !== request.friendlyStopPercent || old.friendlyStopDirectory !== request.friendlyStopDirectory) return false;
+                  old.provider !== request.provider || old.model !== request.model || old.thinking !== request.thinking) return false;
               const active = existingTaskOutcomeManager(ctx)?.snapshot().active;
               save(oldPath, { ...old, supersededBy: request.attemptId, supersededState: active?.state ?? 'final' });
               request.startGeneration = Number(show('@pi_start_generation'));

@@ -59,7 +59,8 @@ test("registered launch retains array bounds and strict item/top-level validatio
     [], Array(17).fill(job), [null], ["not an object"], [JSON.stringify(job)], [{}],
     [{ ...job, provider: "" }], [{ ...job, thinking: "auto" }], [{ ...job, mode: "other" }],
     [{ ...job, cwd: {} }], [{ ...job, extra: true }],
-    ...[39, 81].map(friendly_stop_percent => [{ ...job, friendly_stop_percent }]),
+    ...[40, 80].map(friendly_stop_percent => [{ ...job, friendly_stop_percent }]),
+    [{ ...job, friendly_stop_directory: "/tmp/obsolete" }],
   ]) {
     for (const value of [jobs, JSON.stringify(jobs)]) {
       assert.throws(() => validate({ jobs: value }), /Validation failed for tool "subagent_launch"/, JSON.stringify(value));
