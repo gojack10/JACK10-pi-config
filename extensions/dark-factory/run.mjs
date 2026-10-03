@@ -136,7 +136,7 @@ if (command === 'controller') {
   }
   for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
   const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
-  config.resume = { step: failed.step, previous: failed.previous ?? null, task: failed.role === 'worker' ? prior.task : null };
+  config.resume = { step: failed.step + 2, previous: failed.previous ?? null, task: failed.role === 'worker' ? prior.task : null };
   save(join(directory, 'config.json'), config);
   mkdirSync(lock, { recursive: false });
   writeFileSync(join(lock, 'run'), directory + '\n');
@@ -148,7 +148,7 @@ if (command === 'controller') {
     throw error;
   }
   console.log(JSON.stringify({ task: project.name, route: project.route, session: label, directory,
-    resumed_step: failed.step, failure_evidence: failureDir }, null, 2));
+    resumed_step: failed.step + 2, failure_evidence: failureDir }, null, 2));
 } else if (command === 'status') {
   const candidates = (existsSync(runs) ? readdirSync(runs, { withFileTypes: true }) : [])
     .filter(entry => entry.isDirectory() && existsSync(join(runs, entry.name, 'config.json')))
