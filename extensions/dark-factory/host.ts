@@ -41,7 +41,7 @@ export default function (pi: ExtensionAPI) {
             safe = false; // A crash or ambiguous launch must retain this task's lock.
             const launched = await launcher.launch([{ ...project.route, mode: 'task', cwd: config.cwd,
               session_label: `${project.name}-${role}-${step}`, mission_file: missionPath, report_file: reportPath,
-              extension_files: extensionFiles }]);
+              extension_files: extensionFiles, pause_on_interrupt: true }]);
             const receipt = launched.jobs[0];
             save(join(directory, `${step}-launch.json`), launched);
             save(join(directory, 'active.json'), { step, role, receipt });
@@ -65,12 +65,17 @@ export default function (pi: ExtensionAPI) {
             save(join(directory, `${step}-batch.json`), batch);
             const final = batch.completions[0];
             if (batch.completions.length !== 1 || final.id !== receipt.job || final.status !== 'completed' || final.source !== 'model') {
-              if (existsSync(join(directory, 'STOP'))) {
-                const closed = await pi.exec('tmux', ['kill-session', '-t', receipt.session_label]);
-                if (closed.code !== 0) throw Error(`cannot close stopped worker: ${closed.stderr}`);
-                safe = true;
+              // Escape/technical failure permanently closes report_outcome for this attempt. Pause cleanly;
+              // never leave a pane that looks resumable but has no active task contract.
+              const closed = await pi.exec('tmux', ['kill-session', '-t', receipt.session_label]);
+              if (closed.code !== 0) {
+                const stillThere = await pi.exec('tmux', ['has-session', '-t', `=${receipt.session_label}`]);
+                if (stillThere.code === 0) throw Error(`cannot close interrupted worker: ${closed.stderr}`);
               }
-              throw Error(`non-successful attempt: ${JSON.stringify(batch)}`);
+              safe = true;
+              const paused = Error(`factory paused after interrupted attempt: ${JSON.stringify(batch)}`) as Error & { factoryPaused?: boolean };
+              paused.factoryPaused = true;
+              throw paused;
             }
             const manifest = JSON.parse(readFileSync(receipt.manifest_file!, 'utf8'));
             const markers = readFileSync(receipt.monitor_log!, 'utf8').trim().split('\n').map(line => { try { return JSON.parse(line); } catch { return {}; } });
@@ -90,8 +95,9 @@ export default function (pi: ExtensionAPI) {
       } catch (error) {
         const prior = existsSync(join(directory, 'state.json'))
           ? JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')) : {};
-        save(join(directory, 'state.json'), { ...prior, status: 'error', error: String(error) });
-        save(join(directory, 'error.json'), { error: String(error), safe, notices });
+        const paused = !!(error as { factoryPaused?: boolean }).factoryPaused;
+        save(join(directory, 'state.json'), { ...prior, status: paused ? 'paused' : 'error', error: String(error) });
+        save(join(directory, paused ? 'paused.json' : 'error.json'), { error: String(error), safe, notices });
         throw error;
       } finally {
         if (safe) { background.shutdown(); writeFileSync(join(directory, 'QUIESCENT'), 'No active factory worker remains.\n'); }

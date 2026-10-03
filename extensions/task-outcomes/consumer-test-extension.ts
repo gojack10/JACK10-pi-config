@@ -28,6 +28,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
       summary: Type.Optional(Type.String()),
       command: Type.Optional(Type.String()),
       children: Type.Optional(Type.Array(Type.String())),
+      pause_on_interrupt: Type.Optional(Type.Boolean()),
       expected: Type.Optional(Type.Integer({ minimum: 1 })),
     }),
     async execute(_id, args, _signal, _onUpdate, ctx) {
@@ -42,6 +43,7 @@ export default function consumerTestExtension(pi: ExtensionAPI) {
             reportPath: args.report_path,
             batchId: args.batch_id,
             childJobIds: args.children,
+            pauseOnInterrupt: args.pause_on_interrupt === true,
           });
           break;
         case "child":

@@ -68,7 +68,10 @@ if (command === 'controller') {
     await session.bindExtensions({ mode: 'print' });
     entered = true;
     await session.prompt(`/factory-run ${directory}`);
-    if (!existsSync(join(directory, 'QUIESCENT')) || existsSync(join(directory, 'error.json'))) throw Error('factory did not finish cleanly; inspect error.json/active.json');
+    const terminal = existsSync(join(directory, 'state.json')) ? JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')) : {};
+    if (!existsSync(join(directory, 'QUIESCENT')) || existsSync(join(directory, 'error.json')) || terminal.status === 'paused') {
+      throw Error(`factory ${terminal.status ?? 'unknown'}; inspect status/active artifacts`);
+    }
     save(join(directory, 'finished.json'), { ok: true });
   } catch (error) {
     console.error(error);
@@ -118,25 +121,49 @@ if (command === 'controller') {
     process.exitCode = result.ok ? 0 : 1;
   }
 } else if (command === 'resume') {
-  if (existsSync(join(lock, 'run'))) throw Error(`Factory ${project.name} is locked; stop or recover the inactive attempt first.`);
   if (!existsSync(join(runs, 'LAST'))) throw Error(`Factory ${project.name} has no retained run to resume.`);
   const directory = readFileSync(join(runs, 'LAST'), 'utf8').trim();
-  const found = activity(directory);
-  if (found.controller || found.sessions.length) throw Error(`Cannot resume active factory: controller=${found.controller}, sessions=${found.sessions.join(',')}`);
+  if (existsSync(join(lock, 'run'))) {
+    const found = activity(directory);
+    if (found.controller || found.sessions.length) throw Error(`Cannot resume active factory: controller=${found.controller}, sessions=${found.sessions.join(',')}`);
+    releaseQuiescent(directory, 'resume recovered a proven-quiescent interrupted lock');
+  }
   const failed = JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8'));
-  if (failed.status !== 'error' || !failed.step || !['planner', 'worker'].includes(failed.role)) throw Error('Resume requires a retained planner/worker error checkpoint.');
+  if (!['error', 'paused'].includes(failed.status) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
+    throw Error('Resume requires a retained paused/error planner or worker checkpoint.');
+  }
   const prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
   if (failed.role === 'worker' && (prior?.role !== 'planner' || !prior.task)) throw Error('Failed worker has no verified preceding planner assignment.');
+  const orphanName = `${failed.step}-${failed.role}.json`;
+  let orphan;
+  try {
+    orphan = existsSync(join(directory, orphanName)) && readFileSync(join(directory, orphanName), 'utf8').trim()
+      ? JSON.parse(readFileSync(join(directory, orphanName), 'utf8')) : undefined;
+  } catch { orphan = undefined; }
   const failureDir = join(directory, 'failures', `step-${failed.step}-${Date.now()}`);
   mkdirSync(failureDir, { recursive: true });
   for (const entry of readdirSync(directory)) {
-    if (entry.startsWith(`${failed.step}-`) || ['active.json', 'error.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
+    if (entry.startsWith(`${failed.step}-`) || ['active.json', 'error.json', 'paused.json', 'finished.json', 'state.json', 'interrupted.json'].includes(entry)) {
       renameSync(join(directory, entry), join(failureDir, entry));
     }
   }
   for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
+  const archivedOrphan = join(failureDir, orphanName);
+  const reviewOrphan = failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
+  const nextStep = reviewOrphan ? failed.step + 1 : failed.step + 2;
+  let previous = failed.previous ?? null;
+  let task = failed.role === 'worker' ? prior.task : null;
+  if (reviewOrphan) {
+    previous = join(directory, `pause-handoff-${failed.step}.json`);
+    const batch = join(failureDir, `${failed.step}-batch.json`);
+    save(previous, { version: 1, role: 'worker', disposition: 'interrupted',
+      summary: `UNVERIFIED ORPHAN: Escape/technical failure closed the task contract before report_outcome. A fresh planner must inspect the original report, artifacts and landed tree; never credit it from prose alone. Original: ${archivedOrphan}`,
+      evidence: [archivedOrphan, ...(existsSync(batch) ? [batch] : [])],
+      updated_nodes: Array.isArray(orphan.updated_nodes) ? orphan.updated_nodes : [] });
+    task = null;
+  }
   const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
-  config.resume = { step: failed.step + 2, previous: failed.previous ?? null, task: failed.role === 'worker' ? prior.task : null };
+  config.resume = { step: nextStep, previous, task };
   save(join(directory, 'config.json'), config);
   mkdirSync(lock, { recursive: false });
   writeFileSync(join(lock, 'run'), directory + '\n');
@@ -148,7 +175,8 @@ if (command === 'controller') {
     throw error;
   }
   console.log(JSON.stringify({ task: project.name, route: project.route, session: label, directory,
-    resumed_step: failed.step + 2, failure_evidence: failureDir }, null, 2));
+    resumed_step: nextStep, strategy: reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
+    failure_evidence: failureDir }, null, 2));
 } else if (command === 'status') {
   const candidates = (existsSync(runs) ? readdirSync(runs, { withFileTypes: true }) : [])
     .filter(entry => entry.isDirectory() && existsSync(join(runs, entry.name, 'config.json')))

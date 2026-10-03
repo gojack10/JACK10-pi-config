@@ -46,6 +46,8 @@ export interface TaskLaunchContract {
   batchId?: string;
   parentJobId?: string;
   childJobIds?: readonly string[];
+  /** Keep the same attempt active across Escape/provider interruption; factory-only opt-in. */
+  pauseOnInterrupt?: boolean;
   ownerSessionId?: string;
 }
 
@@ -388,6 +390,7 @@ export class TaskOutcomeManager {
       batchId: manifest.batchId,
       parentJobId: manifest.parentJobId,
       childJobIds: manifest.childJobIds,
+      pauseOnInterrupt: manifest.pauseOnInterrupt === true,
     };
     assertId("manifest jobId", contract.jobId);
     assertId("manifest attemptId", contract.attemptId);
@@ -971,7 +974,8 @@ The declaration is provisional until clean settlement. Do not start more work af
     this.lastAssistant = assistant;
     this.lastInterruption = interruption;
     const contract = this.activeContract();
-    if (interruption?.kind === "cancel" && contract?.state !== "final") {
+    const pausing = contract?.pauseOnInterrupt === true;
+    if (interruption?.kind === "cancel" && contract?.state !== "final" && !(pausing && interruption.source === "escape")) {
       this.requestCancellation(
         interruption.source === "escape" || interruption.source === "task_cancel" || interruption.source === "extension"
           ? interruption.source
@@ -983,9 +987,9 @@ The declaration is provisional until clean settlement. Do not start more work af
     if (assistant.stopReason === "error") {
       this.lastRunFailure = assistant.errorMessage || "assistant error";
     } else if (assistant.stopReason === "aborted" && !interruption?.kind && contract?.state !== "context_paused" && !this.maintenanceState) {
-      // Older hosts do not provide interruption metadata. An unmarked abort is
-      // still a user cancellation, never a provider outage.
-      this.requestCancellation("extension", assistant.errorMessage || "assistant aborted");
+      // Factory attempts treat an unmarked older-host abort as a pause. Default
+      // task transport retains terminal cancellation semantics.
+      if (!pausing) this.requestCancellation("extension", assistant.errorMessage || "assistant aborted");
       this.lastRunFailure = undefined;
     } else if (assistant.stopReason === "aborted") {
       this.lastRunFailure = undefined;
@@ -998,6 +1002,13 @@ The declaration is provisional until clean settlement. Do not start more work af
     const contract = this.activeContract();
     if (this.cancellation && contract && contract.state !== "final") {
       this.finalize(contract, "failed", "technical", `cancelled: ${this.cancellation.reason}`);
+      return;
+    }
+    if (contract?.pauseOnInterrupt &&
+        ((this.lastInterruption?.kind === "cancel" && this.lastInterruption.source === "escape") ||
+         (!this.lastInterruption?.kind && this.lastAssistant?.stopReason === "aborted") || this.lastRunFailure)) {
+      // The task contract and monitor stay active. A later Continue/model turn
+      // resumes this exact attempt and may still declare report_outcome.
       return;
     }
     if (this.maintenanceState) {
@@ -1161,6 +1172,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       batchId: contract.batchId,
       parentJobId: contract.parentJobId,
       childJobIds: [...contract.childJobIds],
+      pauseOnInterrupt: contract.pauseOnInterrupt,
       ownerSessionId: contract.ownerSessionId,
       state: contract.state,
       contextPause: contract.contextPause && { ...contract.contextPause },
@@ -1528,6 +1540,7 @@ The declaration is provisional until clean settlement. Do not start more work af
       batchId: contract.batchId,
       parentJobId: contract.parentJobId,
       childJobIds: [...contract.childJobIds],
+      pauseOnInterrupt: contract.pauseOnInterrupt,
       ownerSessionId: contract.ownerSessionId,
       activatedAt: contract.activatedAt,
       childGeneration: contract.childGeneration,

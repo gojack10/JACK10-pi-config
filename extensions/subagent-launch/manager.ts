@@ -57,6 +57,8 @@ export interface SubagentJobInput {
   report_file?: string;
   /** Trusted programmatic controllers may load additional worker policy extensions. */
   extension_files?: string[];
+  /** Trusted controllers may make Escape/provider interruption pause rather than finalize the attempt. */
+  pause_on_interrupt?: boolean;
   /** Run-scoped friendly-stop opt-in; omitted means disabled. */
   friendly_stop_percent?: number;
   friendly_stop_directory?: string;
@@ -558,6 +560,7 @@ export class SubagentLauncher {
         batchId,
         activatedAt: reservation?.activatedAt,
         parentJobId: old.parentJobId,
+        pauseOnInterrupt: input.pause_on_interrupt === true,
         provider: input.provider,
         model: input.model,
         thinking: input.thinking,
@@ -747,6 +750,7 @@ export class SubagentLauncher {
       batchId: item.batchId,
       activatedAt: item.activatedAt,
       parentJobId: item.parentJobId,
+      pauseOnInterrupt: item.input.pause_on_interrupt === true,
       friendlyStopPercent: item.input.friendly_stop_percent,
       friendlyStopDirectory: friendlyDirectory,
       provider: item.input.provider,
