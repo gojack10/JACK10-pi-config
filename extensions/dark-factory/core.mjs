@@ -76,6 +76,10 @@ export function readAttemptResult(receipt) {
   return { text: reportText, receipt, outcome, contextStopped };
 }
 
+export function isContinuation(report, contextStopped) {
+  return report.disposition === 'continue' || (contextStopped && report.disposition === 'blocked');
+}
+
 export function continuationAfterStop(state, history) {
   const last = history.at(-1);
   if (state.status !== 'stopped' || !last?.receipt || !last.reportPath || last.step + 1 !== state.step ||
@@ -106,8 +110,7 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
     const reportPath = join(directory, `${step}-${role}.json`);
     const result = await runStep({ step, role, reportPath, previous, task });
     const report = validateReport(result.text, role, smoke, project);
-    const contextCheckpoint = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
-    if (report.disposition === 'continue' && !contextCheckpoint) throw Error('continuation requires a verified friendly-stop event');
+    const contextCheckpoint = isContinuation(report, result.contextStopped);
     if (assignments && report.disposition === 'worked') {
       if (report.tree_id !== task.tree_id || report.updated_nodes.length) throw Error('reader report tree identity/write mismatch');
       const packet = report.tree_packet;

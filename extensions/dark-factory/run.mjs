@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { continuationAfterStop, factoryActivity, readAttemptResult, save, taskRuns, taskSettings, validateReport } from './core.mjs';
+import { continuationAfterStop, factoryActivity, isContinuation, readAttemptResult, save, taskRuns, taskSettings, validateReport } from './core.mjs';
 import { suiteStatus } from './parallel.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
@@ -158,7 +158,7 @@ if (command === 'controller') {
     try {
       const result = readAttemptResult(JSON.parse(readFileSync(launchPath, 'utf8')).jobs[0]);
       const report = validateReport(result.text, failed.role, config.smoke, config.project ?? taskSettings());
-      contextResume = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
+      contextResume = isContinuation(report, result.contextStopped);
       blockedResume = failed.status === 'blocked' && process.argv.includes('--retry-blocked') && report.disposition === 'blocked';
     } catch (error) {
       if (['blocked', 'context_checkpoint'].includes(failed.status)) throw error;

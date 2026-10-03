@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BackgroundJobManager } from '../background-jobs/manager.ts';
 import { SubagentLauncher } from '../subagent-launch/manager.ts';
-import { readAttemptResult, taskSettings, runLoop, save, mission, validateReport } from './core.mjs';
+import { isContinuation, readAttemptResult, taskSettings, runLoop, save, mission, validateReport } from './core.mjs';
 import { acquireSlot } from './slots.mjs';
 import { waitProfileInputs } from './parallel.mjs';
 import { closeIdleWatches } from './watch.mjs';
@@ -98,7 +98,7 @@ export default function (pi: ExtensionAPI) {
                 !['completed', 'blocked'].includes(final.status) || final.source !== 'model') await pause();
             const result = readAttemptResult(receipt);
             const report = validateReport(result.text, role, config.smoke, project);
-            const contextCheckpoint = result.contextStopped && ['continue', 'blocked'].includes(report.disposition);
+            const contextCheckpoint = isContinuation(report, result.contextStopped);
             if (config.readers && role === 'planner' && report.disposition === 'next') {
               const inputs = JSON.parse(readFileSync(join(directory, 'reader-inputs.json'), 'utf8'));
               if (inputs.pending.length && !inputs.pending.some(p => p.tree_id === report.task?.tree_id)) {
@@ -113,7 +113,7 @@ export default function (pi: ExtensionAPI) {
             if (closed.code !== 0) throw Error(`cannot close completed worker: ${closed.stderr}`);
             safe = true;
             appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ step, role,
-              event: contextCheckpoint ? 'verified_context_checkpoint' : 'verified_completed', at: Date.now(), job: receipt.job }) + '\n');
+              event: contextCheckpoint ? (result.contextStopped ? 'verified_context_checkpoint' : 'verified_incomplete_checkpoint') : 'verified_completed', at: Date.now(), job: receipt.job }) + '\n');
             if (config.readers && role === 'worker' && report.disposition === 'worked' && task?.tree_id) {
               const path = join(directory, 'merged-trees.json');
               const merged = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];
