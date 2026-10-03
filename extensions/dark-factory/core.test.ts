@@ -24,6 +24,16 @@ test('sequential planner/worker handoff, STOP, invalid reports and repeat detect
     assert.deepEqual(roles, ['planner', 'worker']);
     assert.equal(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).status, 'smoke_passed');
     await assert.rejects(runLoop({ directory: dir, smoke: true, runStep: () => assert.fail('replayed') }), /existing run/);
+    const retry = directory();
+    const prior = join(retry, '1-planner.json');
+    writeFileSync(prior, JSON.stringify(report('planner')));
+    writeFileSync(join(retry, 'state.json'), JSON.stringify({ status: 'error', step: 2 }));
+    await runLoop({ directory: retry, smoke: true, resume: { step: 2, previous: prior, task: report('planner').task },
+      runStep: async ({ step, role, previous, task }) => {
+        assert.equal(step, 2); assert.equal(role, 'worker'); assert.equal(previous, prior); assert.equal(task.instruction, 'read fixture');
+        return { text: JSON.stringify(report(role)), receipt: { job: role } };
+      } });
+    assert.equal(JSON.parse(readFileSync(join(retry, 'state.json'), 'utf8')).status, 'smoke_passed');
     const stop = directory(); writeFileSync(join(stop, 'STOP'), '');
     await runLoop({ directory: stop, smoke: true, runStep: () => assert.fail('ignored STOP') });
     await assert.rejects(runLoop({ directory: directory(), smoke: false, maxSteps: 3,
