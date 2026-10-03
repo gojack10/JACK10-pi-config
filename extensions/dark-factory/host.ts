@@ -15,6 +15,8 @@ export default function (pi: ExtensionAPI) {
     handler: async (directory, ctx) => {
       const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
       const project = config.project ?? taskSettings();
+      const resume = config.resume;
+      if (resume) { delete config.resume; save(join(directory, 'config.json'), config); }
       const notices: string[] = [];
       let wake = () => {};
       const notify = (text: string) => { notices.push(text); wake(); };
@@ -23,7 +25,7 @@ export default function (pi: ExtensionAPI) {
       const launcher = new SubagentLauncher(transportPi, ctx, background);
       let safe = true;
       try {
-        await runLoop({ directory, smoke: config.smoke, project,
+        await runLoop({ directory, smoke: config.smoke, project, resume,
           runStep: async ({ step, role, reportPath, previous, task }) => {
             if (existsSync(join(directory, 'STOP'))) throw Error('stop requested');
             const missionPath = join(directory, `${step}-${role}.md`);
