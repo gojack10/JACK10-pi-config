@@ -514,11 +514,13 @@ test("launcher ingestion preserves durable dynamic child membership", { timeout:
     batchId,
     parentJobId: "outer-parent",
     childJobIds: [],
+    pauseOnInterrupt: true,
   }));
   const oldManifest = process.env.PI_SUBAGENT_MANIFEST;
   process.env.PI_SUBAGENT_MANIFEST = manifestPath;
   try {
     assert.deepEqual(h.manager.ingestLauncherContract()?.childJobIds, []);
+    assert.equal((await h.snapshot()).active.pauseOnInterrupt, true);
     h.manager.registerChild(jobId, "child-one");
     h.manager.registerChild(jobId, "child-two");
     await h.emit("session_tree");
@@ -713,6 +715,30 @@ test("missing declarations stop after two corrective turns", async t => {
   assert.equal(outcome.source, "protocol");
   assert.match(outcome.summary, /after two corrective turns/);
   assert.equal(h.messages.length, 2);
+});
+
+test("factory pause policy keeps the same attempt reportable across Escape and provider failure", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "pause-escape", "a1"), pause_on_interrupt: true });
+  await h.emit("agent_start");
+  await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted", content: [] }],
+    interruption: { kind: "cancel", source: "escape", reason: "execution interrupted by Escape" } });
+  await h.emit("agent_settled");
+  assert.equal((await h.snapshot()).outcomes.length, 0);
+  assert.equal((await h.snapshot()).active.attemptId, "a1");
+  await writeFile(join(h.dir, "pause-escape-a1.md"), "finished after Continue");
+  await h.settle({ outcome: "completed", summary: "continued same attempt" });
+  assert.equal((await h.snapshot()).outcomes.at(-1).outcome, "completed");
+
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "pause-provider", "p1"), pause_on_interrupt: true });
+  await h.emit("agent_start");
+  await h.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error", errorMessage: "network unavailable", content: [] }] });
+  await h.emit("agent_settled");
+  assert.equal((await h.snapshot()).active.attemptId, "p1");
+  assert.equal((await h.snapshot()).outcomes.filter((item: any) => item.attemptId === "p1").length, 0);
+  await writeFile(join(h.dir, "pause-provider-p1.md"), "finished after network returned");
+  await h.settle({ outcome: "completed", summary: "provider recovered" });
+  assert.equal((await h.snapshot()).outcomes.at(-1).outcome, "completed");
 });
 
 test("dialogue and technical failures never trigger task corrections", async t => {
