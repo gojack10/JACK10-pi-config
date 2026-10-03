@@ -181,7 +181,6 @@ const assertId = (name: string, value: string): void => {
 
 const assertSummary = (summary: string): string => {
   if (typeof summary !== "string" || summary.trim().length === 0) throw new Error("summary must be nonempty");
-  if (summary.length > SUMMARY_MAX) throw new Error(`summary exceeds ${SUMMARY_MAX} characters`);
   return summary;
 };
 
