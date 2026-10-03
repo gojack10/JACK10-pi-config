@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { continuationAfterStop, readAttemptResult, runLoop } from './core.mjs';
+import { continuationAfterStop, isContinuation, readAttemptResult, runLoop } from './core.mjs';
 import { publishMonitorReceipt } from '../task-outcomes/monitor-receipt.mjs';
 
 const report = (role, disposition) => ({ version: 1, role, disposition, summary: 'retained progress', evidence: [], updated_nodes: [],
@@ -50,12 +50,25 @@ test('STOP at a context handoff preserves the unfinished assignment and fresh re
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('continue without a transport-confirmed context stop is rejected', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'factory-handoff-invalid-'));
+test('explicit incomplete reports hand off without an 80% event; ordinary blockers remain terminal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-handoff-explicit-'));
   try {
-    await assert.rejects(runLoop({ directory: dir, smoke: true,
-      runStep: async () => ({ text: JSON.stringify(report('planner', 'continue')), receipt: {}, contextStopped: false }) }),
-      /verified friendly-stop event/);
+    assert.equal(isContinuation(report('worker', 'continue'), false), true);
+    assert.equal(isContinuation(report('worker', 'blocked'), false), false);
+    assert.equal(isContinuation(report('worker', 'blocked'), true), true);
+    const seen = [];
+    await runLoop({ directory: dir, smoke: true, maxSteps: 4,
+      runStep: async ({ step, role, previous, task }) => {
+        seen.push(role);
+        if (step === 3) {
+          assert.equal(previous, join(dir, '2-worker.json'));
+          assert.deepEqual(task, report('planner', 'next').task);
+        }
+        return { text: JSON.stringify(report(role, step === 1 ? 'next' : step === 2 ? 'continue' : step === 3 ? 'worked' : 'blocked')),
+          receipt: { job: step }, contextStopped: false };
+      } });
+    assert.deepEqual(seen, ['planner', 'worker', 'worker', 'planner']);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).status, 'blocked');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
