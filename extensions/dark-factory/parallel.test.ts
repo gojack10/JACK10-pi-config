@@ -34,7 +34,7 @@ test('profile waits for reader receipts and suite completion requires exact popu
   try {
     const suite = { video: join(d, 'video'), profile: join(d, 'profile'), readers: [join(d, 'reader')], route: {} };
     for (const p of [suite.video, suite.profile, ...suite.readers]) mkdirSync(p);
-    save(join(suite.readers[0], 'config.json'), { assignments: [{ tree_id: 'a' }] });
+    save(join(suite.readers[0], 'config.json'), { assignments: [{ tree_id: 'a' }, { tree_id: 'b' }] });
     save(join(suite.readers[0], 'state.json'), { status: 'running' });
     const waiting = waitProfileInputs(suite.profile, suite.readers);
     save(join(suite.readers[0], 'completed-trees.json'), [{ tree_id: 'a', tree_packet: '/packet' }]);
@@ -57,7 +57,20 @@ test('profile waits for reader receipts and suite completion requires exact popu
     for (const [lane, status] of [[suite.video, 'video_ready'], [suite.profile, 'profile_ready']]) {
       save(join(lane, 'state.json'), { status }); save(join(lane, 'finished.json'), { ok: true, completed: true });
     }
+    assert.equal(suiteStatus(suite).completed, false); // b has not been read or explicitly excluded.
+    save(join(suite.readers[0], 'excluded-trees.json'), [{ tree_id: 'b' }]);
     assert.equal(suiteStatus(suite).status, 'ready_for_interview');
+    assert.deepEqual(suiteStatus(suite).trees, { total: 2, read: 1, excluded: 1, merged: 1, remaining_to_read: 0, remaining_to_merge: 0 });
+    assert.equal(profileInputs(suite.profile, suite.readers).excluded.length, 1);
+    save(join(suite.readers[0], 'excluded-trees.json'), [{ tree_id: 'a' }]);
+    assert.equal(suiteStatus(suite).completed, false); // Cannot exclude an already-read tree or miss b.
+    save(join(suite.readers[0], 'excluded-trees.json'), [{ tree_id: 'unknown' }]);
+    assert.equal(suiteStatus(suite).completed, false);
+    save(join(suite.readers[0], 'excluded-trees.json'), [{ tree_id: 'b' }, { tree_id: 'b' }]);
+    assert.equal(suiteStatus(suite).completed, false);
+    save(join(suite.readers[0], 'excluded-trees.json'), [{ tree_id: 'b' }]);
+    save(join(suite.profile, 'merged-trees.json'), [{ tree_id: 'b' }]);
+    assert.equal(suiteStatus(suite).completed, false); // Excluded trees must never count as reconciled evidence.
     save(join(suite.profile, 'merged-trees.json'), [{ tree_id: 'wrong' }]);
     assert.equal(suiteStatus(suite).completed, false);
     writeFileSync(join(suite.profile, 'STOP'), 'stop');

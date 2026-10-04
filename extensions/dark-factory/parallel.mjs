@@ -7,10 +7,10 @@ const json = (path, fallback) => existsSync(path) ? JSON.parse(readFileSync(path
 export function profileInputs(directory, readers) {
   const merged = json(join(directory, 'merged-trees.json'), []);
   const lanes = readers.map(directory => ({ directory, state: json(join(directory, 'state.json'), { status: 'not_started' }),
-    completed: json(join(directory, 'completed-trees.json'), []) }));
+    completed: json(join(directory, 'completed-trees.json'), []), excluded: json(join(directory, 'excluded-trees.json'), []) }));
   const completed = lanes.flatMap(l => l.completed);
   const mergedIds = new Set(merged.map(e => e.tree_id));
-  return { readers: lanes.map(({ directory, state }) => ({ directory, state })), completed,
+  return { readers: lanes.map(({ directory, state }) => ({ directory, state })), completed, excluded: lanes.flatMap(l => l.excluded),
     pending: completed.filter(e => !mergedIds.has(e.tree_id)), merged,
     allReadersComplete: lanes.every(l => l.state.status === 'reads_complete'),
     stalled: lanes.filter(l => ['error', 'paused', 'blocked', 'stopped', 'step_limit'].includes(l.state.status)) };
@@ -46,18 +46,23 @@ export function suiteStatus(suite) {
   const profile = profileInputs(suite.profile, suite.readers);
   const readerPopulation = suite.readers.flatMap(d => json(join(d, 'config.json'), {}).assignments ?? []).map(a => a.tree_id);
   const expected = new Set(readerPopulation), actual = new Set(profile.completed.map(e => e.tree_id));
-  const populationComplete = expected.size === readerPopulation.length && profile.completed.length === expected.size &&
-    [...actual].every(id => expected.has(id));
+  const excluded = new Set(profile.excluded.map(e => e.tree_id));
+  const accounted = [...actual, ...excluded];
+  const populationComplete = expected.size === readerPopulation.length && actual.size === profile.completed.length &&
+    excluded.size === profile.excluded.length && accounted.length === expected.size &&
+    new Set(accounted).size === expected.size && accounted.every(id => expected.has(id));
   const ready = lanes[0].state.status === 'video_ready' && lanes[1].state.status === 'profile_ready' &&
     lanes[0].finished?.ok === true && lanes[1].finished?.ok === true && profile.allReadersComplete &&
     populationComplete && lanes.slice(2).every(l => l.finished?.completed === true) &&
-    profile.merged.length === expected.size && new Set(profile.merged.map(e => e.tree_id)).size === expected.size &&
-    profile.merged.every(e => expected.has(e.tree_id));
+    profile.merged.length === actual.size && new Set(profile.merged.map(e => e.tree_id)).size === actual.size &&
+    profile.merged.every(e => actual.has(e.tree_id));
   const needsAttention = lanes.some(l => ['error', 'paused', 'blocked', 'step_limit'].includes(l.state.status));
   return { status: ready ? 'ready_for_interview' : needsAttention ? 'needs_attention' : 'in_progress', model: suite.route,
     video: lanes[0], profile: lanes[1], readers: lanes.slice(2),
-    trees: { total: expected.size, read: actual.size, merged: profile.merged.length },
-    completed: ready, completion_is: 'Both validated lanes, all inventoried trees read and reconciled; personal interview remains unperformed.' };
+    trees: { total: expected.size, read: actual.size, excluded: excluded.size, merged: profile.merged.length,
+      remaining_to_read: [...expected].filter(id => !actual.has(id) && !excluded.has(id)).length,
+      remaining_to_merge: [...actual].filter(id => !profile.merged.some(e => e.tree_id === id)).length },
+    completed: ready, completion_is: 'Both validated lanes; every inventoried tree either read and reconciled or explicitly excluded for denied AI access. Personal interview remains unperformed.' };
 }
 
 export async function watchSuite(suite, output) {

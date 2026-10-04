@@ -36,7 +36,8 @@ export function save(path, value) {
 export function validateReport(text, role, smoke = false, project = taskSettings()) {
   const r = JSON.parse(text);
   if (r.version !== 1 || r.role !== role || typeof r.summary !== 'string' || !r.summary.trim()) throw Error('invalid report identity/summary');
-  const allowed = role === 'planner' ? ['next', project.ready, 'blocked', 'continue'] : ['worked', 'blocked', 'continue'];
+  const allowed = role === 'planner' ? ['next', project.ready, 'blocked', 'continue']
+    : ['worked', 'blocked', 'continue', ...(project.ready === 'reads_complete' && project.excludeUnreadable ? ['excluded'] : [])];
   if (!allowed.includes(r.disposition)) throw Error('invalid disposition');
   if (!Array.isArray(r.evidence) || !r.evidence.every(p => typeof p === 'string' && isAbsolute(p) && existsSync(p))) throw Error('missing evidence');
   if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
@@ -111,12 +112,16 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
     const result = await runStep({ step, role, reportPath, previous, task });
     const report = validateReport(result.text, role, smoke, project);
     const contextCheckpoint = isContinuation(report, result.contextStopped);
-    if (assignments && report.disposition === 'worked') {
+    if (assignments && ['worked', 'excluded'].includes(report.disposition)) {
       if (report.tree_id !== task.tree_id || report.updated_nodes.length) throw Error('reader report tree identity/write mismatch');
       const packet = report.tree_packet;
       if (typeof packet !== 'string' || !isAbsolute(packet) || !report.evidence.includes(packet)) throw Error('missing reader evidence packet');
       const data = JSON.parse(readFileSync(packet, 'utf8'));
-      if (data.tree_id !== task.tree_id || data.root_id !== task.root_id || data.outline_complete !== true ||
+      if (data.tree_id !== task.tree_id || data.root_id !== task.root_id) throw Error('tree packet identity mismatch');
+      if (report.disposition === 'excluded') {
+        if (data.coverage_status !== 'excluded' || data.exclusion_kind !== 'ai_read_denied' ||
+            typeof data.exclusion_reason !== 'string' || !data.exclusion_reason.trim()) throw Error('invalid tree exclusion packet');
+      } else if (data.outline_complete !== true ||
           !Array.isArray(data.content_read_ids) || !data.content_read_ids.includes(task.root_id) ||
           !Array.isArray(data.findings) || !Array.isArray(data.exclusions) ||
           !Array.isArray(data.remaining_work) || data.remaining_work.length) throw Error('invalid tree coverage packet');
@@ -133,8 +138,10 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
       assignmentIndex++;
       previous = null;
       const entries = readFileSync(join(directory, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-      save(join(directory, 'completed-trees.json'), entries.filter(e => e.report.disposition === 'worked').map(e =>
-        ({ tree_id: e.task.tree_id, root_id: e.task.root_id, tree_packet: e.report.tree_packet, reportPath: e.reportPath })));
+      for (const [disposition, file] of [['worked', 'completed-trees.json'], ['excluded', 'excluded-trees.json']]) {
+        save(join(directory, file), entries.filter(e => e.report.disposition === disposition).map(e =>
+          ({ tree_id: e.task.tree_id, root_id: e.task.root_id, tree_packet: e.report.tree_packet, reportPath: e.reportPath })));
+      }
       continue;
     }
     if (role === 'planner') {
@@ -152,7 +159,15 @@ export function mission({ role, reportPath, previous, task, smoke, directory, co
   const ready = project.name === 'bf2'
     ? 'ready_for_user_test (requires launch_command:string and at least two evidence files: actual launch log and actual game UI evidence)'
     : `${project.ready} (requires at least two evidence artifacts proving this lane's coverage/validation, plus verified node IDs; stop before human dialogue)`;
-  const schema = `Write ONLY a JSON object into ${reportPath} (the launcher has reserved this file; write in place, do not rename it). Fields: version:1, role:${JSON.stringify(role)}, disposition, summary:string, evidence:absolute-existing-artifact-path[], updated_nodes:UUID[]. Planner dispositions: next (requires task:{instruction:string,acceptance:string}), ${ready}, blocked, or continue. Worker dispositions: worked, blocked, or continue. If FRIENDLY STOP interrupts unfinished work, use continue, recording completed work, exact evidence, remaining work and the next bounded action; the factory gives the same assignment and this report to a fresh agent of the same role. This does not complete the assignment. Reserve blocked for a real prerequisite/authority/safety blocker, not context capacity. A successor must read its preceding checkpoint and resume unfinished work, verify any landed effects before writing, and not replay completed actions or spend an already-used launch budget. Use completed in report_outcome after the valid report is written, even for a disproved hypothesis, context checkpoint or completed blocked-status report. A technical inability to finish the report is failed. End the turn after report_outcome. Do not launch child agents or untracked background processes. Do not change model/provider/thinking. No human dialogue is available.`;
+  const schema = `Write ONLY a JSON object into ${reportPath} (the launcher has reserved this file; write in place, do not rename it). Fields: version:1, role:${JSON.stringify(role)}, disposition, summary:string, evidence:absolute-existing-artifact-path[], updated_nodes:UUID[]. Planner dispositions: next (requires task:{instruction:string,acceptance:string}), ${ready}, blocked, or continue. Worker dispositions: worked, blocked, or continue${project.ready === 'reads_complete' && project.excludeUnreadable ? ', or excluded for a documented AI read denial under Jack\'s exclusion authorization' : ''}. Do not launch child agents or untracked background processes. Do not change model/provider/thinking. No human dialogue is available.
+
+## Return protocol: work status is not report delivery
+The report's disposition describes the work. report_outcome describes delivery to the controller. outcome:"completed" accepts the report for review; it does NOT claim the assignment, experiment, tree persistence or project succeeded. Only the report's disposition and verified evidence can establish those claims.
+1. Choose the report disposition: continue when authorized work remains and a fresh agent can resume; blocked for a real prerequisite/authority/safety blocker, not context capacity; otherwise use the role's completed-work disposition only when its acceptance checks are satisfied. Record findings, exact evidence, actually verified changes, pending/unverified effects, remaining work and the next bounded action. A failed or inconclusive experiment is a finding, not a failed delivery.
+2. At FRIENDLY STOP, stop substantive work and tree writes immediately. Do not try to finish reconciliation first: preserve unverified writes and remaining checks in the continue report. Drain already-running tracked child/background work; do not launch more.
+3. Write the JSON report in place to the reserved path above, then read it back to verify valid JSON, required fields and truthful completed-versus-unfinished claims. Once the report is valid and tracked work has drained, call report_outcome({outcome:"completed",summary:"<honest report summary, including unfinished work>"}) and end the turn. This applies to continue and blocked reports too. Use outcome:"failed" only when a technical/protocol failure prevents delivery of a valid report or continuation checkpoint; never merely because substantive work, a read-back or reconciliation remains unfinished.
+4. The controller validates the report and durable receipt. A continue report hands the same role and assignment to a fresh agent; blocked stops for resolution; verified finished work advances to the next role or the project-specific human boundary. A successor first reads the preceding report and owner checkpoint, verifies uncertain effects before writing, and resumes only remaining work: never replay completed actions or spend an already-used launch budget. An operator stop or narrower human authorization still limits advancement; a delivered report grants no new authority.
+Examples: unfinished reconciliation at the context limit -> disposition:"continue" + outcome:"completed"; a disproved hypothesis with checks and reconciliation finished -> disposition:"worked" + outcome:"completed"; missing required permission with a valid blocker report -> disposition:"blocked" + outcome:"completed"; unreadable/unwritable report with no valid checkpoint -> outcome:"failed".`;
   if (smoke) return `Read-only transport smoke, not project research. Do not read SiftText or methodology nodes: this is a bounded file-reading fixture. No bash, network, game launch, code edits, or tree writes. Use read on ${join(directory, 'fixture.txt')}${previous ? ` and preceding report ${previous}` : ''}. ${role === 'planner' ? 'Return next with a tiny task asking the worker to report the fixture text, acceptance exact fixture text.' : 'Report the fixture text and whether the preceding planner report was readable; return worked.'} Evidence lists the fixture path. updated_nodes is []. Your only write is your reserved report. ${schema}`;
   if (project.name !== 'bf2') return `${contract}\n\nROLE: ${role}. Project owner: ${project.root}. Run directory: ${directory}. Previous report: ${previous ?? 'none (initial entry)'}.\n${role === 'planner'
     ? `Review the current checkpoint, preceding report and actual evidence. Select exactly one bounded next task under the contract, with named inputs, acceptance check, result recipient and stop condition. The report task object is the assignment artifact; do not perform the worker task. Advance phases only after their coverage and landed content are verified. Return ${project.ready} only at this lane's contract completion boundary, or blocked for an unresolved prerequisite. Never manufacture Jack's answers.`
