@@ -23,6 +23,8 @@ import uuid
 from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
+import swap_policy
+from winnow_runtime import WinnowRuntime, MODEL_ID as WINNOW_MODEL_ID, UPSTREAM_ID as WINNOW_UPSTREAM_ID, PORT as WINNOW_PORT
 
 CHAT_TIMEOUT = ClientTimeout(total=None, sock_connect=10, sock_read=None)
 DISCOVERY_TIMEOUT = ClientTimeout(total=5, sock_connect=2, sock_read=5)
@@ -109,8 +111,8 @@ DS4_MODEL_METADATA = {
     },
     QWEN_NEXT_MODEL_ID: {
         "name": "Qwen3.8 Flash Next",
-        "context_length": 262144,
-        "max_completion_tokens": 262144,
+        "context_length": 500000,
+        "max_completion_tokens": 500000,
     },
     GLM_FLASH_MODEL_ID: {
         "name": "GLM 5.3 Flash",
@@ -135,6 +137,7 @@ ACTIVE_TICKET = None
 REQUEST_QUEUE = []
 CHAT_OWNER = None
 INDEPENDENT_SWITCH = None
+WINNOW = WinnowRuntime()
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -724,18 +727,50 @@ async def start_mlx():
 
 
 async def ensure_mlx_model(model_id):
-    """Called under the admission gate: make model_id the one resident checkpoint."""
+    """Called under the admission gate: make model_id the one resident checkpoint.
+
+    The checked swap policy decides reuse / stop-then-start / refuse; the host
+    proves identity, service exit and readiness.
+    """
     global MLX_LAST_REQUEST_AT
-    if await mlx_resident_model() == model_id:
-        MLX_LAST_REQUEST_AT = time.monotonic()
-        return
-    # One model at a time: evict whatever is resident before publishing the next.
-    await stop_mlx()
-    await asyncio.to_thread(_write_mlx_desired_sync, mlx_model_path(model_id))
-    await start_mlx()
-    resident = await mlx_resident_model()
-    if resident != model_id:
-        raise _mlx_unavailable(f"mlx-lm reports {resident!r} instead of {model_id!r}")
+    resident, mlx_unproven = await refresh_swap_residency()
+    if mlx_unproven:
+        raise _mlx_unavailable("mlx lane is occupied/unproven; no MLX admission was attempted")
+    action, target = swap_policy.SWAP.admit(model_id, qualified=model_id in MLX_MODEL_IDS)
+    if action == "reuse":
+        if await mlx_resident_model() == model_id:
+            MLX_LAST_REQUEST_AT = time.monotonic()
+            return
+        swap_policy.SWAP.adopt_unknown()
+        raise _mlx_unavailable(f"mlx reports no ready {model_id!r} after an identity match; no repair was attempted")
+    if action not in ("stop", "start"):
+        raise _mlx_unavailable(f"swap policy refused {model_id!r} ({action}); resident {resident!r} retained")
+    if action == "stop":
+        try:
+            if target in MLX_MODEL_IDS:
+                await stop_mlx()
+            else:
+                await unload_ds4_if_idle("mlx")
+        except BaseException:
+            try:
+                swap_policy.SWAP.stop_unknown()
+            except swap_policy.SwapPolicyError as exc:
+                log.warning(f"swap policy blocked after stop failure: {exc}")
+            raise
+        swap_policy.SWAP.stop_done()
+    try:
+        await asyncio.to_thread(_write_mlx_desired_sync, mlx_model_path(model_id))
+        await start_mlx()
+        resident_now = await mlx_resident_model()
+        if resident_now != model_id:
+            raise _mlx_unavailable(f"mlx-lm reports {resident_now!r} instead of {model_id!r}")
+    except BaseException:
+        try:
+            swap_policy.SWAP.start_unknown()
+        except swap_policy.SwapPolicyError as exc:
+            log.warning(f"swap policy blocked after start failure: {exc}")
+        raise
+    swap_policy.SWAP.start_ready()
     MLX_LAST_REQUEST_AT = time.monotonic()
 
 
@@ -762,8 +797,17 @@ async def mlx_idle_check_loop():
                 if await mlx_resident_model() is None:
                     MLX_LAST_REQUEST_AT = 0.0
                     continue
-                log.info(f"mlx-lm idle {now - MLX_LAST_REQUEST_AT:.0f}s; stopping")
+                log.info(f"mlx-lm idle {now - MLX_LAST_REQUEST_AT:.0f}s; policy check")
+                resident, mlx_unproven = await refresh_swap_residency()
+                if mlx_unproven:
+                    continue  # foreign/unproven mlx listener: never release or adopt it
+                action, _target = swap_policy.SWAP.idle_tick(
+                    int((time.monotonic() - MLX_LAST_REQUEST_AT) * 1000),
+                    MLX_IDLE_TIMEOUT * 1000, False)
+                if action != "unload":
+                    continue  # Keep: sticky Winnow, unknown identity or active owner
                 await stop_mlx()
+                swap_policy.SWAP.release_done()
         except Exception as e:
             log.warning(f"mlx idle loop: {e}")
 
@@ -886,7 +930,14 @@ async def ds4_idle_check_loop():
                     continue
                 if time.monotonic() - DS4_LAST_REQUEST_AT < DS4_IDLE_TIMEOUT:
                     continue
+                await refresh_swap_residency()
+                action, _target = swap_policy.SWAP.idle_tick(
+                    int((time.monotonic() - DS4_LAST_REQUEST_AT) * 1000),
+                    DS4_IDLE_TIMEOUT * 1000, False)
+                if action != "unload":
+                    continue  # Keep: sticky Winnow, unknown identity or active owner
                 await stop_dsv4()
+                swap_policy.SWAP.release_done()
                 DS4_LAST_REQUEST_AT = 0.0
         except Exception as e:
             log.warning(f"idle loop: {e}")
@@ -1056,28 +1107,147 @@ async def wait_for_ds4_idle():
         await asyncio.sleep(1)
 
 
-async def ensure_ds4_model(model_id):
-    """Called with REQUEST_CONDITION held and no admitted requests."""
-    mode = _mode_from_model_id(model_id)
-    await wait_for_ds4_idle()
-    loaded = await detect_ds4_loaded_model(refresh=True)
-    if loaded == model_id and await ds4_v1_ready():
-        return
-    await stop_mlx()
-    log.info(f"switching ds4 backend to {model_id}")
-    if await detect_ds4_loaded_model(refresh=True) is not None:
-        await stop_dsv4()
+# Models whose lifecycle this proxy owns and whose swaps the checked policy
+# decides. tunnel/flash-moe backends are external and stay host-side.
+DS4_SWAP_MODELS = DS4_MODEL_IDS | {GLM_FLASH_MODEL_ID}
 
-    await asyncio.to_thread(_write_ds4_desired_model_sync, mode)
-    await start_dsv4()
-    if not await wait_for_ds4_model(model_id):
+
+async def refresh_swap_residency():
+    """Host-side identity composition for the checked swap policy.
+
+    Loaded-model identity, service state and readiness are foreign observations
+    the policy cannot prove. `mlx_unproven` is a host guard fact: the managed
+    mlx job is absent (or its checkpoint identity is unproven) while its
+    proxy-owned port is occupied, so a listener that is not the managed job may
+    be a foreign engine. The policy still models proxy-owned engines only; the
+    guard makes transitions fail closed while exclusivity is unproven.
+
+    Returns (resident_model_id_or_None, mlx_unproven).
+    """
+    try:
+        if await asyncio.to_thread(WINNOW.probe):
+            # The ordinary path has no native Winnow adapter. Never adopt
+            # it as empty and start a second engine after a proxy restart.
+            swap_policy.SWAP.adopt_unknown()
+            return None, True
+    except Exception as exc:
+        log.warning(f"swap residency: Winnow identity unproven: {exc}")
+        swap_policy.SWAP.adopt_unknown()
+        return None, True
+    try:
+        ds4 = await detect_ds4_loaded_model(refresh=True)
+    except Exception as exc:
+        log.warning(f"swap residency: ds4 identity unproven: {exc}")
+        ds4 = "unknown"
+    mlx = None
+    mlx_unproven = False
+    try:
+        if await mlx_service_loaded():
+            mlx = await mlx_resident_model()
+            if mlx is None:
+                mlx_unproven = True
+        elif await asyncio.to_thread(swap_policy.port_listening, MLX_PORT):
+            # The managed job is not loaded but its port is occupied: the
+            # listener is foreign/unproven. Listening is not native-quiescence
+            # evidence; it only proves the lane is not proven empty.
+            mlx_unproven = True
+    except Exception as exc:
+        log.warning(f"swap residency: mlx identity unproven: {exc}")
+        mlx_unproven = True
+    if ds4 == "unknown":
+        swap_policy.SWAP.adopt_unknown()
+        return None, True
+    if mlx is None:
+        if mlx_unproven:
+            if ds4 is None:
+                swap_policy.SWAP.adopt_unknown()
+                return None, True
+            swap_policy.SWAP.adopt(ds4)
+            return ds4, True
+        if ds4 is None:
+            swap_policy.SWAP.adopt_empty()
+            return None, False
+        swap_policy.SWAP.adopt(ds4)
+        return ds4, False
+    if ds4 is None:
+        swap_policy.SWAP.adopt(mlx)
+        return mlx, False
+    # One engine at a time; two proven residents is a contradiction.
+    swap_policy.SWAP.adopt_unknown()
+    return None, False
+
+
+async def ensure_ds4_model(model_id):
+    """Called with REQUEST_CONDITION held and no admitted requests.
+
+    The checked swap policy decides reuse / stop-then-start / refuse; this host
+    proves native quiescence and service exit, executes the physical effects and
+    reports the receipts back to the policy.
+    """
+    resident, mlx_unproven = await refresh_swap_residency()
+    if mlx_unproven and resident != model_id:
         raise web.HTTPServiceUnavailable(
             text=json.dumps({"error": {
-                "message": f"Failed to load {model_id} ({mode}); no fallback or automatic restore was attempted.",
-                "type": "model_switch_timeout",
+                "message": f"mlx lane is occupied/unproven; no {model_id} transition while exclusivity is unproven.",
+                "type": "swap_lane_unproven",
             }}),
             content_type="application/json",
         )
+    action, target = swap_policy.SWAP.admit(model_id, qualified=model_id in DS4_SWAP_MODELS)
+    if action == "reuse":
+        if await ds4_v1_ready():
+            await wait_for_ds4_idle()  # same-model reuse still waits for foreign decode
+            return
+        swap_policy.SWAP.adopt_unknown()
+        raise web.HTTPServiceUnavailable(
+            text=json.dumps({"error": {
+                "message": f"{model_id} identity matches but backend readiness is unproven; no repair was attempted.",
+                "type": "model_switch_unready",
+            }}),
+            content_type="application/json",
+        )
+    if action not in ("stop", "start"):
+        raise web.HTTPServiceUnavailable(
+            text=json.dumps({"error": {
+                "message": f"swap policy refused {model_id} ({action}); resident {resident!r} retained.",
+                "type": "model_switch_refused",
+            }}),
+            content_type="application/json",
+        )
+    mode = _mode_from_model_id(model_id)
+    if action == "stop":
+        try:
+            await wait_for_ds4_idle()  # native quiescence: host fact, not policy state
+            if target in MLX_MODEL_IDS:
+                await stop_mlx()
+            else:
+                await stop_dsv4()
+        except BaseException:
+            try:
+                swap_policy.SWAP.stop_unknown()
+            except swap_policy.SwapPolicyError as exc:
+                log.warning(f"swap policy blocked after stop failure: {exc}")
+            raise
+        swap_policy.SWAP.stop_done()
+    try:
+        log.info(f"switching ds4 backend to {model_id}")
+        await asyncio.to_thread(_write_ds4_desired_model_sync, mode)
+        await start_dsv4()
+        if not await wait_for_ds4_model(model_id):
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": {
+                    "message": f"Failed to load {model_id} ({mode}); no fallback or automatic restore was attempted.",
+                    "type": "model_switch_timeout",
+                }}),
+                content_type="application/json",
+            )
+    except BaseException:
+        try:
+            swap_policy.SWAP.start_unknown()
+        except swap_policy.SwapPolicyError as exc:
+            log.warning(f"swap policy blocked after start failure: {exc}")
+        raise
+    swap_policy.SWAP.start_ready()
     log.info(f"ds4 backend ready: {model_id}")
 
 
@@ -1168,7 +1338,11 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                     pass
             if client_disconnected(request):
                 raise ConnectionResetError("client disconnected while queued")
-            if managed:
+            if managed and backend_name == 'winnow':
+                if INDEPENDENT_SWITCH is None:
+                    raise web.HTTPServiceUnavailable(text='Winnow managed switch unavailable')
+                engine = await INDEPENDENT_SWITCH.prepare_winnow()
+            elif managed:
                 # Switch/verify/rebind while no main is admitted and the same
                 # condition still excludes every queued request and idle task.
                 engine = await reservation_body.prepare_main(model_id)
@@ -1321,10 +1495,15 @@ async def unload_ds4_if_idle(reason):
 
 
 async def prepare_non_ds4_backend(backend_name, model_id):
-    await unload_ds4_if_idle(backend_name)
     if backend_name == "mlx":
+        # Policy-owned swap: any DS4 eviction is the policy's Stop directive.
         await ensure_mlx_model(model_id)
     else:
+        # External backends have no checked Winnow handoff. Refuse rather than
+        # overlap an unmanaged request with its resident Metal process.
+        if await asyncio.to_thread(WINNOW.probe):
+            raise web.HTTPServiceUnavailable(text='Winnow resident; external backend handoff unqualified')
+        await unload_ds4_if_idle(backend_name)
         await stop_mlx()
 
 
@@ -1490,6 +1669,58 @@ async def handle_chat(request):
                 await wait_for_ds4_idle()
             await finish_request(backend_name, uncertain=forwarded and not complete and not cancelled,
                                  release_chat=cancelled or client_disconnected(request))
+
+
+async def handle_systemone(request):
+    """Decision-only Winnow entry; no chat route and no direct public GPU port."""
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized()
+    body = await request.content.read(1024 * 1024 + 1)
+    if len(body) > 1024 * 1024:
+        raise web.HTTPRequestEntityTooLarge(max_size=1024 * 1024, actual_size=len(body))
+    payload, err = parse_json_body(body)
+    if err or not isinstance(payload, dict) or payload.get('model') != WINNOW_MODEL_ID:
+        raise web.HTTPBadRequest(text='Explicit model winnow-12b required; Kev/jev aliases are retired')
+    if not isinstance(payload.get('questions'), dict) or not payload['questions'] or \
+       payload.get('state') is None:
+        raise web.HTTPBadRequest(text='Winnow requires state and named questions')
+    if INDEPENDENT_SWITCH is None:
+        raise web.HTTPServiceUnavailable(text='managed Winnow route unavailable')
+    payload['model'] = WINNOW_UPSTREAM_ID
+    started = forwarded = complete = False
+    try:
+        await begin_request('winnow', WINNOW_MODEL_ID, request, managed=True)
+        started = True
+        async with ClientSession(timeout=CHAT_TIMEOUT) as session:
+            forwarded = True
+            async with session.post(f'http://127.0.0.1:{WINNOW_PORT}/v1/systemone',
+                 json=payload, headers=AUTH_HEADERS) as upstream:
+                result = await upstream.read()  # Drain even if the caller disconnects.
+                if upstream.status == 200:
+                    answer = json.loads(result)
+                    if not isinstance(answer, dict) or answer.get('model') != WINNOW_UPSTREAM_ID or \
+                       not isinstance(answer.get('answers'), dict) or \
+                       set(answer['answers']) != set(payload['questions']):
+                        raise RuntimeError('Winnow response identity/questions mismatch')
+                    complete = True  # Error bodies and unverified answers are not native-stop proof.
+                return web.Response(status=upstream.status, body=result,
+                                    content_type=upstream.content_type)
+    except ConnectionResetError:
+        if not started:
+            return web.Response(status=499, text='client cancelled before admission')
+        raise
+    finally:
+        if started:
+            await finish_request('winnow', uncertain=forwarded and not complete,
+                                 release_chat=client_disconnected(request))
+
+
+async def handle_systemone_models(request):
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized()
+    return web.json_response({'object': 'list', 'data': [
+        {'id': WINNOW_MODEL_ID, 'name': WINNOW_UPSTREAM_ID, 'type': 'decision',
+         'context_length': 65536, 'owned_by': 'winnow-inference'}]})
 
 
 async def handle_release_chat(request):
@@ -1670,7 +1901,7 @@ async def main():
     global DS4_LAST_REQUEST_AT, INDEPENDENT_SWITCH
     if DUAL_MODELS:
         from managed_switch import ManagedSwitch
-        manager = INDEPENDENT_SWITCH = ManagedSwitch()
+        manager = INDEPENDENT_SWITCH = ManagedSwitch(winnow=WINNOW)
         reservation_body.MANAGED_ENGINE_PREPARER = manager.prepare
         reservation_body.MANAGED_ENGINE_RELEASER = manager.release
         reservation_body.INDEPENDENT_ADMITTER = begin_independent_kev
@@ -1686,9 +1917,8 @@ async def main():
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat)
-    if RESERVATION_TRIAL:
-        app.router.add_post('/v1/systemone', reservation_body.handle_kev)
-        app.router.add_get('/v1/systemone/models', reservation_body.handle_kev_models)
+    app.router.add_post('/v1/systemone', handle_systemone)
+    app.router.add_get('/v1/systemone/models', handle_systemone_models)
     app.router.add_post("/admin/api/login", handle_admin_login)
     app.router.add_get("/admin/api/stats", handle_admin_stats)
     app.router.add_post("/admin/api/release-chat", handle_release_chat)
