@@ -62,7 +62,7 @@ export function suiteStatus(suite) {
     trees: { total: expected.size, read: actual.size, excluded: excluded.size, merged: profile.merged.length,
       remaining_to_read: [...expected].filter(id => !actual.has(id) && !excluded.has(id)).length,
       remaining_to_merge: [...actual].filter(id => !profile.merged.some(e => e.tree_id === id)).length },
-    completed: ready, completion_is: 'Both validated lanes; every inventoried tree either read and reconciled or explicitly excluded for denied AI access. Personal interview remains unperformed.' };
+    completed: ready, completion_is: 'Both content-complete lanes; every inventoried tree either read and reconciled or explicitly excluded for denied AI access. Personal interview remains unperformed.' };
 }
 
 export async function watchSuite(suite, output) {

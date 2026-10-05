@@ -39,6 +39,11 @@ const releaseQuiescent = (directory, reason) => {
     orphan_report: !!active && existsSync(join(directory, `${active.step}-${active.role}.json`)),
     note: 'An orphan report has no durable successful outcome receipt and is not credited as a completed attempt.',
   });
+  const statePath = join(directory, 'state.json');
+  if (existsSync(statePath)) {
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    if (state.status === 'running') save(statePath, { ...state, status: 'paused' });
+  }
   const configPath = join(directory, 'config.json');
   const sharedSlots = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf8')).shared_slots : undefined;
   if (sharedSlots && existsSync(sharedSlots)) {
@@ -188,9 +193,11 @@ if (command === 'controller') {
   }
   for (const marker of ['STOP', 'QUIESCENT']) if (existsSync(join(directory, marker))) unlinkSync(join(directory, marker));
   const archivedOrphan = join(failureDir, orphanName);
-  const reviewOrphan = !contextResume && !blockedResume && failed.status !== 'stopped' && failed.role === 'worker' && orphan?.version === 1 && orphan.role === 'worker' && existsSync(archivedOrphan);
+  const savedOrphan = !contextResume && !blockedResume && failed.status !== 'stopped' && orphan?.version === 1 && orphan.role === failed.role && existsSync(archivedOrphan);
+  const reviewOrphan = savedOrphan && failed.role === 'worker' && !config.project?.lean;
   const nextStep = contextResume || blockedResume ? failed.step + 1 : failed.status === 'stopped' ? failed.step : reviewOrphan ? failed.step + 1 : failed.step + 2;
-  let previous = contextResume || blockedResume ? join(directory, orphanName) : failed.previous ?? null;
+  let previous = contextResume || blockedResume ? join(directory, orphanName)
+    : savedOrphan && (config.project?.lean || failed.role === 'planner') ? archivedOrphan : failed.previous ?? null;
   let task = failed.role === 'worker' ? failed.task ?? prior.task : null;
   if (reviewOrphan) {
     previous = join(directory, `pause-handoff-${failed.step}.json`);
