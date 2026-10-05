@@ -664,7 +664,11 @@ export class SubagentLauncher {
       if (input.mode !== "task" && input.mode !== "dialogue") throw new Error("mode must be task or dialogue");
       if (!this.ctx.modelRegistry) throw new Error("model registry is unavailable; route cannot be verified");
       const model = this.ctx.modelRegistry.find(provider, modelId);
-      const available = this.ctx.modelRegistry.getAvailable().some(candidate => candidate.provider === provider && candidate.id === modelId);
+      // SDK controllers can have a stale compatibility snapshot after provider registration.
+      const candidates = typeof this.ctx.modelRegistry.getAvailableOfType === 'function'
+        ? await this.ctx.modelRegistry.getAvailableOfType('chat', provider)
+        : this.ctx.modelRegistry.getAvailable();
+      const available = candidates.some(candidate => candidate.provider === provider && candidate.id === modelId);
       if (!model || !available) throw new Error(`exact provider/model is unavailable: ${provider}/${modelId}`);
       if (!getSupportedThinkingLevels(model).includes(input.thinking)) {
         throw new Error(`model ${provider}/${modelId} does not support thinking level ${input.thinking}`);
