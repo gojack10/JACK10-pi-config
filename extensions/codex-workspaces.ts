@@ -154,6 +154,8 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				},
 			},
 			getModels: () => source.getModels().map((model) => ({ ...model, provider: account.providerId })),
+			getAllModels: () => (source.getAllModels?.() ?? source.getModels())
+				.map((model) => ({ ...model, provider: account.providerId })),
 			stream: (model, context, options) => {
 				if (
 					pin?.accountKey !== account.accountKey &&
@@ -199,6 +201,9 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				.getModels()
 				.filter((model) => supportedModels.has(model.id))
 				.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
+		getAllModels: () => (source.getAllModels?.() ?? source.getModels())
+			.filter((model) => supportedModels.has(model.id))
+			.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
 		modelSelectionError: selectionError,
 		resolveModel: async (model, context) => {
 			const work = parseWorkInput(process.env.PI_CODEX_WORK);
