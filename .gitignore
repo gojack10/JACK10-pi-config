@@ -65,3 +65,7 @@ commit-runs/
 .proxy-key
 
 .sifttext-key
+
+# Dark-factory task lanes: per-run assignment prompts name private projects,
+# SiftText owners and model routes. Only the general engine stays tracked.
+extensions/dark-factory/*-contract.md
