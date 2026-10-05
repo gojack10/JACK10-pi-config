@@ -47,12 +47,17 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
   if (smoke && r.updated_nodes.length) throw Error('smoke must not mutate tree');
   if (!smoke && !['blocked', 'continue'].includes(r.disposition)) {
-    if (project.name === 'bf2' && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
+    if (project.name === 'bf2' && !project.lean && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
     if (project.name !== 'bf2' && r.evidence.length === 0) throw Error('completed project work requires evidence');
   }
+  if (project.lean && !smoke && r.disposition === 'next' && Array.isArray(r.task?.acceptance) &&
+      r.task.acceptance.every(item => typeof item === 'string')) r.task.acceptance = r.task.acceptance.join('\n');
+  if (project.lean && project.name === 'sample-aggregate' && r.disposition === 'next' && r.task &&
+      !r.task.tree_id && typeof r.tree_id === 'string') r.task.tree_id = r.tree_id;
   if (r.disposition === 'next' && (!r.task || typeof r.task.instruction !== 'string' || !r.task.instruction.trim() || typeof r.task.acceptance !== 'string' || !r.task.acceptance.trim())) throw Error('next requires bounded task and acceptance');
   if (r.disposition === 'ready_for_user_test' && (smoke || r.evidence.length < 2 || typeof r.launch_command !== 'string' || !r.launch_command.trim())) throw Error('ready requires launch command and launch/UI evidence');
-  if (['complete', 'profile_ready', 'video_ready'].includes(r.disposition) && (smoke || r.evidence.length < 2 || !r.updated_nodes.length)) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
+  if (['complete', 'profile_ready', 'video_ready'].includes(r.disposition) &&
+      (smoke || (!project.lean && (r.evidence.length < 2 || !r.updated_nodes.length)))) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
   return r;
 }
 
@@ -89,7 +94,7 @@ export function continuationAfterStop(state, history) {
   const last = history.at(-1);
   if (state.status !== 'stopped' || !last?.receipt || !last.reportPath || last.step + 1 !== state.step ||
       !['planner', 'worker'].includes(last.role) ||
-      (!['next', 'worked'].includes(last.report?.disposition) && !last.contextCheckpoint)) {
+      (!['next', 'worked', 'excluded'].includes(last.report?.disposition) && !last.contextCheckpoint)) {
     throw Error('Graceful-stop continuation requires the immediately preceding verified checkpoint.');
   }
   return { ...state, role: state.role ?? (last.contextCheckpoint ? last.role : last.role === 'worker' ? 'planner' : 'worker'),
@@ -100,14 +105,15 @@ export function continuationAfterStop(state, history) {
 export async function runLoop({ directory, smoke, runStep, project = taskSettings(), resume, assignments, maxSteps = smoke ? 2 : 10000 }) {
   const statePath = join(directory, 'state.json');
   if (existsSync(statePath) && !resume) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
+  const nodeAssignments = project.name === 'sample-rewrite';
   let previous = resume?.previous ?? null, task = resume?.task ?? null;
   let assignmentIndex = resume?.assignmentIndex ?? 0;
   let role = assignments ? 'worker' : resume?.role ?? ((resume?.step ?? 1) % 2 ? 'planner' : 'worker');
-  if (assignments && previous && JSON.parse(readFileSync(previous, 'utf8')).tree_id !== assignments[assignmentIndex]?.tree_id) previous = null;
+  if (assignments && !nodeAssignments && previous && JSON.parse(readFileSync(previous, 'utf8')).tree_id !== assignments[assignmentIndex]?.tree_id) previous = null;
   const fingerprints = new Set();
   for (let step = resume?.step ?? 1; step <= maxSteps; step++) {
     if (assignments && assignmentIndex === assignments.length) {
-      save(statePath, { status: 'reads_complete', step, assignmentIndex, previous }); return;
+      save(statePath, { status: nodeAssignments ? project.ready : 'reads_complete', step, assignmentIndex, previous }); return;
     }
     if (assignments) task = assignments[assignmentIndex];
     if (existsSync(join(directory, 'STOP'))) { save(statePath, { status: 'stopped', step, role, previous, task, assignmentIndex }); return; }
@@ -116,19 +122,25 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
     const result = await runStep({ step, role, reportPath, previous, task });
     const report = validateReport(result.text, role, smoke, project);
     const contextCheckpoint = isContinuation(report, result.contextStopped);
-    if (assignments && ['worked', 'excluded'].includes(report.disposition)) {
+    if (assignments && !nodeAssignments && ['worked', 'excluded'].includes(report.disposition)) {
       if (report.tree_id !== task.tree_id || report.updated_nodes.length) throw Error('reader report tree identity/write mismatch');
-      const packet = report.tree_packet;
-      if (typeof packet !== 'string' || !isAbsolute(packet) || !report.evidence.includes(packet)) throw Error('missing reader evidence packet');
-      const data = JSON.parse(readFileSync(packet, 'utf8'));
+      const inline = project.lean && report.tree_packet && typeof report.tree_packet === 'object' && !Array.isArray(report.tree_packet);
+      const packet = inline ? join(directory, `${task.tree_id}-packet.json`) : report.tree_packet;
+      if (typeof packet !== 'string' || !isAbsolute(packet) || (!inline && !report.evidence.includes(packet))) throw Error('missing reader evidence packet');
+      const data = inline ? report.tree_packet : JSON.parse(readFileSync(packet, 'utf8'));
       if (data.tree_id !== task.tree_id || data.root_id !== task.root_id) throw Error('tree packet identity mismatch');
       if (report.disposition === 'excluded') {
         if (data.coverage_status !== 'excluded' || data.exclusion_kind !== 'ai_read_denied' ||
             typeof data.exclusion_reason !== 'string' || !data.exclusion_reason.trim()) throw Error('invalid tree exclusion packet');
-      } else if (data.outline_complete !== true ||
+      } else if (!project.lean && (data.outline_complete !== true ||
           !Array.isArray(data.content_read_ids) || !data.content_read_ids.includes(task.root_id) ||
           !Array.isArray(data.findings) || !Array.isArray(data.exclusions) ||
-          !Array.isArray(data.remaining_work) || data.remaining_work.length) throw Error('invalid tree coverage packet');
+          !Array.isArray(data.remaining_work) || data.remaining_work.length)) throw Error('invalid tree coverage packet');
+      if (inline) {
+        save(packet, data);
+        report.tree_packet = packet;
+        if (!report.evidence.includes(packet)) report.evidence.push(packet);
+      }
     }
     const completed = { step, role, reportPath, receipt: result.receipt, report, task, assignmentIndex, contextCheckpoint: !!contextCheckpoint };
     appendFileSync(join(directory, 'history.jsonl'), JSON.stringify(completed) + '\n');
@@ -142,9 +154,14 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
       assignmentIndex++;
       previous = null;
       const entries = readFileSync(join(directory, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-      for (const [disposition, file] of [['worked', 'completed-trees.json'], ['excluded', 'excluded-trees.json']]) {
-        save(join(directory, file), entries.filter(e => e.report.disposition === disposition).map(e =>
-          ({ tree_id: e.task.tree_id, root_id: e.task.root_id, tree_packet: e.report.tree_packet, reportPath: e.reportPath })));
+      if (nodeAssignments) {
+        save(join(directory, 'completed-nodes.json'), entries.filter(e => e.report.disposition === 'worked').map(e =>
+          ({ owner_id: e.task.owner_id, reportPath: e.reportPath, evidence: e.report.evidence, updated_nodes: e.report.updated_nodes })));
+      } else {
+        for (const [disposition, file] of [['worked', 'completed-trees.json'], ['excluded', 'excluded-trees.json']]) {
+          save(join(directory, file), entries.filter(e => e.report.disposition === disposition).map(e =>
+            ({ tree_id: e.task.tree_id, root_id: e.task.root_id, tree_packet: e.report.tree_packet, reportPath: e.reportPath })));
+        }
       }
       continue;
     }
