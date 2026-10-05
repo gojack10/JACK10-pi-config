@@ -24,6 +24,9 @@ def load_proxy():
 class SelectionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.p = p = load_proxy()
+        self.enterContext(patch.object(p.swap_policy, "SWAP", p.swap_policy.SwapPolicy()))
+        self.enterContext(patch.object(p.swap_policy, "port_listening", return_value=False))
+        self.enterContext(patch.object(p.WINNOW, "probe", return_value=None))
         self.loaded = p.GLM_FLASH_MODEL_ID
         self.events = []
         self.fail_start = False
@@ -59,6 +62,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             "wait_for_ds4_model": wait,
             "stop_mlx": AsyncMock(),
             "mlx_resident_model": AsyncMock(return_value=None),
+            "mlx_service_loaded": AsyncMock(return_value=False),
         }
         for name, value in mocks.items():
             self.enterContext(patch.object(p, name, value))
@@ -74,7 +78,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         for mid in ("typo", "", None, [], "qwen", p.DS4_FLASH_MODEL_ID, p.DS4_PRO_MODEL_ID):
             with self.assertRaises(p.web.HTTPBadRequest):
                 p.get_backend_name(mid)
-        self.assertEqual(p.ds4_static_model(p.QWEN_NEXT_MODEL_ID)["context_length"], 262144)
+        self.assertEqual(p.ds4_static_model(p.QWEN_NEXT_MODEL_ID)["context_length"], 500000)
         self.assertEqual(p.ds4_static_model(p.GLM_FLASH_MODEL_ID)["context_length"], 500000)
         body = json.dumps({"model": p.QWEN_NEXT_MODEL_ID, "reasoning_effort": "xhigh"}).encode()
         self.assertEqual(p.maybe_prepare_chat_body("ds4", body), body)
@@ -97,6 +101,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mlx_switch_evicts_then_publishes_one_checkpoint(self):
         p = self.p
+        self.loaded = None
         events, desired = [], []
         resident = {"id": "gemma-4-31b-mlx"}
 
@@ -116,7 +121,8 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             resident["id"] = next(m for m in p.MLX_MODEL_IDS
                                   if p.mlx_model_path(m) == desired[-1])
 
-        with patch.object(p, "mlx_resident_model", fake_resident), \
+        with patch.object(p, "mlx_service_loaded", AsyncMock(return_value=True)), \
+             patch.object(p, "mlx_resident_model", fake_resident), \
              patch.object(p, "stop_mlx", fake_stop), \
              patch.object(p, "start_mlx", fake_start), \
              patch.object(p, "_write_mlx_desired_sync", fake_desired):
@@ -285,6 +291,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mlx_idle_unload_waits_for_quiescence(self):
         p = self.p
+        self.loaded = None
         resident = {"id": "gemma-4-31b-mlx"}
         ticks = 0
 
@@ -303,7 +310,8 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
                 raise asyncio.CancelledError
 
         p.MLX_LAST_REQUEST_AT = p.time.monotonic() - p.MLX_IDLE_TIMEOUT - 1
-        with patch.object(p, "mlx_resident_model", fake_resident), \
+        with patch.object(p, "mlx_service_loaded", AsyncMock(return_value=True)), \
+             patch.object(p, "mlx_resident_model", fake_resident), \
              patch.object(p, "stop_mlx", fake_stop), \
              patch.object(p.asyncio, "sleep", tick):
             with self.assertRaises(asyncio.CancelledError):
@@ -520,6 +528,12 @@ class WrapperTests(unittest.TestCase):
             fake = home / ".local/bin/mlx_lm.server"
             fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
             fake.chmod(0o755)
+            template = source.read_text()
+            real_executable = "/Users/jack/.local/bin/mlx_lm.server"
+            self.assertIn(real_executable, template)
+            wrapper = home / "mlx-server.sh"
+            wrapper.write_text(template.replace(real_executable, str(fake)))
+            source = wrapper
             env = {"HOME": str(home), "PATH": "/bin:/usr/bin"}
             desired = home / ".mlx-lm/desired-model"
             desired.write_text(str(checkpoint) + "\n")
@@ -549,7 +563,7 @@ class WrapperTests(unittest.TestCase):
             home = Path(directory)
             (home / '.dsv4').mkdir()
             script = 'mock_exec() { printf "%s\\n" "$@"; exit 0; }\n' + source.replace('HOME_DIR="/Users/jack"', f'HOME_DIR="{home}"').replace('exec "', 'mock_exec "')
-            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '262144'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
+            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '500000'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
                 (home / '.dsv4/desired-model').write_text(mode)
                 result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True, check=True)
                 args = result.stdout.splitlines()
@@ -560,7 +574,7 @@ class WrapperTests(unittest.TestCase):
                 if mode == 'qwen':
                     self.assertNotIn('--ssd-streaming', args)
                     self.assertEqual(args[0], str(home / 'ds4/ds4-server'))
-                    self.assertIn('unset DS4_QWEN4_YARN_FACTOR', source)
+                    self.assertIn('export DS4_QWEN4_YARN_FACTOR=2', source)
                     self.assertIn(str(home / 'projects/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf'), args)
                     # V4.1 steering is model-bound; Qwen must never receive DS41DIR flags.
                     self.assertNotIn('--dir-steering-file', args)
