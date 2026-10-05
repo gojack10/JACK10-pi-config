@@ -50,7 +50,7 @@ export default function (pi: ExtensionAPI) {
             const extensionFiles: string[] = [];
             if (config.smoke || project.name === 'bf2') {
               const policyFile = join(directory, `${step}-policy.ts`);
-              const policy = { smoke: config.smoke, route: project.route, report: reportPath,
+              const policy = { smoke: config.smoke, route: project.route, role, project, report: reportPath,
                 reads: [join(directory, 'fixture.txt'), ...(previous ? [previous] : [])] };
               writeFileSync(policyFile, `import { installGuard } from ${JSON.stringify(join(dirname(fileURLToPath(import.meta.url)), 'guard.ts'))};\nexport default pi => installGuard(pi, ${JSON.stringify(policy)});\n`);
               extensionFiles.push(policyFile);
