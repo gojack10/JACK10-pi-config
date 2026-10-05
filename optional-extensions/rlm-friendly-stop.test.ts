@@ -44,29 +44,38 @@ function harness(tokens: number | null = 319999, contextWindow = 400000) {
 	return { pi, ctx, active };
 }
 const boundary = { outcome: "completed", continue: false, context: { canContinue: true } };
+const turn = { ...boundary, entries: [] };
+async function armFriendly(h: ReturnType<typeof harness>) {
+	const result = await h.pi.emit("turn_end", turn, h.ctx);
+	if (result?.entries) h.pi.entries.push(...structuredClone(result.entries));
+	return result;
+}
 
-test("automatic 80% threshold uses every model's effective window, not legacy settings", async () => {
+test("automatic 80% threshold persists one fixed reminder for every model's effective window", async () => {
 	for (const window of [128000, 272000, 1048576]) {
 		const h = harness(Math.floor(window * 0.8) - 1, window);
-		assert.equal(await h.pi.emit("context", { messages: [] }, h.ctx), undefined);
+		assert.equal(await armFriendly(h), undefined);
 		h.ctx.getContextUsage = () => ({ tokens: Math.floor(window * 0.8), contextWindow: window });
-		const result = await h.pi.emit("context", { messages: [] }, h.ctx);
-		assert.match(result.messages.at(-1).content, /80%.*report_outcome/);
-		assert.equal(h.pi.entries.length, 1);
-		await h.pi.emit("context", { messages: [] }, h.ctx);
-		assert.equal(h.pi.entries.length, 1, "arm once per attempt");
+		const result = await armFriendly(h);
+		assert.equal(result.entries.length, 2);
+		assert.equal(result.entries[0].type, "custom");
+		assert.equal(result.entries[1].type, "custom_message");
+		assert.match(result.entries[1].content, /80%.*report_outcome/);
+		assert.equal(await armFriendly(h), undefined, "arm once per attempt");
+		assert.equal(h.pi.entries.filter((entry: any) => entry.type === "custom_message").length, 1);
+		assert.equal(await h.pi.emit("context", { messages: [] }, h.ctx), undefined, "never inject a request-only reminder");
 	}
 	for (const [tokens, window] of [[null, 100], [90, 0], [NaN, 100], [90, Infinity]]) {
-		const h = harness(tokens, window!);
-		assert.equal(await h.pi.emit("context", { messages: [] }, h.ctx), undefined);
+		assert.equal(await armFriendly(harness(tokens, window!)), undefined);
 	}
 	const ordinary = harness(400000);
 	(globalThis as any)[Symbol.for("pi.task-outcomes.manager-registry")].delete(ordinary.ctx.sessionManager);
-	assert.equal(await ordinary.pi.emit("context", { messages: [] }, ordinary.ctx), undefined, "ordinary chat has no report contract");
+	assert.equal(await armFriendly(ordinary), undefined, "ordinary chat has no report contract");
 });
 
 test("wrap-up permits report IO and draining existing work, blocks new work and cleanup, and has no turn limit", async () => {
 	const h = harness(320000);
+	await armFriendly(h);
 	for (const toolName of ["read", "write", "edit", "bash", "bash_tail", "bash_jobs", "bash_kill", "report_outcome"]) {
 		assert.equal(await h.pi.emit("tool_call", { toolName }, h.ctx), undefined);
 	}
@@ -86,7 +95,7 @@ test("wrap-up permits report IO and draining existing work, blocks new work and 
 
 test("Escape/errors/maintenance stay interruptible; same-attempt wrap-up survives reload, not new attempts or branches", async () => {
 	const h = harness(320000);
-	await h.pi.emit("context", { messages: [] }, h.ctx);
+	await armFriendly(h);
 	for (const event of [{ ...boundary, outcome: "aborted" }, { ...boundary, outcome: "error" }, { ...boundary, continue: true }]) {
 		assert.equal(await h.pi.emit("agent_before_settle", event, h.ctx), undefined);
 	}
@@ -118,12 +127,20 @@ test("real Pi lifecycle forces current-report completion without checkpoint/clea
 	const reportPath = join(dir, "report.md");
 	const longReport = "Verified partial findings and remaining work.\n".repeat(1000);
 	let calls = 0;
+	let priorReminderIndexes: number[] = [];
 	runtime.registerProvider(provider, { api: model.api, streamSimple: (_model: any, context: any) => {
 		const stream = createAssistantMessageEventStream();
 		void (async () => {
 			calls++;
 			if (calls > 4) throw new Error("reporting did not terminate");
-			if (calls > 1) assert.ok(context.messages.some((m: any) => JSON.stringify(m).includes("FRIENDLY STOP")));
+			if (calls > 1) {
+				const reminders = context.messages.flatMap((message: any, index: number) =>
+					JSON.stringify(message).includes("FRIENDLY STOP") ? [index] : []);
+				assert.ok(reminders.length >= 1);
+				assert.deepEqual(reminders.slice(0, priorReminderIndexes.length), priorReminderIndexes,
+					"durable reminders never disappear or move");
+				priorReminderIndexes = reminders;
+			}
 			// Two prose-only turns prove the final actionable boundary insists on a report.
 			const content = calls < 3 ? [{ type: "text", text: "partial findings, still unfinished" }] : calls === 3
 				? [{ type: "toolCall", id: "write-report", name: "write", arguments: { path: reportPath, content: longReport } }]
@@ -158,4 +175,5 @@ test("real Pi lifecycle forces current-report completion without checkpoint/clea
 	assert.equal(manager.snapshot().outcomes.length, 1);
 	assert.equal(sm.getBranch().some((entry: any) => /context_pause|context_resume|maintenance_begin/.test(entry.data?.kind ?? "")), false);
 	assert.equal(sm.getBranch().filter((entry: any) => entry.customType === "rlm-friendly-stop-state" && entry.type === "custom").length, 1);
+	assert.equal(sm.getBranch().filter((entry: any) => entry.customType === "rlm-friendly-stop-state" && entry.type === "custom_message").length, 2);
 });
