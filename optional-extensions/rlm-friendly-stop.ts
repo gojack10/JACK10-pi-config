@@ -15,22 +15,25 @@ export function registerFriendlyStop(pi: ExtensionAPI): void {
 			}
 		}
 	};
-	const wrapping = (ctx: ExtensionContext) => {
+	const activeContract = (ctx: ExtensionContext) => {
 		const active = existingTaskOutcomeManager(ctx)?.snapshot().active;
-		if (!active || active.state !== "active" || active.declaration) return;
-		if (state?.jobId !== active.jobId || state.attemptId !== active.attemptId) {
-			const usage = ctx.getContextUsage();
-			if (!usage || usage.tokens === null || !Number.isFinite(usage.tokens) ||
-				!Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0 ||
-				usage.tokens < Math.floor(usage.contextWindow * 0.8)) return;
-			const next: State = { version: 2, jobId: active.jobId, attemptId: active.attemptId };
-			// Persist before changing live policy so reload/branch selection retains the same wrap-up.
-			pi.appendEntry(STATE_TYPE, next);
-			state = next;
-		}
+		return active?.state === "active" && !active.declaration ? active : undefined;
+	};
+	const armedContract = (ctx: ExtensionContext) => {
+		const active = activeContract(ctx);
+		return active && state?.jobId === active.jobId && state.attemptId === active.attemptId ? active : undefined;
+	};
+	const arm = (ctx: ExtensionContext) => {
+		if (armedContract(ctx)) return;
+		const active = activeContract(ctx);
+		const usage = ctx.getContextUsage();
+		if (!active || !usage || usage.tokens === null || !Number.isFinite(usage.tokens) ||
+			!Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0 ||
+			usage.tokens < Math.floor(usage.contextWindow * 0.8)) return;
+		state = { version: 2, jobId: active.jobId, attemptId: active.attemptId };
 		return active;
 	};
-	const instruction = (active: NonNullable<ReturnType<typeof wrapping>>) =>
+	const instruction = (active: NonNullable<ReturnType<typeof activeContract>>) =>
 		`FRIENDLY STOP: 80% of context reached. Stop new work now. Report what you have: findings, evidence, changes, unfinished work, and the exact next step. ` +
 		(active.mode === "task" ? `Write the current report in place to ${JSON.stringify(active.reportPath)}, following the assignment's report format. ` : "Put the current findings in report_outcome's summary. ") +
 		`Then call report_outcome with an honest outcome and summary, and end the turn. Follow the existing outcome contract; do not claim unfinished assignment work is complete. ` +
@@ -38,25 +41,26 @@ export function registerFriendlyStop(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => restore(ctx));
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
-	pi.on("turn_end", (_event, ctx) => { wrapping(ctx); });
-	pi.on("context", (event, ctx) => {
-		const active = wrapping(ctx);
-		if (!active) return;
-		return { messages: [...event.messages, {
-			role: "custom" as const, customType: STATE_TYPE, content: instruction(active), display: true, timestamp: Date.now(),
-		}] };
+	pi.on("turn_end", (event, ctx) => {
+		const active = arm(ctx);
+		if (!active || !state) return;
+		return { entries: [...event.entries,
+			{ type: "custom", customType: STATE_TYPE, data: state },
+			{ type: "custom_message", customType: STATE_TYPE, content: instruction(active), display: true },
+		] };
 	});
 	pi.on("agent_before_settle", (event, ctx) => {
 		// Never countermand Escape, provider failure, maintenance, or an existing continuation.
 		if (event.outcome !== "completed" || event.continue) return;
-		const active = wrapping(ctx);
+		const active = armedContract(ctx);
 		if (!active || active.pendingWork.length) return;
-		return { continue: true, entries: [{
-			type: "custom_message" as const, customType: STATE_TYPE, content: instruction(active), display: true,
+		if (event.context.canContinue) return { continue: true };
+		return { continue: true, entries: [...event.entries, {
+			type: "custom_message", customType: STATE_TYPE, content: instruction(active), display: true,
 		}] };
 	});
 	pi.on("tool_call", (event, ctx) => {
-		if (!wrapping(ctx) || REPORT_TOOLS.has(event.toolName)) return;
+		if (!armedContract(ctx) || REPORT_TOOLS.has(event.toolName)) return;
 		return { block: true, reason: "Friendly stop is active: stop new work, write your current report, then call report_outcome." };
 	});
 }
