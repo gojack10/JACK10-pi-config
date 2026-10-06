@@ -2,9 +2,10 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import * as P from './parallel-core.mjs';
+import * as G from './parallel-code.mjs';
 
-// Deterministic parallel-factory controller. All launches, tmux, git and SiftText access go through
-// injected deps so the event flow is testable without models; parallel-host.ts supplies the real ones.
+// Deterministic parallel-factory controller. Transport/tree access uses injected deps;
+// opt-in code tasks use the native Git helper against explicitly configured repositories.
 
 export const save = (path, value) => {
   writeFileSync(`${path}.tmp`, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
@@ -75,6 +76,24 @@ export class ParallelController {
       this.log('controller_started', { pid: process.pid, run_node: this.config.run_node, owner: this.config.owner,
         seats: this.config.seats, dispatcher: this.config.dispatcher, readonly_repos: this.config.readonly_repos, faults: this.config.faults });
     }
+    if (this.state.code_pin && (!this.config.code || this.state.code_pin !== G.codePin(this.config))) {
+      this.codeAttention('code configuration removed/changed; acceptance/ownership must not be weakened', now);
+      this.flushEvents();
+      this.persist();
+      return;
+    }
+    if (this.config.code) {
+      G.validateCodeConfig(this.config.code);
+      if (!this.state.code_pin) await G.preflightCode(this.config);
+      this.repoLock = await G.repoLock(this.config, this.dir);
+      this.state.code_pin ??= G.codePin(this.config);
+      this.state.code_main ??= this.config.code.main_head;
+      if (Object.values(this.state.attempts).some(a => a.status === 'ambiguous') ||
+          Object.values(this.state.tasks).some(task => task.code?.allocating && task.status !== 'running')) {
+        this.codeAttention('ambiguous code launch/allocation remains; operator must reconcile retained sessions and Git identities', now);
+      }
+      try { await this.codeMainCheck(true); } catch (error) { this.codeAttention(String(error), now); }
+    }
     await this.fenceCheck(now, 'controller start');
     this.flushEvents();
     this.persist();
@@ -84,6 +103,15 @@ export class ParallelController {
   async readopt(now) {
     for (const attempt of P.running(this.state)) {
       if (attempt.status !== 'launching') continue;
+      if (attempt.kind === 'worker' && this.state.tasks[attempt.task].code) {
+        // A missing START receipt does not prove a code worker never mutated Git/main.
+        attempt.status = 'ambiguous';
+        this.state.tasks[attempt.task].status = 'errored';
+        this.state.seats[attempt.seat].attempt = null;
+        this.codeAttention(`code launch ${attempt.id} has no durable receipt; inspect its session/draft before recovery`, now);
+        this.log('code_launch_ambiguous', { attempt: attempt.id, task: attempt.task, label: attempt.label });
+        continue;
+      }
       await this.deps.killSessionsWithPrefix(attempt.label);
       attempt.status = 'abandoned';
       attempt.finished_at = now;
@@ -107,10 +135,15 @@ export class ParallelController {
     await this.requestStops(now);
     for (const attempt of P.running(this.state)) {
       if (attempt.status !== 'running') continue;
+      // Do not sample main mid-publication. Settled sibling code reports wait for the grant holder.
+      const publisher = this.state.merge?.task;
+      if (publisher && publisher !== attempt.task && this.state.tasks[publisher]?.code.phase === 'publish' &&
+          this.state.tasks[publisher]?.status === 'running' && this.state.tasks[attempt.task]?.code) continue;
       if (attempt.engine === 'claude') await this.pollClaude(attempt, now);
       else await this.pollPi(attempt, now);
     }
     await this.refreshExternal(now);
+    await this.advanceMerge(now);
     const assignments = P.planAssignments(this.state, this.config, now);
     for (const assignment of assignments) this.launchWorker(assignment, now);
     P.ossIdle(this.state, this.config, now, assignments);
@@ -122,6 +155,9 @@ export class ParallelController {
     if (terminal) {
       this.state.status = terminal;
       this.log('terminal', { status: terminal, attention: this.state.attention ?? undefined });
+      if (!this.state.merge && !this.state.attention && !Object.values(this.state.attempts).some(a => a.status === 'ambiguous')) {
+        G.releaseRepoLock(this.repoLock, this.dir);
+      }
     }
     this.persist();
     return !!terminal;
@@ -184,21 +220,161 @@ export class ParallelController {
     attempt.dir = join(this.dir, 'attempts', `${attempt.id}-worker-${seat}`);
     attempt.report = join(attempt.dir, 'report.json');
     attempt.label = `pf-${this.short}-${seat}-${attempt.id}`;
+    if (record.code) {
+      if (!record.code.worktree) {
+        record.code = G.allocation(this.config, record);
+        record.code.allocating = true;
+      }
+      attempt.code = structuredClone(record.code);
+      attempt.merge = this.state.merge?.task === task ? structuredClone(this.state.merge) : null;
+    }
     const artifacts = join(this.dir, 'artifacts', task);
     mkdirSync(attempt.dir, { recursive: true });
     mkdirSync(artifacts, { recursive: true });
     const mission = join(attempt.dir, 'mission.md');
+    const codePath = record.code ? join(attempt.dir, 'code.json') : undefined;
+    if (codePath) save(codePath, { ...this.config.code, ...attempt.code, task, seat, merge: attempt.merge });
     writeFileSync(mission, P.workerPrompt({ role: this.config.roles.worker, run: this.config.run_node, task,
-      report: attempt.report, previous: attempt.previous, artifacts }));
+      report: attempt.report, previous: attempt.previous, artifacts, code: codePath }));
     const fault = this.seatFault(seat);
     if (fault) attempt.fault = fault;
-    const policy = this.deps.writePolicy(attempt.dir, { report: attempt.report, route: seatConfig.route, role: 'worker', fault });
+    const policy = this.deps.writePolicy(attempt.dir, { report: attempt.report, route: seatConfig.route, role: 'worker', fault, code: attempt.code });
     this.log('worker_launch', { attempt: attempt.id, seat, task, route: seatConfig.route, previous: attempt.previous, fault: !!fault });
     this.persist();
-    this.track(this.deps.launchPi({ label: attempt.label, route: seatConfig.route, missionFile: mission,
-      reportFile: attempt.report, extensionFiles: [policy], cwd: this.config.cwd })
-      .then(receipt => this.launched(attempt, receipt))
-      .catch(error => this.launched(attempt, { status: 'setup_failed', error: String(error?.message ?? error) })));
+    this.track((async () => {
+      if (record.code) {
+        try {
+          await this.codeMainCheck();
+          if (record.code.allocating) {
+            await G.prepareCode(this.config, record.code);
+            delete record.code.allocating;
+            this.persist();
+          }
+          await G.worktreeIdentity(this.config, record.code);
+          if (record.code.phase === 'publish') await this.checkedCandidate(record);
+        } catch (error) {
+          P.finishWorker(this.state, attempt.id, { kind: 'error', summary: String(error) }, this.deps.now());
+          this.codeAttention(String(error), this.deps.now());
+          this.persist();
+          return;
+        }
+      }
+      try {
+        const receipt = await this.deps.launchPi({ label: attempt.label, route: seatConfig.route, missionFile: mission,
+          reportFile: attempt.report, extensionFiles: [policy], cwd: record.code?.worktree ?? this.config.cwd });
+        await this.launched(attempt, receipt);
+      } catch (error) { await this.launched(attempt, { status: 'setup_failed', error: String(error?.message ?? error) }); }
+    })());
+  }
+
+  codeAttention(reason, now) {
+    this.state.attention ??= { reason, at: now };
+    this.log('code_attention', { reason });
+  }
+
+  async codeMainCheck(allowPublished = false) {
+    if (!this.config.code) return;
+    if (G.codePin(readJson(join(this.dir, 'config.json'))) !== this.state.code_pin) throw Error('code configuration changed while running');
+    const head = await G.mainIdentity(this.config.code);
+    const merge = this.state.merge;
+    const publishing = merge && this.state.tasks[merge.task]?.code.phase === 'publish' &&
+      P.running(this.state).some(a => a.task === merge.task && a.code?.phase === 'publish');
+    if (head !== this.state.code_main && !(allowPublished && publishing && head === merge.candidate)) {
+      throw Error(`main moved unexpectedly: expected ${this.state.code_main}, found ${head}`);
+    }
+  }
+
+  requeueMerge(attempt) {
+    const task = this.state.tasks[attempt.task];
+    if (task.code && task.code.phase !== 'develop' && task.status === 'queued') task.status = 'merge_queued';
+  }
+
+  async advanceMerge(now) {
+    if (!this.config.code || this.state.stop || this.state.attention || this.state.status !== 'running' ||
+        ['done', 'blocked'].includes(this.state.dispatcher.last?.disposition)) return;
+    try {
+      if (this.state.merge && this.state.tasks[this.state.merge.task]?.status === 'running') return;
+      await this.codeMainCheck();
+      if (!this.state.merge) {
+        const task = this.state.order.map(id => this.state.tasks[id]).find(t => t.status === 'merge_queued');
+        if (!task) return;
+        this.state.merge = { task: task.node_id, main: this.state.code_main };
+        this.log('merge_reserved', this.state.merge);
+        this.persist(); // Reservation precedes every worker turn/gate, including crash windows.
+      }
+      const task = this.state.tasks[this.state.merge.task];
+      if (!['queued', 'merge_queued'].includes(task.status)) return;
+      if (task.code.phase === 'publish' && P.running(this.state).some(a => a.task !== task.node_id &&
+          a.status === 'launching' && this.state.tasks[a.task]?.code)) return;
+      const active = Object.values(this.state.tasks).filter(t => t.status === 'running');
+      if (active.some(t => P.overlaps(t.scope, task.scope, this.state.scopes))) return;
+      const seat = this.config.seats.find(s => task.seats.includes(s.id) && P.seatFree(this.state, s.id, now));
+      if (seat) this.launchWorker({ seat: seat.id, task: task.node_id }, now);
+    } catch (error) { this.codeAttention(String(error), now); }
+  }
+
+  async checkedCandidate(task) {
+    const merge = this.state.merge;
+    if (!merge || merge.task !== task.node_id || merge.candidate !== task.code.candidate || !merge.checks?.length ||
+        merge.main !== this.state.code_main) throw Error('missing/stale exact-candidate merge grant');
+    await this.codeMainCheck();
+    await G.candidateIdentity(this.config, task.code, merge.candidate, merge.main);
+  }
+
+  async codeOutcome(attempt, outcome, now) {
+    const task = this.state.tasks[attempt.task], code = task.code;
+    if (!code) {
+      if (outcome.report?.code || outcome.report?.disposition === 'candidate') throw Error('tree task cannot return code publication');
+      return;
+    }
+    if (outcome.kind !== 'report') {
+      if (code.phase === 'publish') throw Error('publication outcome is ambiguous; retain grant/main/draft for operator recovery');
+      return;
+    }
+    const r = outcome.report, identity = r.code;
+    if (!identity || identity.worktree !== code.worktree || identity.branch !== code.branch || identity.base !== code.base) throw Error('worker report does not match owned worktree/branch/base');
+    await G.worktreeIdentity(this.config, code);
+    if (['continue', 'blocked'].includes(r.disposition)) {
+      await this.codeMainCheck();
+      code.draft_head = await G.git(code.worktree, 'rev-parse', 'HEAD');
+      if (identity.candidate && identity.candidate !== code.draft_head) throw Error('checkpoint candidate differs from retained draft HEAD');
+      return; // Retain dirty/untracked drafts, candidate, phase and exact next action.
+    }
+    if (code.phase !== 'publish') {
+      if (r.disposition !== 'candidate') throw Error('code development/reconciliation must return candidate, not worked');
+      const base = code.phase === 'reconcile' ? this.state.merge?.main : code.base;
+      if (!base || (code.phase === 'reconcile' && identity.main !== base)) throw Error('reconcile report requires the exact reserved main SHA');
+      await this.codeMainCheck();
+      await G.candidateIdentity(this.config, code, identity.candidate, base);
+      if (code.candidate) await G.git(code.worktree, 'merge-base', '--is-ancestor', code.candidate, identity.candidate);
+      code.candidate = identity.candidate;
+      if (task.stop_requested === 'obsolete') return;
+      if (code.phase === 'reconcile') {
+        this.state.merge.candidate = code.candidate;
+        this.persist();
+        const checks = await G.runCodeChecks(this.config, code, 'candidate', code.candidate, base, attempt.dir);
+        await this.codeMainCheck();
+        await G.candidateIdentity(this.config, code, code.candidate, base);
+        this.state.merge.checks = checks;
+        code.phase = 'publish';
+        this.log('candidate_checked', { task: task.node_id, ...this.state.merge });
+      } else code.phase = 'reconcile';
+    } else {
+      const merge = this.state.merge;
+      if (!merge || merge.task !== task.node_id || !merge.checks?.length || r.disposition !== 'worked' ||
+          identity.candidate !== merge.candidate || identity.main !== merge.candidate) throw Error('publication report does not match checked grant');
+      await G.candidateIdentity(this.config, code, merge.candidate, merge.main);
+      if (await G.mainIdentity(this.config.code) !== merge.candidate) throw Error('main is not the exact checked candidate');
+      const checks = await G.runCodeChecks(this.config, code, 'main', merge.candidate, merge.main, attempt.dir);
+      await this.codeMainCheck(true);
+      if (await G.mainIdentity(this.config.code) !== merge.candidate) throw Error('main changed during main gates');
+      await G.candidateIdentity(this.config, code, merge.candidate, merge.main);
+      code.main_checks = checks;
+      code.phase = 'landed';
+      this.state.code_main = merge.candidate;
+      this.log('code_published', { task: task.node_id, ...merge, main_checks: checks });
+      this.state.merge = null;
+    }
   }
 
   seatFault(seat) {
@@ -219,6 +395,7 @@ export class ParallelController {
       const summary = `launch failed: ${receipt?.error ?? receipt?.status}`;
       if (attempt.kind === 'worker') {
         P.finishWorker(this.state, attempt.id, { kind: 'launch_failed', resetAt: now + P.REST_DEFAULT_MS, summary }, now);
+        this.requeueMerge(attempt);
         this.log('seat_rested', { seat: attempt.seat, until: new Date(now + P.REST_DEFAULT_MS).toISOString(), reason: summary, task: attempt.task });
       } else {
         P.finishDispatcher(this.state, attempt.id, { kind: 'error', summary }, now);
@@ -289,7 +466,10 @@ export class ParallelController {
       try {
         const text = result.text ?? readFileSync(attempt.report, 'utf8');
         const report = attempt.kind === 'worker' ? P.validateWorkerReport(text) : P.validateDispatcherReport(text);
-        if (attempt.kind === 'worker' && result.contextStopped && report.disposition === 'blocked') report.disposition = 'continue';
+        if (attempt.kind === 'worker' && result.contextStopped && report.disposition === 'blocked') {
+          report.disposition = 'continue';
+          if (this.state.tasks[attempt.task].code && !report.next_action.trim()) throw Error('code context checkpoint requires next_action');
+        }
         outcome = { kind: 'report', report, reportPath: attempt.report };
       } catch (error) {
         outcome = { kind: 'error', summary: `invalid ${attempt.kind} report: ${error.message}` };
@@ -327,10 +507,27 @@ export class ParallelController {
 
   async settle(attempt, outcome, now) {
     // Vet before closing: a failed tree lookup retries next tick with the session intact.
+    if (attempt.kind === 'dispatcher' && outcome.kind === 'report' && outcome.report.disposition === 'done' &&
+        Object.values(this.state.tasks).some(task => !['worked', 'stopped'].includes(task.status))) {
+      outcome = { kind: 'error', summary: 'done refused: unfinished tasks remain (private candidates are not main publication)' };
+    }
     const rejected = attempt.kind === 'dispatcher' && outcome.kind === 'report' ? await this.vetTasks(outcome.report) : new Map();
+    if (attempt.kind === 'worker') {
+      try { await this.codeOutcome(attempt, outcome, now); }
+      catch (error) {
+        this.codeAttention(String(error), now);
+        outcome = { kind: 'error', summary: String(error) };
+      }
+    }
     await this.deps.killSession(attempt.engine === 'claude' ? attempt.label : attempt.receipt.session_label);
     if (attempt.kind === 'worker') {
       P.finishWorker(this.state, attempt.id, outcome, now);
+      this.requeueMerge(attempt);
+      if (this.state.tasks[attempt.task].status === 'stopped' && this.state.merge?.task === attempt.task) {
+        this.log('merge_cancelled', { task: attempt.task, reason: 'settled obsolete before publication' });
+        this.state.tasks[attempt.task].code.phase = 'reconcile';
+        this.state.merge = null;
+      }
       this.log('worker_finish', { attempt: attempt.id, seat: attempt.seat, task: attempt.task, outcome: outcome.kind,
         disposition: outcome.report?.disposition, summary: outcome.report?.summary ?? outcome.summary ?? outcome.reason,
         report: outcome.reportPath, updated_nodes: outcome.report?.updated_nodes, evidence: outcome.report?.evidence });
@@ -366,7 +563,12 @@ export class ParallelController {
       else if (task.node_id === owner || !node.includes(owner)) rejected.set(task.node_id, 'task node is outside the write fence');
       else if (!scope) rejected.set(task.node_id, 'write scope node not found');
       else if (!scope.includes(owner)) rejected.set(task.node_id, 'write scope is outside the write fence');
-      else this.state.scopes[task.scope] = scope;
+      else {
+        try {
+          G.vetCodeTask(task, this.config, this.state.tasks[task.node_id]);
+          this.state.scopes[task.scope] = scope;
+        } catch (error) { rejected.set(task.node_id, error.message); }
+      }
     }
     const listed = new Set(report.tasks.map(task => task.node_id));
     const external = report.tasks.flatMap(task => task.depends_on).filter(id => !listed.has(id) && !this.state.tasks[id]);
