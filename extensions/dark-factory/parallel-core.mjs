@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { fileScope, sha, validateCodeConfig } from './parallel-code.mjs';
 
 // Pure seat/event/report rules for the parallel factory (Parallel Execution Contract d96507db).
 // No model turns, no IO beyond existence checks for reported evidence paths.
@@ -22,6 +23,11 @@ export const isNodeId = value => typeof value === 'string' && UUID.test(value);
 
 export function buildConfig({ runNode, owner, repos = [], directory, cwd, overrides = {} }) {
   if (!isNodeId(runNode) || !isNodeId(owner)) throw Error('RUN and OWNER must be node UUIDs');
+  for (const [label, path] of Object.entries({ directory, cwd })) {
+    if (typeof path !== 'string' || !isAbsolute(path) || /[\x00-\x1f\x7f]/.test(path)) throw Error(`${label} must be an absolute path without control characters`);
+  }
+  const roles = { ...ROLE_NODES, ...overrides.roles };
+  if (!Object.values(roles).every(isNodeId)) throw Error('roles must be node UUIDs');
   const routes = { ...ROUTES, ...overrides.routes };
   const fallback = overrides.routes?.fallback ?? routes.codex;
   const dispatcherEngine = overrides.dispatcher_engine ?? 'fallback';
@@ -38,7 +44,8 @@ export function buildConfig({ runNode, owner, repos = [], directory, cwd, overri
   }
   return {
     version: 1, run_node: runNode, owner, readonly_repos: repos, directory, cwd,
-    roles: { ...ROLE_NODES, ...overrides.roles },
+    roles,
+    ...(overrides.code ? { code: validateCodeConfig(overrides.code) } : {}),
     seats,
     dispatcher: { engine: dispatcherEngine, claude: { ...CLAUDE, ...overrides.claude }, fallback },
     faults: overrides.faults ?? {},
@@ -83,7 +90,12 @@ export function validateDispatcherReport(text) {
     if (task.depends_on.includes(task.node_id)) throw Error(`tasks[${index}] depends on itself`);
     if (seen.has(task.node_id)) throw Error(`task ${task.node_id} is listed twice`);
     seen.add(task.node_id);
-    return { node_id: task.node_id, depends_on: [...task.depends_on], scope: task.scope };
+    if (task.seats !== undefined && (!Array.isArray(task.seats) || !task.seats.length ||
+        !task.seats.every(seat => typeof seat === 'string' && /^(oss|codex-[1-3])$/.test(seat)))) throw Error('seats must list explicit worker seat IDs');
+    if (task.code && (typeof task.code !== 'object' || Object.keys(task.code).some(key => key !== 'files'))) throw Error('task.code accepts only files; controller owns Git identities');
+    return { node_id: task.node_id, depends_on: [...task.depends_on], scope: task.scope,
+      ...(task.seats ? { seats: [...new Set(task.seats)] } : {}),
+      ...(task.code ? { code: { files: fileScope(task.code.files) } } : {}) };
   });
   const report = {
     version: 1, role: 'dispatcher', disposition: r.disposition, summary: r.summary, tasks,
@@ -99,7 +111,10 @@ export function validateDispatcherReport(text) {
 export function validateWorkerReport(text) {
   const r = parse(text);
   if (!r || typeof r !== 'object' || r.version !== 1 || r.role !== 'worker') throw Error('report needs version 1 and role "worker"');
-  if (!['worked', 'continue', 'blocked'].includes(r.disposition)) throw Error('disposition must be worked, continue or blocked');
+  if (!['worked', 'candidate', 'continue', 'blocked'].includes(r.disposition)) throw Error('disposition must be worked, candidate, continue or blocked');
+  if (r.disposition === 'candidate' && !r.code) throw Error('candidate requires code identity');
+  if (r.code && (!isAbsolute(r.code.worktree ?? '') || typeof r.code.branch !== 'string' || !sha(r.code.base) ||
+      (r.code.candidate !== null && !sha(r.code.candidate)) || (r.code.main !== undefined && !sha(r.code.main)))) throw Error('invalid worker code identity');
   if (typeof r.summary !== 'string' || !r.summary.trim()) throw Error('summary must be a nonempty string');
   strings(r.evidence, 'evidence');
   for (const path of r.evidence) if (!isAbsolute(path) || !existsSync(path)) throw Error(`evidence path must be absolute and exist: ${path}`);
@@ -141,6 +156,7 @@ export function initialState(config, now) {
     attempts: {},
     dispatcher: { attempt: null, last: null, failures: 0, wakes: 0, claude_resting_until: null, claude_skip: false },
     stop: null, attention: null, fence: null,
+    ...(config.code ? { code_main: config.code.main_head, merge: null } : {}),
   };
 }
 
@@ -167,7 +183,7 @@ export function overlaps(a, b, scopes) {
 }
 
 const ready = state => state.order.map(id => state.tasks[id])
-  .filter(task => task.status === 'queued' && depsMet(state, task))
+  .filter(task => task.status === 'queued' && (!task.code || !task.code.phase || task.code.phase === 'develop') && depsMet(state, task))
   .sort((a, b) => Number(!!b.front) - Number(!!a.front));
 
 export function planAssignments(state, config, now) {
@@ -177,7 +193,8 @@ export function planAssignments(state, config, now) {
   const candidates = ready(state), assignments = [];
   for (const seat of config.seats) {
     if (!seatFree(state, seat.id, now)) continue;
-    const pick = candidates.find(task => !assignments.some(a => a.task === task.node_id) &&
+    const pick = candidates.find(task => (!task.code || state.tasks[state.merge?.task]?.code.phase !== 'publish') &&
+      (!task.seats || task.seats.includes(seat.id)) && !assignments.some(a => a.task === task.node_id) &&
       !taken.some(scope => overlaps(scope, task.scope, state.scopes)));
     if (!pick) continue;
     assignments.push({ seat: seat.id, task: pick.node_id });
@@ -262,7 +279,11 @@ export function finishWorker(state, id, outcome, now) {
   }
   const report = outcome.report;
   task.last_report = outcome.reportPath;
-  if (report.disposition === 'worked') {
+  if (report.disposition === 'candidate') {
+    task.status = task.stop_requested === 'obsolete' ? 'stopped' : 'merge_queued';
+    task.previous = outcome.reportPath;
+    if (task.status !== 'stopped') addEvent(state, { type: 'task_candidate', task: task.node_id, seat: attempt.seat, report: outcome.reportPath }, now);
+  } else if (report.disposition === 'worked') {
     task.status = 'worked';
     addEvent(state, { type: 'task_finished', task: task.node_id, seat: attempt.seat, report: outcome.reportPath }, now);
   } else if (report.disposition === 'blocked') {
@@ -324,10 +345,10 @@ export function finishDispatcher(state, id, outcome, now, rejected = new Map()) 
       continue;
     }
     const known = state.tasks[listed.node_id];
-    if (known && ['running', 'worked'].includes(known.status)) { effects.ignored.push(listed.node_id); continue; }
-    if (known) Object.assign(known, { depends_on: listed.depends_on, scope: listed.scope, status: 'queued', continues: 0, provider_failures: 0, front: false, relisted_at: now });
+    if (known && ['running', 'worked', 'merge_queued'].includes(known.status)) { effects.ignored.push(listed.node_id); continue; }
+    if (known) Object.assign(known, { depends_on: listed.depends_on, scope: listed.scope, seats: listed.seats, status: 'queued', continues: 0, provider_failures: 0, front: false, relisted_at: now });
     else {
-      state.tasks[listed.node_id] = { node_id: listed.node_id, depends_on: listed.depends_on, scope: listed.scope,
+      state.tasks[listed.node_id] = { ...listed,
         status: 'queued', continues: 0, previous: null, attempts: [], listed_at: now };
       state.order.push(listed.node_id);
     }
@@ -356,8 +377,10 @@ export function terminalStatus(state, config, now) {
   if (planAssignments(state, config, now).length) return undefined;
   const queued = Object.values(state.tasks).filter(task => task.status === 'queued');
   const last = state.dispatcher.last?.disposition;
+  if (last === 'done' && (state.merge || Object.values(state.tasks).some(task => !['worked', 'stopped'].includes(task.status)))) return 'needs_attention';
   if (last === 'done') return 'done';
   if (last === 'blocked') return 'blocked';
+  if (Object.values(state.tasks).some(task => task.status === 'merge_queued')) return undefined;
   const resting = Object.values(state.seats).some(seat => seat.resting_until && seat.resting_until > now);
   if (queued.some(task => depsMet(state, task)) && resting) return undefined;
   return 'idle';
@@ -369,6 +392,7 @@ export function dispatcherSnapshot(state, config, now) {
     version: 1,
     run_node: config.run_node,
     owner: config.owner,
+    ...(config.code ? { code: config.code, code_main: state.code_main, merge: state.merge } : {}),
     running: seatRows.filter(seat => seat.attempt && state.attempts[seat.attempt]?.kind === 'worker')
       .map(seat => ({ task: state.attempts[seat.attempt].task, seat: seat.seat, since: state.attempts[seat.attempt].launched_at })),
     free_seats: seatRows.filter(seat => seatFree(state, seat.seat, now)).map(seat => ({ seat: seat.seat, kind: seat.kind })),
@@ -377,7 +401,10 @@ export function dispatcherSnapshot(state, config, now) {
     queued_ready: ready(state).map(task => task.node_id),
     waiting_on_dependencies: state.order.filter(id => state.tasks[id].status === 'queued' && !depsMet(state, state.tasks[id])),
     tasks: state.order.map(id => ({ node_id: id, status: state.tasks[id].status, depends_on: state.tasks[id].depends_on,
-      scope: state.tasks[id].scope, continues: state.tasks[id].continues })),
+      scope: state.tasks[id].scope, continues: state.tasks[id].continues,
+      seats: state.tasks[id].seats, code: state.tasks[id].code,
+      last_report: state.tasks[id].last_report, previous: state.tasks[id].previous,
+      last_attempt: state.attempts[state.tasks[id].attempts.at(-1)] })),
   };
 }
 
@@ -389,11 +416,12 @@ export function dispatcherPrompt({ role, run, events, state, report, tools }) {
   ].join('\n') + '\n';
 }
 
-export function workerPrompt({ role, run, task, report, previous, artifacts }) {
+export function workerPrompt({ role, run, task, report, previous, artifacts, code }) {
   return [
     'You are a factory worker. Read the ROLE node with your SiftText tools and follow it exactly.',
     `ROLE: ${role}`, `RUN: ${run}`, `TASK: ${task}`, `REPORT: ${report}`,
     ...(previous ? [`PREVIOUS: ${previous}`] : []),
     `ARTIFACTS: ${artifacts} (directory for any files you create)`,
+    ...(code ? [`CODE: ${code}`] : []),
   ].join('\n') + '\n';
 }

@@ -4,7 +4,8 @@ import { installGuard } from './guard.ts';
 import { validateDispatcherReport, validateWorkerReport } from './parallel-core.mjs';
 
 type Route = { provider: string; model: string; thinking: string };
-type Policy = { report: string; route: Route; role: 'worker' | 'dispatcher'; fault?: string };
+type Policy = { report: string; route: Route; role: 'worker' | 'dispatcher'; fault?: string;
+  code?: { worktree: string; branch: string; base: string; phase: string } };
 
 // Parallel-factory session policy: the shared BF2 route pin and launch-tool block, plus the role-node
 // report schema at report_outcome. `fault` is smoke-only injection of a provider usage-limit failure.
@@ -15,7 +16,14 @@ export function installParallelGuard(pi: ExtensionAPI, policy: Policy) {
     try {
       const text = readFileSync(policy.report, 'utf8');
       if (policy.role === 'dispatcher') validateDispatcherReport(text);
-      else validateWorkerReport(text);
+      else {
+        const report = validateWorkerReport(text);
+        if (policy.code) {
+          const code = report.code;
+          if (!code || code.worktree !== policy.code.worktree || code.branch !== policy.code.branch || code.base !== policy.code.base) throw Error('report must retain assigned code identity');
+          if (report.disposition === 'worked' && policy.code.phase !== 'publish') throw Error('private candidate is not worked; return candidate for serialized publication');
+        } else if (report.code || report.disposition === 'candidate') throw Error('tree task has no code publication authority');
+      }
     } catch (error) {
       return { block: true, reason: `Factory report check: ${error instanceof Error ? error.message : String(error)}. Repair the JSON at ${policy.report} from the work already done, then call report_outcome again.` };
     }

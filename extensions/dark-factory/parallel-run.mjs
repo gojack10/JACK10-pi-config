@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildConfig, isNodeId, parseRunNode, running } from './parallel-core.mjs';
 import { save } from './parallel-controller.mjs';
+import { preflightCode } from './parallel-code.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
@@ -89,7 +90,9 @@ function summary(directory) {
         task: attempt?.task ?? null, session: attempt?.receipt?.session_label ?? null,
         resting_until: entry.resting_until && entry.resting_until > now ? new Date(entry.resting_until).toISOString() : null }];
     })),
-    tasks: Object.fromEntries(['queued', 'running', 'worked', 'blocked', 'errored', 'needs_split', 'stopped'].map(status => [status, count(status)])),
+    tasks: Object.fromEntries(['queued', 'running', 'merge_queued', 'worked', 'blocked', 'errored', 'needs_split', 'stopped'].map(status => [status, count(status)])),
+    code_main: state.code_main, merge: state.merge,
+    code_tasks: Object.fromEntries(Object.values(state.tasks).filter(task => task.code).map(task => [task.node_id, task.code])),
     in_flight: running(state).map(attempt => ({ attempt: attempt.id, kind: attempt.kind, engine: attempt.engine, seat: attempt.seat, task: attempt.task })),
     sessions,
     history: join(directory, 'history.jsonl'),
@@ -153,6 +156,7 @@ if (command === 'controller') {
   mkdirSync(root, { recursive: true });
   const directory = join(root, `${new Date().toISOString().replaceAll(':', '-')}-${runNode.slice(0, 8)}`);
   const config = { ...buildConfig({ runNode, owner, repos, directory, cwd: homedir(), overrides }), fence_heads: heads };
+  await preflightCode(config);
   takeLock(config, directory);
   try {
     mkdirSync(directory, { mode: 0o700 });
@@ -161,7 +165,7 @@ if (command === 'controller') {
     writeFileSync(join(root, 'LAST'), directory + '\n');
     const session = launchController(directory, config);
     console.log(JSON.stringify({ directory, controller_session: session, owner, readonly_repos: heads, seats: config.seats,
-      dispatcher: config.dispatcher, faults: config.faults,
+      dispatcher: config.dispatcher, faults: config.faults, code: config.code,
       status: `node ${fileURLToPath(import.meta.url)} status --run ${runNode}` }, null, 2));
   } catch (error) { releaseLock(config, directory); throw error; }
 } else if (command === 'status') {
