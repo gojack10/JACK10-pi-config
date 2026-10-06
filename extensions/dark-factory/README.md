@@ -47,4 +47,62 @@ node extensions/dark-factory/parallel-run.mjs resume [--run <RUN node>]
 - **Terminal states.** `done`, `blocked` and `idle` (nothing can start) end the controller; `wake` restarts it. `stop` is graceful: running attempts finish and nothing new launches. `resume` restarts from `state.json` and re-adopts running workers through their durable task-outcome receipts.
 - **Smoke-only faults.** `faults.seat_usage_limit: {seat, launches, minutes}` makes that seat's first launches fail with a usage-limit provider error. `faults.claude_failure: {wake}` launches that wake's Claude dispatcher on a nonexistent model.
 
-Tests: `node --test extensions/dark-factory/parallel-*.test.ts` (offline; simulated seats and clock).
+Tests: `node --test extensions/dark-factory/parallel-*.test.ts` (offline; simulated seats/receipts/clock, with disposable native Git fixtures for code tasks).
+
+### Opt-in code tasks (JIT controller)
+
+Tree-only configs/reports retain the existing behavior. Code runs must override `roles` with run-scoped **JIT** dispatcher/worker instructions; the generic Worker Role's historical code refusal and permanent-chat orchestration instructions are not this protocol. The detached controller makes no model turns. Set `codex_seats: 1`, `dispatcher_engine: "fallback"` for exactly one Qwen worker and one Sol worker plus fresh Sol dispatchers; existing `routes` and `roles` overrides still apply. There is no checker model.
+
+Add this object to the overrides (replace placeholders with approved canonical paths, full SHA and exact independent gate argv):
+
+```json
+{
+  "codex_seats": 1,
+  "dispatcher_engine": "fallback",
+  "roles": {"dispatcher": "<JIT dispatcher node UUID>", "worker": "<JIT worker node UUID>"},
+  "code": {
+    "repo": "/absolute/accepted-main-checkout",
+    "main_branch": "main",
+    "main_head": "<full authorized main commit SHA>",
+    "worktree_root": "/absolute/existing-private-worktree-parent",
+    "allowed_paths": ["src", "tests"],
+    "frozen_paths": ["laws", "tests/frozen-expectations"],
+    "candidate_checks": [["/absolute/check-executable", "candidate-arguments"]],
+    "main_checks": [["/absolute/check-executable", "main-arguments"]]
+  }
+}
+```
+
+`repo` is an existing clean checkout on `main_branch`, pinned at `main_head` at first start; `worktree_root` must already exist, be canonical (no symlink aliases), and be disjoint from `repo`. The mutable repo cannot also be a read-only repo (including another worktree of the same Git repository). A repository-wide `.git/parallel-factory.lock/owner` identifies the owning run directory. Another run or an ambiguous owner is refused, never automatically stolen. Normal safe terminal states release it; ambiguous launches/publication/attention and retained merge reservations keep it. No worktree, branch, stash or dirty draft is removed/reset by the controller.
+
+The parent owns the exact gate selection and frozen paths. `allowed_paths` and `frozen_paths` are nonempty literal repo-relative file/directory arrays, not globs. Each task's files must be inside `allowed_paths` and disjoint from frozen paths, including when a requested directory contains a frozen file. Independent acceptance definitions, assertion/expectation sources and any candidate-local gate scripts must be frozen or located outside mutable worker authority. Do not weaken them to make a candidate pass. Git gates enforce changed-path/identity boundaries, not the meaning of arbitrary checks.
+
+Dispatcher task entries add optional `seats` (explicit IDs) and `code`:
+
+```json
+{"node_id":"<task UUID>","depends_on":[],"scope":"<task subtree UUID>","seats":["codex-1"],"code":{"files":["src/storage"]}}
+```
+
+Code tasks require explicit `seats`; use `oss` for prescribed fixtures/checks/source evidence and `codex-1` for persistence/proof/isolation/synthesis. Tree tasks can use `seats` too, or omit it to retain OSS-first legacy routing. Unavailable seat IDs are rejected. Suitability is an explicit dispatcher constraint, never inferred by the controller. Dependencies release only after `worked`, not after a private candidate. Task-node scopes must remain disjoint for concurrency; overlapping code file scopes are allowed in separate drafts and require worker reconciliation. Retained code file/seat/tree-scope ownership cannot change through re-listing.
+
+On first launch the controller journals a unique task worktree/branch and base before native `git worktree add -b`, then launches at that private cwd. Pointer-only missions add `CODE: /absolute/attempt/code.json`. That file contains task/seat, repo, allowed/frozen paths, worktree, branch, original base, latest candidate, phase and merge reservation/grant. State/snapshots/status expose those identities and receipts; `history.jsonl` records reservations, exact candidate checks, publication, attention and gate log paths. Existing drained input commits can be imported **by the worker** as explicitly named task inputs; old active worktrees are never adopted implicitly.
+
+The worker protocol has three phases, all on a constrained worker seat, with fresh sessions and the same task/worktree:
+
+1. **develop**: worker inspects/stages/commits only its file fence, records tree evidence, returns `candidate`. It never writes main or marks publication complete.
+2. **reconcile**: controller reserves one merge turn naming task and current accepted main SHA. Worker merges that exact main into its branch and resolves conflicts itself, preserving its earlier candidate ancestry; no rebase/reset that drops history. Return `candidate` with `code.main` equal to the reservation's main SHA. Controller requires a clean exact branch tip, main ancestry and allowed changed paths, runs exact candidate gates in the private cwd, then checks identity/cleanliness/main again.
+3. **publish**: only after those gates pass, a fresh worker gets `phase: "publish"` and `merge: {task,main,candidate,checks}`. Before mutation it checks the exact branch/candidate, clean main on the named branch and exact old main SHA. Only this grant permits `git -C <repo> merge --ff-only <full candidate SHA>`. It never stages/edits main or publishes another SHA. Return `worked` with `code.main` and `code.candidate` both equal to the checked candidate. Controller checks exact landed main, runs main gates **in the main checkout** (rebuild there when required), then releases the reservation and credits the task. A private binary/check is not a main-check substitute.
+
+All phases retain the ordinary worker JSON fields and add:
+
+```json
+{"code":{"worktree":"/absolute/owned/worktree","branch":"factory/<run UUID>/<task UUID>","base":"<full original base SHA>","candidate":"<full SHA or null for an uncommitted checkpoint>","main":"<reserved old main SHA for reconciliation; exact published SHA for worked>"}}
+```
+
+`candidate` is a new worker disposition, not completion of the code task. `continue`/`blocked` retain draft/candidate/phase/previous report; include the assigned worktree/branch/base even for interruptions, plus exact remaining work/next action and uncommitted/untracked/stashed evidence. Report `candidate`/`worked` only with clean worktree and actual full commit SHA. Do not resolve the task before its published main acceptance; publication workers record their tree checkpoint, and downstream tasks release only when the controller credits the main gates. Workers write the reserved report in place, call `report_outcome` under their real task contract, and end; completed report transport is not full-run success.
+
+Gate argv are trusted parent configuration, run without shell interpolation or a deadline, with `FACTORY_CANDIDATE`, `FACTORY_MAIN`, `FACTORY_WORKTREE` in the environment. Candidate checks run from the private cwd; main checks run from main. Logs are `attempts/.../{candidate,main}-check-<n>.log`. A nonzero exit, execution failure, output exceeding the 16 MiB capture ceiling, changed candidate, dirty checkout, failed fence, stale main or edited code config stops advancement as attention. Code config is hash-pinned across restarts; stop/resume cannot waive acceptance by editing checks/fences. Gates must be nonmutating except ignored build output; checked tracked/untracked changes invalidate publication. While a gate is running, inbox stop/wake is processed after that gate returns; there is no gate deadline.
+
+`task_candidate` wakes a fresh dispatcher like a finished worker turn; running/merge-queued/credited tasks are not re-assigned by dispatchers. A dispatcher `done` is refused while tasks are unfinished; human-owned unanswered meaning is `blocked`, never `done`. A single reservation spans reconciliation, checks and publication, including friendly/operator stops. New code admissions and sibling code-report processing pause during an active publication so main is not sampled mid-merge. CLI wake/stop/resume and durable known-receipt readoption remain the existing transport. A missing launch receipt, partial worktree allocation, unexpected main mutation or lost publication outcome is **ambiguous**: retain identities/lock/drafts and stop for operator recovery, never force-reset/relaunch/credit a plausible orphan report. Automatic recovery from arbitrary OS/process crashes is not claimed. Tests exercise fake receipt replay, not universal exactly-once START/delivery/publication.
+
+These worktrees/file prompts and Git gates are development/publication discipline, **not OS sandbox enforcement**. Other same-user processes and arbitrary worker commands can bypass them; no service/toolchain/security-policy changes are made.
