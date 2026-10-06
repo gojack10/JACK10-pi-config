@@ -18,13 +18,13 @@ const dispatched = (tasks: Array<{ node_id: string; depends_on: string[]; scope:
     stop_running: [], updated_nodes: [], questions_for_jack: disposition === 'blocked' ? ['q'] : [] }) });
 
 test('RUN parsing takes only the labelled OWNER and read-only repository lines', () => {
-  const text = `- OWNER: [[Extract Retained Contracts|51dfeeec-66f8-471a-9403-634e20bb9964]]. Tasks follow...
-- Read-only repository: \`~/projects/sifttext-platform-local\`, pinned at \`851d5d2\` (clean). Never modify it.
-- Read-only evidence trees: [[SiftText Code Ideas|e2d97fa4-f238-4fbf-a65f-c4bf9b29e4a2@1fe0f256-3a8b-477b-bb78-d15d9f3ec9fa]]`;
+  const text = `- OWNER: [[Extract Contracts|${OWNER}]]. Tasks follow...
+- Read-only repository: \`~/projects/example\`, pinned at \`abcdef0\` (clean). Never modify it.
+- Read-only evidence trees: [[Code Ideas|${id(3)}@${RUN}]]`;
   const parsed = parseRunNode(text);
-  assert.equal(parsed.owner, '51dfeeec-66f8-471a-9403-634e20bb9964');
-  assert.deepEqual(parsed.repos, ['~/projects/sifttext-platform-local']);
-  assert.equal(parseRunNode('- OWNER: the child named Census (node `8c00dd0c-6859-4872-bb8b-a60dcccb28d3`).').owner, '8c00dd0c-6859-4872-bb8b-a60dcccb28d3');
+  assert.equal(parsed.owner, OWNER);
+  assert.deepEqual(parsed.repos, ['~/projects/example']);
+  assert.equal(parseRunNode(`- OWNER: the child named Census (node \`${id(4)}\`).`).owner, id(4));
 });
 
 test('config fills OSS first and allows per-run route overrides', () => {

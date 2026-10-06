@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { bumpRecencyOrder, selectMostRecentModel, updateRecencyFile } from "../model-recency.ts";
 
-const accounts = new Set(["openai-codex", "openai-codex-alt", "openai-codex-sifttext"]);
+const accounts = new Set(["openai-codex", "openai-codex-alt", "openai-codex-third"]);
 
 test("Codex account selections surface only the Personal router", () => {
 	assert.deepEqual(bumpRecencyOrder([
