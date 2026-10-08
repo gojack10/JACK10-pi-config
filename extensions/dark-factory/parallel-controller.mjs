@@ -408,6 +408,14 @@ export class ParallelController {
     let bytes;
     try { bytes = readFileSync(pending.packet, 'utf8'); } catch { return reject('the proposal snapshot is missing'); }
     if (createHash('sha256').update(bytes.trimEnd()).digest('hex') !== pending.proposal_hash) return reject('proposal snapshot changed after it was proposed');
+    const stale = await this.drift(JSON.parse(bytes));
+    if (stale.length) {
+      this.state.setup = null;
+      P.addEvent(this.state, { type: 'spec_drift', task: setup.task, sources: stale,
+        note: 'the governing text moved after authoring; re-derive the packet from the current revision, newest clause wins' }, now);
+      this.state.wake = true;
+      return reject(`governing sources changed since authoring: ${stale.map(item => item.node).join(', ')}`);
+    }
     const reviewHash = createHash('sha256').update(JSON.stringify(review)).digest('hex');
     const reviewPath = join(store, `${pending.check}.review.json`);
     writeFileSync(reviewPath, JSON.stringify(review, null, 2) + '\n');
@@ -422,6 +430,18 @@ export class ParallelController {
     this.log('check_registered', { task: setup.task, check: pending.check, cases: this.state.checks[pending.check].cases.length, review: reviewPath });
     P.addEvent(this.state, { type: 'check_registered', task: setup.task, check: pending.check, cases: this.state.checks[pending.check].cases.length }, now);
     this.state.wake = true;
+  }
+
+  // A check is only as valid as the revision it was derived from. When the tree moves, the newest clause
+  // wins and the packet must be re-derived; nothing here chooses a meaning, it only detects staleness.
+  async drift(entry) {
+    const sources = entry?.sources ?? [];
+    const ids = [...new Set(sources.map(source => source.node))];
+    if (!ids.length || !this.deps.revisions) return [];
+    let current;
+    try { current = await this.deps.revisions(ids); } catch { return []; } // an unreadable tree is not evidence of drift
+    return sources.filter(source => current.get(source.node) && current.get(source.node) !== source.revision)
+      .map(source => ({ node: source.node, cited: source.revision, current: current.get(source.node) }));
   }
 
   // A dispatcher may ask for a wedged assignment to be resumed. Only the controller acts, and only when the
@@ -794,6 +814,18 @@ export class ParallelController {
       else if (!scope) rejected.set(task.node_id, 'write scope node not found');
       else if (!scope.includes(owner)) rejected.set(task.node_id, 'write scope is outside the write fence');
       else if ((task.checks ?? []).some(id => !this.state.checks?.[id])) rejected.set(task.node_id, 'named check is not registered');
+      else if ((task.checks ?? []).length) {
+        const stale = (await Promise.all(task.checks.map(id => this.drift(this.state.checks[id])))).flat();
+        if (stale.length) {
+          rejected.set(task.node_id, `registered check sources drifted: ${stale.map(item => item.node).join(', ')}`);
+          const pending = this.state.pending_events ?? [];
+          if (!pending.some(event => event.type === 'spec_drift' && event.task === task.node_id)) {
+            P.addEvent(this.state, { type: 'spec_drift', task: task.node_id, sources: stale,
+              note: 're-derive the packet from the current revision; the newest clause of the changed text wins' }, this.deps.now());
+            this.state.wake = true;
+          }
+        }
+      }
       else {
         try {
           G.vetCodeTask(task, this.config, this.state.tasks[task.node_id]);
