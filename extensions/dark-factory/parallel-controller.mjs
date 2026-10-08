@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import * as P from './parallel-core.mjs';
 import * as G from './parallel-code.mjs';
@@ -329,6 +329,101 @@ export class ParallelController {
     })());
   }
 
+  // A check packet is data. Models never supply executable gate code, argv or paths outside their own attempt.
+  validatePacket(parsed, taskId) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('setup packet must be one JSON object');
+    if (Object.keys(parsed).sort().join(',') !== 'cases,fence,limits,observer,sources,task') {
+      throw Error('setup packet needs exactly task, fence, observer, sources, cases and limits');
+    }
+    if (parsed.task !== taskId) throw Error('setup packet task differs from the reported task');
+    const fence = G.fileScope(parsed.fence, 'packet.fence');
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(String(parsed.observer))) throw Error('packet.observer must be one bare target/debug executable name');
+    if (!Array.isArray(parsed.sources) || !parsed.sources.length) throw Error('packet.sources must cite at least one governing clause');
+    const sources = parsed.sources.map(source => {
+      if (typeof source?.node !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(source.node) ||
+          typeof source.revision !== 'string' || !source.revision.trim() || typeof source.clause !== 'string' || !source.clause.trim()) {
+        throw Error('each source needs a node UUID, its revision and the quoted clause');
+      }
+      return { node: source.node, revision: source.revision.trim(), clause: source.clause.trim() };
+    });
+    if (!Array.isArray(parsed.cases) || parsed.cases.length < 2) throw Error('packet.cases needs positive cases and a rejecting control');
+    let positive = 0, negative = 0;
+    for (const item of parsed.cases) {
+      if (!item || typeof item !== 'object' || !('input' in item)) throw Error('each case needs input');
+      if (item.expect_nonzero === true && item.expected_output === undefined) negative += 1;
+      else if (item.expected_output !== undefined && item.expect_nonzero === undefined) positive += 1;
+      else throw Error('each case needs exactly one of expected_output or expect_nonzero true');
+    }
+    if (!positive || !negative) throw Error('packet needs at least one positive case and one rejecting control');
+    if (typeof parsed.limits !== 'string' || !parsed.limits.trim()) throw Error('packet.limits must state what the check does not prove');
+    return { task: taskId, fence, observer: parsed.observer, sources, cases: parsed.cases, limits: parsed.limits.trim() };
+  }
+
+  async setupTransition(attempt, setup, now) {
+    const reject = reason => {
+      this.log('setup_rejected', { attempt: attempt.id, task: setup.task, action: setup.action, reason });
+      P.addEvent(this.state, { type: 'setup_rejected', task: setup.task, action: setup.action, reason }, now);
+      this.state.wake = true;
+    };
+    const actor = attempt.receipt?.session_id ?? attempt.claude_session ?? attempt.label;
+    if (setup.packet !== attempt.setup_packet) return reject('setup packet must be the path assigned to this attempt');
+    const store = join(this.dir, 'checks');
+    mkdirSync(store, { recursive: true });
+    if (setup.action === 'propose') {
+      let raw;
+      try { raw = readFileSync(setup.packet, 'utf8'); } catch { return reject('the assigned setup packet was not written'); }
+      const hash = createHash('sha256').update(raw).digest('hex');
+      let packet;
+      try { packet = this.validatePacket(JSON.parse(raw), setup.task); }
+      catch (error) { return reject(String(error.message ?? error)); }
+      const id = hash.slice(0, 16), snapshot = join(store, `${id}.proposal.json`);
+      // Snapshot the exact bytes that were hashed: validation normalises, the receipt must not.
+      writeFileSync(snapshot, raw.endsWith('\n') ? raw : raw + '\n');
+      this.state.setup = { task: setup.task, check: id, proposal_hash: hash, author: actor, author_attempt: attempt.id,
+        packet: snapshot, proposed_at: now };
+      this.log('setup_proposed', { attempt: attempt.id, task: setup.task, check: id, hash, cases: packet.cases.length });
+      P.addEvent(this.state, { type: 'setup_proposed', task: setup.task, check: id, proposal_hash: hash, packet: snapshot }, now);
+      this.state.wake = true; // review requires a different fresh dispatcher
+      return;
+    }
+    const pending = this.state.setup;
+    if (!pending || pending.task !== setup.task) return reject('no setup proposal is pending for this task');
+    if (setup.proposal_hash !== pending.proposal_hash) return reject('review does not bind the pending proposal hash');
+    if (pending.author === actor) return reject('a proposal requires review by a different dispatcher session');
+    if (setup.verdict !== 'approve') {
+      this.state.setup = null;
+      this.log('setup_returned', { attempt: attempt.id, task: setup.task, verdict: setup.verdict });
+      P.addEvent(this.state, { type: 'setup_returned', task: setup.task, verdict: setup.verdict, proposal_hash: pending.proposal_hash }, now);
+      this.state.wake = true;
+      return;
+    }
+    let review;
+    try { review = JSON.parse(readFileSync(setup.packet, 'utf8')); } catch (error) { return reject(`review artifact is not valid JSON: ${error.message}`); }
+    // Agreement alone is not review: the reviewer must add cases the author did not think of.
+    if (!Array.isArray(review?.challenges) || !review.challenges.length ||
+        typeof review?.rationale !== 'string' || !review.rationale.trim() ||
+        !Array.isArray(review?.sources_read) || !review.sources_read.length) {
+      return reject('review needs sources_read, added challenges and a rationale');
+    }
+    let bytes;
+    try { bytes = readFileSync(pending.packet, 'utf8'); } catch { return reject('the proposal snapshot is missing'); }
+    if (createHash('sha256').update(bytes.trimEnd()).digest('hex') !== pending.proposal_hash) return reject('proposal snapshot changed after it was proposed');
+    const reviewHash = createHash('sha256').update(JSON.stringify(review)).digest('hex');
+    const reviewPath = join(store, `${pending.check}.review.json`);
+    writeFileSync(reviewPath, JSON.stringify(review, null, 2) + '\n');
+    let proposal;
+    try { proposal = this.validatePacket(JSON.parse(bytes), setup.task); } catch (error) { return reject(`proposal snapshot no longer validates: ${error.message ?? error}`); }
+    this.state.checks ??= {};
+    this.state.checks[pending.check] = { task: setup.task, observer: proposal.observer, fence: proposal.fence, sources: proposal.sources,
+      cases: [...proposal.cases, ...review.challenges], limits: proposal.limits, packet: pending.packet, review: reviewPath,
+      proposal_hash: pending.proposal_hash, review_hash: reviewHash, author: pending.author, reviewer: actor,
+      author_attempt: pending.author_attempt, reviewer_attempt: attempt.id, registered_at: now };
+    this.state.setup = null;
+    this.log('check_registered', { task: setup.task, check: pending.check, cases: this.state.checks[pending.check].cases.length, review: reviewPath });
+    P.addEvent(this.state, { type: 'check_registered', task: setup.task, check: pending.check, cases: this.state.checks[pending.check].cases.length }, now);
+    this.state.wake = true;
+  }
+
   codeAttention(reason, now) {
     this.state.attention ??= { reason, at: now };
     this.log('code_attention', { reason });
@@ -483,8 +578,10 @@ export class ParallelController {
     const eventsPath = join(attempt.dir, 'events.json'), statePath = join(attempt.dir, 'state.json');
     save(eventsPath, events);
     save(statePath, P.dispatcherSnapshot(this.state, this.config, now));
+    attempt.setup_packet = join(attempt.dir, 'setup-packet.json');
     const prompt = P.dispatcherPrompt({ role: this.config.roles.dispatcher, run: this.config.run_node, events: eventsPath,
-      state: statePath, report: attempt.report, tools: engine === 'claude' ? 'the `sifttext` CLI through Bash' : 'your SiftText tools' });
+      state: statePath, report: attempt.report, setup: attempt.setup_packet,
+      tools: engine === 'claude' ? 'the `sifttext` CLI through Bash' : 'your SiftText tools' });
     const missionFile = join(attempt.dir, 'mission.md');
     writeFileSync(missionFile, prompt);
     const fault = engine === 'claude' && this.config.faults?.claude_failure?.wake === this.state.dispatcher.wakes;
@@ -622,6 +719,7 @@ export class ParallelController {
       }
       await this.fenceCheck(now, attempt.id);
     } else {
+      if (outcome.kind === 'report' && outcome.report.setup) await this.setupTransition(attempt, outcome.report.setup, now);
       const effects = P.finishDispatcher(this.state, attempt.id, outcome, now, rejected);
       this.log('dispatcher_finish', { attempt: attempt.id, engine: attempt.engine, outcome: outcome.kind,
         disposition: outcome.report?.disposition, summary: outcome.report?.summary ?? outcome.summary ?? outcome.reason,
@@ -649,6 +747,7 @@ export class ParallelController {
       else if (task.node_id === owner || !node.includes(owner)) rejected.set(task.node_id, 'task node is outside the write fence');
       else if (!scope) rejected.set(task.node_id, 'write scope node not found');
       else if (!scope.includes(owner)) rejected.set(task.node_id, 'write scope is outside the write fence');
+      else if ((task.checks ?? []).some(id => !this.state.checks?.[id])) rejected.set(task.node_id, 'named check is not registered');
       else {
         try {
           G.vetCodeTask(task, this.config, this.state.tasks[task.node_id]);
