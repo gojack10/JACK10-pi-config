@@ -685,11 +685,21 @@ export class ParallelController {
     catch { return undefined; }
   }
 
+  // The guard writes the canonical route verdict for its own attempt; no role infers route identity.
+  readRouteVerdict(attempt) {
+    try { return JSON.parse(readFileSync(join(attempt.dir, 'route-verdict.json'), 'utf8')); } catch { return null; }
+  }
+
   async settle(attempt, outcome, now) {
     // Vet before closing: a failed tree lookup retries next tick with the session intact.
     if (attempt.kind === 'dispatcher' && outcome.kind === 'report' && outcome.report.disposition === 'done' &&
         Object.values(this.state.tasks).some(task => !['worked', 'stopped'].includes(task.status))) {
       outcome = { kind: 'error', summary: 'done refused: unfinished tasks remain (private candidates are not main publication)' };
+    }
+    const verdict = this.readRouteVerdict(attempt);
+    attempt.route_verdict = verdict;
+    if (verdict && verdict.verdict !== 'accepted') {
+      this.log('route_verdict', { attempt: attempt.id, verdict: verdict.verdict, expected: verdict.expected, actual: verdict.actual, pin: verdict.pin });
     }
     const rejected = attempt.kind === 'dispatcher' && outcome.kind === 'report' ? await this.vetTasks(outcome.report) : new Map();
     if (attempt.kind === 'worker') {

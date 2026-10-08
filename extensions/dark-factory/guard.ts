@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { routeEntry, type RoutePin } from '../codex-personal/resolution.ts';
 import { ROUTE, taskSettings, validateReport } from './core.mjs';
@@ -14,6 +14,13 @@ export function allowedRoute(model: { provider: string; id: string } | undefined
   return pin?.umbrella === expected.provider && pin.model === expected.model && pin.actualProviderId === model.provider;
 }
 
+// A factory role must never lose an assignment by passing content to mark_stuck: that call replaces
+// crystallization instead of appending, which destroyed a prepared task contract once already.
+export function allowedTreeWrite(name: string, input: any, policy: Policy) {
+  if (policy.smoke || !/mark_stuck$/.test(name)) return true;
+  return !(typeof input?.crystallization === 'string' && input.crystallization.trim());
+}
+
 export function allowedTool(name: string, input: any, policy: Policy) {
   if (policy.smoke) {
     if (name === 'report_outcome') return true;
@@ -22,8 +29,30 @@ export function allowedTool(name: string, input: any, policy: Policy) {
   }
   return !['subagent_launch', 'subagent_followup'].includes(name);
 }
+// The canonical verdict is recorded once per factory attempt so no role has to infer route identity
+// from PI_PROVIDER or session metadata. It uses the same allowedRoute() logic as enforcement.
+export function routeVerdict(ctx: any, policy: Policy, thinking: string | undefined) {
+  const expected = policy.route ?? ROUTE;
+  const pin = routeEntry(ctx.sessionManager.getBranch());
+  const accepted = allowedRoute(ctx.model, thinking, expected, pin);
+  return {
+    expected: { provider: expected.provider, model: expected.model, thinking: expected.thinking },
+    actual: { provider: ctx.model?.provider ?? null, model: ctx.model?.id ?? null, thinking },
+    pin: pin ? { umbrella: pin.umbrella, model: pin.model, actualProviderId: pin.actualProviderId } : null,
+    verdict: accepted ? 'accepted' : 'rejected',
+    reason: accepted ? 'the resolved provider matches the authorized selector and its pinned backing account'
+      : 'the resolved provider/model/thinking does not match the authorized selector or its pinned backing account',
+  };
+}
+
 export function installGuard(pi: ExtensionAPI, policy: Policy) {
   let providerError = false;
+  // Written before any request is admitted, so the controller has canonical evidence even when the guard aborts.
+  const recordVerdict = (ctx: any) => {
+    try { writeFileSync(join(dirname(policy.report), 'route-verdict.json'),
+      JSON.stringify(routeVerdict(ctx, policy, pi.getThinkingLevel()), null, 2) + '\n'); }
+    catch { /* the controller treats a missing verdict as a platform condition */ }
+  };
   pi.on('agent_end', event => {
     const last = [...event.messages].reverse().find(message => message.role === 'assistant');
     providerError = !event.interruption && last?.stopReason === 'error';
@@ -47,13 +76,17 @@ export function installGuard(pi: ExtensionAPI, policy: Policy) {
         content: `Provider generation failed. Retry ${retries + 1}/2 in the SAME assignment and attempt. Use retained progress and the existing report; ${(policy.project ?? taskSettings()).lean ? 'trust saved results and recover uncertain delivery only with a narrow marker lookup' : 'verify uncertain effects before acting'}. Do not replay completed work or spent launches. If the report is already valid and tracked work drained, finish report_outcome under the return protocol. No new authority or model change.` },
     ] };
   });
-  pi.on('session_start', () => {
+  pi.on('session_start', (_event, ctx) => {
     pi.setActiveTools(pi.getActiveTools().filter(name => policy.smoke
       ? ['read', 'write', 'report_outcome'].includes(name)
       : !['subagent_launch', 'subagent_followup'].includes(name)));
+    recordVerdict(ctx);
   });
   pi.on('tool_call', event => {
     if (!allowedTool(event.toolName, event.input, policy)) return { block: true, reason: 'Factory policy: this tool/path is outside the assigned authority.' };
+    if (!allowedTreeWrite(event.toolName, event.input, policy)) {
+      return { block: true, reason: 'Factory policy: mark_stuck replaces crystallization rather than appending it, so it must not carry content. Use append or a section edit for content, then mark the task stuck with the blocker only.' };
+    }
     if (event.toolName === 'report_outcome' && policy.role && ['completed', 'blocked'].includes(event.input.outcome)) {
       try { validateReport(readFileSync(policy.report, 'utf8'), policy.role, policy.smoke, policy.project ?? taskSettings()); }
       catch (error) { return { block: true, reason: `Factory report validation: ${String(error)}. Repair the reserved JSON report from existing work, then retry report_outcome. Do not repeat research or tree writes; the current attempt remains open.` }; }
@@ -70,6 +103,7 @@ export function installGuard(pi: ExtensionAPI, policy: Policy) {
     return { action: 'handled' as const };
   });
   pi.on('before_provider_request', (_event, ctx) => {
+    recordVerdict(ctx);
     if (!routeOK(ctx)) {
       ctx.abort();
       throw Error(`Factory route changed; ${JSON.stringify(policy.route ?? ROUTE)} required`);
