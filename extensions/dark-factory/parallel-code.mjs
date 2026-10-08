@@ -130,14 +130,14 @@ const canonicalJson = value => JSON.stringify(value, (key, item) =>
   item && typeof item === 'object' && !Array.isArray(item) ? Object.keys(item).sort().reduce((sum, k) => ({ ...sum, [k]: item[k] }), {}) : item);
 
 export function checkSetDigest(checks) {
-  return createHash('sha256').update(Object.keys(checks ?? {}).sort()
-    .map(id => `${id}:${checks[id].proposal_hash}:${checks[id].review_hash}`).join('\n')).digest('hex');
+  return createHash('sha256').update(Object.keys(checks ?? {}).filter(id => !checks[id].superseded).sort()
+    .map(id => `${id}:${checks[id].proposal_hash}:${checks[id].review_hash}:${canonicalJson(checks[id].cases)}`).join('\n')).digest('hex');
 }
 
 export async function runRegisteredChecks(config, checks, code, kind, directory) {
   const root = kind === 'candidate' ? code.worktree : config.code.repo;
   const logs = [];
-  for (const id of Object.keys(checks ?? {}).sort()) {
+  for (const id of Object.keys(checks ?? {}).filter(id => !checks[id].superseded).sort()) {
     const entry = checks[id], path = join(directory, `${kind}-registered-${id}.log`);
     logs.push(path);
     const lines = [];
@@ -151,7 +151,7 @@ export async function runRegisteredChecks(config, checks, code, kind, directory)
           input: typeof item.input === 'string' ? item.input : JSON.stringify(item.input) });
       } catch (error) { rejected = error; }
       if (item.expect_nonzero === true) {
-        if (!rejected || rejected.killed) { failures += 1; lines.push(`case ${index}: expected rejection, exited 0`); }
+        if (!rejected || !Number.isInteger(rejected.status) || rejected.status === 0 || rejected.signal) { failures += 1; lines.push(`case ${index}: expected rejection, exited 0`); }
         else lines.push(`case ${index}: rejected as expected`);
         continue;
       }
