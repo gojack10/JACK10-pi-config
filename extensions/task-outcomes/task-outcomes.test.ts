@@ -669,7 +669,9 @@ test("task contracts inject instructions and correct missing declarations withou
   const h = await harness(t);
   assert.equal(h.manager.taskInstruction(), undefined);
   await h.call("task_outcomes_consumer", contract(h.dir, "repair", "r1"));
-  assert.match(h.manager.taskInstruction(), /report_outcome/);
+  assert.match(h.manager.taskInstruction(), /If registered child\/background work is still running, do not call report_outcome yet/);
+  assert.match(h.manager.taskInstruction(), /Do not use needs_input, blocked, or failed as a wait\/yield signal/);
+  assert.match(h.manager.taskInstruction(), /Use needs_input only when a specific human answer is required/);
   assert.ok(h.manager.taskInstruction().includes(JSON.stringify(join(h.dir, "repair-r1.md"))));
   await h.settle({ stopReason: "stop", text: "Done" });
   assert.equal((await h.snapshot()).outcomes.length, 0);

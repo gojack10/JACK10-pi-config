@@ -720,8 +720,9 @@ export class TaskOutcomeManager {
     if (!contract || contract.mode !== "task" || contract.state !== "active") return undefined;
     return `SYSTEM TASK CONTRACT: ${contract.jobId}/${contract.attemptId}
 You are a task subagent. A prose answer alone does not complete this task.
+If registered child/background work is still running, do not call report_outcome yet. End this turn and wait for its normal completion notification; then inspect the result and continue the task. Do not use needs_input, blocked, or failed as a wait/yield signal.
 Write your report to ${JSON.stringify(contract.reportPath)}. This file is already reserved: write into it without deleting, replacing, or renaming it.
-Then call report_outcome with an honest outcome and summary. Use completed only after writing a readable nonempty report and finishing all tracked child/background work. Otherwise declare blocked, needs_input, or failed with the reason; include partial findings in the report when possible. Never invent success to satisfy this contract.
+Then call report_outcome with an honest outcome and summary. Use completed only after writing a readable nonempty report and finishing all tracked child/background work. Use needs_input only when a specific human answer is required to continue; use blocked for a missing external prerequisite or authority; use failed for a terminal failure. Include partial findings in the report when possible. Never invent success to satisfy this contract.
 The declaration is provisional until clean settlement. Do not start more work after declaring. Missing declarations trigger at most two corrective turns, then protocol failure.`;
   }
 
