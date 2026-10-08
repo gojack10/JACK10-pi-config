@@ -111,8 +111,8 @@ DS4_MODEL_METADATA = {
     },
     QWEN_NEXT_MODEL_ID: {
         "name": "Qwen3.8 Flash Next",
-        "context_length": 500000,
-        "max_completion_tokens": 500000,
+        "context_length": 750000,
+        "max_completion_tokens": 750000,
     },
     GLM_FLASH_MODEL_ID: {
         "name": "GLM 5.3 Flash",

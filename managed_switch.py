@@ -22,7 +22,7 @@ ROOT = HOME/'research/bend'
 MODELS = {
  'qwen3.8-flash-next': dict(mode='qwen', binary=HOME/'ds4/ds4-server',
    sha='23f9e6d99db3120cc24a32839ea57e6680fbae3de142b424a2780e8aa0494e32',
-   args=['Qwen3.8-Flash-Next-Q4.gguf','--mtp','--ctx 500000']),
+   args=['Qwen3.8-Flash-Next-Q4.gguf','--mtp','--ctx 750000']),
  'deepseek-v4.1-flash': dict(mode='ds41', binary=HOME/'ds4/ds4-server-v41-reservation',
    sha='a3897ee4f2a85f51a2b499ede9e4bbd13886ee0b5f9b1d52cd5ed04e5c7d512a',
    args=['DeepSeek-V4.1-Flash-Q2.gguf','--metal','--ssd-streaming','--power 100',
