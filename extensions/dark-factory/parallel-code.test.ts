@@ -297,6 +297,11 @@ test('checked grant rejects stale candidate/main and changed gate config before 
     save(join(f.directory, 'config.json'), config);
     writeFileSync(join(f.repo, 'shared.txt'), 'unexpected\n'); git(f.repo, 'add', 'shared.txt'); git(f.repo, 'commit', '-m', 'fixture: unauthorized main');
     await assert.rejects(ctl.checkedCandidate(task), /main moved/);
+    git(f.repo, 'reset', '--hard', task.code.base === undefined ? 'HEAD' : 'HEAD~1');
+    // A packet registered after the grant must invalidate it, never silently change acceptance.
+    ctl.state.checks.aaaaaaaaaaaaaaaa = { task: A, observer: 'rows-observe', fence: ['draft.txt'], cases: [{ input: 1, expected_output: 1 }, { input: 'x', expect_nonzero: true }],
+      proposal_hash: 'a'.repeat(64), review_hash: 'b'.repeat(64) };
+    await assert.rejects(ctl.checkedCandidate(task), /check set changed/);
   } finally { f.cleanup(); }
 });
 
@@ -415,5 +420,37 @@ test('worker guard validates identity and prevents private worked or tree public
       { report: path, route: P.ROUTES.oss, role: 'worker' });
     save(path, report(A, { ...code, candidate: f.code.main_head }, 'candidate'));
     assert.match(treeHandlers.at(-1)(event).reason, /no code publication/);
+  } finally { f.cleanup(); }
+});
+
+test('registered check packets run as data and bind the publication grant', async () => {
+  const f = fixture();
+  try {
+    const ctl = new ParallelController(f.directory, transport(f).deps);
+    await ctl.start();
+    const code = G.allocation(f.config, { ...order(A, 'oss'), code: { files: ['shared.txt', 'draft.txt'] } });
+    await G.prepareCode(f.config, code);
+    mkdirSync(join(code.worktree, 'target/debug'), { recursive: true });
+    writeFileSync(join(code.worktree, 'target/debug/rows-observe'),
+      `#!${process.execPath}\nlet s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);if(j.ok!==1)process.exit(1);process.stdout.write(JSON.stringify({ok:j.ok}));}catch{process.exit(1);}});\n`, { mode: 0o755 });
+    const entry = (cases: any[]) => ({ id: { task: A, observer: 'rows-observe', fence: ['draft.txt'], cases,
+      proposal_hash: 'a'.repeat(64), review_hash: 'b'.repeat(64) } });
+    const dir = join(f.directory, 'registered'); mkdirSync(dir, { recursive: true });
+    const passing = entry([{ input: { ok: 1 }, expected_output: { ok: 1 } }, { input: 'not json', expect_nonzero: true }]);
+    assert.equal((await G.runRegisteredChecks(f.config, passing, code, 'candidate', dir)).length, 1);
+    const log = readFileSync(join(dir, 'candidate-registered-id.log'), 'utf8');
+    assert.match(log, /case 0: matched/);
+    assert.match(log, /case 1: rejected as expected/);
+    // A candidate that fails a registered packet is one bad item, never a run-wide halt.
+    await assert.rejects(G.runRegisteredChecks(f.config, entry([{ input: { ok: 2 }, expected_output: { ok: 1 } }]), code, 'candidate', dir),
+      (error: any) => error instanceof G.TaskFault && /1 of 1 cases/.test(error.message));
+    await assert.rejects(G.runRegisteredChecks(f.config, entry([{ input: { ok: 1 }, expect_nonzero: true }]), code, 'candidate', dir),
+      (error: any) => error instanceof G.TaskFault && /expected rejection/.test(error.message));
+    // The grant is bound to the reviewed bytes, so a later edit cannot silently change acceptance.
+    // The grant binds the reviewed bytes: a new packet or a different review changes the digest,
+    // while a mutable case array alone does not, because the pinned hashes already cover it.
+    assert.notEqual(G.checkSetDigest(passing), G.checkSetDigest({}));
+    assert.notEqual(G.checkSetDigest(passing), G.checkSetDigest({ id: { ...passing.id, review_hash: 'c'.repeat(64) } }));
+    assert.equal(G.checkSetDigest(passing), G.checkSetDigest({ id: { ...passing.id, cases: [] } }));
   } finally { f.cleanup(); }
 });
