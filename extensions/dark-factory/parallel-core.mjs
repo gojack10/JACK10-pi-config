@@ -93,9 +93,15 @@ export function validateDispatcherReport(text) {
     if (task.seats !== undefined && (!Array.isArray(task.seats) || !task.seats.length ||
         !task.seats.every(seat => typeof seat === 'string' && /^(oss|codex-[1-3])$/.test(seat)))) throw Error('seats must list explicit worker seat IDs');
     if (task.code && (typeof task.code !== 'object' || Object.keys(task.code).some(key => key !== 'files'))) throw Error('task.code accepts only files; controller owns Git identities');
+    if (task.checks !== undefined && !Array.isArray(task.checks)) throw Error(`tasks[${index}].checks must be an array`);
+    const checks = (task.checks ?? []).map(check => {
+      if (!/^[0-9a-f]{16}$/.test(String(check))) throw Error(`tasks[${index}].checks needs registered check IDs`);
+      return String(check);
+    });
     return { node_id: task.node_id, depends_on: [...task.depends_on], scope: task.scope,
       ...(task.seats ? { seats: [...new Set(task.seats)] } : {}),
-      ...(task.code ? { code: { files: fileScope(task.code.files) } } : {}) };
+      ...(task.code ? { code: { files: fileScope(task.code.files) } } : {}),
+      ...(checks.length ? { checks } : {}) };
   });
   const blockers = (r.blockers ?? []).map((item, index) => {
     if (!isNodeId(item?.node_id) || !['external', 'authority', 'platform'].includes(item.kind) ||
@@ -185,7 +191,7 @@ export function initialState(config, now) {
     seats: Object.fromEntries(config.seats.map(seat => [seat.id, { attempt: null, resting_until: null, launches: 0 }])),
     attempts: {},
     dispatcher: { attempt: null, last: null, failures: 0, wakes: 0, claude_resting_until: null, claude_skip: false },
-    stop: null, attention: null, awaiting_input: [], fence: null,
+    stop: null, attention: null, awaiting_input: [], fence: null, setup: null, checks: {},
     ...(config.code ? { code_main: config.code.main_head, merge: null } : {}),
   };
 }
@@ -387,7 +393,10 @@ export function finishDispatcher(state, id, outcome, now, rejected = new Map()) 
     }
     const known = state.tasks[listed.node_id];
     if (known && ['running', 'worked', 'merge_queued'].includes(known.status)) { effects.ignored.push(listed.node_id); continue; }
-    if (known) Object.assign(known, { depends_on: listed.depends_on, scope: listed.scope, seats: listed.seats, status: 'queued', continues: 0, provider_failures: 0, front: false, relisted_at: now });
+    if (known) {
+      Object.assign(known, { depends_on: listed.depends_on, scope: listed.scope, seats: listed.seats, status: 'queued', continues: 0,
+        provider_failures: 0, front: false, relisted_at: now, checks: listed.checks ?? known.checks ?? [] });
+    }
     else {
       state.tasks[listed.node_id] = { ...listed,
         status: 'queued', continues: 0, previous: null, attempts: [], listed_at: now };
@@ -438,6 +447,9 @@ export function dispatcherSnapshot(state, config, now) {
     run_node: config.run_node,
     owner: config.owner,
     ...(config.code ? { code: config.code, code_main: state.code_main, merge: state.merge } : {}),
+    setup: state.setup ?? null,
+    checks: Object.fromEntries(Object.entries(state.checks ?? {}).map(([id, entry]) => [id, { task: entry.task, observer: entry.observer,
+      cases: entry.cases.length, proposal: entry.proposal_hash, review: entry.review_hash, registered_at: entry.registered_at }])),
     running: seatRows.filter(seat => seat.attempt && state.attempts[seat.attempt]?.kind === 'worker')
       .map(seat => ({ task: state.attempts[seat.attempt].task, seat: seat.seat, since: state.attempts[seat.attempt].launched_at })),
     free_seats: seatRows.filter(seat => seatFree(state, seat.seat, now)).map(seat => ({ seat: seat.seat, kind: seat.kind })),
@@ -454,10 +466,11 @@ export function dispatcherSnapshot(state, config, now) {
 }
 
 // Prompts carry pointers only; every instruction lives in the role nodes.
-export function dispatcherPrompt({ role, run, events, state, report, tools }) {
+export function dispatcherPrompt({ role, run, events, state, report, setup, tools }) {
   return [
     `You are a factory dispatcher. Read the ROLE node with ${tools} and follow it exactly.`,
     `ROLE: ${role}`, `RUN: ${run}`, `EVENTS: ${events}`, `STATE: ${state}`, `REPORT: ${report}`,
+    ...(setup ? [`SETUP_PACKET: ${setup} (the only path this attempt may write for a setup proposal or review)`] : []),
   ].join('\n') + '\n';
 }
 
