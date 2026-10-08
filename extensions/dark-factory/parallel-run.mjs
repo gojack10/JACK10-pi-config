@@ -21,7 +21,7 @@ const lines = (file, args) => {
   try { return execFileSync(file, args, { encoding: 'utf8' }).trim().split('\n').filter(Boolean); }
   catch { return []; }
 };
-const usage = 'Usage: node parallel-run.mjs <start-parallel --run <RUN node> [--config overrides.json] | status | wake [--note text] | stop [--now] | resume> [--run <RUN node>]';
+const usage = 'Usage: node parallel-run.mjs <start-parallel --run <RUN node> [--config overrides.json] | status | wake [--note text] | answer --task <TASK node> --text <answer> | stop [--now] | resume> [--run <RUN node>]';
 
 function runDirectory() {
   const run = flag('--run');
@@ -79,6 +79,7 @@ function summary(directory) {
   return {
     directory, run_node: config.run_node, owner: config.owner,
     status: state.status, controller_alive: controllerAlive(directory), attention: state.attention ?? undefined,
+    primary_required: state.primary_required ?? false, awaiting_input: state.awaiting_input ?? [],
     dispatcher: { configured_engine: config.dispatcher.engine ?? 'claude', route: config.dispatcher.fallback,
       running: state.dispatcher.attempt ? state.attempts[state.dispatcher.attempt].engine : null, wakes: state.dispatcher.wakes,
       last: state.dispatcher.last, claude_resting_until: state.dispatcher.claude_resting_until && new Date(state.dispatcher.claude_resting_until).toISOString() },
@@ -175,6 +176,15 @@ if (command === 'controller') {
   inbox(directory, { type: 'wake', note: flag('--note') ?? 'factory wake' });
   const session = controllerAlive(directory) ? undefined : resume(directory);
   console.log(JSON.stringify({ directory, woke: true, resumed_controller: session ?? null }));
+} else if (command === 'answer') {
+  const directory = runDirectory();
+  const task = flag('--task'), text = flag('--text');
+  if (!isNodeId(task) || typeof text !== 'string' || !text.trim() || text.length > 8000) throw Error('answer requires --task <task UUID> and nonempty --text (max 8000 characters)');
+  const state = readJson(join(directory, 'state.json'));
+  if (!state?.awaiting_input?.some(item => item.task === task)) throw Error(`No pending human-input question for task ${task}`);
+  inbox(directory, { type: 'answer', task, text });
+  const session = controllerAlive(directory) ? undefined : resume(directory);
+  console.log(JSON.stringify({ directory, task, answer_queued: true, resumed_controller: session ?? null }));
 } else if (command === 'stop') {
   const directory = runDirectory();
   if (!controllerAlive(directory)) console.log(JSON.stringify({ directory, stopped: true, note: 'no live controller' }));
