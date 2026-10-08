@@ -5,6 +5,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
+// A rejected submission belongs to one task: the controller keeps the evidence and the dispatcher retries.
+// Anything else that halts code work is shared-repo or configuration ambiguity and must stop admission.
+export class TaskFault extends Error {}
 export const sha = value => typeof value === 'string' && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(value);
 const text = value => typeof value === 'string' && value.length && !/[\x00-\x1f\x7f]/.test(value);
 const within = (path, root) => path === root || path.startsWith(root === '/' ? '/' : root + '/');
@@ -105,11 +108,15 @@ export async function worktreeIdentity(config, code, candidate) {
   if (candidate && (await git(code.worktree, 'rev-parse', 'HEAD') !== candidate ||
       await git(code.worktree, 'status', '--porcelain', '--untracked-files=all'))) throw Error('candidate changed or worktree is dirty');
 }
-export async function candidateIdentity(config, code, candidate, base) {
-  if (!sha(candidate) || !sha(base)) throw Error('candidate/base requires full SHA');
+export async function candidateIdentity(config, code, candidate, base, acceptedMain = base) {
+  if (!sha(candidate) || !sha(base) || !sha(acceptedMain)) throw Error('candidate/base/accepted main requires full SHA');
   await worktreeIdentity(config, code, candidate);
   await git(code.worktree, 'merge-base', '--is-ancestor', base, candidate);
-  const paths = (await git(code.worktree, 'diff', '--name-only', '--no-renames', '-z', base, candidate)).split('\0').filter(Boolean);
+  // Exclude only accepted history actually imported by this candidate, not newer unmerged main.
+  const comparison = await git(code.worktree, 'merge-base', '--all', candidate, acceptedMain);
+  if (!sha(comparison)) throw Error('candidate requires a single accepted-history merge base');
+  await git(code.worktree, 'merge-base', '--is-ancestor', base, comparison);
+  const paths = (await git(code.worktree, 'diff', '--name-only', '--no-renames', '-z', comparison, candidate)).split('\0').filter(Boolean);
   for (const path of paths) {
     if (!code.files.some(root => within(path, root)) || config.code.frozen_paths.some(root => within(path, root))) throw Error(`candidate violates file fence: ${path}`);
     // Symlink/gitlink publication is deliberately unsupported, not sandbox enforcement.
@@ -130,7 +137,10 @@ export async function runCodeChecks(config, code, kind, candidate, main, directo
       writeFileSync(path, JSON.stringify({ argv, cwd, candidate, main }) + '\n' + result.stdout + result.stderr);
     } catch (error) {
       writeFileSync(path, JSON.stringify({ argv, cwd, candidate, main }) + '\n' + (error.stdout ?? '') + (error.stderr ?? '') + String(error));
-      throw Error(`${kind} check failed; retained log: ${path}`);
+      // A candidate that fails its own gate is one bad item on the line. A main that fails after publication
+      // means accepted history is unverified, which stays a stop until the run can decide a revert.
+      throw kind === 'candidate' ? new TaskFault(`${kind} check failed; retained log: ${path}`)
+        : Error(`${kind} check failed; retained log: ${path}`);
     }
   }
   return logs;

@@ -239,6 +239,46 @@ test('unsafe repo/path/ref/check inputs and changed candidate are refused', asyn
   } finally { f.cleanup(); }
 });
 
+test('development fences exclude imported accepted history, not worker edits or unmerged main', async () => {
+  const f = fixture();
+  try {
+    const ctl = new ParallelController(f.directory, transport(f).deps);
+    await ctl.start();
+    const task = { ...order(A, 'oss'), code: { files: ['draft.txt'] } };
+    ctl.state.tasks[A] = task;
+    const code = G.allocation(f.config, task);
+    ctl.state.tasks[A].code = code;
+    await G.prepareCode(f.config, code);
+
+    writeFileSync(join(f.repo, 'shared.txt'), 'accepted sibling\n');
+    git(f.repo, 'add', 'shared.txt'); git(f.repo, 'commit', '-m', 'fixture: accepted sibling');
+    const accepted = git(f.repo, 'rev-parse', 'HEAD');
+    ctl.state.code_main = accepted; // Simulate the controller's previously checked main receipt.
+    git(code.worktree, 'merge', '--ff-only', accepted);
+    writeFileSync(join(code.worktree, 'draft.txt'), 'task contribution\n');
+    git(code.worktree, 'add', 'draft.txt'); git(code.worktree, 'commit', '-m', 'fixture: assigned draft');
+    const candidate = git(code.worktree, 'rev-parse', 'HEAD');
+    await ctl.codeOutcome({ task: A }, { kind: 'report', report: report(A, { ...code, candidate }, 'candidate') }, 1);
+    assert.equal(code.candidate, candidate);
+    assert.equal(code.phase, 'reconcile');
+    assert.deepEqual(await G.candidateIdentity(f.config, code, candidate, code.base, accepted), ['draft.txt']);
+
+    // Main can advance without being imported: absence of those newer bytes is not a worker edit.
+    writeFileSync(join(f.repo, 'shared.txt'), 'newer accepted sibling\n');
+    git(f.repo, 'add', 'shared.txt'); git(f.repo, 'commit', '-m', 'fixture: newer main');
+    const newer = git(f.repo, 'rev-parse', 'HEAD');
+    assert.deepEqual(await G.candidateIdentity(f.config, code, candidate, code.base, newer), ['draft.txt']);
+
+    writeFileSync(join(code.worktree, 'shared.txt'), 'unauthorized sibling edit\n');
+    git(code.worktree, 'add', 'shared.txt'); git(code.worktree, 'commit', '-m', 'fixture: unauthorized edit');
+    await assert.rejects(G.candidateIdentity(f.config, code, git(code.worktree, 'rev-parse', 'HEAD'), code.base, newer), /fence: shared.txt/);
+    git(code.worktree, 'restore', '--source', accepted, '--', 'shared.txt');
+    writeFileSync(join(code.worktree, 'law.txt'), 'weakened\n');
+    git(code.worktree, 'add', 'shared.txt', 'law.txt'); git(code.worktree, 'commit', '-m', 'fixture: frozen violation');
+    await assert.rejects(G.candidateIdentity(f.config, code, git(code.worktree, 'rev-parse', 'HEAD'), code.base, newer), /fence: law.txt/);
+  } finally { f.cleanup(); }
+});
+
 test('checked grant rejects stale candidate/main and changed gate config before publication', async () => {
   const f = fixture();
   try {
@@ -307,12 +347,15 @@ test('failed or candidate-mutating gates retain drafts/logs and never grant publ
       f.config.code.candidate_checks = [[process.execPath, '-e', script]];
       save(join(f.directory, 'config.json'), f.config);
       const t = transport(f), ctl = new ParallelController(f.directory, t.deps);
-      assert.equal(await ctl.run(), 'needs_attention');
-      assert.match(ctl.state.attention.reason, script.startsWith('process.exit') ? /check failed/ : /candidate changed|dirty/);
+      // A rejected candidate is one bad item on the line: the run keeps moving and the dispatcher decides.
+      assert.equal(await ctl.run(), 'idle');
+      assert.equal(ctl.state.attention, null);
+      assert.equal(ctl.state.tasks[A].status, 'errored');
       assert.equal(git(f.repo, 'rev-parse', 'HEAD'), f.code.main_head);
       assert.equal(t.launches.filter(l => l.code?.phase === 'publish').length, 0);
-      assert.ok(ctl.state.merge);
-      assert.ok(history(f.directory).some(row => row.type === 'code_attention'));
+      assert.equal(ctl.state.merge, null); // reservation released so other work can proceed
+      assert.ok(history(f.directory).some(row => row.type === 'candidate_rejected'));
+      assert.ok(!history(f.directory).some(row => row.type === 'code_attention'));
       const attempt = Object.values(ctl.state.attempts).find((a: any) => a.code?.phase === 'reconcile') as any;
       assert.ok(existsSync(join(attempt.dir, 'candidate-check-0.log')));
       assert.ok(existsSync(ctl.state.tasks[A].code.worktree));

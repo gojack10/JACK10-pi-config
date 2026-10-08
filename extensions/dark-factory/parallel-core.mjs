@@ -79,7 +79,7 @@ const parse = text => {
 export function validateDispatcherReport(text) {
   const r = parse(text);
   if (!r || typeof r !== 'object' || r.version !== 1 || r.role !== 'dispatcher') throw Error('report needs version 1 and role "dispatcher"');
-  if (!['tasks', 'done', 'blocked'].includes(r.disposition)) throw Error('disposition must be tasks, done or blocked');
+  if (!['tasks', 'setup', 'done', 'blocked'].includes(r.disposition)) throw Error('disposition must be tasks, setup, done or blocked');
   if (typeof r.summary !== 'string' || !r.summary.trim()) throw Error('summary must be a nonempty string');
   if (!Array.isArray(r.tasks)) throw Error('tasks must be an array');
   const seen = new Set();
@@ -97,14 +97,44 @@ export function validateDispatcherReport(text) {
       ...(task.seats ? { seats: [...new Set(task.seats)] } : {}),
       ...(task.code ? { code: { files: fileScope(task.code.files) } } : {}) };
   });
+  const blockers = (r.blockers ?? []).map((item, index) => {
+    if (!isNodeId(item?.node_id) || !['external', 'authority', 'platform'].includes(item.kind) ||
+        typeof item.required !== 'string' || !item.required.trim()) {
+      throw Error(`blockers[${index}] needs node_id, kind external|authority|platform and a required result`);
+    }
+    return { node_id: item.node_id, kind: item.kind, required: item.required.trim(),
+      ...(typeof item.evidence === 'string' && item.evidence.trim() ? { evidence: item.evidence.trim() } : {}) };
+  });
+  // A recovery request must survive validation: dropping it turns a factory-owned lifecycle repair into a human wake.
+  const recover = (r.recover ?? []).map((item, index) => {
+    if (!isNodeId(item?.node_id) || typeof item.reason !== 'string' || !item.reason.trim()) {
+      throw Error(`recover[${index}] needs node_id and the exact lifecycle reason`);
+    }
+    return { node_id: item.node_id, reason: item.reason.trim() };
+  });
+  const setup = r.setup === undefined ? null : (() => {
+    if (!isNodeId(r.setup.task) || !['propose', 'review'].includes(r.setup.action)) throw Error('setup needs a task UUID and action propose|review');
+    if (typeof r.setup.packet !== 'string' || !r.setup.packet.trim()) throw Error('setup needs the controller-assigned packet path');
+    if (r.setup.action === 'review' && !/^[0-9a-f]{64}$/.test(r.setup.proposal_hash ?? '')) throw Error('setup review needs the proposal hash it reviewed');
+    if (r.setup.action === 'review' && !['approve', 'revise', 'blocked'].includes(r.setup.verdict)) throw Error('setup review needs verdict approve|revise|blocked');
+    return { task: r.setup.task, action: r.setup.action, packet: r.setup.packet.trim(),
+      ...(r.setup.proposal_hash ? { proposal_hash: r.setup.proposal_hash } : {}),
+      ...(r.setup.verdict ? { verdict: r.setup.verdict } : {}) };
+  })();
   const report = {
     version: 1, role: 'dispatcher', disposition: r.disposition, summary: r.summary, tasks,
     stop_running: uuids(r.stop_running ?? [], 'stop_running'),
     updated_nodes: uuids(r.updated_nodes ?? [], 'updated_nodes'),
     questions_for_jack: strings(r.questions_for_jack ?? [], 'questions_for_jack'),
+    blockers, recover, ...(setup ? { setup } : {}),
   };
-  if (report.disposition !== 'tasks' && tasks.length) throw Error(`${report.disposition} requires an empty tasks list`);
-  if (report.disposition === 'blocked' && !report.questions_for_jack.length) throw Error('blocked requires questions_for_jack');
+  if (!['tasks'].includes(report.disposition) && tasks.length) throw Error(`${report.disposition} requires an empty tasks list`);
+  // A machine-owned condition is a blocker with an owner, not a question to Jack.
+  if (report.disposition === 'blocked' && !report.questions_for_jack.length && !blockers.length) {
+    throw Error('blocked requires a blocker with a required result or a genuine question for Jack');
+  }
+  if (report.disposition === 'setup' && !setup) throw Error('setup requires exactly one bounded proposal or review request');
+  if (setup && report.disposition !== 'setup') throw Error('a setup request requires disposition setup');
   return report;
 }
 
@@ -155,7 +185,7 @@ export function initialState(config, now) {
     seats: Object.fromEntries(config.seats.map(seat => [seat.id, { attempt: null, resting_until: null, launches: 0 }])),
     attempts: {},
     dispatcher: { attempt: null, last: null, failures: 0, wakes: 0, claude_resting_until: null, claude_skip: false },
-    stop: null, attention: null, fence: null,
+    stop: null, attention: null, awaiting_input: [], fence: null,
     ...(config.code ? { code_main: config.code.main_head, merge: null } : {}),
   };
 }
@@ -187,8 +217,16 @@ const ready = state => state.order.map(id => state.tasks[id])
   .sort((a, b) => Number(!!b.front) - Number(!!a.front));
 
 export function planAssignments(state, config, now) {
-  if (state.status !== 'running' || state.stop || state.attention) return [];
+  if (state.status !== 'running' || state.stop || state.attention || state.awaiting_input?.length) return [];
   if (['done', 'blocked'].includes(state.dispatcher.last?.disposition)) return [];
+  if (state.primary_required) {
+    const primary = config.seats.find(seat => seat.kind === 'oss');
+    if (!primary) return [];
+    const active = state.seats[primary.id]?.attempt;
+    const primaryRunning = active && state.attempts[active]?.status === 'running' && state.attempts[active]?.kind === 'worker';
+    const primaryReady = ready(state).some(task => !task.seats || task.seats.includes(primary.id));
+    if (!primaryRunning && !primaryReady) return [];
+  }
   const taken = Object.values(state.tasks).filter(task => task.status === 'running').map(task => task.scope);
   const candidates = ready(state), assignments = [];
   for (const seat of config.seats) {
@@ -207,7 +245,7 @@ export function planAssignments(state, config, now) {
 export function ossIdle(state, config, now, assignments) {
   const oss = config.seats.find(seat => seat.kind === 'oss');
   if (!oss || state.oss_idle_emitted || state.wake || state.dispatcher.attempt) return false;
-  if (state.status !== 'running' || state.stop || state.attention) return false;
+  if (state.status !== 'running' || state.stop || state.attention || state.awaiting_input?.length) return false;
   if (!seatFree(state, oss.id, now) || assignments.some(a => a.seat === oss.id)) return false;
   state.oss_idle_emitted = true;
   addEvent(state, { type: 'oss_idle', seat: oss.id }, now);
@@ -255,6 +293,10 @@ export function finishWorker(state, id, outcome, now) {
   const seat = state.seats[attempt.seat];
   Object.assign(attempt, { status: 'finished', finished_at: now, outcome: outcomeRecord(outcome) });
   if (seat.attempt === id) seat.attempt = null;
+  // The stop being honoured here belongs to this attempt only. Left on the task it would stop the
+  // replacement attempt the instant it started, which is not a new operator request.
+  const stop = task.stop_requested;
+  delete task.stop_requested;
   if (outcome.kind === 'provider_failure') {
     // A provider that keeps failing after Pi's own retries is unavailable capacity, not task work.
     // Bounded per task so a task that itself breaks providers still reaches the dispatcher.
@@ -280,7 +322,7 @@ export function finishWorker(state, id, outcome, now) {
   const report = outcome.report;
   task.last_report = outcome.reportPath;
   if (report.disposition === 'candidate') {
-    task.status = task.stop_requested === 'obsolete' ? 'stopped' : 'merge_queued';
+    task.status = stop === 'obsolete' ? 'stopped' : 'merge_queued';
     task.previous = outcome.reportPath;
     if (task.status !== 'stopped') addEvent(state, { type: 'task_candidate', task: task.node_id, seat: attempt.seat, report: outcome.reportPath }, now);
   } else if (report.disposition === 'worked') {
@@ -289,12 +331,12 @@ export function finishWorker(state, id, outcome, now) {
   } else if (report.disposition === 'blocked') {
     task.status = 'blocked';
     addEvent(state, { type: 'task_blocked', task: task.node_id, seat: attempt.seat, report: outcome.reportPath }, now);
-  } else if (task.stop_requested === 'obsolete') {
+  } else if (stop === 'obsolete') {
     task.status = 'stopped';
     task.previous = outcome.reportPath;
   } else {
     task.previous = outcome.reportPath;
-    if (task.stop_requested === 'operator') {
+    if (stop === 'operator') {
       // An operator stop is not a friendly stop: keep the continuation for resume without counting it.
       task.status = 'queued';
       task.front = true;
@@ -309,7 +351,6 @@ export function finishWorker(state, id, outcome, now) {
       }
     }
   }
-  delete task.stop_requested;
   return {};
 }
 
@@ -355,7 +396,11 @@ export function finishDispatcher(state, id, outcome, now, rejected = new Map()) 
     effects.accepted.push(listed.node_id);
   }
   for (const node of report.stop_running) {
-    if (state.tasks[node]?.status === 'running') { state.tasks[node].stop_requested = 'obsolete'; effects.stop.push(node); }
+    const task = state.tasks[node];
+    if (task?.status === 'running') { task.stop_requested = 'obsolete'; effects.stop.push(node); }
+    else if (task && task.status !== 'worked' && state.merge?.task !== node && (!task.code || task.code.phase === 'develop')) {
+      task.status = 'stopped'; task.stop_requested = 'obsolete'; effects.stop.push(node);
+    }
   }
   d.last = { disposition: report.disposition, at: now, attempt: id };
   // A report whose every task was refused cannot make progress on its own; count it toward attention.

@@ -55,6 +55,23 @@ test('dispatcher reports follow the role-node schema', () => {
   assert.throws(() => validateDispatcherReport('not json'), /not valid JSON/);
 });
 
+test('dispatcher cancellation stops inactive obsolete work without erasing landed work or merge grants', () => {
+  const s = initialState(config(), 0);
+  s.tasks[id(1)] = { node_id: id(1), status: 'errored', code: { phase: 'develop', worktree: '/retained', candidate: null } };
+  s.tasks[id(2)] = { node_id: id(2), status: 'worked' };
+  s.tasks[id(3)] = { node_id: id(3), status: 'merge_queued', code: { phase: 'publish' } };
+  s.merge = { task: id(3), candidate: 'retained grant' };
+  const attempt = startAttempt(s, { kind: 'dispatcher', engine: 'fallback', events: [] });
+  const outcome = dispatched([]);
+  outcome.report.stop_running = [id(1), id(2), id(3)];
+  assert.deepEqual(finishDispatcher(s, attempt.id, outcome, 1).stop, [id(1)]);
+  assert.equal(s.tasks[id(1)].status, 'stopped');
+  assert.equal(s.tasks[id(1)].code.worktree, '/retained');
+  assert.equal(s.tasks[id(2)].status, 'worked');
+  assert.equal(s.tasks[id(3)].status, 'merge_queued');
+  assert.equal(s.merge.candidate, 'retained grant');
+});
+
 test('worker reports follow the role-node schema', () => {
   const dir = mkdtempSync(join(tmpdir(), 'pf-worker-'));
   try {
@@ -99,6 +116,42 @@ test('seat filling is OSS first, dependency-aware and keeps write scopes disjoin
   ]), 1);
   const plan = planAssignments(s, c, 2);
   assert.deepEqual(plan, [{ seat: 'oss', task: id(1) }, { seat: 'codex-1', task: id(2) }, { seat: 'codex-2', task: id(3) }]);
+});
+
+test('mandatory primary blocks additional-seat-only admission and permits parallel work when primary is active', () => {
+  const c = config(), s = initialState(c, 0);
+  s.primary_required = true;
+  Object.assign(s.scopes, scopes(id(1), id(2)));
+  const task = (node: string, seat: string) => ({ node_id: node, status: 'queued', depends_on: [], scope: node, seats: [seat], attempts: [] });
+  s.tasks[id(1)] = task(id(1), 'codex-1');
+  s.order.push(id(1));
+  assert.deepEqual(planAssignments(s, c, 1), [], 'Sol-only work cannot start without active primary work or recovery');
+
+  s.tasks[id(2)] = task(id(2), 'oss');
+  s.order.push(id(2));
+  assert.deepEqual(planAssignments(s, c, 2), [{ seat: 'oss', task: id(2) }, { seat: 'codex-1', task: id(1) }]);
+
+  s.tasks[id(2)].status = 'running';
+  s.seats.oss.attempt = 'primary-attempt';
+  s.attempts['primary-attempt'] = { id: 'primary-attempt', kind: 'worker', status: 'running', task: id(2), seat: 'oss' };
+  assert.deepEqual(planAssignments(s, c, 3), [{ seat: 'codex-1', task: id(1) }], 'Sol can supplement an active primary task');
+});
+
+test('mandatory primary blocks Sol-only plans until OSS has real work', () => {
+  const c = config(), s = initialState(c, 0);
+  s.primary_required = true;
+  Object.assign(s.scopes, scopes(id(1), id(2)));
+  const task = (node: string, seat: string) => ({ node_id: node, status: 'queued', depends_on: [], scope: node, seats: [seat], attempts: [] });
+  s.tasks[id(1)] = task(id(1), 'codex-1');
+  s.order.push(id(1));
+  assert.deepEqual(planAssignments(s, c, 1), []);
+  s.tasks[id(2)] = task(id(2), 'oss');
+  s.order.push(id(2));
+  assert.deepEqual(planAssignments(s, c, 2), [{ seat: 'oss', task: id(2) }, { seat: 'codex-1', task: id(1) }]);
+  s.tasks[id(2)].status = 'running';
+  s.seats.oss.attempt = 'primary-attempt';
+  s.attempts['primary-attempt'] = { id: 'primary-attempt', kind: 'worker', status: 'running', task: id(2), seat: 'oss' };
+  assert.deepEqual(planAssignments(s, c, 3), [{ seat: 'codex-1', task: id(1) }]);
 });
 
 test('worker outcomes: worked, continue handoff, third continue, usage-limit rest and requeue', () => {
@@ -177,6 +230,57 @@ test('rejected tasks never enter the queue; stop_running marks running tasks obs
   assert.equal(s.tasks[id(1)].stop_requested, 'obsolete');
   finishWorker(s, w.id, { kind: 'report', report: { disposition: 'continue' }, reportPath: '/r/c.json' }, 3);
   assert.equal(s.tasks[id(1)].status, 'stopped');
+});
+
+test('dispatcher reports separate factory-owned blockers, recovery requests and setup work from human questions', () => {
+  const base = { version: 1, role: 'dispatcher', summary: 'x', tasks: [], stop_running: [], updated_nodes: [] };
+  const report = (extra: any) => JSON.stringify({ ...base, ...extra });
+  // A machine condition is owned work, not a question for Jack.
+  const blocked = validateDispatcherReport(report({ disposition: 'blocked',
+    blockers: [{ node_id: id(1), kind: 'platform', required: 'restore the pinned runner', evidence: 'gate log' }] }));
+  assert.equal(blocked.blockers[0].kind, 'platform');
+  assert.deepEqual(blocked.questions_for_jack, []);
+  assert.throws(() => validateDispatcherReport(report({ disposition: 'blocked' })), /blocker with a required result or a genuine question/);
+  assert.throws(() => validateDispatcherReport(report({ disposition: 'blocked', blockers: [{ node_id: id(1), kind: 'hard', required: 'x' }] })), /kind external\|authority\|platform/);
+  // A dropped recovery field previously turned a lifecycle repair into a human wake.
+  assert.deepEqual(validateDispatcherReport(report({ disposition: 'tasks', recover: [{ node_id: id(1), reason: 'resume retained draft' }] })).recover,
+    [{ node_id: id(1), reason: 'resume retained draft' }]);
+  // Setup is one bounded proposal or review, and a review must bind the bytes it reviewed.
+  const proposed = validateDispatcherReport(report({ disposition: 'setup', setup: { task: id(1), action: 'propose', packet: '/run/staging/1.json' } }));
+  assert.equal(proposed.setup.action, 'propose');
+  assert.throws(() => validateDispatcherReport(report({ disposition: 'setup' })), /one bounded proposal or review/);
+  assert.throws(() => validateDispatcherReport(report({ disposition: 'setup', setup: { task: id(1), action: 'review', packet: '/r' } })), /proposal hash/);
+  assert.throws(() => validateDispatcherReport(report({ disposition: 'tasks', setup: { task: id(1), action: 'propose', packet: '/r' } })), /requires disposition setup/);
+  assert.throws(() => validateDispatcherReport(report({ disposition: 'setup', tasks: [{ node_id: id(1), depends_on: [], scope: id(1) }],
+    setup: { task: id(1), action: 'propose', packet: '/r' } })), /requires an empty tasks list/);
+});
+
+test('a stop consumed by one attempt cannot stop its replacement', () => {
+  const c = config(), s = initialState(c, 0);
+  Object.assign(s.scopes, scopes(id(1)));
+  finishDispatcher(s, startAttempt(s, { kind: 'dispatcher', engine: 'claude', events: [] }).id,
+    dispatched([{ node_id: id(1), depends_on: [], scope: id(1) }]), 1);
+  const settle = (outcome: any, at: number) => {
+    const attempt = startAttempt(s, { kind: 'worker', seat: 'oss', seat_kind: 'oss', task: id(1) });
+    s.tasks[id(1)].stop_requested = 'operator';
+    return { attempt, settled: finishWorker(s, attempt.id, outcome, at) };
+  };
+  // The observed incident: an operator stop landed as an error, and its flag stopped the next attempt.
+  settle({ kind: 'error', summary: 'cancelled: execution interrupted by Escape' }, 2);
+  assert.equal(s.tasks[id(1)].status, 'errored');
+  assert.equal(s.tasks[id(1)].stop_requested, undefined, 'error settlement leaked the consumed stop');
+  settle({ kind: 'usage_limit', resetAt: 9 }, 10);
+  assert.equal(s.tasks[id(1)].status, 'queued');
+  assert.equal(s.tasks[id(1)].stop_requested, undefined, 'capacity requeue leaked the consumed stop');
+  settle({ kind: 'report', report: { disposition: 'continue' }, reportPath: '/r/continue.json' }, 20);
+  assert.equal(s.tasks[id(1)].status, 'queued');
+  assert.equal(s.tasks[id(1)].stop_requested, undefined, 'friendly stop leaked the consumed stop');
+  // Obsolete cancellation still decides this settlement, then goes away.
+  const cancelled = startAttempt(s, { kind: 'worker', seat: 'oss', seat_kind: 'oss', task: id(1) });
+  s.tasks[id(1)].stop_requested = 'obsolete';
+  finishWorker(s, cancelled.id, { kind: 'report', report: { disposition: 'candidate' }, code: {}, reportPath: '/r/cand.json' }, 30);
+  assert.equal(s.tasks[id(1)].status, 'stopped');
+  assert.equal(s.tasks[id(1)].stop_requested, undefined);
 });
 
 test('repeated provider failures rest seats and requeue, then reach the dispatcher on the third', () => {
