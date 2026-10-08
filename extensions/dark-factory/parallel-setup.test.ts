@@ -22,11 +22,12 @@ const review = { sources_read: [NODE], challenges: [{ input: { rows: [1, 2] }, e
 function ready() { return realpathSync(mkdtempSync(join(tmpdir(), 'factory-setup-'))); }
 
 // The controller supplies its own runtime directory; use the same shape the code tests use.
-function controller(directory) {
+function controller(directory, revisions = new Map()) {
   const config = P.buildConfig({ runNode: RUN, owner: OWNER, cwd: directory, directory, overrides: { codex_seats: 1 } });
   mkdirSync(join(directory, 'attempts'), { recursive: true });
   writeFileSync(join(directory, 'config.json'), JSON.stringify(config));
-  const ctl = new ParallelController(directory, { now: () => 1000, sleep: async () => {}, primaryRequired: async () => false });
+  const ctl = new ParallelController(directory, { now: () => 1000, sleep: async () => {}, primaryRequired: async () => false,
+    revisions: async () => revisions });
   ctl.state = P.initialState(config, 1000);
   return ctl;
 }
@@ -145,5 +146,45 @@ test('recovery resumes only provably quiet assignments', async () => {
     const refused = ctl.state.pending_events.filter(event => event.type === 'recovery_refused').map(event => event.task);
     assert.equal(refused.length, 7, 'every unsafe or unknown recovery is refused with a reason');
     assert.ok(ctl.state.pending_events.some(event => event.type === 'task_requeued' && event.task === TASK));
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('a moved governing clause invalidates the packet that cited the old revision', async () => {
+  const directory = ready();
+  try {
+    const current = new Map([[NODE, '2026-10-08T09:00:00+00:00']]);
+    const ctl = controller(directory, current);
+    await propose(ctl, packet());
+    const pending = ctl.state.setup;
+    const reviewer = P.startAttempt(ctl.state, { kind: 'dispatcher', engine: 'fallback', events: [] });
+    reviewer.dir = join(ctl.dir, 'attempts', 'review-drift'); mkdirSync(reviewer.dir, { recursive: true });
+    reviewer.setup_packet = join(reviewer.dir, 'setup-packet.json'); reviewer.receipt = { session_id: 'reviewer-drift' };
+    writeFileSync(reviewer.setup_packet, JSON.stringify(review));
+    await ctl.setupTransition(reviewer, { task: TASK, action: 'review', packet: reviewer.setup_packet, proposal_hash: pending.proposal_hash, verdict: 'approve' }, 6000);
+    assert.equal(ctl.state.checks[pending.check], undefined, 'a packet citing a moved clause must not register');
+    const drift = ctl.state.pending_events.find(event => event.type === 'spec_drift');
+    assert.equal(drift.sources[0].node, NODE);
+    assert.equal(drift.sources[0].current, '2026-10-08T09:00:00+00:00');
+    assert.match(drift.note, /newest clause wins/);
+    assert.ok(ctl.state.wake, 'drift must wake a fresh dispatcher to re-derive, not park the run');
+
+    // A registered check also stops being admissible once its clause moves again.
+    current.clear();
+    const fresh = controller(directory, new Map());
+    await propose(fresh, packet());
+    const other = P.startAttempt(fresh.state, { kind: 'dispatcher', engine: 'fallback', events: [] });
+    other.dir = join(fresh.dir, 'attempts', 'review-ok'); mkdirSync(other.dir, { recursive: true });
+    other.setup_packet = join(other.dir, 'setup-packet.json'); other.receipt = { session_id: 'reviewer-ok' };
+    writeFileSync(other.setup_packet, JSON.stringify(review));
+    await fresh.setupTransition(other, { task: TASK, action: 'review', packet: other.setup_packet, proposal_hash: fresh.state.setup.proposal_hash, verdict: 'approve' }, 7000);
+    const id = fresh.state.setup === null ? Object.keys(fresh.state.checks)[0] : null;
+    assert.ok(id, 'unchanged sources still register');
+    fresh.state.tasks[TASK] = { node_id: TASK, scope: TASK, status: 'errored', depends_on: [], continues: 0, attempts: [], checks: [id] };
+    const moved = new Map([[NODE, '2026-10-09T00:00:00+00:00']]);
+    fresh.deps.revisions = async () => moved;
+    fresh.deps.ancestors = async () => new Map([[TASK, [OWNER, RUN, TASK]], [NODE, [NODE]]]);
+    const rejected = await fresh.vetTasks({ tasks: [{ node_id: TASK, scope: TASK, depends_on: [], checks: [id] }] });
+    assert.match(rejected.get(TASK), /sources drifted/);
+    assert.ok(fresh.state.pending_events.some(event => event.type === 'spec_drift' && event.task === TASK));
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
