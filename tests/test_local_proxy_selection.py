@@ -78,7 +78,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         for mid in ("typo", "", None, [], "qwen", p.DS4_FLASH_MODEL_ID, p.DS4_PRO_MODEL_ID):
             with self.assertRaises(p.web.HTTPBadRequest):
                 p.get_backend_name(mid)
-        self.assertEqual(p.ds4_static_model(p.QWEN_NEXT_MODEL_ID)["context_length"], 500000)
+        self.assertEqual(p.ds4_static_model(p.QWEN_NEXT_MODEL_ID)["context_length"], 750000)
         self.assertEqual(p.ds4_static_model(p.GLM_FLASH_MODEL_ID)["context_length"], 500000)
         body = json.dumps({"model": p.QWEN_NEXT_MODEL_ID, "reasoning_effort": "xhigh"}).encode()
         self.assertEqual(p.maybe_prepare_chat_body("ds4", body), body)
@@ -563,7 +563,7 @@ class WrapperTests(unittest.TestCase):
             home = Path(directory)
             (home / '.dsv4').mkdir()
             script = 'mock_exec() { printf "%s\\n" "$@"; exit 0; }\n' + source.replace('HOME_DIR="/Users/jack"', f'HOME_DIR="{home}"').replace('exec "', 'mock_exec "')
-            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '500000'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
+            for mode, model, ctx in [('qwen', 'qwen3.8-flash-next', '750000'), ('ds41', 'deepseek-v4.1-flash', '1000000')]:
                 (home / '.dsv4/desired-model').write_text(mode)
                 result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True, check=True)
                 args = result.stdout.splitlines()
@@ -574,7 +574,16 @@ class WrapperTests(unittest.TestCase):
                 if mode == 'qwen':
                     self.assertNotIn('--ssd-streaming', args)
                     self.assertEqual(args[0], str(home / 'ds4/ds4-server'))
-                    self.assertIn('export DS4_QWEN4_YARN_FACTOR=2', source)
+                    self.assertIn('export DS4_QWEN4_YARN_FACTOR=4', source)
+                    import managed_switch
+                    self.assertIn('--ctx ' + ctx, managed_switch.MODELS[model]['args'])
+                    metadata = load_proxy().DS4_MODEL_METADATA[model]
+                    self.assertEqual(metadata['context_length'], int(ctx))
+                    self.assertEqual(metadata['max_completion_tokens'], int(ctx))
+                    models = json.loads((SOURCE.parent / 'models.json').read_text())
+                    pi_model = next(m for m in models['providers']['local']['models'] if m['id'] == model)
+                    self.assertEqual(pi_model['contextWindow'], int(ctx))
+                    self.assertEqual(pi_model['maxTokens'], int(ctx))
                     self.assertIn(str(home / 'projects/ds4/gguf/Qwen3.8-Flash-Next-Q4.gguf'), args)
                     # V4.1 steering is model-bound; Qwen must never receive DS41DIR flags.
                     self.assertNotIn('--dir-steering-file', args)
