@@ -67,6 +67,8 @@ export class ParallelController {
       const previous = this.state.status;
       // Resume means the operator handled whatever stopped the run.
       Object.assign(this.state, { status: 'running', stop: null, attention: null, error: undefined });
+      // A stop consumed by the previous controller must not stop a fresh attempt after resume/crash.
+      for (const task of Object.values(this.state.tasks)) delete task.stop_requested;
       this.state.dispatcher.failures = 0;
       this.log('controller_resumed', { previous, pid: process.pid });
       await this.readopt(now);
@@ -76,6 +78,12 @@ export class ParallelController {
       this.log('controller_started', { pid: process.pid, run_node: this.config.run_node, owner: this.config.owner,
         seats: this.config.seats, dispatcher: this.config.dispatcher, readonly_repos: this.config.readonly_repos, faults: this.config.faults });
     }
+    const primaryRequired = await this.deps.primaryRequired?.(this.config.run_node) ?? false;
+    if (this.state.primary_required === true && !primaryRequired) {
+      this.state.attention ??= { reason: 'mandatory primary-seat authority disappeared from RUN; operator must reconcile before admission', at: now };
+    }
+    this.state.primary_required = primaryRequired;
+    if (primaryRequired && !this.state.seats.oss.attempt) this.state.oss_idle_emitted = false;
     if (this.state.code_pin && (!this.config.code || this.state.code_pin !== G.codePin(this.config))) {
       this.codeAttention('code configuration removed/changed; acceptance/ownership must not be weakened', now);
       this.flushEvents();
@@ -130,11 +138,17 @@ export class ParallelController {
 
   async tick() {
     const now = this.deps.now();
-    this.readInbox(now);
+    await this.readInbox(now);
     this.endRests(now);
     await this.requestStops(now);
     for (const attempt of P.running(this.state)) {
       if (attempt.status !== 'running') continue;
+      if (attempt.awaiting_input) {
+        if (!(await this.alive(attempt, attempt.receipt.session_label, now))) {
+          await this.settle(attempt, { kind: 'error', summary: 'worker transport lost while awaiting human input; retain draft and verify background-work drain before retry' }, now);
+        }
+        continue;
+      }
       // Do not sample main mid-publication. Settled sibling code reports wait for the grant holder.
       const publisher = this.state.merge?.task;
       if (publisher && publisher !== attempt.task && this.state.tasks[publisher]?.code.phase === 'publish' &&
@@ -147,7 +161,7 @@ export class ParallelController {
     const assignments = P.planAssignments(this.state, this.config, now);
     for (const assignment of assignments) this.launchWorker(assignment, now);
     P.ossIdle(this.state, this.config, now, assignments);
-    if (this.state.wake && !this.state.dispatcher.attempt && this.state.status === 'running' && !this.state.stop && !this.state.attention) {
+    if (this.state.wake && !this.state.dispatcher.attempt && this.state.status === 'running' && !this.state.stop && !this.state.attention && !(this.state.awaiting_input?.length)) {
       this.launchDispatcher(now);
     }
     this.flushEvents();
@@ -171,7 +185,7 @@ export class ParallelController {
     }
   }
 
-  readInbox(now) {
+  async readInbox(now) {
     const inbox = join(this.dir, 'inbox');
     if (!existsSync(inbox)) return;
     for (const name of readdirSync(inbox).filter(name => name.endsWith('.json')).sort()) {
@@ -181,8 +195,56 @@ export class ParallelController {
       rmSync(path, { force: true });
       if (command.type === 'wake') P.addEvent(this.state, { type: 'human_wake', note: command.note ?? 'factory wake' }, now);
       else if (command.type === 'stop') this.state.stop = { requested: now, now: !!command.now };
-      this.log('inbox', { command });
+      else if (command.type === 'answer') await this.answerWorker(command, now);
+      this.log('inbox', { command: command.type === 'answer' ? { type: command.type, task: command.task, text: '[redacted]' } : { command } });
     }
+  }
+
+  async answerWorker(command, now) {
+    const pending = this.state.awaiting_input?.find(item => item.task === command.task);
+    if (!pending || typeof command.text !== 'string' || !command.text.trim()) {
+      this.log('worker_input_rejected', { task: command.task, reason: 'no matching pending question or empty answer' });
+      return;
+    }
+    const attempt = this.state.attempts[pending.attempt];
+    if (!attempt || attempt.status !== 'running' || !attempt.awaiting_input || !this.deps.followupPi) {
+      this.log('worker_input_rejected', { task: command.task, attempt: pending.attempt, reason: 'saved worker cannot be safely continued' });
+      return;
+    }
+    const resume = (attempt.resume_count ?? 0) + 1;
+    attempt.resume_count = resume;
+    const dir = join(attempt.dir, `input-${resume}`);
+    mkdirSync(dir, { recursive: true });
+    const report = join(dir, 'report.json');
+    const codePath = attempt.code ? join(dir, 'code.json') : undefined;
+    if (codePath) save(codePath, { ...this.config.code, ...attempt.code, task: attempt.task, seat: attempt.seat,
+      merge: this.state.merge?.task === attempt.task ? this.state.merge : null });
+    const mission = join(dir, 'mission.md');
+    const input = command.text.trim();
+    const prompt = P.workerPrompt({ role: this.config.roles.worker, run: this.config.run_node, task: attempt.task,
+      report, previous: attempt.report, artifacts: join(this.dir, 'artifacts', attempt.task), code: codePath });
+    writeFileSync(mission, `${prompt}\nPending question:\n${pending.question}\n\nHuman answer (applies only to this task; preserve all existing RUN authority):\n${input}\n`);
+    const policy = this.deps.writePolicy(dir, { report, route: attempt.route, role: 'worker', code: attempt.code });
+    try {
+      const receipt = await this.deps.followupPi({ label: attempt.receipt.session_label, route: attempt.route, missionFile: mission,
+        reportFile: report, extensionFiles: [policy], cwd: attempt.code?.worktree ?? this.config.cwd,
+        job: attempt.receipt.job, sessionId: attempt.receipt.session_id });
+      if (!['running', 'start_timeout', 'queued'].includes(receipt?.status)) throw Error(`follow-up did not start: ${receipt?.status ?? 'no receipt'}`);
+      const oldAttempt = attempt.receipt.attempt_id;
+      attempt.previous_report = attempt.report;
+      attempt.report = report;
+      attempt.dir = dir;
+      attempt.receipt = receipt;
+      attempt.resume_count = resume;
+      delete attempt.awaiting_input;
+      this.state.awaiting_input = this.state.awaiting_input.filter(item => item.attempt !== pending.attempt);
+      this.log('worker_input_accepted', { task: attempt.task, attempt: attempt.id, previous_transport_attempt: oldAttempt,
+        transport_attempt: receipt.attempt_id, resume, report });
+    } catch (error) {
+      pending.error = String(error);
+      this.log('worker_input_followup_failed', { task: attempt.task, attempt: attempt.id, error: String(error) });
+    }
+    this.persist();
   }
 
   endRests(now) {
@@ -290,7 +352,7 @@ export class ParallelController {
   }
 
   async advanceMerge(now) {
-    if (!this.config.code || this.state.stop || this.state.attention || this.state.status !== 'running' ||
+    if (!this.config.code || this.state.stop || this.state.attention || this.state.awaiting_input?.length || this.state.status !== 'running' ||
         ['done', 'blocked'].includes(this.state.dispatcher.last?.disposition)) return;
     try {
       if (this.state.merge && this.state.tasks[this.state.merge.task]?.status === 'running') return;
@@ -332,20 +394,24 @@ export class ParallelController {
       return;
     }
     const r = outcome.report, identity = r.code;
-    if (!identity || identity.worktree !== code.worktree || identity.branch !== code.branch || identity.base !== code.base) throw Error('worker report does not match owned worktree/branch/base');
-    await G.worktreeIdentity(this.config, code);
+    // Rejection of this worker's own submission is a task outcome: evidence retained, dispatcher retries.
+    const taskFault = async (work) => { try { return await work; } catch (error) { throw error instanceof G.TaskFault ? error : new G.TaskFault(String(error.message ?? error)); } };
+    if (!identity || identity.worktree !== code.worktree || identity.branch !== code.branch || identity.base !== code.base) {
+      throw new G.TaskFault('worker report does not match owned worktree/branch/base');
+    }
+    await taskFault(G.worktreeIdentity(this.config, code));
     if (['continue', 'blocked'].includes(r.disposition)) {
       await this.codeMainCheck();
       code.draft_head = await G.git(code.worktree, 'rev-parse', 'HEAD');
-      if (identity.candidate && identity.candidate !== code.draft_head) throw Error('checkpoint candidate differs from retained draft HEAD');
+      if (identity.candidate && identity.candidate !== code.draft_head) throw new G.TaskFault('checkpoint candidate differs from retained draft HEAD');
       return; // Retain dirty/untracked drafts, candidate, phase and exact next action.
     }
     if (code.phase !== 'publish') {
-      if (r.disposition !== 'candidate') throw Error('code development/reconciliation must return candidate, not worked');
+      if (r.disposition !== 'candidate') throw new G.TaskFault('code development/reconciliation must return candidate, not worked');
       const base = code.phase === 'reconcile' ? this.state.merge?.main : code.base;
-      if (!base || (code.phase === 'reconcile' && identity.main !== base)) throw Error('reconcile report requires the exact reserved main SHA');
+      if (!base || (code.phase === 'reconcile' && identity.main !== base)) throw new G.TaskFault('reconcile report requires the exact reserved main SHA');
       await this.codeMainCheck();
-      await G.candidateIdentity(this.config, code, identity.candidate, base);
+      await taskFault(G.candidateIdentity(this.config, code, identity.candidate, base, this.state.code_main));
       if (code.candidate) await G.git(code.worktree, 'merge-base', '--is-ancestor', code.candidate, identity.candidate);
       code.candidate = identity.candidate;
       if (task.stop_requested === 'obsolete') return;
@@ -354,7 +420,7 @@ export class ParallelController {
         this.persist();
         const checks = await G.runCodeChecks(this.config, code, 'candidate', code.candidate, base, attempt.dir);
         await this.codeMainCheck();
-        await G.candidateIdentity(this.config, code, code.candidate, base);
+        await taskFault(G.candidateIdentity(this.config, code, code.candidate, base));
         this.state.merge.checks = checks;
         code.phase = 'publish';
         this.log('candidate_checked', { task: task.node_id, ...this.state.merge });
@@ -455,6 +521,16 @@ export class ParallelController {
       result = await this.deps.piOutcome(attempt.receipt) ??
         { status: 'failed', source: 'transport', summary: 'tmux session disappeared without a durable outcome' };
     }
+    if (result.status === 'needs_input') {
+      attempt.awaiting_input = { at: now, question: result.summary };
+      this.state.awaiting_input ??= [];
+      const existing = this.state.awaiting_input.find(item => item.attempt === attempt.id);
+      const pending = { task: attempt.task, attempt: attempt.id, seat: attempt.seat, question: result.summary, at: now };
+      if (existing) Object.assign(existing, pending); else this.state.awaiting_input.push(pending);
+      this.log('worker_needs_input', pending);
+      this.persist();
+      return;
+    }
     let outcome;
     if (result.status === 'failed') {
       const limit = P.usageLimit(result.summary, now);
@@ -513,9 +589,19 @@ export class ParallelController {
     }
     const rejected = attempt.kind === 'dispatcher' && outcome.kind === 'report' ? await this.vetTasks(outcome.report) : new Map();
     if (attempt.kind === 'worker') {
+      this.state.awaiting_input = (this.state.awaiting_input ?? []).filter(item => item.attempt !== attempt.id);
+      delete attempt.awaiting_input;
       try { await this.codeOutcome(attempt, outcome, now); }
       catch (error) {
-        this.codeAttention(String(error), now);
+        if (error instanceof G.TaskFault) {
+          // One bad item: reject it, keep the draft/evidence, free the reservation, and let the dispatcher decide.
+          if (this.state.merge?.task === attempt.task) {
+            this.state.tasks[attempt.task].code.phase = 'reconcile';
+            this.log('merge_released', { task: attempt.task, reason: 'candidate rejected before publication grant' });
+            this.state.merge = null;
+          }
+          this.log('candidate_rejected', { attempt: attempt.id, task: attempt.task, reason: String(error.message ?? error) });
+        } else this.codeAttention(String(error), now);
         outcome = { kind: 'error', summary: String(error) };
       }
     }
@@ -568,6 +654,17 @@ export class ParallelController {
           G.vetCodeTask(task, this.config, this.state.tasks[task.node_id]);
           this.state.scopes[task.scope] = scope;
         } catch (error) { rejected.set(task.node_id, error.message); }
+      }
+    }
+    if (this.state.primary_required) {
+      const primary = this.config.seats.find(seat => seat.kind === 'oss');
+      const active = primary && this.state.seats[primary.id]?.attempt;
+      const primaryRunning = active && this.state.attempts[active]?.status === 'running';
+      const primaryOrder = primary && report.tasks.some(task => !rejected.has(task.node_id) && (!task.seats || task.seats.includes(primary.id)));
+      if (!primary || (!primaryRunning && !primaryOrder)) {
+        for (const task of report.tasks) if (!rejected.has(task.node_id)) {
+          rejected.set(task.node_id, 'RUN requires an active OSS primary contribution; do not admit Sol-only work');
+        }
       }
     }
     const listed = new Set(report.tasks.map(task => task.node_id));

@@ -19,7 +19,10 @@ const CLAUDE = join(homedir(), '.local/bin/claude');
 // One pre-trusted, otherwise empty directory: dispatchers load no project memory or CLAUDE.md from it.
 export const CLAUDE_CWD = join(homedir(), '.pi/agent/factory-runs/parallel/claude-dispatcher');
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-const PAUSED = /paused for context|needs input|maintenance error|human maintenance/;
+const noticeFor = (receipt: any, text: string) => text.includes(receipt.job) &&
+  (!receipt.attempt_id || text.includes(receipt.attempt_id));
+const NEEDS_INPUT = /needs human input:/i;
+const PAUSED = /paused for context|maintenance error|human maintenance/;
 
 const tmux = async (args: string[]) => {
   try { return { code: 0, stdout: (await exec('tmux', args)).stdout }; }
@@ -76,6 +79,10 @@ export default function (pi: ExtensionAPI) {
       const deps = {
         now: () => Date.now(),
         sleep: (ms: number) => new Promise(resolve => setTimeout(resolve, ms)),
+        primaryRequired: async (runNode: string) => {
+          const node = await exec(SIFTTEXT, ['get_node', `node_id=${runNode}`], { maxBuffer: 16 * 1024 * 1024 });
+          return node.stdout.includes('Qwen participation is mandatory throughout active factory work.');
+        },
         writePolicy: (dir: string, policy: unknown) => {
           const path = join(dir, 'policy.ts');
           writeFileSync(path, `import { installParallelGuard } from ${JSON.stringify(join(here, 'parallel-guard.ts'))};\nexport default pi => installParallelGuard(pi, ${JSON.stringify(policy)});\n`);
@@ -87,12 +94,20 @@ export default function (pi: ExtensionAPI) {
           own.add(launched.batch_id);
           return { ...launched.jobs[0], batch_id: launched.batch_id };
         }),
+        followupPi: ({ label, route, missionFile, reportFile, extensionFiles, cwd, job, sessionId }: any) => serial(async () => {
+          const receipt = await launcher.followup({ ...route, mode: 'task', cwd, session_label: label, mission_file: missionFile,
+            report_file: reportFile, extension_files: extensionFiles, pause_on_interrupt: false, job_id: job, session_id: sessionId });
+          own.add(receipt.batch_id);
+          return receipt;
+        }),
         piOutcome: async (receipt: any) => {
           await sessionFile(receipt);
           if (own.has(receipt.batch_id)) {
             const final = background.getReport(receipt.batch_id)?.completions?.[0];
             if (final) return fromFinal(receipt, final.status, final.source, final.summary);
-            const notice = notices.find(text => text.includes(receipt.job) && PAUSED.test(text));
+            const question = notices.find(text => noticeFor(receipt, text) && NEEDS_INPUT.test(text));
+            if (question) return { status: 'needs_input', source: 'model', summary: question };
+            const notice = notices.find(text => noticeFor(receipt, text) && PAUSED.test(text));
             return notice ? { status: 'failed', source: 'technical', summary: notice } : undefined;
           }
           // After a controller restart the in-process monitor is gone; read the worker's durable receipt.

@@ -13,17 +13,19 @@ const C = 'cccccccc-0000-4000-8000-000000000000', D = 'dddddddd-0000-4000-8000-0
 const field = (text: string, key: string) => new RegExp(`^${key}: (\\S+)`, 'm').exec(text)?.[1];
 
 // Simulated seats on a simulated clock: no tmux, models or tree access.
-function harness(directory: string, { dirty = false } = {}) {
+function harness(directory: string, { dirty = false, needsInputTask, primaryRequired = false, solOnlyPlan = false }: { dirty?: boolean; needsInputTask?: string; primaryRequired?: boolean; solOnlyPlan?: boolean } = {}) {
   let t = 1_000_000_000_000;
   const scheduled: Array<{ at: number; run: () => void }> = [];
   const later = (ms: number, run: () => void) => scheduled.push({ at: t + ms, run });
   const policies = new Map<string, any>(), killed = new Set<string>(), messages: string[] = [];
   const outcomes = new Map<string, any>();
-  let jobs = 0;
+  let jobs = 0, answerQueued = false;
+  const followups: any[] = [];
   const dispatcherReport = (statePath: string) => {
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     if (!state.tasks.length) return { version: 1, role: 'dispatcher', disposition: 'tasks', summary: 'first tasks', updated_nodes: [A, B, C, D],
-      tasks: [A, B, C].map(node => ({ node_id: node, depends_on: [], scope: node })).concat([{ node_id: D, depends_on: [A, B, C], scope: D }]),
+      tasks: solOnlyPlan ? [{ node_id: A, depends_on: [], scope: A, seats: ['codex-1'] }] :
+        [A, B, C].map(node => ({ node_id: node, depends_on: [], scope: node })).concat([{ node_id: D, depends_on: [A, B, C], scope: D }]),
       stop_running: [], questions_for_jack: [] };
     const done = state.tasks.every((task: any) => task.status === 'worked');
     return { version: 1, role: 'dispatcher', disposition: done ? 'done' : 'tasks', summary: done ? 'acceptance met' : 'nothing new', tasks: [],
@@ -31,6 +33,7 @@ function harness(directory: string, { dirty = false } = {}) {
   };
   const deps = {
     now: () => t,
+    primaryRequired: async () => primaryRequired,
     sleep: async (ms: number) => {
       t += ms;
       for (const item of scheduled.splice(0).sort((x, y) => x.at - y.at)) {
@@ -41,7 +44,8 @@ function harness(directory: string, { dirty = false } = {}) {
     writePolicy: (dir: string, policy: any) => { policies.set(dir, policy); return join(dir, 'policy.ts'); },
     launchPi: async ({ label, missionFile, reportFile }: any) => {
       const job = `job-${++jobs}`, mission = readFileSync(missionFile, 'utf8'), policy = policies.get(dirname(reportFile));
-      const receipt = { status: 'running', job, batch_id: `batch-${jobs}`, session_label: `${label}-x`, report_file: reportFile };
+      const receipt = { status: 'running', job, batch_id: `batch-${jobs}`, session_id: `session-${jobs}`,
+        session_label: `${label}-x`, report_file: reportFile };
       if (policy.fault) later(1000, () => outcomes.set(job, { status: 'failed', source: 'technical', summary: `provider/transport failure: ${policy.fault}` }));
       else if (policy.role === 'dispatcher') later(20_000, () => {
         writeFileSync(reportFile, JSON.stringify(dispatcherReport(field(mission, 'STATE')!)));
@@ -49,7 +53,8 @@ function harness(directory: string, { dirty = false } = {}) {
       });
       else {
         const task = field(mission, 'TASK')!;
-        later(task === B ? 35_000 : 30_000, () => {
+        if (task === needsInputTask) later(30_000, () => outcomes.set(job, { status: 'needs_input', source: 'model', summary: `Task ${task} needs human input: choose the checked continuation` }));
+        else later(task === B ? 35_000 : 30_000, () => {
           writeFileSync(reportFile, JSON.stringify({ version: 1, role: 'worker', disposition: 'worked', summary: `counted ${task}`, evidence: [],
             updated_nodes: [task], remaining_work: '', next_action: '' }));
           outcomes.set(job, { status: 'completed', source: 'model', summary: 'ok' });
@@ -57,8 +62,25 @@ function harness(directory: string, { dirty = false } = {}) {
       }
       return receipt;
     },
+    followupPi: async ({ label, route, reportFile, job: oldJob, sessionId }: any) => {
+      const job = `job-${++jobs}`, receipt = { status: 'running', job, batch_id: `batch-${jobs}`, attempt_id: `followup-${jobs}`,
+        session_id: sessionId, session_label: label, report_file: reportFile, route };
+      followups.push({ oldJob, sessionId, label, route, reportFile, sessionWasLive: !killed.has(label) });
+      later(10_000, () => {
+        const task = field(readFileSync(join(dirname(reportFile), 'mission.md'), 'utf8'), 'TASK');
+        writeFileSync(reportFile, JSON.stringify({ version: 1, role: 'worker', disposition: 'worked', summary: `resumed ${task}`, evidence: [],
+          updated_nodes: [task], remaining_work: '', next_action: '' }));
+        outcomes.set(job, { status: 'completed', source: 'model', summary: `resumed ${oldJob}` });
+      });
+      return receipt;
+    },
     piOutcome: async (receipt: any) => {
       const outcome = outcomes.get(receipt.job);
+      if (outcome?.status === 'needs_input' && !answerQueued) {
+        answerQueued = true;
+        later(1000, () => { mkdirSync(join(directory, 'inbox'), { recursive: true });
+          save(join(directory, 'inbox', 'answer.json'), { type: 'answer', task: needsInputTask, text: 'Use the accepted checked option.' }); });
+      }
       return outcome && { ...outcome, text: outcome.status === 'completed' ? readFileSync(receipt.report_file, 'utf8') : undefined };
     },
     launchClaude: async ({ model, promptFile, attemptDir, report }: any) => {
@@ -78,7 +100,7 @@ function harness(directory: string, { dirty = false } = {}) {
     ancestors: async (ids: string[]) => new Map(ids.map(id => [id, [id, OWNER]])),
     statuses: async (ids: string[]) => new Map(ids.map(id => [id, 'in_progress'])),
   };
-  return { deps, messages };
+  return { deps, messages, killed, followups };
 }
 
 function setup(faults: unknown, dispatcherEngine?: string) {
@@ -140,6 +162,41 @@ test('default dispatcher uses Pi on every wake and after resume without launchin
     const piDispatchers = launches.filter(args => args.label.includes('-dispatch-'));
     assert.equal(piDispatchers.length, dispatchers.length);
     assert.ok(piDispatchers.every(args => JSON.stringify(args.route) === JSON.stringify(route)));
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('needs_input pauses admissions, preserves the worker, and resumes the same route after an explicit answer', async () => {
+  const directory = setup({});
+  try {
+    const { deps, messages, followups } = harness(directory, { needsInputTask: A });
+    assert.equal(await new ParallelController(directory, deps).run(), 'done');
+    const rows = history(directory);
+    const waiting = rows.find(row => row.type === 'worker_needs_input');
+    const resumed = rows.find(row => row.type === 'worker_input_accepted');
+    const finish = rows.find(row => row.type === 'worker_finish' && row.task === A);
+    assert.ok(waiting && resumed && finish);
+    assert.equal(finish.disposition, 'worked');
+    assert.equal(followups.length, 1);
+    const launch = rows.find(row => row.type === 'worker_launch' && row.task === A);
+    assert.equal(followups[0].oldJob, rows.find(row => row.type === 'worker_started' && row.attempt === launch.attempt).job);
+    assert.equal(followups[0].sessionWasLive, true);
+    assert.equal(followups[0].route.model, 'gpt-5.6-luna');
+    assert.deepEqual(JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')).awaiting_input, []);
+    assert.ok(!messages.some(message => message.includes('FACTORY CONTROLLER: stop now')));
+    assert.equal(rows.some(row => row.type === 'worker_launch' && row.task === C && row.t > waiting.t && row.t < resumed.t), false,
+      'no new task is admitted before the primary receives its answer');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('mandatory-primary RUN rejects Sol-only orders instead of starting them', async () => {
+  const directory = setup({});
+  try {
+    const { deps } = harness(directory, { primaryRequired: true, solOnlyPlan: true });
+    assert.equal(await new ParallelController(directory, deps).run(), 'needs_attention');
+    const rows = history(directory);
+    assert.equal(rows.filter(row => row.type === 'worker_launch').length, 0);
+    assert.ok(rows.some(row => row.type === 'dispatcher_finish' && /active OSS primary contribution/.test(row.rejected?.[A] ?? '')));
+    assert.equal(JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')).primary_required, true);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
