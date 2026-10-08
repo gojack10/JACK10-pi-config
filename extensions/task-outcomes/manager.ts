@@ -622,6 +622,15 @@ export class TaskOutcomeManager {
     const declarationWorkGeneration = this.background().workGeneration();
     const declarationChildGeneration = contract.childGeneration;
 
+    // Registered work gates every transition, not only completion: an accepted needs_input used to pause
+    // the attempt while the agent's own checks were still running, which stranded the real result.
+    const pendingAtDeclaration = this.pendingWork(contract);
+    if (pendingAtDeclaration.length > 0) {
+      throw new Error(`Registered work is still running: ${pendingAtDeclaration.join(", ")}. ` +
+        "No outcome was recorded and the attempt remains active. " +
+        "End this turn with ordinary assistant text and wait for the automatic completion notification; do not retry with another outcome value.");
+    }
+
     if (outcome === "completed") {
       await this.verifyReport(contract);
       if (this.maintenanceState || this.activeContract() !== contract || contract.state !== "active") {
@@ -720,10 +729,17 @@ export class TaskOutcomeManager {
     if (!contract || contract.mode !== "task" || contract.state !== "active") return undefined;
     return `SYSTEM TASK CONTRACT: ${contract.jobId}/${contract.attemptId}
 You are a task subagent. A prose answer alone does not complete this task.
-If registered child/background work is still running, do not call report_outcome yet. End this turn and wait for its normal completion notification; then inspect the result and continue the task. Do not use needs_input, blocked, or failed as a wait/yield signal.
+While registered child/background work is running, use no report_outcome value.
+To wait, send a short ordinary assistant message such as "Checks are running; waiting for their completion notification", then end the turn without a tool call.
+That ends the turn, not the task attempt, and it does not request human input.
+Resume from the automatic completion notification, read the completed result, and continue the assigned task.
+Do not poll, and do not treat an echo of your own outcome declaration as a job-completion notification.
+A failing check inside your authorized fence returns to diagnosis, revision and a rerun after work drains; it is not automatically blocked, failed or a human question.
 Write your report to ${JSON.stringify(contract.reportPath)}. This file is already reserved: write into it without deleting, replacing, or renaming it.
 Then call report_outcome with an honest outcome and summary. Use completed only after writing a readable nonempty report and finishing all tracked child/background work. Use needs_input only when a specific human answer is required to continue; use blocked for a missing external prerequisite or authority; use failed for a terminal failure. Include partial findings in the report when possible. Never invent success to satisfy this contract.
-The declaration is provisional until clean settlement. Do not start more work after declaring. Missing declarations trigger at most two corrective turns, then protocol failure.`;
+Do not start more work after an accepted declaration: completed, blocked and failed await clean settlement, while an accepted needs_input pauses the attempt for a human answer and is not a final result.
+Wait for registered work instead of declaring to avoid a corrective turn.
+After work drains, a task turn that ends without an accepted outcome can receive at most two corrective turns before protocol failure.`;
   }
 
   beginMaintenance(sessionFile?: string): MaintenanceLease {
