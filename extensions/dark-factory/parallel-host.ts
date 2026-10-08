@@ -160,6 +160,8 @@ export default function (pi: ExtensionAPI) {
           return map;
         },
         statuses: async (ids: string[]) => new Map((await sql(`SELECT id, status FROM nodes WHERE id IN (${idList(ids)})`)).map((row: any) => [row.id, row.status])),
+        governing: async (ids: string[]) => new Map((await sql(`SELECT id, updated_at::text AS updated_at, scope, crystallization FROM nodes WHERE id IN (${idList(ids)})`))
+          .map((row: any) => [row.id, row])),
         // Drift is mechanical: a check cites the revision it was derived from, and the tree moves.
         revisions: async (ids: string[]) => new Map((await sql(`SELECT id, updated_at::text AS updated_at FROM nodes WHERE id IN (${idList(ids)})`))
           .map((row: any) => [row.id, row.updated_at])),

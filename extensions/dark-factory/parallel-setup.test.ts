@@ -22,7 +22,7 @@ const review = { sources_read: [NODE], challenges: [{ input: { rows: [1, 2] }, e
 function ready() { return realpathSync(mkdtempSync(join(tmpdir(), 'factory-setup-'))); }
 
 // The controller supplies its own runtime directory; use the same shape the code tests use.
-function controller(directory, revisions = new Map()) {
+function controller(directory, revisions = new Map([[NODE, packet().sources[0].revision]])) {
   const config = P.buildConfig({ runNode: RUN, owner: OWNER, cwd: directory, directory, overrides: { codex_seats: 1 } });
   mkdirSync(join(directory, 'attempts'), { recursive: true });
   writeFileSync(join(directory, 'config.json'), JSON.stringify(config));
@@ -170,7 +170,7 @@ test('a moved governing clause invalidates the packet that cited the old revisio
 
     // A registered check also stops being admissible once its clause moves again.
     current.clear();
-    const fresh = controller(directory, new Map());
+    const fresh = controller(directory);
     await propose(fresh, packet());
     const other = P.startAttempt(fresh.state, { kind: 'dispatcher', engine: 'fallback', events: [] });
     other.dir = join(fresh.dir, 'attempts', 'review-ok'); mkdirSync(other.dir, { recursive: true });
