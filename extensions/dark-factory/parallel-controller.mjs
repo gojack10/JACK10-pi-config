@@ -424,6 +424,34 @@ export class ParallelController {
     this.state.wake = true;
   }
 
+  // A dispatcher may ask for a wedged assignment to be resumed. Only the controller acts, and only when the
+  // lifecycle is provably quiet: no live attempt, no reservation, no ambiguity about retained work.
+  async applyRecoveries(requests, now) {
+    for (const request of requests ?? []) {
+      const task = this.state.tasks[request.node_id];
+      const unresolved = Object.values(this.state.attempts).find(a => a.task === request.node_id &&
+        ['running', 'launching', 'ambiguous'].includes(a.status));
+      const refusal = !task ? 'unknown task'
+        : task.status === 'running' ? 'the task has a live attempt'
+        : task.status === 'worked' ? 'the task is already accepted'
+        : task.status === 'stopped' ? 'the task was cancelled; it needs an explicit re-list, not recovery'
+        : task.status === 'merge_queued' ? 'a checked candidate already awaits publication'
+        : task.status === 'queued' ? 'the task is already queued'
+        : this.state.merge?.task === request.node_id ? 'a publication reservation is held'
+        : unresolved ? `attempt ${unresolved.id} is ${unresolved.status}` : null;
+      if (refusal) {
+        this.log('recovery_refused', { task: request.node_id, reason: refusal, requested: request.reason });
+        P.addEvent(this.state, { type: 'recovery_refused', task: request.node_id, reason: refusal }, now);
+        continue;
+      }
+      Object.assign(task, { status: 'queued', front: true, continues: 0, recovered_at: now });
+      // The retained draft and its identity survive: recovery resumes the same assignment, never a replacement.
+      this.log('recovery_applied', { task: request.node_id, requested: request.reason,
+        worktree: task.code?.worktree ?? null, phase: task.code?.phase ?? 'tree-only' });
+      P.addEvent(this.state, { type: 'task_requeued', task: request.node_id, reason: request.reason }, now);
+    }
+  }
+
   codeAttention(reason, now) {
     this.state.attention ??= { reason, at: now };
     this.log('code_attention', { reason });
@@ -738,6 +766,7 @@ export class ParallelController {
     } else {
       if (outcome.kind === 'report' && outcome.report.setup) await this.setupTransition(attempt, outcome.report.setup, now);
       const effects = P.finishDispatcher(this.state, attempt.id, outcome, now, rejected);
+      if (outcome.kind === 'report' && outcome.report.recover?.length) await this.applyRecoveries(outcome.report.recover, now);
       this.log('dispatcher_finish', { attempt: attempt.id, engine: attempt.engine, outcome: outcome.kind,
         disposition: outcome.report?.disposition, summary: outcome.report?.summary ?? outcome.summary ?? outcome.reason,
         tasks: outcome.report?.tasks, questions_for_jack: outcome.report?.questions_for_jack, effects,
