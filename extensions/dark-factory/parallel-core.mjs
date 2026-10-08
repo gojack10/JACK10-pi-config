@@ -45,6 +45,7 @@ export function buildConfig({ runNode, owner, repos = [], directory, cwd, overri
   return {
     version: 1, run_node: runNode, owner, readonly_repos: repos, directory, cwd,
     roles,
+    ...(overrides.acceptance ? { acceptance: overrides.acceptance } : {}),
     ...(overrides.code ? { code: validateCodeConfig(overrides.code) } : {}),
     seats,
     dispatcher: { engine: dispatcherEngine, claude: { ...CLAUDE, ...overrides.claude }, fallback },
@@ -447,6 +448,9 @@ export function dispatcherSnapshot(state, config, now) {
     run_node: config.run_node,
     owner: config.owner,
     ...(config.code ? { code: config.code, code_main: state.code_main, merge: state.merge } : {}),
+    acceptance: config.acceptance ?? null,
+    baseline: state.baseline ?? null,
+    recovery_policy: 'A terminal quiet task may start a fresh guarded attempt. Historical route verdicts are not required.',
     setup: state.setup ?? null,
     checks: Object.fromEntries(Object.entries(state.checks ?? {}).map(([id, entry]) => [id, { task: entry.task, observer: entry.observer,
       cases: entry.cases.length, proposal: entry.proposal_hash, review: entry.review_hash, registered_at: entry.registered_at }])),
@@ -474,12 +478,13 @@ export function dispatcherPrompt({ role, run, events, state, report, setup, tool
   ].join('\n') + '\n';
 }
 
-export function workerPrompt({ role, run, task, report, previous, artifacts, code }) {
+export function workerPrompt({ role, run, task, report, previous, artifacts, code, routeVerdict }) {
   return [
     'You are a factory worker. Read the ROLE node with your SiftText tools and follow it exactly.',
     `ROLE: ${role}`, `RUN: ${run}`, `TASK: ${task}`, `REPORT: ${report}`,
     ...(previous ? [`PREVIOUS: ${previous}`] : []),
     `ARTIFACTS: ${artifacts} (directory for any files you create)`,
     ...(code ? [`CODE: ${code}`] : []),
+    ...(routeVerdict ? [`ROUTE_VERDICT: ${routeVerdict} (this attempt only; do not require historical verdicts)`] : []),
   ].join('\n') + '\n';
 }

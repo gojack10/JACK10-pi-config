@@ -451,6 +451,6 @@ test('registered check packets run as data and bind the publication grant', asyn
     // while a mutable case array alone does not, because the pinned hashes already cover it.
     assert.notEqual(G.checkSetDigest(passing), G.checkSetDigest({}));
     assert.notEqual(G.checkSetDigest(passing), G.checkSetDigest({ id: { ...passing.id, review_hash: 'c'.repeat(64) } }));
-    assert.equal(G.checkSetDigest(passing), G.checkSetDigest({ id: { ...passing.id, cases: [] } }));
+    assert.notEqual(G.checkSetDigest(passing), G.checkSetDigest({ id: { ...passing.id, cases: [] } }), 'grant also binds executed cases, not only claimed hashes');
   } finally { f.cleanup(); }
 });
