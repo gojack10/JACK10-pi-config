@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -12,7 +12,7 @@ const jiti = createJiti(import.meta.url, { alias: {
   '@mariozechner/pi-coding-agent': join(pkg, 'dist/index.js'),
   '@earendil-works/pi-coding-agent': join(pkg, 'dist/index.js'),
 } });
-const { installGuard } = await jiti.import('./guard.ts');
+const { installGuard, routeVerdict, allowedTreeWrite } = await jiti.import('./guard.ts');
 
 function harness(dir: string) {
   const handlers = new Map<string, any>();
@@ -112,5 +112,57 @@ test('human/policy stops, queued work, final outcomes and ordinary chats never a
     rmSync(join(dir, 'STOP'));
     (globalThis as any)[Symbol.for('pi.task-outcomes.manager-registry')].delete(h.ctx.sessionManager);
     assert.equal(await h.settle(), undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The route identity that made a Sol worker refuse at entry: an umbrella selector on its backing account.
+const UMBRELLA = { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high' };
+const pinEntry = (actualProviderId: string, model = 'gpt-6.1-sol') => ({ type: 'custom', customType: 'codex-route/v1',
+  data: { umbrella: 'openai-codex-personal', model, actualProviderId } });
+const routeCtx = (entries: any[], provider: string) => ({ model: { provider, id: 'gpt-6.1-sol' }, sessionManager: { getBranch: () => entries } });
+
+test('the route verdict accepts an umbrella selector on its pinned backing account and rejects everything else', () => {
+  const pinned = routeCtx([pinEntry('openai-codex-third')], 'openai-codex-third');
+  const verdict = routeVerdict(pinned, { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high');
+  assert.equal(verdict.verdict, 'accepted');
+  assert.equal(verdict.actual.provider, 'openai-codex-third');
+  assert.equal(verdict.pin.actualProviderId, 'openai-codex-third');
+
+  // No pin provenance, a different backing account, or a changed model all fail closed.
+  assert.equal(routeVerdict(routeCtx([], 'openai-codex-third'), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
+  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-team')], 'openai-codex-third'), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
+  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-third'), { type: 'model_change', provider: 'openai-codex-third', modelId: 'gpt-6-astra' }], 'openai-codex-third'),
+    { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
+  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-third')], 'openai-codex-third'), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'low').verdict, 'rejected');
+  // A non-umbrella route still requires exact provider equality.
+  const local = { smoke: false, report: '/r', reads: [], route: { provider: 'local', model: 'gpt-6.1-sol', thinking: 'xhigh' } } as any;
+  assert.equal(routeVerdict(routeCtx([], 'local'), local, 'xhigh').verdict, 'accepted');
+  assert.equal(routeVerdict(routeCtx([], 'other'), local, 'xhigh').verdict, 'rejected');
+});
+
+test('mark_stuck never carries content in a factory role, because it replaces crystallization', () => {
+  const policy = { smoke: false, report: '/r', reads: [] } as any;
+  assert.equal(allowedTreeWrite('sifttext_mark_stuck', { node_id: 'n', blocker: 'b', crystallization: 'release hold' }, policy), false);
+  assert.equal(allowedTreeWrite('sifttext_mark_stuck', { node_id: 'n', blocker: 'b', crystallization: '   ' }, policy), true);
+  assert.equal(allowedTreeWrite('sifttext_mark_stuck', { node_id: 'n', blocker: 'b' }, policy), true);
+  assert.equal(allowedTreeWrite('sifttext_resolve', { crystallization: 'x' }, policy), true);
+  assert.equal(allowedTreeWrite('sifttext_mark_stuck', { crystallization: 'x' }, { smoke: true, report: '/r', reads: [] }), true);
+});
+
+test('the guard records the route verdict into its own attempt directory at session start', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guard-route-'));
+  try {
+    const handlers = new Map<string, any>();
+    const tools = ['read', 'subagent_launch'];
+    const pi: any = { on: (name: string, handler: any) => handlers.set(name, handler),
+      getThinkingLevel: () => 'high', getActiveTools: () => tools, setActiveTools: () => {} };
+    installGuard(pi, { smoke: false, report: join(dir, 'report.json'), reads: [], role: 'worker',
+      route: UMBRELLA } as any);
+    handlers.get('session_start')({}, { model: { provider: 'openai-codex-third', id: 'gpt-6.1-sol' },
+      sessionManager: { getBranch: () => [pinEntry('openai-codex-third')] } });
+    const recorded = JSON.parse(readFileSync(join(dir, 'route-verdict.json'), 'utf8'));
+    assert.equal(recorded.verdict, 'accepted');
+    assert.equal(recorded.expected.provider, 'openai-codex-personal');
+    assert.equal(recorded.actual.provider, 'openai-codex-third');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
