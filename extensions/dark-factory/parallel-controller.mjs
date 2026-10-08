@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import * as P from './parallel-core.mjs';
 import * as G from './parallel-code.mjs';
+import {applyBaseline} from './parallel-baseline.mjs';
 
 // Deterministic parallel-factory controller. Transport/tree access uses injected deps;
 // opt-in code tasks use the native Git helper against explicitly configured repositories.
@@ -222,7 +223,8 @@ export class ParallelController {
     const mission = join(dir, 'mission.md');
     const input = command.text.trim();
     const prompt = P.workerPrompt({ role: this.config.roles.worker, run: this.config.run_node, task: attempt.task,
-      report, previous: attempt.report, artifacts: join(this.dir, 'artifacts', attempt.task), code: codePath });
+      report, previous: attempt.report, artifacts: join(this.dir, 'artifacts', attempt.task), code: codePath,
+      routeVerdict: join(dir, 'route-verdict.json') });
     writeFileSync(mission, `${prompt}\nPending question:\n${pending.question}\n\nHuman answer (applies only to this task; preserve all existing RUN authority):\n${input}\n`);
     const policy = this.deps.writePolicy(dir, { report, route: attempt.route, role: 'worker', code: attempt.code });
     try {
@@ -297,7 +299,8 @@ export class ParallelController {
     const codePath = record.code ? join(attempt.dir, 'code.json') : undefined;
     if (codePath) save(codePath, { ...this.config.code, ...attempt.code, task, seat, merge: attempt.merge });
     writeFileSync(mission, P.workerPrompt({ role: this.config.roles.worker, run: this.config.run_node, task,
-      report: attempt.report, previous: attempt.previous, artifacts, code: codePath }));
+      report: attempt.report, previous: attempt.previous, artifacts, code: codePath,
+      routeVerdict: join(attempt.dir, 'route-verdict.json') }));
     const fault = this.seatFault(seat);
     if (fault) attempt.fault = fault;
     const policy = this.deps.writePolicy(attempt.dir, { report: attempt.report, route: seatConfig.route, role: 'worker', fault, code: attempt.code });
@@ -332,6 +335,14 @@ export class ParallelController {
   // A check packet is data. Models never supply executable gate code, argv or paths outside their own attempt.
   validatePacket(parsed, taskId) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('setup packet must be one JSON object');
+    if (parsed.kind === 'baseline') {
+      if (Object.keys(parsed).sort().join(',') !== 'changes,kind,limits,sources,task' || parsed.task !== taskId ||
+          !Array.isArray(parsed.sources) || !parsed.sources.length || !Array.isArray(parsed.changes) || !parsed.changes.length ||
+          typeof parsed.limits !== 'string' || !parsed.limits.trim()) throw Error('baseline packet needs kind, task, sources, changes and limits');
+      for (const source of parsed.sources) if (!P.isNodeId(source?.node) || !Number.isFinite(Date.parse(source.revision)) ||
+          typeof source.clause !== 'string' || !source.clause.trim()) throw Error('baseline sources need node, revision and exact current clause');
+      return parsed;
+    }
     if (Object.keys(parsed).sort().join(',') !== 'cases,fence,limits,observer,sources,task') {
       throw Error('setup packet needs exactly task, fence, observer, sources, cases and limits');
     }
@@ -378,10 +389,10 @@ export class ParallelController {
       catch (error) { return reject(String(error.message ?? error)); }
       const id = hash.slice(0, 16), snapshot = join(store, `${id}.proposal.json`);
       // Snapshot the exact bytes that were hashed: validation normalises, the receipt must not.
-      writeFileSync(snapshot, raw.endsWith('\n') ? raw : raw + '\n');
+      writeFileSync(snapshot, raw);
       this.state.setup = { task: setup.task, check: id, proposal_hash: hash, author: actor, author_attempt: attempt.id,
         packet: snapshot, proposed_at: now };
-      this.log('setup_proposed', { attempt: attempt.id, task: setup.task, check: id, hash, cases: packet.cases.length });
+      this.log('setup_proposed', { attempt: attempt.id, task: setup.task, check: id, hash, cases: packet.cases?.length ?? 0, kind: packet.kind ?? 'check' });
       P.addEvent(this.state, { type: 'setup_proposed', task: setup.task, check: id, proposal_hash: hash, packet: snapshot }, now);
       this.state.wake = true; // review requires a different fresh dispatcher
       return;
@@ -407,7 +418,7 @@ export class ParallelController {
     }
     let bytes;
     try { bytes = readFileSync(pending.packet, 'utf8'); } catch { return reject('the proposal snapshot is missing'); }
-    if (createHash('sha256').update(bytes.trimEnd()).digest('hex') !== pending.proposal_hash) return reject('proposal snapshot changed after it was proposed');
+    if (createHash('sha256').update(bytes).digest('hex') !== pending.proposal_hash) return reject('proposal snapshot changed after it was proposed');
     const stale = await this.drift(JSON.parse(bytes));
     if (stale.length) {
       this.state.setup = null;
@@ -421,7 +432,32 @@ export class ParallelController {
     writeFileSync(reviewPath, JSON.stringify(review, null, 2) + '\n');
     let proposal;
     try { proposal = this.validatePacket(JSON.parse(bytes), setup.task); } catch (error) { return reject(`proposal snapshot no longer validates: ${error.message ?? error}`); }
+    if (proposal.kind === 'baseline') {
+      try {
+        if (P.running(this.state).some(a => a.kind === 'worker') || this.state.merge) throw Error('finish active worker/publication work before baseline reconciliation');
+        if (!this.config.acceptance || !this.deps.governing) throw Error('baseline reconciliation needs delegated paths and current source access');
+        const ids = proposal.sources.map(source => source.node);
+        const current = await this.deps.governing(ids);
+        const ancestry = await this.deps.ancestors(ids);
+        for (const source of proposal.sources) {
+          const node = current.get(source.node);
+          if (!node || Date.parse(node.updated_at) !== Date.parse(source.revision) ||
+              ![node.scope, node.crystallization].some(text => text?.includes(source.clause)) ||
+              !ancestry.get(source.node)?.includes(this.config.acceptance.spec_scope)) throw Error('baseline source is missing, stale, outside the spec scope or does not contain the cited clause');
+          if (!review.sources_read.includes(source.node)) throw Error('review must read each cited baseline source');
+        }
+        const receipt = applyBaseline(this.config.acceptance, proposal, join(store, pending.check + '.baseline'));
+        this.state.baseline = {...receipt, author:pending.author, reviewer:actor, registered_at:now};
+        for (const entry of Object.values(this.state.checks ?? {})) if (entry.sources.some(source => ids.includes(source.node))) entry.superseded = pending.proposal_hash;
+        this.state.setup = null;
+        this.log('baseline_reconciled', {task:setup.task, proposal_hash:pending.proposal_hash, ...receipt});
+        P.addEvent(this.state, {type:'baseline_reconciled', task:setup.task, sources:proposal.sources, manifest_hash:receipt.manifest_hash}, now);
+      } catch (error) { return reject(String(error.message ?? error)); }
+      return;
+    }
+    // New reviewed expectations replace stale packets for the same task. Retain old receipts as history.
     this.state.checks ??= {};
+    for (const entry of Object.values(this.state.checks)) if (entry.task === setup.task) entry.superseded = pending.proposal_hash;
     this.state.checks[pending.check] = { task: setup.task, observer: proposal.observer, fence: proposal.fence, sources: proposal.sources,
       cases: [...proposal.cases, ...review.challenges], limits: proposal.limits, packet: pending.packet, review: reviewPath,
       proposal_hash: pending.proposal_hash, review_hash: reviewHash, author: pending.author, reviewer: actor,
@@ -439,8 +475,8 @@ export class ParallelController {
     const ids = [...new Set(sources.map(source => source.node))];
     if (!ids.length || !this.deps.revisions) return [];
     let current;
-    try { current = await this.deps.revisions(ids); } catch { return []; } // an unreadable tree is not evidence of drift
-    return sources.filter(source => current.get(source.node) && current.get(source.node) !== source.revision)
+    current = await this.deps.revisions(ids);
+    return sources.filter(source => !current.get(source.node) || Date.parse(current.get(source.node)) !== Date.parse(source.revision))
       .map(source => ({ node: source.node, cited: source.revision, current: current.get(source.node) }));
   }
 
@@ -464,7 +500,8 @@ export class ParallelController {
         P.addEvent(this.state, { type: 'recovery_refused', task: request.node_id, reason: refusal }, now);
         continue;
       }
-      Object.assign(task, { status: 'queued', front: true, continues: 0, recovered_at: now });
+      // Historical route receipts are not eligibility for a new attempt. The new guard checks its own route.
+      Object.assign(task, { status: 'queued', front: true, continues: 0, recovered_at: now, route_check: 'fresh attempt only' });
       // The retained draft and its identity survive: recovery resumes the same assignment, never a replacement.
       this.log('recovery_applied', { task: request.node_id, requested: request.reason,
         worktree: task.code?.worktree ?? null, phase: task.code?.phase ?? 'tree-only' });
@@ -813,7 +850,7 @@ export class ParallelController {
       else if (task.node_id === owner || !node.includes(owner)) rejected.set(task.node_id, 'task node is outside the write fence');
       else if (!scope) rejected.set(task.node_id, 'write scope node not found');
       else if (!scope.includes(owner)) rejected.set(task.node_id, 'write scope is outside the write fence');
-      else if ((task.checks ?? []).some(id => !this.state.checks?.[id])) rejected.set(task.node_id, 'named check is not registered');
+      else if ((task.checks ?? []).some(id => !this.state.checks?.[id] || this.state.checks[id].superseded)) rejected.set(task.node_id, 'named check is not registered');
       else if ((task.checks ?? []).length) {
         const stale = (await Promise.all(task.checks.map(id => this.drift(this.state.checks[id])))).flat();
         if (stale.length) {
@@ -826,7 +863,7 @@ export class ParallelController {
           }
         }
       }
-      else {
+      if (!rejected.has(task.node_id)) {
         try {
           G.vetCodeTask(task, this.config, this.state.tasks[task.node_id]);
           this.state.scopes[task.scope] = scope;
