@@ -593,7 +593,7 @@ test("launcher ingestion preserves durable dynamic child membership", { timeout:
   await writeFile(join(h.dir, "P-p1.md"), "provisional report");
   await assert.rejects(
     h.call("report_outcome", { outcome: "completed", summary: "premature" }),
-    /premature|pending work/,
+    /premature|pending work|Registered work is still running/,
   );
   await h.settle();
   assert.equal(h.messages.length, 0);
@@ -669,8 +669,8 @@ test("task contracts inject instructions and correct missing declarations withou
   const h = await harness(t);
   assert.equal(h.manager.taskInstruction(), undefined);
   await h.call("task_outcomes_consumer", contract(h.dir, "repair", "r1"));
-  assert.match(h.manager.taskInstruction(), /If registered child\/background work is still running, do not call report_outcome yet/);
-  assert.match(h.manager.taskInstruction(), /Do not use needs_input, blocked, or failed as a wait\/yield signal/);
+  assert.match(h.manager.taskInstruction(), /While registered child\/background work is running, use no report_outcome value/);
+  assert.match(h.manager.taskInstruction(), /then end the turn without a tool call/);
   assert.match(h.manager.taskInstruction(), /Use needs_input only when a specific human answer is required/);
   assert.ok(h.manager.taskInstruction().includes(JSON.stringify(join(h.dir, "repair-r1.md"))));
   await h.settle({ stopReason: "stop", text: "Done" });
@@ -736,14 +736,23 @@ test("dialogue and technical failures never trigger task corrections", async t =
   assert.equal(h.messages.length, 0);
 });
 
-test("batch failures wait for siblings and needs_input is non-final until a fresh attempt", { timeout: 10000 }, async t => {
+test("no outcome may be declared while a registered child is unreported", { timeout: 10000 }, async t => {
   const h = await harness(t);
   await h.call("task_outcomes_consumer", { ...contract(h.dir, "A", "a1", "batch-ab"), children: ["B"] });
   await h.call("task_outcomes_consumer", { action: "close", batch_id: "batch-ab" });
-  await h.settle({ outcome: "failed", summary: "A failed semantically" });
-  assert.equal(h.messages.length, 0);
+  for (const outcome of ["completed", "blocked", "needs_input", "failed"]) {
+    await assert.rejects(h.call("report_outcome", { outcome, summary: "premature" }),
+      /Registered work is still running: child:B/);
+  }
+  assert.equal((await h.snapshot()).outcomes.length, 0, "a rejected declaration must record nothing");
+  assert.equal((await h.snapshot()).active.state, "active", "a rejected declaration must not pause the attempt");
+  assert.equal((await h.snapshot()).active.declaration, undefined, "a rejected declaration must not consume the sequence");
+});
 
-  await h.call("task_outcomes_consumer", { ...contract(h.dir, "B", "b1", "batch-ab") });
+test("batch siblings wait and needs_input is non-final until a fresh attempt", { timeout: 10000 }, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "B", "b1", "batch-b") });
+  await h.call("task_outcomes_consumer", { action: "close", batch_id: "batch-b" });
   await h.settle({ outcome: "needs_input", summary: "choose a continuation" });
   assert.equal(h.messages.length, 1);
   assert.match(h.messages[0].text, /choose a continuation/);
@@ -754,11 +763,10 @@ test("batch failures wait for siblings and needs_input is non-final until a fres
     h.call("report_outcome", { outcome: "needs_input", summary: "duplicate question" }),
     /no active|not active|already declared/,
   );
-  await h.call("task_outcomes_consumer", { ...contract(h.dir, "B", "b2", "batch-ab") });
+  await h.call("task_outcomes_consumer", { ...contract(h.dir, "B", "b2", "batch-b") });
   await writeFile(join(h.dir, "B-b2.md"), "B report");
   await h.settle({ outcome: "completed", summary: "B resolved" });
   await until(() => h.messages.length === 2);
-  assert.match(h.messages[1].text, /A failed semantically/);
   assert.match(h.messages[1].text, /B resolved/);
   const records = (await h.snapshot()).outcomes;
   assert.ok(records.some((item: any) => item.attemptId === "b1" && item.outcome === "needs_input"));

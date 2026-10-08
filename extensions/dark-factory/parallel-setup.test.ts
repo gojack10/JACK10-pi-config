@@ -109,3 +109,41 @@ test('unverified setup requests are refused with the exact reason', async () => 
     assert.match(ctl.state.pending_events.at(-1).reason, /snapshot changed/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('recovery resumes only provably quiet assignments', async () => {
+  const directory = ready();
+  try {
+    const ctl = controller(directory);
+    const unsafe = ['bbbbbbbb-0000-4000-8000-000000000001','bbbbbbbb-0000-4000-8000-000000000002','bbbbbbbb-0000-4000-8000-000000000003','bbbbbbbb-0000-4000-8000-000000000004','bbbbbbbb-0000-4000-8000-000000000005','bbbbbbbb-0000-4000-8000-000000000006'];
+    const add = (id: string, status: string, extra = {}) => { ctl.state.tasks[id] = { node_id: id, status, scope: id, depends_on: [],
+      continues: 2, attempts: [], code: { worktree: `/wt/${id}`, phase: 'develop', candidate: null }, ...extra }; ctl.state.order.push(id); };
+    add(TASK, 'errored');
+    add(unsafe[0], 'running');
+    add(unsafe[1], 'stopped');
+    add(unsafe[2], 'worked');
+    add(unsafe[3], 'merge_queued');
+    add(unsafe[4], 'blocked');
+    add(unsafe[5], 'blocked');
+    ctl.state.merge = { task: unsafe[5] };
+    P.startAttempt(ctl.state, { kind: 'worker', seat: 'oss', seat_kind: 'oss', task: unsafe[4] });
+    ctl.state.attempts[Object.keys(ctl.state.attempts).at(-1)].status = 'ambiguous';
+
+    await ctl.applyRecoveries([{ node_id: TASK, reason: 'settled transport loss, draft drained' },
+      { node_id: unsafe[0], reason: 'live' },
+      { node_id: unsafe[1], reason: 'cancelled' },
+      { node_id: unsafe[2], reason: 'accepted' },
+      { node_id: unsafe[3], reason: 'pending publication' },
+      { node_id: unsafe[4], reason: 'ambiguous attempt' },
+      { node_id: unsafe[5], reason: 'reservation held' },
+      { node_id: 'missing-missing-missing-missing-missingmissing', reason: 'unknown' }], 5000);
+
+    assert.equal(ctl.state.tasks[TASK].status, 'queued');
+    assert.equal(ctl.state.tasks[TASK].front, true);
+    assert.equal(ctl.state.tasks[TASK].continues, 0, 'recovery must not inherit the old continue count');
+    assert.equal(ctl.state.tasks[TASK].code.worktree, `/wt/${TASK}`, 'recovery resumes the retained draft identity');
+        for (const id of unsafe) assert.notEqual(ctl.state.tasks[id].status, 'queued', id + ' must not be requeued');
+    const refused = ctl.state.pending_events.filter(event => event.type === 'recovery_refused').map(event => event.task);
+    assert.equal(refused.length, 7, 'every unsafe or unknown recovery is refused with a reason');
+    assert.ok(ctl.state.pending_events.some(event => event.type === 'task_requeued' && event.task === TASK));
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

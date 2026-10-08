@@ -25,7 +25,11 @@ export function installParallelGuard(pi: ExtensionAPI, policy: Policy) {
         } else if (report.code || report.disposition === 'candidate') throw Error('tree task has no code publication authority');
       }
     } catch (error) {
-      return { block: true, reason: `Factory report check: ${error instanceof Error ? error.message : String(error)}. Repair the JSON at ${policy.report} from the work already done, then call report_outcome again.` };
+      // A validation error is not fresh permission to declare: it previously induced wait-as-outcome retries.
+      return { block: true, reason: `Factory report check: ${error instanceof Error ? error.message : String(error)}. ` +
+        `Repair the JSON at ${policy.report} from the work already done. Retry report_outcome only when the task contract permits that outcome and all registered work has drained. ` +
+        'If work is still running, end this turn with ordinary assistant text and wait for its completion notification; do not substitute another outcome value. ' +
+        'If the attempt is inactive, preserve the report and return the refusal to the controller instead of retrying or starting more task work.' };
     }
   });
   if (policy.fault) {
