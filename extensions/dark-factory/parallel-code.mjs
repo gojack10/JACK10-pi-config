@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, realpathSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -125,6 +125,54 @@ export async function candidateIdentity(config, code, candidate, base, acceptedM
   }
   return paths;
 }
+// Registered packets are data. This is the only thing that executes them, so a model can never author a check.
+const canonicalJson = value => JSON.stringify(value, (key, item) =>
+  item && typeof item === 'object' && !Array.isArray(item) ? Object.keys(item).sort().reduce((sum, k) => ({ ...sum, [k]: item[k] }), {}) : item);
+
+export function checkSetDigest(checks) {
+  return createHash('sha256').update(Object.keys(checks ?? {}).sort()
+    .map(id => `${id}:${checks[id].proposal_hash}:${checks[id].review_hash}`).join('\n')).digest('hex');
+}
+
+export async function runRegisteredChecks(config, checks, code, kind, directory) {
+  const root = kind === 'candidate' ? code.worktree : config.code.repo;
+  const logs = [];
+  for (const id of Object.keys(checks ?? {}).sort()) {
+    const entry = checks[id], path = join(directory, `${kind}-registered-${id}.log`);
+    logs.push(path);
+    const lines = [];
+    let failures = 0;
+    for (const [index, item] of entry.cases.entries()) {
+      const argv = [join(root, 'target/debug', entry.observer)];
+      let result, rejected;
+      try {
+        // execFileSync, not execFile: only the sync form accepts `input`, and an unclosed stdin hangs the observer.
+        result = execFileSync(argv[0], argv.slice(1), { cwd: root, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+          input: typeof item.input === 'string' ? item.input : JSON.stringify(item.input) });
+      } catch (error) { rejected = error; }
+      if (item.expect_nonzero === true) {
+        if (!rejected || rejected.killed) { failures += 1; lines.push(`case ${index}: expected rejection, exited 0`); }
+        else lines.push(`case ${index}: rejected as expected`);
+        continue;
+      }
+      if (rejected) { failures += 1; lines.push(`case ${index}: observer failed: ${rejected.stderr ?? rejected.message}`); continue; }
+      let actual;
+      try { actual = JSON.parse(result); } catch { failures += 1; lines.push(`case ${index}: observer output is not JSON`); continue; }
+      if (canonicalJson(actual) !== canonicalJson(item.expected_output)) {
+        failures += 1; lines.push(`case ${index}: output differs from the registered expectation`);
+      } else lines.push(`case ${index}: matched`);
+    }
+    writeFileSync(path, JSON.stringify({ check: id, task: entry.task, observer: entry.observer, cases: entry.cases.length }) + '\n' + lines.join('\n') + '\n');
+    if (failures) {
+      // A landed feature that no longer passes is a platform fact; a candidate that fails one is its own fault.
+      const reasons = lines.filter(line => !/: matched$/.test(line) && !/: rejected as expected$/.test(line)).slice(0, 4).join('; ');
+      const message = `registered check ${id} failed for task ${entry.task}; ${failures} of ${entry.cases.length} cases: ${reasons}; retained log: ${path}`;
+      throw kind === 'candidate' ? new TaskFault(message) : Error(message);
+    }
+  }
+  return logs;
+}
+
 export async function runCodeChecks(config, code, kind, candidate, main, directory) {
   const cwd = kind === 'candidate' ? code.worktree : config.code.repo;
   const logs = [];

@@ -474,6 +474,8 @@ export class ParallelController {
     const merge = this.state.merge;
     if (!merge || merge.task !== task.node_id || merge.candidate !== task.code.candidate || !merge.checks?.length ||
         merge.main !== this.state.code_main) throw Error('missing/stale exact-candidate merge grant');
+    // Registration is additive, so the grant must be re-validated against the current reviewed bytes.
+    if (merge.check_set !== G.checkSetDigest(this.state.checks)) throw Error('registered check set changed after the publication grant');
     await this.codeMainCheck();
     await G.candidateIdentity(this.config, task.code, merge.candidate, merge.main);
   }
@@ -513,24 +515,29 @@ export class ParallelController {
       if (code.phase === 'reconcile') {
         this.state.merge.candidate = code.candidate;
         this.persist();
+        const set = G.checkSetDigest(this.state.checks);
         const checks = await G.runCodeChecks(this.config, code, 'candidate', code.candidate, base, attempt.dir);
+        const registered = await G.runRegisteredChecks(this.config, this.state.checks, code, 'candidate', attempt.dir);
         await this.codeMainCheck();
         await taskFault(G.candidateIdentity(this.config, code, code.candidate, base));
-        this.state.merge.checks = checks;
+        this.state.merge.checks = [...checks, ...registered];
+        this.state.merge.check_set = set; // the grant is bound to these exact expectations
         code.phase = 'publish';
         this.log('candidate_checked', { task: task.node_id, ...this.state.merge });
       } else code.phase = 'reconcile';
     } else {
       const merge = this.state.merge;
       if (!merge || merge.task !== task.node_id || !merge.checks?.length || r.disposition !== 'worked' ||
-          identity.candidate !== merge.candidate || identity.main !== merge.candidate) throw Error('publication report does not match checked grant');
+          identity.candidate !== merge.candidate || identity.main !== merge.candidate) throw new G.TaskFault('publication report does not match checked grant');
+      if (merge.check_set !== G.checkSetDigest(this.state.checks)) throw Error('registered check set changed after the publication grant');
       await G.candidateIdentity(this.config, code, merge.candidate, merge.main);
       if (await G.mainIdentity(this.config.code) !== merge.candidate) throw Error('main is not the exact checked candidate');
       const checks = await G.runCodeChecks(this.config, code, 'main', merge.candidate, merge.main, attempt.dir);
+      const registered = await G.runRegisteredChecks(this.config, this.state.checks, code, 'main', attempt.dir);
       await this.codeMainCheck(true);
       if (await G.mainIdentity(this.config.code) !== merge.candidate) throw Error('main changed during main gates');
       await G.candidateIdentity(this.config, code, merge.candidate, merge.main);
-      code.main_checks = checks;
+      code.main_checks = [...checks, ...registered];
       code.phase = 'landed';
       this.state.code_main = merge.candidate;
       this.log('code_published', { task: task.node_id, ...merge, main_checks: checks });
