@@ -25,6 +25,7 @@ const absolute = (path, label) => {
 export function validateCodeConfig(code) {
   if (!code) return undefined;
   const c = { ...code };
+  if (c.integration !== undefined && c.integration !== 'dispatcher') throw Error('code.integration must be dispatcher when set');
   absolute(c.repo, 'code.repo'); absolute(c.worktree_root, 'code.worktree_root');
   if (within(c.worktree_root, c.repo) || within(c.repo, c.worktree_root)) throw Error('code worktree_root and repo must be disjoint');
   if (!text(c.main_branch) || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(c.main_branch) || c.main_branch.includes('..') ||

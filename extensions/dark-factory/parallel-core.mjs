@@ -80,7 +80,7 @@ const parse = text => {
 export function validateDispatcherReport(text) {
   const r = parse(text);
   if (!r || typeof r !== 'object' || r.version !== 1 || r.role !== 'dispatcher') throw Error('report needs version 1 and role "dispatcher"');
-  if (!['tasks', 'setup', 'done', 'blocked'].includes(r.disposition)) throw Error('disposition must be tasks, setup, done or blocked');
+  if (!['tasks', 'setup', 'done', 'blocked', 'continue'].includes(r.disposition)) throw Error('disposition must be tasks, setup, done, blocked or continue');
   if (typeof r.summary !== 'string' || !r.summary.trim()) throw Error('summary must be a nonempty string');
   if (!Array.isArray(r.tasks)) throw Error('tasks must be an array');
   const seen = new Set();
@@ -128,12 +128,19 @@ export function validateDispatcherReport(text) {
       ...(r.setup.proposal_hash ? { proposal_hash: r.setup.proposal_hash } : {}),
       ...(r.setup.verdict ? { verdict: r.setup.verdict } : {}) };
   })();
+  const completed = (r.completed ?? []).map(item => {
+    if (!isNodeId(item?.node_id) || !sha(item.candidate) || !sha(item.main)) throw Error('completed needs task UUID and full candidate/main SHAs');
+    strings(item.checks, 'completed.checks');
+    if (!item.checks.length || item.checks.some(path => !isAbsolute(path) || !existsSync(path))) throw Error('completed needs existing absolute test logs');
+    return { node_id: item.node_id, candidate: item.candidate, main: item.main, checks: item.checks };
+  });
+  if (new Set(completed.map(item => item.node_id)).size !== completed.length) throw Error('completed lists a task twice');
   const report = {
     version: 1, role: 'dispatcher', disposition: r.disposition, summary: r.summary, tasks,
     stop_running: uuids(r.stop_running ?? [], 'stop_running'),
     updated_nodes: uuids(r.updated_nodes ?? [], 'updated_nodes'),
     questions_for_jack: strings(r.questions_for_jack ?? [], 'questions_for_jack'),
-    blockers, recover, ...(setup ? { setup } : {}),
+    blockers, recover, ...(completed.length ? { completed } : {}), ...(setup ? { setup } : {}),
   };
   if (!['tasks'].includes(report.disposition) && tasks.length) throw Error(`${report.disposition} requires an empty tasks list`);
   // A machine-owned condition is a blocker with an owner, not a question to Jack.
@@ -226,7 +233,7 @@ const ready = state => state.order.map(id => state.tasks[id])
 export function planAssignments(state, config, now) {
   if (state.status !== 'running' || state.stop || state.attention || state.awaiting_input?.length) return [];
   if (['done', 'blocked'].includes(state.dispatcher.last?.disposition)) return [];
-  if (state.primary_required) {
+  if (state.primary_required && config.code?.integration !== 'dispatcher') {
     const primary = config.seats.find(seat => seat.kind === 'oss');
     if (!primary) return [];
     const active = state.seats[primary.id]?.attempt;
@@ -413,6 +420,10 @@ export function finishDispatcher(state, id, outcome, now, rejected = new Map()) 
     }
   }
   d.last = { disposition: report.disposition, at: now, attempt: id };
+  if (report.disposition === 'continue') {
+    d.previous = outcome.reportPath;
+    addEvent(state, { type: 'dispatcher_continued', report: outcome.reportPath }, now);
+  } else delete d.previous;
   // A report whose every task was refused cannot make progress on its own; count it toward attention.
   d.failures = effects.rejected.length && !effects.accepted.length ? d.failures + 1 : 0;
   if (d.failures >= DISPATCH_FAILURE_LIMIT) state.attention = { reason: `${d.failures} consecutive dispatcher reports without an acceptable task`, at: now };
@@ -450,7 +461,9 @@ export function dispatcherSnapshot(state, config, now) {
     ...(config.code ? { code: config.code, code_main: state.code_main, merge: state.merge } : {}),
     acceptance: config.acceptance ?? null,
     baseline: state.baseline ?? null,
+    integration_handoff: state.integration_handoff ?? null,
     recovery_policy: 'A terminal quiet task may start a fresh guarded attempt. Historical route verdicts are not required.',
+    previous_dispatcher: state.dispatcher.previous ?? null,
     setup: state.setup ?? null,
     checks: Object.fromEntries(Object.entries(state.checks ?? {}).map(([id, entry]) => [id, { task: entry.task, observer: entry.observer,
       cases: entry.cases.length, proposal: entry.proposal_hash, review: entry.review_hash, registered_at: entry.registered_at }])),
@@ -470,10 +483,11 @@ export function dispatcherSnapshot(state, config, now) {
 }
 
 // Prompts carry pointers only; every instruction lives in the role nodes.
-export function dispatcherPrompt({ role, run, events, state, report, setup, tools }) {
+export function dispatcherPrompt({ role, run, events, state, report, setup, previous, tools }) {
   return [
     `You are a factory dispatcher. Read the ROLE node with ${tools} and follow it exactly.`,
     `ROLE: ${role}`, `RUN: ${run}`, `EVENTS: ${events}`, `STATE: ${state}`, `REPORT: ${report}`,
+    ...(previous ? [`PREVIOUS: ${previous}`] : []),
     ...(setup ? [`SETUP_PACKET: ${setup} (the only path this attempt may write for a setup proposal or review)`] : []),
   ].join('\n') + '\n';
 }
