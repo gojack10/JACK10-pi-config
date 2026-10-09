@@ -33,7 +33,7 @@ export function renderQuotaLines(
 			: row.verifying
 				? "RESETS ?"
 				: "";
-		const badge = row.blocked ? "BLOCKED" : row.stale ? "STALE" : "";
+		const badge = row.blocked ? "BLOCKED" : "";
 		const suffix = [schedule, badge].filter(Boolean).join(" ");
 		const line = `${theme.fg("dim", prefix)}${theme.fg(quotaBarColorForRemainingPercent(row.remaining), quotaBarForRemainingPercent(row.remaining))}${theme.fg("dim", ` ${amount}${suffix ? `   ${suffix}` : ""}`)}`;
 		return visibleWidth(line) > width ? fitToWidth(line, width) : line;

@@ -56,30 +56,12 @@ export type CodexUsageState = {
 };
 
 export type QuotaIncrease = { at: number; percent: number };
-export type QuotaStatus = {
-	h5?: number;
-	week?: number;
-	h5Increases: QuotaIncrease[];
-	weekIncreases: QuotaIncrease[];
-	h5Verifying: boolean;
-	weekVerifying: boolean;
-	routable: boolean;
-	recoveryAt?: number;
-	stale: boolean;
-	aged?: boolean;
-};
-
 export type QuotaAccountEvaluation = {
 	routable: boolean;
 	reasons: string[];
-	ageMs: number | null;
-	freshness: "fresh" | "aged" | "unknown";
 	degradations: string[];
-	effectiveWindows: CodexWindow[];
 	recoveryAt?: number;
 };
-
-export const QUOTA_FEED_AGED_MS = 15 * 60_000;
 
 type LegacyWindow = Omit<CodexWindow, "slopePctPerHour" | "projectedExhaustAt">;
 type LegacyAccount = {
@@ -134,30 +116,10 @@ const parseRetryAfter = (headers: Record<string, string>, now: number): number |
 	return Number.isFinite(date) ? Math.ceil(date / 1000) : undefined;
 };
 
-const projectWindow = (
-	next: LegacyWindow,
-	previous: CodexWindow | undefined,
-	previousFetchedAt: number | undefined,
-	now: number,
-): CodexWindow => {
-	if (!previous || previous.resetAt !== next.resetAt) return { ...next, slopePctPerHour: null, projectedExhaustAt: null };
-	const elapsedHours = (now - (previousFetchedAt ?? now)) / 3_600_000;
-	const increase = next.pctUsed - previous.pctUsed;
-	if (!Number.isFinite(elapsedHours) || elapsedHours < 5 / 60 || increase < 1)
-		return { ...next, slopePctPerHour: null, projectedExhaustAt: null };
-	const slopePctPerHour = increase / elapsedHours;
-	return {
-		...next,
-		slopePctPerHour,
-		projectedExhaustAt: Math.ceil(now / 1000 + ((100 - next.pctUsed) / slopePctPerHour) * 3600),
-	};
-};
-
 const parseWindow = (
 	headers: Record<string, string>,
 	slot: "primary" | "secondary",
 	now: number,
-	previous: CodexAccount | undefined,
 ): CodexWindow | undefined => {
 	const minutes = numberHeader(headers, `x-codex-${slot}-window-minutes`);
 	if (minutes === undefined) return undefined;
@@ -172,13 +134,8 @@ const parseWindow = (
 		throw new Error(`${slot} reset headers disagree`);
 	const resetAt = absolute ?? (relative === undefined ? undefined : now / 1000 + relative);
 	if (resetAt === undefined || !Number.isFinite(resetAt) || resetAt <= 0) throw new Error(`${slot} reset is missing`);
-	const prior = previous?.windows.find((window) => window.minutes === minutes);
-	return projectWindow(
-		{ minutes, pctUsed, resetAt: Math.ceil(resetAt) },
-		prior,
-		previous?.status429 ? undefined : previous?.fetchedAt,
-		now,
-	);
+	// Keep the schema-2 fields for existing caches; usage is reported, not extrapolated.
+	return { minutes, pctUsed, resetAt: Math.ceil(resetAt), slopePctPerHour: null, projectedExhaustAt: null };
 };
 
 export const normalizeObservation = (
@@ -196,7 +153,7 @@ export const normalizeObservation = (
 	if (!plan) throw new Error("Codex plan is missing");
 	const sawWindowShape = "x-codex-primary-window-minutes" in headers || "x-codex-secondary-window-minutes" in headers;
 	if (status === 200 && !sawWindowShape) throw new Error("Codex window shape is missing");
-	const parsed = [parseWindow(headers, "primary", now, previous), parseWindow(headers, "secondary", now, previous)].filter(
+	const parsed = [parseWindow(headers, "primary", now), parseWindow(headers, "secondary", now)].filter(
 		(window): window is CodexWindow => window !== undefined,
 	);
 	const windows = sawWindowShape
@@ -235,8 +192,6 @@ export const resetNotes = (previous: CodexAccount | undefined, next: CodexAccoun
 };
 
 const quotaIso = (seconds: number): string => new Date(seconds * 1000).toISOString();
-const quotaAge = (milliseconds: number): string => `${Math.max(0, Math.floor(milliseconds / 1000))}s`;
-
 export const evaluateQuotaAccount = (
 	account: CodexAccount,
 	now: number = Date.now(),
@@ -247,49 +202,23 @@ export const evaluateQuotaAccount = (
 	if (account.policyClass === "unknown") reasons.push("POLICY UNKNOWN");
 	if (account.captureHealth !== "healthy")
 		degradations.push(`CAPTURE ${account.captureHealth.toUpperCase()}: ${account.parseErrors.join(", ") || "meter unavailable"}`);
-	const ageMs = account.fetchedAt > 0 ? Math.max(0, now - account.fetchedAt) : null;
-	const aged = ageMs != null && ageMs > QUOTA_FEED_AGED_MS;
-	if (ageMs == null) reasons.push("NO ACCEPTED SAMPLE");
-	else if (aged) degradations.push(`STALE TELEMETRY age ${quotaAge(ageMs)}`);
+	if (account.fetchedAt <= 0) reasons.push("NO ACCEPTED SAMPLE");
 	if (account.notBefore != null && now < account.notBefore * 1000) {
 		if (account.status429) reasons.push("RATE LIMITED");
 		reasons.push(`NOT BEFORE ${quotaIso(account.notBefore)}`);
 		recoveryGates.push(account.notBefore);
-	} else if (account.status429) {
+	} else if (account.status429 && account.notBefore == null) {
 		reasons.push("RATE LIMITED");
-		degradations.push(
-			account.notBefore == null
-				? "RATE LIMIT OBSERVED WITHOUT ACTIVE COOLDOWN"
-				: `RATE LIMIT COOLDOWN ELAPSED ${quotaIso(account.notBefore)}`,
-		);
 	}
 	if (account.windows.length === 0) reasons.push("CAPACITY UNKNOWN");
 	if (!account.plan.toLowerCase().startsWith("pro") && !account.windows.some((window) => window.minutes === 300))
 		reasons.push("5H WINDOW MISSING");
 	if (!account.windows.some((window) => window.minutes === 10080)) reasons.push("WEEKLY WINDOW MISSING");
-	const effectiveWindows: CodexWindow[] = [];
+	// A passed reset permits a real request to verify capacity; it never erases the cached reading.
 	for (const window of account.windows) {
-		if (window.resetAt * 1000 <= now) {
-			reasons.push(`WINDOW UNKNOWN AFTER RESET ${window.minutes}m`);
-			degradations.push(`WINDOW ${window.minutes}m snapshot expired at ${quotaIso(window.resetAt)}`);
-			continue;
-		}
-		const slope = aged && window.slopePctPerHour != null && window.slopePctPerHour > 0 ? window.slopePctPerHour : null;
-		const pctUsed = aged
-			? Math.min(100, slope == null ? Math.max(window.pctUsed, 90) : window.pctUsed + slope * (ageMs! / 3_600_000))
-			: window.pctUsed;
-		const projectedExhaustAt =
-			slope == null
-				? window.projectedExhaustAt
-				: (window.projectedExhaustAt ?? Math.ceil(now / 1000 + ((100 - pctUsed) / slope) * 3600));
-		const effective = { ...window, pctUsed, projectedExhaustAt };
-		effectiveWindows.push(effective);
-		if (aged && pctUsed !== window.pctUsed)
-			degradations.push(`WINDOW ${window.minutes}m degraded ${window.pctUsed}%→${pctUsed.toFixed(1)}%`);
-		if (pctUsed >= 100) {
+		if (window.resetAt * 1000 > now && window.pctUsed >= 100) {
 			reasons.push(`WINDOW EXHAUSTED ${window.minutes}m`);
 			recoveryGates.push(window.resetAt);
-			continue;
 		}
 	}
 	const onlyTimedReasons = reasons.every(
@@ -301,90 +230,8 @@ export const evaluateQuotaAccount = (
 	return {
 		routable: reasons.length === 0,
 		reasons,
-		ageMs,
-		freshness: ageMs == null ? "unknown" : aged ? "aged" : "fresh",
 		degradations,
-		effectiveWindows,
 		...(onlyTimedReasons && recoveryGates.length > 0 ? { recoveryAt: Math.max(...recoveryGates) } : {}),
-	};
-};
-
-const poolStatus = (
-	accounts: Array<{ account: CodexAccount; evaluation: QuotaAccountEvaluation }>,
-	minutes: number,
-	now: number,
-	denominator: number,
-) => {
-	const gains = new Map<number, number>();
-	const addGain = (at: number, percent: number) => {
-		if (percent > 0 && at * 1000 > now)
-			gains.set(at, (gains.get(at) ?? 0) + percent / denominator);
-	};
-	let remaining = 0;
-	let verifying = false;
-	for (const { account, evaluation } of accounts) {
-		const observed = account.windows.find((window) => window.minutes === minutes);
-		if (observed && observed.resetAt * 1000 <= now) verifying = true;
-		const window = observed?.resetAt && observed.resetAt * 1000 > now ? observed : undefined;
-		if (!window) continue;
-		// Weekly balance is independent of short-window exhaustion and routing blocks.
-		if (minutes === 10080 || evaluation.routable) {
-			remaining += 100 - window.pctUsed;
-			addGain(window.resetAt, window.pctUsed);
-			continue;
-		}
-		if (evaluation.recoveryAt === undefined) continue;
-		const afterRecovery = window.resetAt <= evaluation.recoveryAt ? 100 : 100 - window.pctUsed;
-		addGain(evaluation.recoveryAt, afterRecovery);
-		if (window.resetAt > evaluation.recoveryAt) addGain(window.resetAt, window.pctUsed);
-	}
-	return {
-		remaining: remaining / denominator,
-		increases: [...gains].sort(([left], [right]) => left - right)
-			.map(([at, percent]) => ({ at, percent })),
-		verifying,
-	};
-};
-
-export const quotaStatus = (
-	feed: CodexUsageState | undefined,
-	now: number = Date.now(),
-	registeredAccounts?: number,
-	model?: string,
-): QuotaStatus => {
-	if (!feed) return {
-		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
-		routable: false, stale: true,
-	};
-	const observed = model
-		? feed.accounts.filter((account) => account.supportedModels.includes(model))
-		: feed.accounts;
-	const denominator = Math.max(registeredAccounts ?? observed.length, observed.length);
-	if (denominator === 0) return {
-		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
-		routable: false, stale: true,
-	};
-	const accounts = observed.map((account) => ({ account, evaluation: evaluateQuotaAccount(account, now) }));
-	const evaluations = accounts.map(({ evaluation }) => evaluation);
-	const routable = evaluations.some((evaluation) => evaluation.routable);
-	const recoveries = evaluations
-		.map((evaluation) => evaluation.recoveryAt)
-		.filter((value): value is number => value !== undefined);
-	const recoveryAt = recoveries.length > 0 ? Math.min(...recoveries) : undefined;
-	// ponytail: equal-weight normalized accounts; weight absolute limits if telemetry exposes them.
-	const h5 = poolStatus(accounts, 300, now, denominator);
-	const week = poolStatus(accounts, 10080, now, denominator);
-	return {
-		h5: h5.remaining,
-		week: week.remaining,
-		h5Increases: h5.increases,
-		weekIncreases: week.increases,
-		h5Verifying: h5.verifying,
-		weekVerifying: week.verifying,
-		routable,
-		...(recoveryAt === undefined ? {} : { recoveryAt }),
-		stale: !routable && recoveryAt === undefined,
-		...(evaluations.some((evaluation) => evaluation.freshness === "aged") ? { aged: true } : {}),
 	};
 };
 
@@ -397,7 +244,6 @@ export type QuotaBucketRow = {
 	increases: QuotaIncrease[];
 	verifying: boolean;
 	blocked: boolean;
-	stale: boolean;
 };
 
 const bucketFor = (plan: string): QuotaBucket | undefined => {
@@ -407,49 +253,39 @@ const bucketFor = (plan: string): QuotaBucket | undefined => {
 	return undefined;
 };
 
-// Bucket rows are model-independent gauges: remaining is summed across every live
-// account that has the window (429'd included, aged degradation included) and
-// divided by the count of those live accounts, never by registered accounts.
+// Gauge the cached readings, including idle accounts and passed resets.
+// ponytail: equal-weight percentages; weight by capacity if the API ever exposes limits.
 export const quotaBuckets = (
 	feed: CodexUsageState | undefined,
 	now: number = Date.now(),
 ): QuotaBucketRow[] => {
 	if (!feed || feed.accounts.length === 0) return [];
-	const evaluated = feed.accounts.map((account) => ({ account, evaluation: evaluateQuotaAccount(account, now) }));
 	const rows: QuotaBucketRow[] = [];
 	for (const bucket of ["PLUS", "PRO"] as const) {
-		const members = evaluated.filter(({ account }) => bucketFor(account.plan) === bucket);
+		const members = feed.accounts.filter((account) => bucketFor(account.plan) === bucket);
 		for (const minutes of [300, 10080] as const) {
-			if (!members.some(({ account }) => account.windows.some((window) => window.minutes === minutes))) continue;
-			const live = members.filter(({ evaluation }) =>
-				evaluation.effectiveWindows.some((window) => window.minutes === minutes)
-			);
+			const samples = members.filter((account) => account.windows.some((window) => window.minutes === minutes));
+			if (samples.length === 0) continue;
 			// A routing failure/429 does not identify which quota window is empty.
 			// Weekly exhaustion can block 5H use, but never the reverse.
-			const blocked = live.length > 0 && live.every(({ evaluation }) =>
-				evaluation.effectiveWindows.some((window) =>
-					(window.minutes === minutes || window.minutes === 10080) && window.pctUsed >= 100
+			const blocked = samples.every((account) =>
+				account.windows.some((window) =>
+					(window.minutes === minutes || window.minutes === 10080) && window.resetAt * 1000 > now && window.pctUsed >= 100
 				)
 			);
-			const stale = !blocked && live.some(({ evaluation }) => evaluation.freshness === "aged");
 			const refillByReset = new Map<number, number>();
-			for (const { evaluation } of live) {
-				for (const window of evaluation.effectiveWindows) {
+			for (const account of samples) {
+				for (const window of account.windows) {
 					if (window.minutes !== minutes || window.resetAt * 1000 <= now || window.pctUsed <= 0) continue;
 					refillByReset.set(window.resetAt, (refillByReset.get(window.resetAt) ?? 0) + window.pctUsed);
 				}
 			}
 			const events: QuotaIncrease[] = [...refillByReset]
 				.sort(([left], [right]) => left - right)
-				.map(([at, percent]) => ({ at, percent: percent / live.length }));
-			const remaining =
-				live.length === 0
-					? 0
-					: live.reduce((sum, { evaluation }) => {
-							const window = evaluation.effectiveWindows.find((candidate) => candidate.minutes === minutes)!;
-							return sum + (100 - window.pctUsed);
-						}, 0) / live.length;
-			const verifying = members.some(({ account }) =>
+				.map(([at, percent]) => ({ at, percent: percent / samples.length }));
+			const remaining = samples.reduce((sum, account) =>
+				sum + 100 - account.windows.find((window) => window.minutes === minutes)!.pctUsed, 0) / samples.length;
+			const verifying = samples.some((account) =>
 				account.windows.some((window) => window.minutes === minutes && window.resetAt * 1000 <= now)
 			);
 			rows.push({
@@ -459,7 +295,6 @@ export const quotaBuckets = (
 				increases: events,
 				verifying,
 				blocked,
-				stale,
 			});
 		}
 	}
@@ -665,11 +500,6 @@ export class CodexUsageStore {
 		return this.snapshot();
 	}
 
-	async registeredAccountCount(model?: string): Promise<number> {
-		const accounts = (await this.getRegistry()).accounts;
-		return model ? accounts.filter((account) => account.supportedModels.includes(model)).length : accounts.length;
-	}
-
 	snapshot(): CodexUsageState {
 		return structuredClone(this.state);
 	}
@@ -760,7 +590,10 @@ export class CodexUsageStore {
 			const merged = new Map(disk.accounts.map((account) => [account.accountKey, account]));
 			for (const accountKey of this.dirtyAccountKeys) {
 				const account = local.get(accountKey);
-				if (account) merged.set(accountKey, account);
+				const prior = merged.get(accountKey);
+				if (account && (!prior || account.fetchedAt > prior.fetchedAt ||
+					(account.fetchedAt === prior.fetchedAt && account.lastAttemptAt >= prior.lastAttemptAt)))
+					merged.set(accountKey, account);
 			}
 			const next: CodexUsageState = {
 				...disk,
