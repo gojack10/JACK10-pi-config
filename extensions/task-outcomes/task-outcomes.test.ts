@@ -435,8 +435,8 @@ test("friendly reporting retains an active contract and accepts an uncapped curr
     getContextUsage: () => ({ tokens: 80, contextWindow: 100, percent: 80 }),
     abort: () => assert.fail("friendly reporting must not abort"),
   };
-  const result = await loaded.extensions[0].handlers.get("context")[0]({ messages: [] }, ctx);
-  assert.match(result.messages.at(-1).content, /report_outcome/);
+  const result = await loaded.extensions[0].handlers.get("turn_end")[0]({ entries: [] }, ctx);
+  assert.match(result.entries.at(-1).content, /report_outcome/);
   assert.equal(h.manager.snapshot().active.state, "active");
   const findings = "partial findings and remaining work\n".repeat(1000);
   await writeFile(join(h.dir, "friendly-A.md"), findings);
