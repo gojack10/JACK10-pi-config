@@ -3,250 +3,131 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import {
-	allowlistedHeaders,
-	type CodexAccountRegistry,
-	CodexUsageStore,
-	normalizeObservation,
-	parseRegistry,
-	quotaBuckets,
-	quotaStatus,
-	resetNotes,
-	type RegistryAccount,
-} from "./store.ts";
+import { allowlistedHeaders, type CodexAccountRegistry, CodexUsageStore, evaluateQuotaAccount,
+	normalizeObservation, parseRegistry, quotaBuckets, resetNotes, type RegistryAccount } from "./store.ts";
 
-const alt: RegistryAccount = {
-	accountKey: "account-alt",
-	providerId: "openai-codex-alt",
-	credentialRef: "openai-codex-alt",
-	label: "Alt",
-	policyClass: "perishable",
-	supportedModels: ["gpt-5.6-sol"],
-};
-const team: RegistryAccount = {
-	accountKey: "account-team",
-	providerId: "openai-codex-team",
-	credentialRef: "openai-codex-team",
-	label: "Team",
-	policyClass: "unknown",
-	supportedModels: ["gpt-5.6-sol"],
-};
-const registry: CodexAccountRegistry = {
-	schemaVersion: 1,
-	umbrellaProviderId: "openai-codex-personal",
-	accounts: [alt, team],
-};
+const alt: RegistryAccount = { accountKey: "account-alt", providerId: "openai-codex-alt", credentialRef: "openai-codex-alt",
+	label: "Alt", policyClass: "perishable", supportedModels: ["gpt-6-astra"] };
+const team: RegistryAccount = { ...alt, accountKey: "account-team", providerId: "openai-codex-team", credentialRef: "openai-codex-team", label: "Team" };
+const registry: CodexAccountRegistry = { schemaVersion: 1, umbrellaProviderId: "openai-codex-personal", accounts: [alt, team] };
+const headers = (short = "46", reset = "2000", weekly = "76", plan = "edu_plus") => ({
+	"X-Codex-Plan-Type": plan, "X-Codex-Primary-Used-Percent": short,
+	"X-Codex-Primary-Window-Minutes": "300", "X-Codex-Primary-Reset-At": reset,
+	"X-Codex-Secondary-Used-Percent": weekly, "X-Codex-Secondary-Window-Minutes": "10080",
+	"X-Codex-Secondary-Reset-At": "7000", Authorization: "secret", Cookie: "secret", "X-Request-Id": "request-1",
+});
+const state = (accounts: ReturnType<typeof normalizeObservation>[]) => ({ schemaVersion: 2 as const, generation: 1, generatedAt: 1_000_000, accounts });
 
-const headers = (primaryPct = "46", primaryReset = "2000") => ({
-	"X-Codex-Plan-Type": "edu",
-	"X-Codex-Primary-Used-Percent": primaryPct,
-	"X-Codex-Primary-Window-Minutes": "300",
-	"X-Codex-Primary-Reset-At": primaryReset,
-	"X-Codex-Secondary-Used-Percent": "76",
-	"X-Codex-Secondary-Window-Minutes": "10080",
-	"X-Codex-Secondary-Reset-At": "7000",
-	Authorization: "secret",
-	Cookie: "secret",
-	"X-Request-Id": "request-1",
+test("allowlists diagnostics without credentials and rejects ambiguous identities", () => {
+	const allowed = allowlistedHeaders(headers());
+	assert.equal(allowed.authorization, undefined);
+	assert.equal(allowed.cookie, undefined);
+	assert.equal(allowed["x-codex-primary-used-percent"], "46");
+	assert.equal(allowed["x-request-id"], "request-1");
+	assert.throws(() => parseRegistry({ ...registry, accounts: [alt, { ...team, providerId: alt.providerId }] }), /mappings must be unique/);
 });
 
-const state = (accounts: ReturnType<typeof normalizeObservation>[], current = alt) => ({
-	schemaVersion: 2 as const,
-	generation: 1,
-	generatedAt: 1_000_000,
-	accounts,
-	current: current.providerId,
-	currentAccountKey: current.accountKey,
-});
-
-test("allowlists quota diagnostics without credentials", () => {
-	assert.deepEqual(allowlistedHeaders(headers()), {
-		"x-codex-plan-type": "edu",
-		"x-codex-primary-used-percent": "46",
-		"x-codex-primary-window-minutes": "300",
-		"x-codex-primary-reset-at": "2000",
-		"x-codex-secondary-used-percent": "76",
-		"x-codex-secondary-window-minutes": "10080",
-		"x-codex-secondary-reset-at": "7000",
-		"x-request-id": "request-1",
-	});
-});
-
-test("rejects ambiguous provider mappings", () => {
-	assert.throws(
-		() => parseRegistry({ ...registry, accounts: [alt, { ...team, providerId: alt.providerId }] }),
-		/mappings must be unique/,
-	);
-});
-
-test("normalizes schema-2 identity and suppresses zero-minute windows", () => {
-	const account = normalizeObservation(
-		alt,
-		200,
-		{ ...headers(), "X-Codex-Secondary-Window-Minutes": "0", "X-Codex-Secondary-Reset-At": "" },
-		undefined,
-		1_000_000,
-	);
+test("normalizes identity, suppresses zero-minute windows and rejects bad readings", () => {
+	const account = normalizeObservation(alt, 200, { ...headers(), "X-Codex-Secondary-Window-Minutes": "0" }, undefined, 1_000_000);
 	assert.equal(account.accountKey, alt.accountKey);
-	assert.equal(account.policyClass, "perishable");
-	assert.deepEqual(account.supportedModels, ["gpt-5.6-sol"]);
-	assert.deepEqual(account.windows, [
-		{ minutes: 300, pctUsed: 46, resetAt: 2000, slopePctPerHour: null, projectedExhaustAt: null },
-	]);
-	assert.equal(account.captureHealth, "healthy");
-	assert.equal(account.lastAttemptAt, 1_000_000);
+	assert.deepEqual(account.supportedModels, alt.supportedModels);
+	assert.deepEqual(account.windows, [{ minutes: 300, pctUsed: 46, resetAt: 2000, slopePctPerHour: null, projectedExhaustAt: null }]);
+	assert.throws(() => normalizeObservation(alt, 200, headers("101")), /used percent is invalid/);
+	assert.throws(() => normalizeObservation(alt, 200, {}), /quota headers are missing/);
 });
 
-test("projects exhaustion only from sufficiently separated same-epoch samples", () => {
-	const before = normalizeObservation(alt, 200, headers("40", "2000"), undefined, 1_000_000);
-	const projected = normalizeObservation(alt, 200, headers("42", "2000"), before, 1_600_000);
-	assert.equal(projected.windows[0]?.slopePctPerHour, 12);
-	assert.equal(projected.windows[0]?.projectedExhaustAt, 19_000);
-	const tooSoon = normalizeObservation(alt, 200, headers("44", "2000"), projected, 1_800_000);
-	assert.equal(tooSoon.windows[0]?.slopePctPerHour, null);
-	assert.equal(tooSoon.windows[0]?.projectedExhaustAt, null);
+test("reports observed usage without projecting further consumption while idle", () => {
+	const before = normalizeObservation(alt, 200, headers("40"), undefined, 1_000_000);
+	const next = normalizeObservation(alt, 200, headers("42"), before, 1_600_000);
+	assert.equal(next.windows[0]!.pctUsed, 42);
+	assert.equal(next.windows[0]!.slopePctPerHour, null);
+	assert.equal(next.windows[0]!.projectedExhaustAt, null);
+	assert.equal(quotaBuckets(state([next]), 1_900_000)[0]!.remaining, 58);
 });
 
-test("headerless 429 retains windows and only a valid 200 clears blocking", () => {
+test("headerless 429 retains readings, cooldown gates routing, valid 200 clears it", () => {
 	const before = normalizeObservation(alt, 200, headers(), undefined, 1_000_000);
 	const blocked = normalizeObservation(alt, 429, {}, before, 1_100_000);
 	assert.deepEqual(blocked.windows, before.windows);
-	assert.equal(blocked.fetchedAt, 1_100_000);
-	assert.equal(blocked.status429, true);
 	assert.equal(blocked.notBefore, 2000);
-	const status = quotaStatus(state([blocked]), 1_100_000);
-	assert.equal(status?.routable, false);
-	assert.equal(status?.recoveryAt, 2000);
-
+	assert.equal(evaluateQuotaAccount(blocked, 1_100_000).routable, false);
+	assert.equal(evaluateQuotaAccount(blocked, 2_000_001).routable, true);
 	const cleared = normalizeObservation(alt, 200, headers(), blocked, 1_200_000);
 	assert.equal(cleared.status429, false);
 	assert.equal(cleared.notBefore, null);
 });
 
 test("detects reset epochs and percentage drops", () => {
-	const before = normalizeObservation(alt, 200, headers("46", "2000"), undefined, 1_000_000);
+	const before = normalizeObservation(alt, 200, headers(), undefined, 1_000_000);
 	const next = normalizeObservation(alt, 200, headers("40", "3000"), before, 1_100_000);
 	assert.deepEqual(resetNotes(before, next), ["openai-codex-alt 300m reset observed"]);
 });
 
-test("quota status preserves weekly balance when short capacity is blocked", () => {
-	const available = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
-	const exhausted = normalizeObservation({ ...team, policyClass: "perishable" }, 200, headers("100"), undefined, 1_000_000);
-	const status = quotaStatus(state([exhausted, available]), 1_000_000);
-	assert.equal(status.h5, 50);
-	assert.equal(status.week, 24);
-	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }]);
-	assert.deepEqual(status.weekIncreases, [{ at: 7000, percent: 76 }]);
-	assert.equal(status.routable, true);
-	assert.equal(quotaStatus(state([available]), 1_000_000, 3).h5, 100 / 3);
-	assert.equal(quotaStatus(state([available]), 1_000_000, 3).week, 8);
+test("weekly exhaustion blocks routing until reset without deleting short balance", () => {
+	const sample = normalizeObservation(alt, 200, headers("20", "2000", "100"), undefined, 1_000_000);
+	assert.equal(evaluateQuotaAccount(sample, 1_000_000).routable, false);
+	const rows = quotaBuckets(state([sample]), 1_000_000);
+	assert.equal(rows[0]!.remaining, 80);
+	assert.equal(rows[0]!.blocked, true);
+	assert.equal(rows[1]!.remaining, 0);
+	assert.equal(evaluateQuotaAccount(sample, 7_000_001).routable, true);
+	assert.equal(quotaBuckets(state([sample]), 7_000_001)[0]!.remaining, 80);
 });
 
-test("weekly exhaustion blocks short capacity, not vice versa", () => {
-	const shortExhausted = normalizeObservation(
-		alt,
-		200,
-		{ ...headers("100"), "X-Codex-Secondary-Used-Percent": "58" },
-		undefined,
-		1_000_000,
-	);
-	const weekExhausted = normalizeObservation(
-		{ ...team, policyClass: "perishable" },
-		200,
-		{ ...headers("0"), "X-Codex-Secondary-Used-Percent": "100" },
-		undefined,
-		1_000_000,
-	);
-	const status = quotaStatus(state([shortExhausted, weekExhausted]), 1_000_000);
-	assert.equal(status.h5, 0);
-	assert.equal(status.week, 21);
-	assert.deepEqual(status.h5Increases, [{ at: 2000, percent: 50 }, { at: 7000, percent: 50 }]);
-	assert.deepEqual(status.weekIncreases, [{ at: 7000, percent: 79 }]);
-	assert.equal(status.routable, false);
-	assert.equal(status.recoveryAt, 2000);
+test("cached gauges keep exact percentages even after days without Codex usage", () => {
+	const plus = normalizeObservation(alt, 200, headers("20", "2000", "76"), undefined, 1_000_000);
+	for (const now of [1_960_000, 7_000_001, 1_000_000 + 7 * 86400_000]) {
+		const rows = quotaBuckets(state([plus]), now);
+		assert.deepEqual(rows.map((row) => row.remaining), [80, 24]);
+		assert.ok(rows.every((row) => !("stale" in row)));
+		assert.deepEqual(plus.windows.map((window) => window.pctUsed), [20, 76]);
+	}
 });
 
-test("quota status verifies expired windows and labels aged observed capacity", () => {
-	const expired = normalizeObservation(alt, 200, headers("0"), undefined, 1_000_000);
-	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
-	const expiredStatus = quotaStatus(state([expired]), 1_000_000);
-	assert.equal(expiredStatus.h5, 0);
-	assert.equal(expiredStatus.week, 24);
-	assert.equal(expiredStatus.h5Verifying, true);
-	assert.equal(expiredStatus.routable, false);
-
-	const aged = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
-	const agedStatus = quotaStatus(state([aged]), 1_000_000 + 15 * 60_000 + 1);
-	assert.equal(agedStatus.h5, 80);
-	assert.equal(agedStatus.week, 24);
-	assert.equal(agedStatus.routable, true);
-	assert.equal(agedStatus.stale, false);
-	assert.equal(agedStatus.aged, true);
+test("bucket gauges average all cached accounts per window; 429 does not erase them", () => {
+	const plus = normalizeObservation(alt, 200, headers("37", "2000", "88"), undefined, 1_000_000);
+	const another = normalizeObservation(team, 200, headers("100", "2600", "23", "plus"), undefined, 1_000_000);
+	const pro = normalizeObservation(team, 200, { ...headers("0", "3000", "76", "prolite"),
+		"X-Codex-Primary-Window-Minutes": "0" }, undefined, 1_000_000);
+	const rows = quotaBuckets(state([plus, another, pro]), 1_000_000);
+	assert.deepEqual(rows.map((row) => [row.bucket, row.window, row.remaining]),
+		[["PLUS", "5H", 31.5], ["PLUS", "WEEK", 44.5], ["PRO", "WEEK", 24]]);
+	assert.deepEqual(rows[0]!.increases, [{ at: 2000, percent: 18.5 }, { at: 2600, percent: 50 }]);
+	const limited = normalizeObservation(alt, 429, { "Retry-After": "10" }, plus, 1_100_000);
+	assert.deepEqual(quotaBuckets(state([limited]), 1_200_000).map((row) => row.remaining), [63, 12]);
+	assert.ok(quotaBuckets(state([limited]), 1_200_000).every((row) => !row.blocked));
+	assert.deepEqual(quotaBuckets(undefined), []);
+	assert.deepEqual(quotaBuckets(state([])), []);
 });
 
-test("quota status is stale only when the router has no route or recovery", () => {
-	assert.deepEqual(quotaStatus(undefined), {
-		h5Increases: [], weekIncreases: [], h5Verifying: false, weekVerifying: false,
-		routable: false, stale: true,
-	});
-	const blocked = normalizeObservation(alt, 200, headers("20"), undefined, 1_000_000);
-	blocked.notBefore = 2000;
-	const recovering = quotaStatus(state([blocked]), 1_000_000);
-	assert.equal(recovering.h5, 0);
-	assert.equal(recovering.week, 24);
-	assert.equal(recovering.routable, false);
-	assert.equal(recovering.recoveryAt, 2000);
-	assert.equal(recovering.stale, false);
-
-	const elapsed429 = normalizeObservation(alt, 429, { "Retry-After": "10" }, blocked, 1_100_000);
-	const stale = quotaStatus(state([elapsed429]), 1_200_000);
-	assert.equal(stale.h5, 0);
-	assert.equal(stale.week, 24);
-	assert.equal(stale.routable, false);
-	assert.equal(stale.stale, true);
-});
-
-test("migrates schema-1 state through immutable registry identity", async (t) => {
+test("migrates old caches without losing percentages", async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), "codex-quota-v1-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const path = join(directory, "state.json");
-	await writeFile(
-		path,
-		JSON.stringify({
-			accounts: [
-				{
-					id: alt.providerId,
-					plan: "edu",
-					windows: [{ minutes: 300, pctUsed: 46, resetAt: 2000 }],
-					status429: false,
-					fetchedAt: 1_000_000,
-				},
-			],
-			current: alt.providerId,
-		}),
-	);
+	await writeFile(path, JSON.stringify({ accounts: [{ id: alt.providerId, plan: "edu_plus",
+		windows: [{ minutes: 300, pctUsed: 46, resetAt: 2000 }], status429: false, fetchedAt: 1_000_000 }], current: alt.providerId }));
 	const migrated = await new CodexUsageStore(path, registry).load();
 	assert.equal(migrated.schemaVersion, 2);
 	assert.equal(migrated.currentAccountKey, alt.accountKey);
-	assert.equal(migrated.accounts[0]?.accountKey, alt.accountKey);
-	assert.equal(migrated.accounts[0]?.windows[0]?.slopePctPerHour, null);
+	assert.equal(migrated.accounts[0]!.windows[0]!.pctUsed, 46);
 });
 
-test("persists degraded capture health without replacing accepted windows", async (t) => {
-	const directory = await mkdtemp(join(tmpdir(), "codex-quota-failure-"));
+test("failed refresh and restart retain accepted usage", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-quota-cache-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
-	const store = new CodexUsageStore(join(directory, "state.json"), registry);
+	const path = join(directory, "state.json");
+	const store = new CodexUsageStore(path, registry);
 	store.observe(alt.providerId, 200, headers(), 1_000_000);
 	store.recordFailure(alt.providerId, new Error("bad headers"), 1_100_000);
-	const degraded = store.snapshot().accounts[0]!;
-	assert.equal(degraded.captureHealth, "degraded");
-	assert.equal(degraded.lastAttemptAt, 1_100_000);
-	assert.equal(degraded.fetchedAt, 1_000_000);
-	assert.equal(degraded.windows.length, 2);
-	assert.deepEqual(degraded.parseErrors, ["bad headers"]);
+	await store.write();
+	const cached = await new CodexUsageStore(path, registry).load();
+	assert.equal(cached.accounts[0]!.captureHealth, "degraded");
+	assert.equal(cached.accounts[0]!.fetchedAt, 1_000_000);
+	assert.deepEqual(cached.accounts[0]!.windows.map((window) => window.pctUsed), [46, 76]);
+	assert.deepEqual(quotaBuckets(cached, 8_000_000).map((row) => row.remaining), [54, 24]);
 });
 
-test("merges concurrent account writers under a lock", async (t) => {
+test("concurrent account upserts preserve both accounts, atomic files and private permissions", async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), "codex-quota-merge-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const path = join(directory, "state.json");
@@ -254,199 +135,28 @@ test("merges concurrent account writers under a lock", async (t) => {
 	const second = new CodexUsageStore(path, registry);
 	await Promise.all([first.load(), second.load()]);
 	first.observe(alt.providerId, 200, headers(), 1_000_000);
-	second.observe(
-		team.providerId,
-		200,
-		{
-			"x-codex-plan-type": "business",
-			"x-codex-primary-window-minutes": "0",
-			"x-codex-secondary-window-minutes": "0",
-		},
-		1_000_000,
-	);
+	second.observe(team.providerId, 200, headers("12"), 1_100_000);
 	await Promise.all([first.write(), second.write()]);
 	const merged = JSON.parse(await readFile(path, "utf8"));
-	assert.equal(merged.schemaVersion, 2);
 	assert.equal(merged.generation, 2);
-	assert.deepEqual(
-		merged.accounts.map((account: { accountKey: string }) => account.accountKey).sort(),
-		[team.accountKey, alt.accountKey].sort(),
-	);
+	assert.deepEqual(merged.accounts.map((account: { accountKey: string }) => account.accountKey).sort(), [alt.accountKey, team.accountKey].sort());
+	assert.equal((await stat(path)).mode & 0o777, 0o600);
+	assert.deepEqual(await readdir(directory), ["state.json"]);
 });
 
-test("writes state atomically with mode 0600", async (t) => {
-	const directory = await mkdtemp(join(tmpdir(), "codex-quota-"));
+test("an older writer or failed capture cannot overwrite a newer accepted reading", async (t) => {
+	const directory = await mkdtemp(join(tmpdir(), "codex-quota-upsert-"));
 	t.after(() => rm(directory, { recursive: true, force: true }));
 	const path = join(directory, "state.json");
-	const store = new CodexUsageStore(path, registry);
-	store.observe(alt.providerId, 200, headers(), 1_000_000);
-	store.observe(alt.providerId, 429, {}, 1_100_000);
-	await store.write();
-	assert.equal((await stat(path)).mode & 0o777, 0o600);
-	const blocked = JSON.parse(await readFile(path, "utf8"));
-	assert.equal(blocked.schemaVersion, 2);
-	assert.equal(blocked.generation, 1);
-	assert.equal(blocked.currentAccountKey, alt.accountKey);
-	assert.equal(blocked.accounts[0].notBefore, 2000);
-	assert.deepEqual((await readdir(directory)).sort(), ["state.json"]);
-});
-
-test("buckets quota by plan with live per-window denominators", () => {
-	const eduPlus = normalizeObservation(
-		alt,
-		200,
-		{
-			"X-Codex-Plan-Type": "edu_plus",
-			"X-Codex-Primary-Used-Percent": "37",
-			"X-Codex-Primary-Window-Minutes": "300",
-			"X-Codex-Primary-Reset-At": "2000",
-			"X-Codex-Secondary-Used-Percent": "88",
-			"X-Codex-Secondary-Window-Minutes": "10080",
-			"X-Codex-Secondary-Reset-At": "7000",
-		},
-		undefined,
-		1_000_000,
-	);
-	const plusAcc = normalizeObservation(
-		team,
-		200,
-		{
-			"X-Codex-Plan-Type": "plus",
-			"X-Codex-Primary-Used-Percent": "100",
-			"X-Codex-Primary-Window-Minutes": "300",
-			"X-Codex-Primary-Reset-At": "2600",
-			"X-Codex-Secondary-Used-Percent": "23",
-			"X-Codex-Secondary-Window-Minutes": "10080",
-			"X-Codex-Secondary-Reset-At": "9000",
-		},
-		undefined,
-		1_000_000,
-	);
-	const proAcc = normalizeObservation(
-		{ ...team, policyClass: "perishable" },
-		200,
-		{
-			"X-Codex-Plan-Type": "pro",
-			"X-Codex-Secondary-Used-Percent": "76",
-			"X-Codex-Secondary-Window-Minutes": "10080",
-			"X-Codex-Secondary-Reset-At": "7100",
-		},
-		undefined,
-		1_000_000,
-	);
-	const rows = quotaBuckets(state([eduPlus, plusAcc, proAcc]), 1_000_000);
-	assert.deepEqual(rows, [
-		{
-			bucket: "PLUS",
-			window: "5H",
-			remaining: 31.5,
-			increases: [{ at: 2000, percent: 18.5 }, { at: 2600, percent: 50 }],
-			verifying: false,
-			blocked: false,
-			stale: false,
-		},
-		{
-			bucket: "PLUS",
-			window: "WEEK",
-			remaining: 44.5,
-			increases: [{ at: 7000, percent: 44 }, { at: 9000, percent: 11.5 }],
-			verifying: false,
-			blocked: false,
-			stale: false,
-		},
-		{
-			bucket: "PRO",
-			window: "WEEK",
-			remaining: 24,
-			increases: [{ at: 7100, percent: 76 }],
-			verifying: false,
-			blocked: false,
-			stale: false,
-		},
-	]);
-});
-
-test("bucket rows do not infer exhaustion from 429s or expired sibling windows", () => {
-	const healthy = normalizeObservation(alt, 200, { ...headers(), "X-Codex-Plan-Type": "plus" }, undefined, 1_000_000);
-	const rateLimited = normalizeObservation(alt, 429, { "Retry-After": "10" }, healthy, 1_100_000);
-	const rows = quotaBuckets(state([rateLimited]), 1_200_000);
-	assert.deepEqual(rows, [
-		{
-			bucket: "PLUS",
-			window: "5H",
-			remaining: 54,
-			increases: [{ at: 2000, percent: 46 }],
-			verifying: false,
-			blocked: false,
-			stale: false,
-		},
-		{
-			bucket: "PLUS",
-			window: "WEEK",
-			remaining: 24,
-			increases: [{ at: 7000, percent: 76 }],
-			verifying: false,
-			blocked: false,
-			stale: false,
-		},
-	]);
-	const expired = normalizeObservation(alt, 200, { ...headers(), "X-Codex-Plan-Type": "pro" }, undefined, 1_000_000);
-	expired.windows.find((window) => window.minutes === 300)!.resetAt = 999;
-	const expiredRows = quotaBuckets(state([expired]), 1_200_000);
-	assert.deepEqual(expiredRows, [
-		{
-			bucket: "PRO",
-			window: "5H",
-			remaining: 0,
-			increases: [],
-			verifying: true,
-			blocked: false,
-			stale: false,
-		},
-		{
-			bucket: "PRO",
-			window: "WEEK",
-			remaining: 24,
-			increases: [{ at: 7000, percent: 76 }],
-			verifying: false,
-			blocked: false,
-			stale: false,
-		},
-	]);
-});
-
-test("bucket rows badge stale when live telemetry has aged", () => {
-	const aged = normalizeObservation(
-		alt,
-		200,
-		{ ...headers("20"), "X-Codex-Plan-Type": "pro" },
-		undefined,
-		1_000_000,
-	);
-	const rows = quotaBuckets(state([aged]), 1_000_000 + 15 * 60_000 + 1);
-	assert.deepEqual(rows, [
-		{
-			bucket: "PRO",
-			window: "5H",
-			remaining: 10,
-			increases: [{ at: 2000, percent: 90 }],
-			verifying: false,
-			blocked: false,
-			stale: true,
-		},
-		{
-			bucket: "PRO",
-			window: "WEEK",
-			remaining: 10,
-			increases: [{ at: 7000, percent: 90 }],
-			verifying: false,
-			blocked: false,
-			stale: true,
-		},
-	]);
-});
-
-test("bucket rows vanish when no account remains", () => {
-	assert.deepEqual(quotaBuckets(undefined), []);
-	assert.deepEqual(quotaBuckets(state([])), []);
+	const older = new CodexUsageStore(path, registry);
+	const newer = new CodexUsageStore(path, registry);
+	await Promise.all([older.load(), newer.load()]);
+	older.observe(alt.providerId, 200, headers("40"), 1_000_000);
+	newer.observe(alt.providerId, 200, headers("50"), 1_100_000);
+	await newer.write();
+	older.recordFailure(alt.providerId, "offline", 1_200_000);
+	await older.write();
+	const saved = await new CodexUsageStore(path, registry).load();
+	assert.equal(saved.accounts[0]!.fetchedAt, 1_100_000);
+	assert.equal(saved.accounts[0]!.windows[0]!.pctUsed, 50);
 });
