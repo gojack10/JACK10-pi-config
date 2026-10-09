@@ -17,7 +17,6 @@ const row = (
 ): QuotaBucketRow => ({
 	verifying: false,
 	blocked: false,
-	stale: false,
 	...extra,
 	bucket,
 	window,
@@ -57,11 +56,11 @@ test("renders verifying rows as bare question countdowns", () => {
 	]);
 });
 
-test("badges blocked and stale per row, never both", () => {
+test("only badges blocked rows; cached percentages render normally", () => {
 	assert.deepEqual(
 		renderQuotaLines(
 			[
-				row("PRO", "WEEK", 10, [{ at: 2000, percent: 90 }], { stale: true }),
+				row("PRO", "WEEK", 10, [{ at: 2000, percent: 90 }]),
 				row("PLUS", "5H", 0, [], { blocked: true }),
 			],
 			300,
@@ -71,7 +70,7 @@ test("badges blocked and stale per row, never both", () => {
 			fit,
 		),
 		[
-			"CODEX PRO  WEEK █░░░░░░░░░  10.0%   RESETS 16M:40S +90% STALE",
+			"CODEX PRO  WEEK █░░░░░░░░░  10.0%   RESETS 16M:40S +90%",
 			"CODEX PLUS 5H   ░░░░░░░░░░   0.0%   BLOCKED",
 		],
 	);
