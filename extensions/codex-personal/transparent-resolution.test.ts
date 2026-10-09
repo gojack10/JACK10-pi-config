@@ -5,334 +5,76 @@ import type { CodexAccountRegistry } from "../codex-quota-extension/store.ts";
 import { resolveCodexPersonalSelection } from "./resolution.ts";
 import type { RouteEvaluation } from "./router.ts";
 
-const model = (provider: string, id = "gpt-5.6-sol") =>
-	({ provider, id }) as Model;
+const id = "gpt-6-astra";
+const model = (provider: string) => ({ provider, id }) as Model;
 const umbrella = model("openai-codex-personal");
-const gpt56Ids = ["gpt-5.6-luna", umbrella.id, "gpt-5.6-terra"];
-const astraUmbrella = model(umbrella.provider, "gpt-6-astra");
-const personal = model("openai-codex");
-const sifttext = model("openai-codex-third");
-const astraSifttext = model(sifttext.provider, astraUmbrella.id);
-const team = model("openai-codex-team");
-const direct = model("openai");
+const providers = ["openai-codex", "openai-codex-first", "openai-codex-third"];
 const registry: CodexAccountRegistry = {
-	schemaVersion: 1,
-	umbrellaProviderId: umbrella.provider,
-	accounts: [
-		{
-			accountKey: "personal",
-			providerId: personal.provider,
-			credentialRef: personal.provider,
-			label: "Personal",
-			policyClass: "stable-weekly",
-			supportedModels: gpt56Ids,
-		},
-		{
-			accountKey: "sifttext",
-			providerId: sifttext.provider,
-			credentialRef: sifttext.provider,
-			label: "SiftText",
-			policyClass: "perishable",
-			supportedModels: [...gpt56Ids, astraUmbrella.id],
-		},
-		{
-			accountKey: "team",
-			providerId: team.provider,
-			credentialRef: team.provider,
-			label: "Team",
-			policyClass: "stable-weekly",
-			supportedModels: gpt56Ids,
-		},
-	],
+	schemaVersion: 1, umbrellaProviderId: umbrella.provider,
+	accounts: providers.map((providerId) => ({ accountKey: providerId, providerId, credentialRef: providerId,
+		label: providerId, policyClass: "perishable", supportedModels: [id] })),
 };
-
-const context = (
-	authenticated: string[],
-	previousModel?: Model,
-): ModelResolutionContext => ({
-	previousModel,
-	getModel: (provider, id) =>
-		[personal, sifttext, astraSifttext, team, direct].find(
-			(entry) => entry.provider === provider && entry.id === id,
-		) ?? (gpt56Ids.includes(id) && registry.accounts.some((account) => account.providerId === provider)
-			? model(provider, id)
-			: undefined),
+const context = (authenticated: string[]): ModelResolutionContext => ({
+	getModel: (provider, requested) => requested === id ? model(provider) : undefined,
 	hasAuth: async (provider) => authenticated.includes(provider),
 });
-
 const routable = (): RouteEvaluation => ({
-	allBlocked: false,
-	accounts: [],
-	feedSource: "state",
-	candidates: [
-		{
-			accountKey: "personal",
-			actualProviderId: personal.provider,
-			model: umbrella.id,
-			reason: "first",
-			warnings: [],
-			feedGeneration: 7,
-		},
-		{
-			accountKey: "sifttext",
-			actualProviderId: sifttext.provider,
-			model: umbrella.id,
-			reason: "second",
-			warnings: [],
-			feedGeneration: 7,
-		},
-		{
-			accountKey: "team",
-			actualProviderId: team.provider,
-			model: umbrella.id,
-			reason: "third",
-			warnings: [],
-			feedGeneration: 7,
-		},
-	],
+	allBlocked: false, accounts: [], feedSource: "state",
+	candidates: providers.map((provider) => ({ accountKey: provider, actualProviderId: provider, model: id,
+		reason: "priority", warnings: [], feedGeneration: 7 })),
+});
+const blocked = (): RouteEvaluation => ({
+	allBlocked: true, accounts: [], candidates: [], feedSource: "state", error: "Earliest recovery: 2030-01-01T00:00:00.000Z",
 });
 
-test("transparent selection substitutes the first authenticated routed account", async () => {
-	const resolved = await resolveCodexPersonalSelection({
-		model: umbrella,
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: routable,
-		context: context([sifttext.provider]),
-	});
-	assert.equal(resolved.model, sifttext);
-	assert.ok(resolved.pin);
-	assert.deepEqual(resolved.pin, {
-		umbrella: umbrella.provider,
-		accountKey: "sifttext",
-		model: umbrella.id,
-		actualProviderId: sifttext.provider,
-		feedGeneration: 7,
-		routedAt: resolved.pin.routedAt,
-		workClass: "unpredictable",
-	});
-});
-
-test("switching models reroutes an incompatible pin to a compatible account", async () => {
-	const resolved = await resolveCodexPersonalSelection({
-		model: astraUmbrella,
-		pin: {
-			umbrella: umbrella.provider,
-			accountKey: "personal",
-			model: umbrella.id,
-			actualProviderId: personal.provider,
-			feedGeneration: 7,
-			routedAt: 1,
-			workClass: "unpredictable",
-		},
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: () => ({
-			allBlocked: false,
-			accounts: [],
-			feedSource: "state",
-			candidates: [{
-				accountKey: "sifttext",
-				actualProviderId: sifttext.provider,
-				model: astraUmbrella.id,
-				reason: "Astra compatible",
-				warnings: [],
-				feedGeneration: 8,
-			}],
-		}),
-		context: context([sifttext.provider]),
-	});
-	assert.equal(resolved.model, astraSifttext);
-	assert.equal(resolved.pin?.accountKey, "sifttext");
-	assert.equal(resolved.pin?.model, astraUmbrella.id);
-});
-
-test("switching to any GPT-5.6 model leaves an Astra-capable pin when another account is available", async () => {
-	for (const id of gpt56Ids) {
-		const resolved = await resolveCodexPersonalSelection({
-			model: model(umbrella.provider, id),
-			pin: {
-				umbrella: umbrella.provider,
-				accountKey: "sifttext",
-				model: astraUmbrella.id,
-				actualProviderId: sifttext.provider,
-				feedGeneration: 7,
-				routedAt: 1,
-				workClass: "unpredictable",
-			},
-			registry,
-			work: { workClass: "unpredictable" },
-			evaluate: () => ({
-				allBlocked: false,
-				accounts: [],
-				feedSource: "state",
-				candidates: [{
-					accountKey: "personal",
-					actualProviderId: personal.provider,
-					model: id,
-					reason: "preserve Astra",
-					warnings: [],
-					feedGeneration: 7,
-				}],
-			}),
-			context: context([personal.provider, sifttext.provider]),
-		});
-		assert.equal(resolved.model.provider, personal.provider);
-		assert.equal(resolved.model.id, id);
-		assert.equal(resolved.pin?.accountKey, "personal");
+test("selection substitutes the first authenticated account in priority order", async () => {
+	for (let start = 0; start < providers.length; start++) {
+		const result = await resolveCodexPersonalSelection({ model: umbrella, registry, evaluate: routable, context: context(providers.slice(start)) });
+		assert.equal(result.model.provider, providers[start]);
+		assert.deepEqual(result.pin, { umbrella: umbrella.provider, accountKey: providers[start], model: id,
+			actualProviderId: providers[start], feedGeneration: 7, routedAt: result.pin!.routedAt });
 	}
 });
 
-test("missing model support produces an obvious error", async () => {
-	await assert.rejects(
-		resolveCodexPersonalSelection({
-			model: model(umbrella.provider, "gpt-9-missing"),
-			registry,
-			work: { workClass: "unpredictable" },
-			evaluate: routable,
-			context: context([]),
-		}),
-		/MODEL UNAVAILABLE: no Codex Personal account supports gpt-9-missing/,
-	);
+test("every selection reevaluates instead of sticking to the previous provider", async () => {
+	let evaluations = 0;
+	const ctx = { ...context(providers), previousModel: model("openai-codex-third") };
+	const result = await resolveCodexPersonalSelection({ model: umbrella, registry, context: ctx,
+		evaluate: () => { evaluations++; return routable(); } });
+	assert.equal(result.model.provider, "openai-codex");
+	assert.equal(evaluations, 1);
 });
 
-test("transparent selection refuses an all-blocked route with recovery", async () => {
-	await assert.rejects(
-		resolveCodexPersonalSelection({
-			model: umbrella,
-			registry,
-			work: { workClass: "unpredictable" },
-			evaluate: () => ({
-				allBlocked: true,
-				accounts: [],
-				candidates: [],
-				feedSource: "state",
-				error:
-					"ERROR: unavailable\nEarliest recovery: 2030-01-01T00:00:00.000Z",
-			}),
-			context: context([personal.provider, sifttext.provider]),
-		}),
-		/Earliest recovery: 2030-01-01/,
-	);
+test("missing model support and blocked accounts produce an obvious error", async () => {
+	await assert.rejects(resolveCodexPersonalSelection({ model: { ...umbrella, id: "missing" }, registry,
+		evaluate: routable, context: context(providers) }), /no Codex Personal account supports missing/);
+	await assert.rejects(resolveCodexPersonalSelection({ model: umbrella, registry,
+		evaluate: blocked, context: context(providers) }), /Earliest recovery: 2030-01-01/);
 });
 
 test("all-blocked startup can fall back to the same direct model", async () => {
-	const resolved = await resolveCodexPersonalSelection({
-		model: umbrella,
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: () => ({
-			allBlocked: true,
-			accounts: [],
-			candidates: [],
-			feedSource: "state",
-			error: "ERROR: unavailable",
-		}),
-		context: context([direct.provider]),
-		fallbackProviderId: direct.provider,
-	});
-	assert.equal(resolved.model, direct);
-	assert.equal(resolved.warning, "ERROR: unavailable");
+	const result = await resolveCodexPersonalSelection({ model: umbrella, registry,
+		evaluate: blocked, context: context(["openai"]), fallbackProviderId: "openai" });
+	assert.equal(result.model.provider, "openai");
+	assert.match(result.warning!, /Earliest recovery/);
 });
 
-test("runtime failover excludes the pinned account and skips unauthenticated candidates", async () => {
-	const authChecks: string[] = [];
-	const considered = new Set(["personal"]);
-	const resolved = await resolveCodexPersonalSelection({
-		model: umbrella,
-		pin: {
-			umbrella: umbrella.provider,
-			accountKey: "personal",
-			model: umbrella.id,
-			actualProviderId: personal.provider,
-			feedGeneration: 7,
-			routedAt: 1,
-			workClass: "unpredictable",
-		},
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: routable,
-		context: {
-			...context([]),
-			hasAuth: async (provider) => {
-				authChecks.push(provider);
-				return provider === team.provider;
-			},
-		},
-		excludedAccountKeys: new Set(["personal"]),
-		consideredAccountKeys: considered,
-		reevaluatePin: true,
-	});
-	assert.equal(resolved.model, team);
-	assert.equal(resolved.pin?.accountKey, "team");
-	assert.deepEqual(authChecks, [sifttext.provider, team.provider]);
-	assert.deepEqual([...considered], ["personal", "sifttext", "team"]);
+test("failover excludes failed accounts and checks remaining credentials once", async () => {
+	const checked: string[] = [];
+	const considered = new Set([providers[0]!]);
+	const result = await resolveCodexPersonalSelection({ model: umbrella, registry, evaluate: routable,
+		excludedAccountKeys: new Set([providers[0]!]), consideredAccountKeys: considered,
+		context: { ...context([]), hasAuth: async (provider) => { checked.push(provider); return provider === providers[2]; } } });
+	assert.equal(result.model.provider, providers[2]);
+	assert.deepEqual(checked, providers.slice(1));
+	assert.deepEqual([...considered], providers);
 });
 
-test("manual umbrella reevaluation leaves a failed pin", async () => {
-	const resolved = await resolveCodexPersonalSelection({
-		model: umbrella,
-		pin: {
-			umbrella: umbrella.provider,
-			accountKey: "personal",
-			model: umbrella.id,
-			actualProviderId: personal.provider,
-			feedGeneration: 7,
-			routedAt: 1,
-			workClass: "unpredictable",
-		},
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: routable,
-		context: context([sifttext.provider]),
-		excludedAccountKeys: new Set(["personal"]),
-		consideredAccountKeys: new Set(["personal"]),
-		reevaluatePin: true,
-	});
-	assert.equal(resolved.model, sifttext);
-	assert.equal(resolved.pin?.accountKey, "sifttext");
-});
-
-test("failover exhaustion considers each remaining candidate once", async () => {
-	const authChecks: string[] = [];
-	const considered = new Set(["personal"]);
-	await assert.rejects(
-		resolveCodexPersonalSelection({
-			model: umbrella,
-			registry,
-			work: { workClass: "unpredictable" },
-			evaluate: routable,
-			context: {
-				...context([]),
-				hasAuth: async (provider) => {
-					authChecks.push(provider);
-					return false;
-				},
-			},
-			excludedAccountKeys: new Set(["personal"]),
-			consideredAccountKeys: considered,
-			reevaluatePin: true,
-		}),
-		/no routable compatible account with usable credentials.*personal/,
-	);
-	assert.deepEqual(authChecks, [sifttext.provider, team.provider]);
-	assert.deepEqual([...considered], ["personal", "sifttext", "team"]);
-});
-
-test("resuming a real routed provider keeps the pin without evaluating again", async () => {
-	let evaluations = 0;
-	const resolved = await resolveCodexPersonalSelection({
-		model: umbrella,
-		previousModel: sifttext,
-		registry,
-		work: { workClass: "unpredictable" },
-		evaluate: () => {
-			evaluations++;
-			return routable();
-		},
-		context: context([sifttext.provider], sifttext),
-	});
-	assert.equal(resolved.model, sifttext);
-	assert.equal(resolved.pin, undefined);
-	assert.equal(evaluations, 0);
+test("failover exhaustion reports the excluded account without looping", async () => {
+	const checked: string[] = [];
+	await assert.rejects(resolveCodexPersonalSelection({ model: umbrella, registry, evaluate: routable,
+		excludedAccountKeys: new Set([providers[0]!]), consideredAccountKeys: new Set([providers[0]!]),
+		context: { ...context([]), hasAuth: async (provider) => { checked.push(provider); return false; } } }),
+	/no routable compatible account with usable credentials.*openai-codex/);
+	assert.deepEqual(checked, providers.slice(1));
 });

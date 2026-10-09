@@ -1,9 +1,6 @@
 import type { AssistantMessage, Model, ModelResolutionContext } from "@earendil-works/pi-ai";
-import type {
-	CodexAccountRegistry,
-	RegistryAccount,
-} from "../codex-quota-extension/store.ts";
-import type { RouteEvaluation, WorkInput } from "./router.ts";
+import type { CodexAccountRegistry } from "../codex-quota-extension/store.ts";
+import type { RouteEvaluation } from "./router.ts";
 
 export const isTerminalCodexUsageLimit = (message: AssistantMessage): boolean =>
 	message.stopReason === "error" &&
@@ -23,8 +20,6 @@ export type RoutePin = {
 	actualProviderId: string;
 	feedGeneration: number;
 	routedAt: number;
-	workClass: "short" | "long" | "unpredictable";
-	horizonMinutes?: number;
 };
 
 export function routeEntry(entries: readonly unknown[]): RoutePin | undefined {
@@ -49,57 +44,19 @@ export function routeEntry(entries: readonly unknown[]): RoutePin | undefined {
 	return pin;
 }
 
-function validatePin(
-	pin: RoutePin,
-	account: RegistryAccount,
-	umbrella: string,
-): void {
-	if (
-		pin.umbrella !== umbrella ||
-		pin.actualProviderId !== account.providerId ||
-		!account.supportedModels.includes(pin.model)
-	)
-		throw new Error(
-			"ROUTE DENIED: Codex route pin does not match the private account registry",
-		);
-}
-
 export async function resolveCodexPersonalSelection(options: {
 	model: Model;
-	previousModel?: Model;
-	pin?: RoutePin;
 	registry: CodexAccountRegistry;
-	work: WorkInput;
 	evaluate: () => RouteEvaluation;
 	context: ModelResolutionContext;
 	excludedAccountKeys?: ReadonlySet<string>;
 	consideredAccountKeys?: Set<string>;
-	reevaluatePin?: boolean;
 	fallbackProviderId?: string;
 }): Promise<{ model: Model; pin?: RoutePin; warning?: string }> {
-	const { model, previousModel, registry, context, pin } = options;
+	const { model, registry, context } = options;
 	const compatibleAccounts = registry.accounts.filter((account) => account.supportedModels.includes(model.id));
 	if (compatibleAccounts.length === 0)
 		throw new Error(`MODEL UNAVAILABLE: no Codex Personal account supports ${model.id}`);
-	const pinnedAccount = options.reevaluatePin
-		? undefined
-		: pin
-			? registry.accounts.find((account) => account.accountKey === pin.accountKey)
-			: registry.accounts.find(
-					(account) => account.providerId === previousModel?.provider,
-				);
-	if (pin && pinnedAccount) validatePin(pin, pinnedAccount, registry.umbrellaProviderId);
-	const shouldPreserveAstra =
-		!!pin && model.id.startsWith("gpt-5.6-") && !!pinnedAccount?.supportedModels.includes("gpt-6-astra");
-	if (pinnedAccount?.supportedModels.includes(model.id) && !shouldPreserveAstra) {
-		const pinned = pin ? { ...pin, model: model.id } : undefined;
-		const target = context.getModel(pinnedAccount.providerId, model.id);
-		if (!target) throw new Error(`Pinned account does not support ${model.id}`);
-		if (!(await context.hasAuth(pinnedAccount.credentialRef)))
-			throw new Error(`AUTH UNAVAILABLE: ${pinnedAccount.label}`);
-		return { model: target, ...(pinned ? { pin: pinned } : {}) };
-	}
-
 	const evaluation = options.evaluate();
 	if (evaluation.allBlocked) {
 		const fallback = options.fallbackProviderId
@@ -132,10 +89,6 @@ export async function resolveCodexPersonalSelection(options: {
 				actualProviderId: candidate.actualProviderId,
 				feedGeneration: candidate.feedGeneration,
 				routedAt: Date.now(),
-				workClass: options.work.workClass,
-				...(options.work.horizonMinutes === undefined
-					? {}
-					: { horizonMinutes: options.work.horizonMinutes }),
 			},
 		};
 	}

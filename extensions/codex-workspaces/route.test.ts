@@ -25,7 +25,6 @@ test("a later model switch invalidates a durable Codex route", () => {
 		actualProviderId: "openai-codex",
 		feedGeneration: 1,
 		routedAt: 1,
-		workClass: "unpredictable",
 	};
 	const route = { type: "custom", customType: "codex-route/v1", data: pin };
 	assert.equal(routeEntry([route]), pin);

@@ -18,7 +18,7 @@ My harness heavily depends upon [SiftText](https://sifttext.com)
 
 ## Router for multiple codex accounts
 
-The codex router reads the quota headers from every response, then ranks the accounts by room left and when the limit resets for optimal usage. A conversation stays pinned to one account so tool ids keep working, but when an account empties, the next request goes elsewhere.
+The codex router uses configured account priority, skipping accounts that lack the model or quota. It checks that order at startup and before each prompt, and switches accounts on a zero-output usage-limit failure. Real responses update the saved quota readings; idle accounts keep their percentages without background polling or stale badges.
 
 ## Custom subagent systemn (WIP)
 

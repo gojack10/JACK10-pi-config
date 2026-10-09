@@ -75,7 +75,6 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 	assert.equal(state.currentAccountKey, accountKey);
 	assert.equal(state.accounts[0].captureHealth, "healthy");
 	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 46);
-	assert.equal(updates.at(-1).registeredAccounts, 1);
 
 	await handlers.get("after_provider_response")?.({ status: 200, headers: {} }, ctx);
 	state = JSON.parse(await readFile(join(agentDir, "codex-usage-state.json"), "utf8"));
@@ -99,6 +98,11 @@ test("captures Codex response state and persists degraded attempts", async (t) =
 	await writeFile(join(agentDir, "codex-usage-state.json"), JSON.stringify(state));
 	for (let attempt = 0; attempt < 20 && updates.at(-1).state.accounts[0].windows[0].pctUsed !== 12; attempt++)
 		await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 12);
+	const cached = await readFile(join(agentDir, "codex-usage-state.json"), "utf8");
+	ctx.model = { provider: "anthropic", id: "claude" };
+	await handlers.get("session_start")?.({}, ctx);
+	assert.equal(await readFile(join(agentDir, "codex-usage-state.json"), "utf8"), cached);
 	assert.equal(updates.at(-1).state.accounts[0].windows[0].pctUsed, 12);
 	await handlers.get("session_shutdown")?.({}, ctx);
 });

@@ -5,16 +5,12 @@ import {
 	type CodexAccount,
 	type CodexAccountRegistry,
 	type CodexUsageState,
-	type CodexWindow,
 	evaluateQuotaAccount,
 	normalizeObservation,
 	parseRegistry,
 	parseUsageState,
 	type RegistryAccount,
 } from "../codex-quota-extension/store.ts";
-
-export type WorkClass = "short" | "long" | "unpredictable";
-export type WorkInput = { workClass: WorkClass; horizonMinutes?: number };
 
 export type RouteCandidate = {
 	accountKey: string;
@@ -30,10 +26,7 @@ export type AccountEligibility = {
 	telemetry?: CodexAccount;
 	routable: boolean;
 	reasons: string[];
-	ageMs: number | null;
-	freshness: "fresh" | "aged" | "unknown";
 	degradations: string[];
-	effectiveWindows: CodexWindow[];
 };
 
 export type RouteEvaluation = {
@@ -45,29 +38,9 @@ export type RouteEvaluation = {
 	error?: string;
 };
 
-type RankedAccount = AccountEligibility & {
-	telemetry: CodexAccount;
-	shortReset: number;
-	earliestReset: number;
-	burnUrgency: number;
-	weeklyRemaining: number;
-	bottleneckRemaining: number;
-};
-
 const DEFAULT_REGISTRY_PATH = join(homedir(), ".pi", "agent", "codex-accounts.json");
 const DEFAULT_FEED_PATH = join(homedir(), ".pi", "agent", "codex-usage-state.json");
 const DEFAULT_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-usage-observability.jsonl");
-
-export const parseWorkInput = (value: string | undefined): WorkInput => {
-	if (!value || value === "unpredictable") return { workClass: "unpredictable" };
-	const match = /^(short|long)(?::(\d+))?$/.exec(value);
-	if (!match) throw new Error("--codex-work must be short[:minutes], long[:minutes], or unpredictable");
-	const workClass = match[1] as "short" | "long";
-	const horizonMinutes = match[2] ? Number(match[2]) : workClass === "short" ? 120 : 480;
-	if (!Number.isSafeInteger(horizonMinutes) || horizonMinutes <= 0)
-		throw new Error("Codex work horizon must be a positive whole number of minutes");
-	return { workClass, horizonMinutes };
-};
 
 const iso = (seconds: number): string => new Date(seconds * 1000).toISOString();
 const ageText = (milliseconds: number): string => `${Math.max(0, Math.floor(milliseconds / 1000))}s`;
@@ -107,7 +80,7 @@ const formatBlockedError = (
 	const earliestRecovery = recoveryTimes.length > 0 ? iso(Math.min(...recoveryTimes)) : "unknown";
 	const earliestNotBefore = notBeforeValues.sort((a, b) => a.value - b.value)[0];
 	const notBeforeText = earliestNotBefore
-		? `${iso(earliestNotBefore.value)}${earliestNotBefore.elapsed429 ? " (elapsed; newer valid 200 required)" : ""}`
+		? `${iso(earliestNotBefore.value)}${earliestNotBefore.elapsed429 ? " (elapsed)" : ""}`
 		: "none";
 	const accountText =
 		accounts.length > 0
@@ -121,93 +94,35 @@ const formatBlockedError = (
 	return `${headline}\nEarliest recovery: ${earliestRecovery} / earliest notBefore: ${notBeforeText}.\nFeed: ${feedPath}; ${feedSummary}.\nAccounts: ${accountText}.`;
 };
 
-const rank = (
-	accounts: AccountEligibility[],
-	work: WorkInput,
-	model: string,
-	generation: number,
-	now: number,
-): RouteCandidate[] => {
-	const ranked = accounts
-		.filter((entry): entry is AccountEligibility & { telemetry: CodexAccount } => entry.routable && !!entry.telemetry)
-		.map((entry): RankedAccount => {
-			const windows = entry.effectiveWindows;
-			const shortWindow = [...windows].sort((a, b) => a.minutes - b.minutes)[0]!;
-			const weekly = windows.find((window) => window.minutes === 10080);
-			return {
-				...entry,
-				shortReset: shortWindow.resetAt,
-				earliestReset: Math.min(...windows.map((window) => window.resetAt)),
-				burnUrgency: (100 - shortWindow.pctUsed) / ((shortWindow.resetAt * 1000 - now) / 3_600_000),
-				weeklyRemaining: weekly ? 100 - weekly.pctUsed : Number.NEGATIVE_INFINITY,
-				bottleneckRemaining: Math.min(...windows.map((window) => 100 - window.pctUsed)),
-			};
-		});
-	const lexical = (a: RankedAccount, b: RankedAccount) => a.account.accountKey.localeCompare(b.account.accountKey);
-	const shortSort = (a: RankedAccount, b: RankedAccount) =>
-		b.burnUrgency - a.burnUrgency ||
-		a.shortReset - b.shortReset ||
-		b.bottleneckRemaining - a.bottleneckRemaining ||
-		lexical(a, b);
-	const longSort = (a: RankedAccount, b: RankedAccount) =>
-		b.weeklyRemaining - a.weeklyRemaining ||
-		b.bottleneckRemaining - a.bottleneckRemaining ||
-		b.earliestReset - a.earliestReset ||
-		lexical(a, b);
-	let ordered: RankedAccount[];
-	if (work.workClass === "short") {
-		const perishable = ranked.filter((entry) => entry.account.policyClass === "perishable").sort(shortSort);
-		const stable = ranked.filter((entry) => entry.account.policyClass === "stable-weekly");
-		const reserve = [...stable].sort((a, b) => b.weeklyRemaining - a.weeklyRemaining || lexical(a, b))[0];
-		const nonReserve = stable.filter((entry) => entry !== reserve).sort(shortSort);
-		ordered = [...perishable, ...nonReserve, ...(reserve ? [reserve] : [])];
-	} else {
-		ordered = [
-			...ranked.filter((entry) => entry.account.policyClass === "stable-weekly").sort(longSort),
-			...ranked
-				.filter((entry) => entry.account.policyClass === "perishable")
-				.sort((a, b) => b.bottleneckRemaining - a.bottleneckRemaining || b.earliestReset - a.earliestReset || lexical(a, b)),
-		];
-	}
-	if (model.startsWith("gpt-5.6-"))
-		ordered = [
-			...ordered.filter((entry) => !entry.account.supportedModels.includes("gpt-6-astra")),
-			...ordered.filter((entry) => entry.account.supportedModels.includes("gpt-6-astra")),
-		];
-	return ordered.map((entry) => {
-		const stableCount = ranked.filter((candidate) => candidate.account.policyClass === "stable-weekly").length;
-		const warning =
-			work.workClass === "short" && entry.account.policyClass === "stable-weekly" && stableCount === 1
-				? "STABLE WEEKLY RESERVE CONSUMED"
-				: work.workClass !== "short" && entry.account.policyClass === "perishable"
-					? "NO STABLE ACCOUNT; LONG WORK PINNED TO PERISHABLE"
-					: undefined;
-		return {
+const ACCOUNT_ORDER = ["openai-codex", "openai-codex-first", "openai-codex-third"];
+const priority = (provider: string): number => {
+	const index = ACCOUNT_ORDER.indexOf(provider);
+	return index < 0 ? ACCOUNT_ORDER.length : index;
+};
+
+const rank = (accounts: AccountEligibility[], model: string, generation: number): RouteCandidate[] =>
+	accounts
+		.filter((entry) => entry.routable)
+		.sort((a, b) => priority(a.account.providerId) - priority(b.account.providerId))
+		.map((entry) => ({
 			accountKey: entry.account.accountKey,
 			actualProviderId: entry.account.providerId,
 			model,
-			reason:
-				work.workClass === "short"
-					? `short work ranked by burn urgency ${entry.burnUrgency}`
-					: `${work.workClass} work ranked by weekly/bottleneck headroom`,
-			warnings: [...entry.degradations, ...(warning ? [warning] : [])],
+			reason: "configured account priority",
+			warnings: entry.degradations,
 			feedGeneration: generation,
-		};
-	});
-};
+		}));
 
 export const evaluateCodexRoute = (options: {
 	registry: CodexAccountRegistry;
 	feed: CodexUsageState;
 	model: string;
-	work?: WorkInput;
 	now?: number;
 	feedPath?: string;
 	feedSource?: "state" | "observability";
 	feedNotice?: string;
 }): RouteEvaluation => {
 	const { registry, feed, model } = options;
-	const work = options.work ?? { workClass: "unpredictable" };
 	const now = options.now ?? Date.now();
 	const feedSource = options.feedSource ?? "state";
 	const telemetryByKey = new Map(feed.accounts.map((account) => [account.accountKey, account]));
@@ -221,10 +136,7 @@ export const evaluateCodexRoute = (options: {
 				account,
 				routable: false,
 				reasons: [...reasons, "TELEMETRY MISSING"],
-				ageMs: null,
-				freshness: "unknown",
 				degradations,
-				effectiveWindows: [],
 			};
 		if (telemetry.id !== account.providerId || telemetry.policyClass !== account.policyClass)
 			reasons.push("REGISTRY/FEED MISMATCH");
@@ -239,7 +151,7 @@ export const evaluateCodexRoute = (options: {
 			degradations: [...degradations, ...quota.degradations],
 		};
 	});
-	const candidates = rank(accounts, work, model, feed.generation, now);
+	const candidates = rank(accounts, model, feed.generation);
 	if (candidates.length > 0)
 		return { allBlocked: false, candidates, accounts, feedSource, ...(options.feedNotice ? { feedNotice: options.feedNotice } : {}) };
 	const healthy = feed.accounts.filter((account) => account.captureHealth === "healthy").length;
@@ -303,7 +215,6 @@ const loadObservabilityFallback = (
 
 export const evaluateCodexRouteFromFiles = (options: {
 	model: string;
-	work?: WorkInput;
 	now?: number;
 	registryPath?: string;
 	feedPath?: string;
@@ -348,10 +259,7 @@ export const evaluateCodexRouteFromFiles = (options: {
 				account,
 				routable: false,
 				reasons: [`FEED UNREADABLE OR MALFORMED: ${message}`],
-				ageMs: null,
-				freshness: "unknown",
 				degradations: [`OBSERVABILITY FALLBACK UNAVAILABLE: ${fallbackMessage}`],
-				effectiveWindows: [],
 			}));
 			return {
 				allBlocked: true,

@@ -297,7 +297,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.events.on("codex-usage:update", (data) => {
 		if (!data || typeof data !== "object") return;
-		const update = data as CodexUsageState | { state?: CodexUsageState; registeredAccounts?: number };
+		const update = data as CodexUsageState | { state?: CodexUsageState };
 		const state = "accounts" in update ? update : update.state;
 		if (state) quotaState = state;
 		requestRender?.();
