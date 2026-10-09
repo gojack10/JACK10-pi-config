@@ -9,7 +9,7 @@ import { evaluateCodexRouteFromFiles } from "../codex-personal/router.ts";
 
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1, umbrellaProviderId: "openai-codex-personal",
-	accounts: ["openai-codex", "openai-codex-first"].map((providerId) => ({
+	accounts: ["openai-codex-first", "openai-codex-second"].map((providerId) => ({
 		accountKey: providerId, providerId, credentialRef: providerId, label: providerId,
 		policyClass: "perishable", supportedModels: ["gpt-6-astra"],
 	})),
@@ -28,13 +28,13 @@ async function setup(t: test.TestContext) {
 	await writeFile(registryPath, JSON.stringify(registry));
 	const now = Date.now();
 	const store = new CodexUsageStore(feedPath, registry);
-	store.observe("openai-codex", 429, headers("100", now), now - REFRESH_MS - 1);
-	store.observe("openai-codex-first", 200, headers("20", now), now);
+	store.observe(registry.accounts[0]!.providerId, 429, headers("100", now), now - REFRESH_MS - 1);
+	store.observe(registry.accounts[1]!.providerId, 200, headers("20", now), now);
 	await store.write();
 	return { feedPath, registryPath, now };
 }
 
-test("a shared ten-minute check discovers an early reset and restores Codex eligibility", async (t) => {
+test("a shared ten-minute check discovers an early reset and restores account eligibility", async (t) => {
 	const { feedPath, registryPath, now } = await setup(t);
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
@@ -53,15 +53,16 @@ test("a shared ten-minute check discovers an early reset and restores Codex elig
 	assert.equal(await refreshQuota(feedPath, { registryPath, now, probe }), false);
 	release.resolve();
 	assert.equal(await first, true);
-	assert.deepEqual(calls, ["openai-codex"]); // Active account already has fresh response headers.
+	const providers = registry.accounts.map((account) => account.providerId);
+	assert.deepEqual(calls, [providers[0]]); // The active account already has fresh response headers.
 	const cache = JSON.parse(await readFile(feedPath, "utf8"));
-	assert.equal(cache.accounts.find((account: any) => account.id === "openai-codex").windows[1].pctUsed, 0);
-	assert.equal(cache.accounts.find((account: any) => account.id === "openai-codex").status429, false);
-	assert.deepEqual(evaluateCodexRouteFromFiles({ model: "gpt-6-astra", registryPath, feedPath, now }).candidates.map((candidate) => candidate.actualProviderId), ["openai-codex-first", "openai-codex"]);
+	assert.equal(cache.accounts.find((account: any) => account.id === providers[0]).windows[1].pctUsed, 0);
+	assert.equal(cache.accounts.find((account: any) => account.id === providers[0]).status429, false);
+	assert.deepEqual(evaluateCodexRouteFromFiles({ model: "gpt-6-astra", registryPath, feedPath, now }).candidates.map((candidate) => candidate.actualProviderId), providers);
 	assert.equal(await refreshQuota(feedPath, { registryPath, now: now + REFRESH_MS - 1, probe }), false);
-	assert.deepEqual(calls, ["openai-codex"]);
+	assert.deepEqual(calls, [providers[0]]);
 	assert.equal(await refreshQuota(feedPath, { registryPath, now: now + REFRESH_MS, probe }), true);
-	assert.deepEqual(calls, ["openai-codex", "openai-codex", "openai-codex-first"]);
+	assert.deepEqual(calls, [providers[0], ...providers]);
 	assert.equal((await stat(`${feedPath}.refresh`)).mode & 0o777, 0o600);
 	await assert.rejects(stat(`${feedPath}.refresh.lock`), { code: "ENOENT" });
 });
@@ -84,7 +85,7 @@ test("recovers a crashed check lock and maintenance probes never recurse", async
 	assert.equal(await refreshQuota(feedPath, { registryPath, now, probe: async () => { calls++; } }), true);
 	assert.equal(calls, 1);
 	const old = process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
-	process.env.PI_CODEX_ACCOUNT_MAINTENANCE = "openai-codex";
+	process.env.PI_CODEX_ACCOUNT_MAINTENANCE = registry.accounts[0]!.providerId;
 	try {
 		assert.equal(await refreshQuota(feedPath, { registryPath, now: now + REFRESH_MS, probe: async () => { assert.fail("recursive check"); } }), false);
 	} finally {

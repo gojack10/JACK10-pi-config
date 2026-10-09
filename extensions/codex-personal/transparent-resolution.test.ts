@@ -8,7 +8,7 @@ import type { RouteEvaluation } from "./router.ts";
 const id = "gpt-6-astra";
 const model = (provider: string) => ({ provider, id }) as Model;
 const umbrella = model("openai-codex-personal");
-const providers = ["openai-codex-first", "openai-codex", "openai-codex-third"];
+const providers = ["openai-codex-first", "openai-codex-second", "openai-codex-third"];
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1, umbrellaProviderId: umbrella.provider,
 	accounts: providers.map((providerId) => ({ accountKey: providerId, providerId, credentialRef: providerId,
@@ -38,10 +38,10 @@ test("selection substitutes the first authenticated account in priority order", 
 
 test("every selection reevaluates instead of sticking to the previous provider", async () => {
 	let evaluations = 0;
-	const ctx = { ...context(providers), previousModel: model("openai-codex-third") };
+	const ctx = { ...context(providers), previousModel: model(providers[2]!) };
 	const result = await resolveCodexPersonalSelection({ model: umbrella, registry, context: ctx,
 		evaluate: () => { evaluations++; return routable(); } });
-	assert.equal(result.model.provider, "openai-codex-first");
+	assert.equal(result.model.provider, providers[0]);
 	assert.equal(evaluations, 1);
 });
 
