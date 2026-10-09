@@ -4,6 +4,7 @@ auth.json.bak*
 auth.json.backup.*
 
 # Auto-generated / cache
+crashes.json
 sessions/
 git/
 model-recency.json
