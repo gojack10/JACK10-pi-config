@@ -69,16 +69,29 @@ export default function (pi: ExtensionAPI) {
     } catch { /* retry next tick */ }
   }
 
-  pi.on("agent_end", (event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     if (!token) return;
     const text = preferredAssistantText(event.messages, ctx.sessionManager.getBranch());
     if (!text) return;
-    void fetch(`${BASE_URL}/inject`, {
-      method: "POST",
-      headers: headers({ "Content-Type": "text/plain; charset=utf-8" }),
-      body: text,
-      signal: AbortSignal.timeout(2000),
-    }).catch(() => {});
+    const requestToken = token;
+    try {
+      // /inject only acknowledges delivery; audio rendering happens later in the player.
+      const r = await fetch(`${BASE_URL}/inject`, {
+        method: "POST",
+        headers: headers({ "Content-Type": "text/plain; charset=utf-8" }),
+        body: text,
+        signal: AbortSignal.timeout(10000),
+      });
+      if (r.status === 409 && token === requestToken) {
+        if (timer) clearInterval(timer);
+        timer = null;
+        token = "";
+        throw new Error("session expired or claimed elsewhere — run /vega to reconnect");
+      }
+      if (!r.ok) throw new Error(`server returned ${r.status}`);
+    } catch (error) {
+      ctx.ui.notify(`VEGA delivery failed: ${error}`, "error");
+    }
   });
 
   pi.registerCommand("vega", {
