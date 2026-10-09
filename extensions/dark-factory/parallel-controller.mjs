@@ -371,6 +371,7 @@ export class ParallelController {
   }
 
   async setupTransition(attempt, setup, now) {
+    if (this.config.code?.integration === 'dispatcher') throw Error('tree-forward dispatchers own tests; check registration is not part of this pipeline');
     const reject = reason => {
       this.log('setup_rejected', { attempt: attempt.id, task: setup.task, action: setup.action, reason });
       P.addEvent(this.state, { type: 'setup_rejected', task: setup.task, action: setup.action, reason }, now);
@@ -491,7 +492,7 @@ export class ParallelController {
         : task.status === 'running' ? 'the task has a live attempt'
         : task.status === 'worked' ? 'the task is already accepted'
         : task.status === 'stopped' ? 'the task was cancelled; it needs an explicit re-list, not recovery'
-        : task.status === 'merge_queued' ? 'a checked candidate already awaits publication'
+        : task.status === 'merge_queued' && this.config.code?.integration !== 'dispatcher' ? 'a checked candidate already awaits publication'
         : task.status === 'queued' ? 'the task is already queued'
         : this.state.merge?.task === request.node_id ? 'a publication reservation is held'
         : unresolved ? `attempt ${unresolved.id} is ${unresolved.status}` : null;
@@ -517,6 +518,8 @@ export class ParallelController {
   async codeMainCheck(allowPublished = false) {
     if (!this.config.code) return;
     if (G.codePin(readJson(join(this.dir, 'config.json'))) !== this.state.code_pin) throw Error('code configuration changed while running');
+    // The sole dispatcher owns integration. Workers may develop while it tests/updates main.
+    if (this.config.code.integration === 'dispatcher') return;
     const head = await G.mainIdentity(this.config.code);
     const merge = this.state.merge;
     const publishing = merge && this.state.tasks[merge.task]?.code.phase === 'publish' &&
@@ -532,7 +535,7 @@ export class ParallelController {
   }
 
   async advanceMerge(now) {
-    if (!this.config.code || this.state.stop || this.state.attention || this.state.awaiting_input?.length || this.state.status !== 'running' ||
+    if (!this.config.code || this.config.code.integration === 'dispatcher' || this.state.stop || this.state.attention || this.state.awaiting_input?.length || this.state.status !== 'running' ||
         ['done', 'blocked'].includes(this.state.dispatcher.last?.disposition)) return;
     try {
       if (this.state.merge && this.state.tasks[this.state.merge.task]?.status === 'running') return;
@@ -576,6 +579,18 @@ export class ParallelController {
       return;
     }
     const r = outcome.report, identity = r.code;
+    if (this.config.code.integration === 'dispatcher') {
+      if (!identity || identity.worktree !== code.worktree || identity.branch !== code.branch || identity.base !== code.base) {
+        throw new G.TaskFault('worker report does not match owned worktree/branch/base');
+      }
+      if (r.disposition === 'worked') throw new G.TaskFault('dispatcher integrates code; worker must return candidate');
+      if (r.disposition === 'candidate') {
+        await G.candidateIdentity(this.config, code, identity.candidate, code.base, this.state.code_main);
+        if (code.candidate) await G.git(code.worktree, 'merge-base', '--is-ancestor', code.candidate, identity.candidate);
+        code.candidate = identity.candidate;
+      } else await G.worktreeIdentity(this.config, code);
+      return;
+    }
     // Rejection of this worker's own submission is a task outcome: evidence retained, dispatcher retries.
     const taskFault = async (work) => { try { return await work; } catch (error) { throw error instanceof G.TaskFault ? error : new G.TaskFault(String(error.message ?? error)); } };
     if (!identity || identity.worktree !== code.worktree || identity.branch !== code.branch || identity.base !== code.base) {
@@ -630,6 +645,29 @@ export class ParallelController {
     }
   }
 
+  // Agents run tests and reconcile ordinary Git conflicts. The scheduler consumes their integration result,
+  // checks the shared Git identity once, and releases dependencies; it never reruns tests or selects packets.
+  async dispatcherCodeOutcome(report) {
+    const completed = report.completed ?? [];
+    if (!completed.length) return;
+    if (this.config.code?.integration !== 'dispatcher') throw Error('dispatcher integration is not enabled');
+    const head = await G.mainIdentity(this.config.code);
+    for (const item of completed) {
+      const task = this.state.tasks[item.node_id];
+      if (!task?.code || !['merge_queued', 'worked'].includes(task.status)) throw Error('integration result needs a settled code candidate');
+      await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', task.code.candidate, item.candidate);
+      await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', item.candidate, item.main);
+      await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', item.main, head);
+    }
+    for (const item of completed) {
+      const task = this.state.tasks[item.node_id];
+      task.status = 'worked';
+      Object.assign(task.code, { phase: 'landed', candidate: item.candidate, accepted_main: item.main, main_checks: item.checks });
+      this.log('dispatcher_integrated', { task: item.node_id, ...item });
+    }
+    this.state.code_main = head;
+  }
+
   seatFault(seat) {
     const fault = this.config.faults?.seat_usage_limit;
     if (!fault || fault.seat !== seat || this.state.seats[seat].launches > (fault.launches ?? 1)) return undefined;
@@ -672,8 +710,8 @@ export class ParallelController {
     save(statePath, P.dispatcherSnapshot(this.state, this.config, now));
     attempt.setup_packet = join(attempt.dir, 'setup-packet.json');
     const prompt = P.dispatcherPrompt({ role: this.config.roles.dispatcher, run: this.config.run_node, events: eventsPath,
-      state: statePath, report: attempt.report, setup: attempt.setup_packet,
-      tools: engine === 'claude' ? 'the `sifttext` CLI through Bash' : 'your SiftText tools' });
+      state: statePath, report: attempt.report, setup: this.config.code?.integration === 'dispatcher' ? undefined : attempt.setup_packet,
+      previous: this.state.dispatcher.previous, tools: engine === 'claude' ? 'the `sifttext` CLI through Bash' : 'your SiftText tools' });
     const missionFile = join(attempt.dir, 'mission.md');
     writeFileSync(missionFile, prompt);
     const fault = engine === 'claude' && this.config.faults?.claude_failure?.wake === this.state.dispatcher.wakes;
@@ -731,6 +769,7 @@ export class ParallelController {
       try {
         const text = result.text ?? readFileSync(attempt.report, 'utf8');
         const report = attempt.kind === 'worker' ? P.validateWorkerReport(text) : P.validateDispatcherReport(text);
+        if (attempt.kind === 'dispatcher' && result.contextStopped && report.disposition === 'blocked') report.disposition = 'continue';
         if (attempt.kind === 'worker' && result.contextStopped && report.disposition === 'blocked') {
           report.disposition = 'continue';
           if (this.state.tasks[attempt.task].code && !report.next_action.trim()) throw Error('code context checkpoint requires next_action');
@@ -777,6 +816,13 @@ export class ParallelController {
 
   async settle(attempt, outcome, now) {
     // Vet before closing: a failed tree lookup retries next tick with the session intact.
+    if (attempt.kind === 'dispatcher' && outcome.kind === 'report') {
+      try { await this.dispatcherCodeOutcome(outcome.report); }
+      catch (error) {
+        this.codeAttention(`dispatcher integration: ${String(error)}`, now);
+        outcome = { kind: 'error', summary: String(error) };
+      }
+    }
     if (attempt.kind === 'dispatcher' && outcome.kind === 'report' && outcome.report.disposition === 'done' &&
         Object.values(this.state.tasks).some(task => !['worked', 'stopped'].includes(task.status))) {
       outcome = { kind: 'error', summary: 'done refused: unfinished tasks remain (private candidates are not main publication)' };
@@ -850,8 +896,8 @@ export class ParallelController {
       else if (task.node_id === owner || !node.includes(owner)) rejected.set(task.node_id, 'task node is outside the write fence');
       else if (!scope) rejected.set(task.node_id, 'write scope node not found');
       else if (!scope.includes(owner)) rejected.set(task.node_id, 'write scope is outside the write fence');
-      else if ((task.checks ?? []).some(id => !this.state.checks?.[id] || this.state.checks[id].superseded)) rejected.set(task.node_id, 'named check is not registered');
-      else if ((task.checks ?? []).length) {
+      else if (this.config.code?.integration !== 'dispatcher' && (task.checks ?? []).some(id => !this.state.checks?.[id] || this.state.checks[id].superseded)) rejected.set(task.node_id, 'named check is not registered');
+      else if (this.config.code?.integration !== 'dispatcher' && (task.checks ?? []).length) {
         const stale = (await Promise.all(task.checks.map(id => this.drift(this.state.checks[id])))).flat();
         if (stale.length) {
           rejected.set(task.node_id, `registered check sources drifted: ${stale.map(item => item.node).join(', ')}`);
@@ -870,7 +916,7 @@ export class ParallelController {
         } catch (error) { rejected.set(task.node_id, error.message); }
       }
     }
-    if (this.state.primary_required) {
+    if (this.state.primary_required && this.config.code?.integration !== 'dispatcher') {
       const primary = this.config.seats.find(seat => seat.kind === 'oss');
       const active = primary && this.state.seats[primary.id]?.attempt;
       const primaryRunning = active && this.state.attempts[active]?.status === 'running';

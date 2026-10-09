@@ -51,7 +51,17 @@ node extensions/dark-factory/parallel-run.mjs resume [--run <RUN node>]
 
 Tests: `node --test extensions/dark-factory/parallel-*.test.ts` (offline; simulated seats/receipts/clock, with disposable native Git fixtures for code tasks).
 
-### Opt-in code tasks (JIT controller)
+### Tree-forward code tasks
+
+Set `code.integration: "dispatcher"` for the agent-owned pipeline. The tree's dispatcher and worker roles own the engineering protocol; the controller only schedules, allocates private worktrees, consumes settled reports and tracks identities. It does not execute gates, register acceptance packets, enforce registry membership or launch reconciliation/publication workers in this mode. The original JIT mode below remains available only for unmigrated runs; changing modes requires an authorized, drained config/pin migration, not a casual resume edit.
+
+Workers implement and test in their assigned worktree, checkpoint their task node and return `candidate`. Overlapping source fences are allowed. A candidate is a settled draft, not accepted main. The sole dispatcher trusts those checkpoints, runs the required integration tests, reconciles ordinary Git conflicts, merges and records the result in the tree. Existing frozen tests and file/tree fences still apply; an unlanded sibling observer is not a global prerequisite. The dispatcher maintains mandatory-primary participation and selects actual dependencies, rather than code inventing policy from check registration.
+
+After integration the dispatcher includes `completed: [{node_id, candidate, main, checks: [absolute_test_log_paths]}]` in its ordinary report. Candidate and main are full SHAs; each integrated main must be in the current clean main history. The controller releases dependencies from that result without rerunning tests. It does not write to the tree. If integration fails, the dispatcher retains the draft and assigns repair, while independent work continues.
+
+At 80% context a dispatcher returns `disposition: "continue", tasks: []` with any integrations already completed and a precise next step in its summary. The next dispatcher receives `PREVIOUS` and current STATE and continues without re-auditing completed work. Worker continuation uses the existing retained-worktree/report handoff. Tests use real disposable Git worktrees and executable checks with simulated agent transport; they do not claim universal live-agent compliance.
+
+### Original code tasks (unmigrated JIT controller)
 
 Tree-only configs/reports retain the existing behavior. Code runs must override `roles` with run-scoped **JIT** dispatcher/worker instructions; the generic Worker Role's historical code refusal and permanent-chat orchestration instructions are not this protocol. The detached controller makes no model turns. Set `codex_seats: 1`, `dispatcher_engine: "fallback"` for exactly one Qwen worker and one Sol worker plus fresh Sol dispatchers; existing `routes` and `roles` overrides still apply. There is no checker model.
 
