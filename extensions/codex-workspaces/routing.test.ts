@@ -23,7 +23,7 @@ test("resumes and reroutes on each prompt, recovers priority after reset, and bo
 	const dir = join(home, ".pi/agent");
 	await mkdir(dir, { recursive: true });
 	const id = "gpt-6-astra";
-	const providers = ["openai-codex-first", "openai-codex", "openai-codex-third"];
+	const providers = ["openai-codex-first", "openai-codex-second", "openai-codex-third"];
 	const accounts = providers.map((providerId) => ({ accountKey: providerId, providerId, credentialRef: providerId,
 		label: providerId, policyClass: "perishable" as const, supportedModels: [id] }));
 	await writeFile(join(dir, "codex-accounts.json"), JSON.stringify({ schemaVersion: 1, umbrellaProviderId: "openai-codex-personal", accounts }));

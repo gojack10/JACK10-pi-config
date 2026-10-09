@@ -9,9 +9,9 @@ import { evaluateCodexRoute, evaluateCodexRouteFromFiles } from "./router.ts";
 const now = 2_000_000_000_000;
 const seconds = now / 1000;
 const model = "gpt-6-astra";
-const accounts: RegistryAccount[] = ["openai-codex-first", "openai-codex", "openai-codex-third"].map((providerId) => ({
+const accounts: RegistryAccount[] = ["openai-codex-first", "openai-codex-second", "openai-codex-third"].map((providerId) => ({
 	accountKey: providerId, providerId, credentialRef: providerId, label: providerId,
-	policyClass: providerId === "openai-codex" ? "stable-weekly" : "perishable",
+	policyClass: providerId === "openai-codex-second" ? "stable-weekly" : "perishable",
 	supportedModels: [model, "gpt-5.6-sol", "gpt-6.1-sol"],
 }));
 const registry: CodexAccountRegistry = { schemaVersion: 1, umbrellaProviderId: "openai-codex-personal", accounts };
@@ -30,27 +30,28 @@ const order = (samples: CodexAccount[], routedModel = model, configured = regist
 	registry: configured, feed: feed(...samples), model: routedModel, now,
 }).candidates.map((candidate) => candidate.actualProviderId);
 
-test("configured account priority, regardless of quota headroom, model or registry order", () => {
-	const configured = { ...registry, accounts: [...accounts].reverse() };
-	for (const routedModel of accounts[0]!.supportedModels) {
-		assert.deepEqual(order([telemetry(accounts[2]!, 0, 0), telemetry(accounts[1]!, 0, 0), telemetry(accounts[0]!, 99, 99)], routedModel, configured),
-			accounts.map((account) => account.providerId));
+test("private registry order wins regardless of quota headroom, model or feed order", () => {
+	const samples = [telemetry(accounts[2]!, 0, 0), telemetry(accounts[1]!, 0, 0), telemetry(accounts[0]!, 99, 99)];
+	for (const configured of [registry, { ...registry, accounts: [...accounts].reverse() }]) {
+		for (const routedModel of accounts[0]!.supportedModels) {
+			assert.deepEqual(order(samples, routedModel, configured), configured.accounts.map((account) => account.providerId));
+		}
 	}
 });
 
 test("skip exhausted accounts in that same order", () => {
 	assert.deepEqual(order([telemetry(accounts[0]!, 100), telemetry(accounts[1]!), telemetry(accounts[2]!)]),
-		["openai-codex", "openai-codex-third"]);
+		accounts.slice(1).map((account) => account.providerId));
 	assert.deepEqual(order([telemetry(accounts[0]!, 100), telemetry(accounts[1]!, 20, 100), telemetry(accounts[2]!)]),
-		["openai-codex-third"]);
+		[accounts[2]!.providerId]);
 });
 
 test("registry model support, not stale telemetry, decides compatibility", () => {
 	const samples = accounts.map((account) => telemetry(account));
 	samples[0]!.supportedModels = [];
-	const configured = { ...registry, accounts: accounts.map((account) => account.providerId === "openai-codex-first"
+	const configured = { ...registry, accounts: accounts.map((account, index) => index === 0
 		? { ...account, supportedModels: [model] } : account) };
-	assert.deepEqual(order(samples, "gpt-6.1-sol", configured), ["openai-codex", "openai-codex-third"]);
+	assert.deepEqual(order(samples, "gpt-6.1-sol", configured), accounts.slice(1).map((account) => account.providerId));
 });
 
 test("unsupported models and missing telemetry fail closed", () => {
@@ -80,7 +81,7 @@ test("Pro accounts can route with weekly-only quota", () => {
 	const pro = telemetry(accounts[2]!);
 	pro.plan = "prolite";
 	pro.windows = pro.windows.filter((window) => window.minutes === 10080);
-	assert.deepEqual(order([pro]), ["openai-codex-third"]);
+	assert.deepEqual(order([pro]), [accounts[2]!.providerId]);
 });
 
 test("old samples do not invent usage or change priority", () => {
@@ -101,11 +102,11 @@ test("cooldowns block until elapsed; resets permit a real request to verify capa
 	personal.notBefore = seconds - 1;
 	assert.deepEqual(order([personal]), []); // The short window is still exhausted.
 	personal.windows[0]!.resetAt = seconds - 1;
-	assert.deepEqual(order([personal]), ["openai-codex"]);
+	assert.deepEqual(order([personal]), [personal.id]);
 	personal.windows[1]!.pctUsed = 100;
 	assert.deepEqual(order([personal]), []); // A future weekly exhaustion still blocks.
 	personal.windows[1]!.resetAt = seconds - 1;
-	assert.deepEqual(order([personal]), ["openai-codex"]);
+	assert.deepEqual(order([personal]), [personal.id]);
 	personal.notBefore = null;
 	assert.deepEqual(order([personal]), []); // A 429 without any known cooldown stays blocked.
 });
@@ -131,7 +132,7 @@ test("uses cached observability quota when the state feed is corrupt or missing"
 	await writeFile(registryPath, JSON.stringify(registry));
 	await writeFile(feedPath, "{broken");
 	await writeFile(observabilityPath, `${JSON.stringify({
-		capturedAt: new Date(now - 86400_000).toISOString(), kind: "http_response", provider: "openai-codex", status: 200,
+		capturedAt: new Date(now - 86400_000).toISOString(), kind: "http_response", provider: accounts[0]!.providerId, status: 200,
 		headers: { "x-codex-plan-type": "plus", "x-codex-primary-window-minutes": "300", "x-codex-primary-used-percent": "20",
 			"x-codex-primary-reset-at": String(seconds + 7200), "x-codex-secondary-window-minutes": "10080",
 			"x-codex-secondary-used-percent": "30", "x-codex-secondary-reset-at": String(seconds + 4 * 86400) },
@@ -141,7 +142,7 @@ test("uses cached observability quota when the state feed is corrupt or missing"
 		const result = evaluateCodexRouteFromFiles({ model, now, registryPath, feedPath, observabilityPath });
 		assert.equal(result.allBlocked, false);
 		assert.equal(result.feedSource, "observability");
-		assert.equal(result.candidates[0]?.actualProviderId, "openai-codex");
-		assert.equal(result.accounts.find((entry) => entry.account.providerId === "openai-codex")?.telemetry?.windows[0]?.pctUsed, 20);
+		assert.equal(result.candidates[0]?.actualProviderId, accounts[0]!.providerId);
+		assert.equal(result.accounts[0]?.telemetry?.windows[0]?.pctUsed, 20);
 	}
 });

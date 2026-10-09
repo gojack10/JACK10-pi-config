@@ -122,18 +122,19 @@ const pinEntry = (actualProviderId: string, model = 'gpt-6.1-sol') => ({ type: '
 const routeCtx = (entries: any[], provider: string) => ({ model: { provider, id: 'gpt-6.1-sol' }, sessionManager: { getBranch: () => entries } });
 
 test('the route verdict accepts an umbrella selector on its pinned backing account and rejects everything else', () => {
-  const pinned = routeCtx([pinEntry('openai-codex-third')], 'openai-codex-third');
+  const provider = 'openai-codex-primary';
+  const pinned = routeCtx([pinEntry(provider)], provider);
   const verdict = routeVerdict(pinned, { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high');
   assert.equal(verdict.verdict, 'accepted');
-  assert.equal(verdict.actual.provider, 'openai-codex-third');
-  assert.equal(verdict.pin.actualProviderId, 'openai-codex-third');
+  assert.equal(verdict.actual.provider, provider);
+  assert.equal(verdict.pin.actualProviderId, provider);
 
   // No pin provenance, a different backing account, or a changed model all fail closed.
-  assert.equal(routeVerdict(routeCtx([], 'openai-codex-third'), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
-  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-team')], 'openai-codex-third'), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
-  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-third'), { type: 'model_change', provider: 'openai-codex-third', modelId: 'gpt-6-astra' }], 'openai-codex-third'),
+  assert.equal(routeVerdict(routeCtx([], provider), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
+  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-secondary')], provider), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
+  assert.equal(routeVerdict(routeCtx([pinEntry(provider), { type: 'model_change', provider, modelId: 'gpt-6-astra' }], provider),
     { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'high').verdict, 'rejected');
-  assert.equal(routeVerdict(routeCtx([pinEntry('openai-codex-third')], 'openai-codex-third'), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'low').verdict, 'rejected');
+  assert.equal(routeVerdict(routeCtx([pinEntry(provider)], provider), { smoke: false, report: '/r', reads: [], route: UMBRELLA } as any, 'low').verdict, 'rejected');
   // A non-umbrella route still requires exact provider equality.
   const local = { smoke: false, report: '/r', reads: [], route: { provider: 'local', model: 'gpt-6.1-sol', thinking: 'xhigh' } } as any;
   assert.equal(routeVerdict(routeCtx([], 'local'), local, 'xhigh').verdict, 'accepted');
@@ -158,11 +159,11 @@ test('the guard records the route verdict into its own attempt directory at sess
       getThinkingLevel: () => 'high', getActiveTools: () => tools, setActiveTools: () => {} };
     installGuard(pi, { smoke: false, report: join(dir, 'report.json'), reads: [], role: 'worker',
       route: UMBRELLA } as any);
-    handlers.get('session_start')({}, { model: { provider: 'openai-codex-third', id: 'gpt-6.1-sol' },
-      sessionManager: { getBranch: () => [pinEntry('openai-codex-third')] } });
+    handlers.get('session_start')({}, { model: { provider: 'openai-codex-primary', id: 'gpt-6.1-sol' },
+      sessionManager: { getBranch: () => [pinEntry('openai-codex-primary')] } });
     const recorded = JSON.parse(readFileSync(join(dir, 'route-verdict.json'), 'utf8'));
     assert.equal(recorded.verdict, 'accepted');
     assert.equal(recorded.expected.provider, 'openai-codex-personal');
-    assert.equal(recorded.actual.provider, 'openai-codex-third');
+    assert.equal(recorded.actual.provider, 'openai-codex-primary');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

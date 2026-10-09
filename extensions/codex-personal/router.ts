@@ -94,21 +94,14 @@ const formatBlockedError = (
 	return `${headline}\nEarliest recovery: ${earliestRecovery} / earliest notBefore: ${notBeforeText}.\nFeed: ${feedPath}; ${feedSummary}.\nAccounts: ${accountText}.`;
 };
 
-const ACCOUNT_ORDER = ["openai-codex-first", "openai-codex", "openai-codex-third"];
-const priority = (provider: string): number => {
-	const index = ACCOUNT_ORDER.indexOf(provider);
-	return index < 0 ? ACCOUNT_ORDER.length : index;
-};
-
 const rank = (accounts: AccountEligibility[], model: string, generation: number): RouteCandidate[] =>
 	accounts
 		.filter((entry) => entry.routable)
-		.sort((a, b) => priority(a.account.providerId) - priority(b.account.providerId))
 		.map((entry) => ({
 			accountKey: entry.account.accountKey,
 			actualProviderId: entry.account.providerId,
 			model,
-			reason: "configured account priority",
+			reason: "private registry order",
 			warnings: entry.degradations,
 			feedGeneration: generation,
 		}));

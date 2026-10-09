@@ -39,6 +39,8 @@ When a change is too large to review as one commit, segment it into independentl
 
 ## New machine
 
+Never put private Codex account names or identifiers in tracked code, tests, docs, or commit messages. Use generic fixtures; keep account identity and routing order in the untracked `codex-accounts.json`. Its `accounts` array is first-choice first.
+
 Six extensions read `~/.pi/agent/codex-accounts.json`, which names your Codex accounts and is never committed. Start from the tracked template and edit it:
 
 ```bash
