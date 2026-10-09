@@ -94,7 +94,7 @@ const formatBlockedError = (
 	return `${headline}\nEarliest recovery: ${earliestRecovery} / earliest notBefore: ${notBeforeText}.\nFeed: ${feedPath}; ${feedSummary}.\nAccounts: ${accountText}.`;
 };
 
-const ACCOUNT_ORDER = ["openai-codex", "openai-codex-first", "openai-codex-third"];
+const ACCOUNT_ORDER = ["openai-codex-first", "openai-codex", "openai-codex-third"];
 const priority = (provider: string): number => {
 	const index = ACCOUNT_ORDER.indexOf(provider);
 	return index < 0 ? ACCOUNT_ORDER.length : index;

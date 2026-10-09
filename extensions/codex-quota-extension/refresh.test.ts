@@ -34,7 +34,7 @@ async function setup(t: test.TestContext) {
 	return { feedPath, registryPath, now };
 }
 
-test("a shared ten-minute check discovers an early reset and restores Codex priority", async (t) => {
+test("a shared ten-minute check discovers an early reset and restores Codex eligibility", async (t) => {
 	const { feedPath, registryPath, now } = await setup(t);
 	const entered = Promise.withResolvers<void>();
 	const release = Promise.withResolvers<void>();
@@ -57,7 +57,7 @@ test("a shared ten-minute check discovers an early reset and restores Codex prio
 	const cache = JSON.parse(await readFile(feedPath, "utf8"));
 	assert.equal(cache.accounts.find((account: any) => account.id === "openai-codex").windows[1].pctUsed, 0);
 	assert.equal(cache.accounts.find((account: any) => account.id === "openai-codex").status429, false);
-	assert.equal(evaluateCodexRouteFromFiles({ model: "gpt-6-astra", registryPath, feedPath, now }).candidates[0]?.actualProviderId, "openai-codex");
+	assert.deepEqual(evaluateCodexRouteFromFiles({ model: "gpt-6-astra", registryPath, feedPath, now }).candidates.map((candidate) => candidate.actualProviderId), ["openai-codex-first", "openai-codex"]);
 	assert.equal(await refreshQuota(feedPath, { registryPath, now: now + REFRESH_MS - 1, probe }), false);
 	assert.deepEqual(calls, ["openai-codex"]);
 	assert.equal(await refreshQuota(feedPath, { registryPath, now: now + REFRESH_MS, probe }), true);

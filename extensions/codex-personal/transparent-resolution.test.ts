@@ -8,7 +8,7 @@ import type { RouteEvaluation } from "./router.ts";
 const id = "gpt-6-astra";
 const model = (provider: string) => ({ provider, id }) as Model;
 const umbrella = model("openai-codex-personal");
-const providers = ["openai-codex", "openai-codex-first", "openai-codex-third"];
+const providers = ["openai-codex-first", "openai-codex", "openai-codex-third"];
 const registry: CodexAccountRegistry = {
 	schemaVersion: 1, umbrellaProviderId: umbrella.provider,
 	accounts: providers.map((providerId) => ({ accountKey: providerId, providerId, credentialRef: providerId,
@@ -41,7 +41,7 @@ test("every selection reevaluates instead of sticking to the previous provider",
 	const ctx = { ...context(providers), previousModel: model("openai-codex-third") };
 	const result = await resolveCodexPersonalSelection({ model: umbrella, registry, context: ctx,
 		evaluate: () => { evaluations++; return routable(); } });
-	assert.equal(result.model.provider, "openai-codex");
+	assert.equal(result.model.provider, "openai-codex-first");
 	assert.equal(evaluations, 1);
 });
 
@@ -75,6 +75,6 @@ test("failover exhaustion reports the excluded account without looping", async (
 	await assert.rejects(resolveCodexPersonalSelection({ model: umbrella, registry, evaluate: routable,
 		excludedAccountKeys: new Set([providers[0]!]), consideredAccountKeys: new Set([providers[0]!]),
 		context: { ...context([]), hasAuth: async (provider) => { checked.push(provider); return false; } } }),
-	/no routable compatible account with usable credentials.*openai-codex/);
+	/no routable compatible account with usable credentials.*openai-codex-first/);
 	assert.deepEqual(checked, providers.slice(1));
 });
