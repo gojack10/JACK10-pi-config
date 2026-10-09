@@ -1,6 +1,7 @@
 import { type Stats, unwatchFile, watchFile } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CodexUsageStore } from "./store.ts";
+import { refreshQuota } from "./refresh.ts";
 
 const isCodex = (provider: unknown): provider is string =>
 	typeof provider === "string" && provider.startsWith("openai-codex") && provider !== "openai-codex-personal";
@@ -20,6 +21,7 @@ export default function (pi: ExtensionAPI) {
 	let pending = Promise.resolve();
 	let publishedGeneration = -1;
 	let watcher: ((current: Stats, previous: Stats) => void) | undefined;
+	let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
 	const publish = async (ctx: CaptureContext, degraded?: string) => {
 		const state = store.snapshot();
@@ -49,6 +51,15 @@ export default function (pi: ExtensionAPI) {
 		return pending;
 	};
 
+	const refresh = async (ctx: CaptureContext) => {
+		if (await refreshQuota(store.path)) {
+			await store.load();
+			await publish(ctx);
+		}
+	};
+
+	pi.on("before_agent_start", (_event, ctx) => enqueue(ctx, undefined, () => refresh(ctx)));
+
 	pi.on("session_start", (_event, ctx) => {
 		const provider = isCodex(ctx.model?.provider) ? ctx.model.provider : undefined;
 		if (!watcher) {
@@ -75,6 +86,11 @@ export default function (pi: ExtensionAPI) {
 				await store.write();
 			}
 			await publish(ctx);
+			if (!refreshTimer && !process.env.PI_CODEX_ACCOUNT_MAINTENANCE) {
+				refreshTimer = setInterval(() => { void enqueue(ctx, undefined, () => refresh(ctx)); }, 60_000);
+				refreshTimer.unref();
+			}
+			await refresh(ctx);
 		});
 	});
 
@@ -113,6 +129,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (refreshTimer) clearInterval(refreshTimer);
+		refreshTimer = undefined;
 		if (watcher) unwatchFile(store.path, watcher);
 		watcher = undefined;
 		await pending;
