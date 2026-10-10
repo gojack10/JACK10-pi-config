@@ -65,6 +65,7 @@ export class ParallelController {
     const now = this.deps.now();
     if (existsSync(this.statePath)) {
       this.state = readJson(this.statePath);
+      this.reconcileSavedSeats(now);
       const previous = this.state.status;
       // Resume means the operator handled whatever stopped the run.
       Object.assign(this.state, { status: 'running', stop: null, attention: null, error: undefined });
@@ -106,6 +107,33 @@ export class ParallelController {
     await this.fenceCheck(now, 'controller start');
     this.flushEvents();
     this.persist();
+  }
+
+  reconcileSavedSeats(now) {
+    const configured = new Map(this.config.seats.map(seat => [seat.id, seat]));
+    if (configured.size !== this.config.seats.length) throw Error('duplicate configured seat IDs');
+    for (const seat of configured.values()) {
+      if (!/^(oss|codex-[1-6])$/.test(seat.id) || seat.kind !== (seat.id === 'oss' ? 'oss' : 'codex')) {
+        throw Error(`invalid configured seat ${seat.id}`);
+      }
+    }
+    for (const id of Object.keys(this.state.seats)) {
+      if (!configured.has(id)) throw Error(`saved seat ${id} cannot be removed on resume`);
+    }
+    for (const attempt of Object.values(this.state.attempts)) {
+      if (attempt.kind !== 'worker' || !['running', 'launching', 'ambiguous'].includes(attempt.status)) continue;
+      const seat = configured.get(attempt.seat);
+      if (!this.state.seats[attempt.seat]) throw Error(`unresolved attempt ${attempt.id} has no saved seat`);
+      if (!seat || seat.kind !== attempt.seat_kind ||
+          ['provider', 'model', 'thinking'].some(key => seat.route?.[key] !== attempt.route?.[key])) {
+        throw Error(`unresolved attempt ${attempt.id} route cannot change on resume`);
+      }
+    }
+    // Add only missing idle records. Never replace counters, rests, ownership or retained drafts.
+    const defaults = P.initialState(this.config, now).seats;
+    const added = [...configured.keys()].filter(id => !Object.hasOwn(this.state.seats, id));
+    for (const id of added) this.state.seats[id] = defaults[id];
+    if (added.length) this.log('seats_added', { seats: added });
   }
 
   // An attempt caught mid-launch by a controller crash has no receipt: close it and give its work back.

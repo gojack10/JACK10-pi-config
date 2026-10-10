@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { buildConfig } from './parallel-core.mjs';
+import { buildConfig, initialState, planAssignments } from './parallel-core.mjs';
 import { ParallelController, save } from './parallel-controller.mjs';
 
 const RUN = '11111111-1111-4111-8111-111111111111';
@@ -107,7 +107,7 @@ function setup(faults: unknown, dispatcherEngine?: string) {
   const directory = mkdtempSync(join(tmpdir(), 'pf-controller-'));
   const luna = { provider: 'openai-codex-personal', model: 'gpt-5.6-luna', thinking: 'high' };
   const config = buildConfig({ runNode: RUN, owner: OWNER, repos: ['/repo'], directory, cwd: directory,
-    overrides: { routes: { oss: luna, codex: luna, fallback: luna }, faults,
+    overrides: { codex_seats: 3, routes: { oss: luna, codex: luna, fallback: luna }, faults,
       ...(dispatcherEngine ? { dispatcher_engine: dispatcherEngine } : {}) } });
   save(join(directory, 'config.json'), { ...config, fence_heads: { '/repo': 'abc' } });
   return directory;
@@ -210,6 +210,107 @@ test('a dirty read-only repository stops the run as needs_attention and asks run
     assert.ok(rows.some(row => row.type === 'attention' && /read-only repository changed/.test(row.reason)));
     assert.ok(messages.length >= 1, 'running workers were told to stop');
     assert.equal(rows.filter(row => row.type === 'worker_launch' && row.t > rows.find(r => r.type === 'attention').t).length, 0);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+for (const codexSeats of [3, 4, 6]) test(`saved two-seat blocked run resumes with ${codexSeats + 1} real seats without resetting retained state`, async () => {
+  const directory = setup({});
+  try {
+    const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
+    const saved = initialState({ ...config, seats: config.seats.slice(0, 2) }, 100);
+    config.seats = buildConfig({ runNode: RUN, owner: OWNER, directory, cwd: directory,
+      overrides: { codex_seats: codexSeats, routes: { oss: config.seats[0].route, codex: config.seats[1].route } } }).seats;
+    save(join(directory, 'config.json'), config);
+    const tasks = Array.from({ length: codexSeats + 1 }, (_, i) => `${String(i + 1).padStart(8, '0')}-0000-4000-8000-000000000000`);
+    Object.assign(saved, { status: 'blocked', seq: 139 });
+    saved.seats.oss.launches = 33;
+    saved.seats['codex-1'].launches = 21;
+    saved.seats['codex-1'].resting_until = 999;
+    saved.dispatcher.wakes = 85;
+    saved.dispatcher.last = { disposition: 'blocked', at: 99, attempt: '139' };
+    saved.attempts['139'] = { id: '139', kind: 'dispatcher', status: 'finished', report: '/retained/report.json',
+      receipt: { job: 'retained-job', attempt_id: 'retained-attempt' } };
+    for (const [i, id] of tasks.entries()) {
+      saved.tasks[id] = { node_id: id, scope: id, seats: [config.seats[i].id], depends_on: [], status: 'queued',
+        continues: 2, attempts: ['retained-worker'], previous: '/retained/previous.json' };
+      saved.scopes[id] = [id, OWNER];
+      saved.order.push(id);
+    }
+    const retained = 'eeeeeeee-0000-4000-8000-000000000000';
+    saved.tasks[retained] = { node_id: retained, status: 'worked', seats: ['oss'], attempts: ['135'],
+      last_report: '/retained/worker-report.json', code: { files: ['src/owned.rs'], worktree: '/retained/draft',
+        branch: 'retained-branch', base: 'a'.repeat(40), candidate: 'b'.repeat(40), phase: 'landed' } };
+    saved.order.push(retained);
+    saved.attempts['135'] = { id: '135', kind: 'worker', seat: 'oss', task: retained, status: 'finished',
+      report: '/retained/worker-report.json', receipt: { job: 'retained-worker-job', attempt_id: 'retained-worker-attempt' } };
+    save(join(directory, 'state.json'), saved);
+    const { deps } = harness(directory);
+    const controller = new ParallelController(directory, deps);
+    await controller.start();
+    const expected = structuredClone(saved);
+    expected.status = 'running';
+    expected.primary_required = false;
+    for (const seat of config.seats.slice(2)) expected.seats[seat.id] = { attempt: null, resting_until: null, launches: 0 };
+    assert.deepEqual(JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')), expected);
+    assert.deepEqual(planAssignments(controller.state, config, deps.now()), [], 'blocked dispatcher still guards admission');
+    await controller.start();
+    assert.deepEqual(controller.state.seats, expected.seats, 'reconciliation is idempotent');
+    mkdirSync(join(directory, 'inbox'));
+    save(join(directory, 'inbox', 'wake.json'), { type: 'wake', note: 'approved pool expansion' });
+    await controller.tick();
+    await Promise.all(controller.inflight);
+    assert.equal(controller.state.dispatcher.attempt, '140', 'fresh dispatcher owns task selection');
+    assert.deepEqual(controller.state.attempts['139'], saved.attempts['139']);
+    for (let i = 0; i < 21; i++) { await deps.sleep(1000); await controller.tick(); }
+    await Promise.all(controller.inflight);
+    const launches = history(directory).filter(row => row.type === 'worker_started');
+    assert.equal(launches.length, codexSeats + 1, 'all configured worker seats actually start');
+    assert.deepEqual(Object.values(controller.state.attempts).filter((a: any) => a.kind === 'worker' && a.status === 'running').map((a: any) => a.seat),
+      config.seats.map((s: any) => s.id));
+    assert.deepEqual(Object.values(controller.state.seats).map((s: any) => s.launches), [34, 22, ...Array(codexSeats - 1).fill(1)]);
+    assert.deepEqual(controller.state.tasks[retained], saved.tasks[retained]);
+    assert.deepEqual(controller.state.attempts['135'], saved.attempts['135']);
+    for (const id of tasks) {
+      assert.equal(controller.state.tasks[id].previous, saved.tasks[id].previous);
+      assert.equal(controller.state.tasks[id].continues, 2);
+      assert.equal(controller.state.tasks[id].attempts[0], 'retained-worker');
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('seat resume preserves active ownership and refuses destructive pools or changed unresolved routes before writes', async () => {
+  const directory = setup({});
+  try {
+    const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
+    const saved = initialState({ ...config, seats: config.seats.slice(0, 2) }, 100);
+    saved.seq = 12;
+    saved.seats.oss = { launches: 7, attempt: '12', resting_until: 999 };
+    saved.tasks[A] = { node_id: A, status: 'running', attempts: ['12'], code: { worktree: '/retained', base: 'base' } };
+    saved.attempts['12'] = { id: '12', kind: 'worker', status: 'running', task: A, seat: 'oss', seat_kind: 'oss',
+      route: config.seats[0].route, receipt: { job: 'owned-job', attempt_id: 'owned-attempt' } };
+    const { deps } = harness(directory);
+    save(join(directory, 'state.json'), saved);
+    const controller = new ParallelController(directory, deps);
+    await controller.start();
+    assert.deepEqual(controller.state.seats.oss, saved.seats.oss);
+    assert.deepEqual(controller.state.tasks, saved.tasks);
+    assert.deepEqual(controller.state.attempts, saved.attempts);
+    for (const invalid of [
+      { ...config, seats: config.seats.filter((s: any) => s.id !== 'codex-1') },
+      { ...config, seats: [...config.seats, config.seats[0]] },
+      { ...config, seats: [...config.seats, { id: 'codex-7', kind: 'codex', route: config.seats[1].route }] },
+      { ...config, seats: config.seats.map((s: any) => s.id === 'oss' ? { ...s, route: { ...s.route, thinking: 'low' } } : s) },
+    ]) {
+      save(join(directory, 'config.json'), invalid);
+      save(join(directory, 'state.json'), saved);
+      const before = readFileSync(join(directory, 'state.json'), 'utf8');
+      await assert.rejects(new ParallelController(directory, deps).start(), /cannot be removed|duplicate|route cannot change|invalid configured seat/);
+      assert.equal(readFileSync(join(directory, 'state.json'), 'utf8'), before);
+    }
+    save(join(directory, 'config.json'), config);
+    saved.attempts['12'].seat = 'codex-2';
+    save(join(directory, 'state.json'), saved);
+    await assert.rejects(new ParallelController(directory, deps).start(), /has no saved seat/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
