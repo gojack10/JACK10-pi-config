@@ -1,14 +1,13 @@
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { BackgroundJobManager } from '../background-jobs/manager.ts';
 import { SubagentLauncher } from '../subagent-launch/manager.ts';
-import { readMonitorReceipt } from '../task-outcomes/monitor-receipt.mjs';
-import { readAttemptResult } from './core.mjs';
+import { readPiOutcome } from './parallel-lifecycle.mjs';
 import { ParallelController, save } from './parallel-controller.mjs';
 import { closeIdleWatches } from './watch.mjs';
 
@@ -19,10 +18,6 @@ const CLAUDE = join(homedir(), '.local/bin/claude');
 // One pre-trusted, otherwise empty directory: dispatchers load no project memory or CLAUDE.md from it.
 export const CLAUDE_CWD = join(homedir(), '.pi/agent/factory-runs/parallel/claude-dispatcher');
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-const noticeFor = (receipt: any, text: string) => text.includes(receipt.job) &&
-  (!receipt.attempt_id || text.includes(receipt.attempt_id));
-const NEEDS_INPUT = /needs human input:/i;
-const PAUSED = /paused for context|maintenance error|human maintenance/;
 
 const tmux = async (args: string[]) => {
   try { return { code: 0, stdout: (await exec('tmux', args)).stdout }; }
@@ -41,8 +36,7 @@ export default function (pi: ExtensionAPI) {
     description: 'Run the deterministic parallel factory controller (programmatic entry only)',
     handler: async (argument, ctx) => {
       const directory = argument.trim();
-      const notices: string[] = [];
-      const notify = (text: unknown) => { notices.push(String(text)); if (notices.length > 1000) notices.shift(); };
+      const notify = () => {}; // Lifecycle is read from identity-bound receipts, not notification prose.
       const transportPi = new Proxy(pi, { get: (target, key) => key === 'sendUserMessage' ? notify : Reflect.get(target, key) });
       const background = new BackgroundJobManager(notify);
       const launcher = new SubagentLauncher(transportPi, ctx, background);
@@ -61,15 +55,6 @@ export default function (pi: ExtensionAPI) {
         StopFailure: [{ hooks: [{ type: 'command', command: hook, timeout: 30 }] }],
       } });
 
-      const fromFinal = (receipt: any, status: string, source: string, summary: string) => {
-        if (status === 'failed' || source !== 'model') return { status: 'failed', source, summary };
-        try {
-          const result = readAttemptResult(receipt);
-          return { status, source, summary, text: result.text, contextStopped: result.contextStopped };
-        } catch (error) {
-          return { status: 'failed', source: 'protocol', summary: `unreadable settled outcome: ${String(error)}` };
-        }
-      };
       const sessionFile = async (receipt: any) => {
         if (receipt.session_file || !receipt.pane_id) return;
         const shown = await tmux(['show-options', '-p', '-v', '-t', receipt.pane_id, '@pi_session_file']);
@@ -102,28 +87,9 @@ export default function (pi: ExtensionAPI) {
         }),
         piOutcome: async (receipt: any) => {
           await sessionFile(receipt);
-          if (own.has(receipt.batch_id)) {
-            const final = background.getReport(receipt.batch_id)?.completions?.[0];
-            if (final) return fromFinal(receipt, final.status, final.source, final.summary);
-            const question = notices.find(text => noticeFor(receipt, text) && NEEDS_INPUT.test(text));
-            if (question) return { status: 'needs_input', source: 'model', summary: question };
-            const notice = notices.find(text => noticeFor(receipt, text) && PAUSED.test(text));
-            return notice ? { status: 'failed', source: 'technical', summary: notice } : undefined;
-          }
-          // After a controller restart the in-process monitor is gone; read the worker's durable receipt.
-          if (!receipt.session_file || !receipt.manifest_file) return undefined;
-          try {
-            const manifest = JSON.parse(readFileSync(receipt.manifest_file, 'utf8'));
-            const sessionId = JSON.parse(readFileSync(receipt.session_file, 'utf8').split('\n')[0]).id;
-            const durable = readMonitorReceipt(receipt.session_file, { sessionId, jobId: receipt.job, attemptId: receipt.attempt_id,
-              mode: 'task', reportPath: receipt.report_file, reportIdentity: manifest.reportIdentity });
-            if (['final', 'transport_lost'].includes(durable.state)) {
-              const outcome = durable.payload.outcome;
-              return fromFinal(receipt, ['completed', 'blocked'].includes(outcome) ? outcome : 'failed', durable.payload.source, durable.payload.summary);
-            }
-            if (durable.state === 'context_paused') return { status: 'failed', source: 'technical', summary: `paused: ${durable.payload.summary}` };
-          } catch {}
-          return undefined;
+          const final = own.has(receipt.batch_id)
+            ? background.getReport(receipt.batch_id)?.completions?.find(item => item.id === receipt.job) : undefined;
+          return readPiOutcome(receipt, final);
         },
         sessionAlive: async (label: string) => (await tmux(['has-session', '-t', `=${label}`])).code === 0,
         killSession: async (label: string) => { await tmux(['kill-session', '-t', `=${label}`]); },
