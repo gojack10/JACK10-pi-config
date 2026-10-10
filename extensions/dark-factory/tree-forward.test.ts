@@ -45,33 +45,38 @@ function transport(f:ReturnType<typeof fixture>,options:any={}) {
       if(task){
         assert.equal(code.phase,'develop','no reconcile/publish worker ceremonies');
         if(launches.filter(l=>l.task).length<2)return;
-        writeFileSync(join(code.worktree,'shared.txt'),task===A?'A\n':'B\n');git(code.worktree,'add','shared.txt');
-        git(code.worktree,'commit','-m','fixture: worker implements');
-        r={version:1,role:'worker',disposition:'candidate',summary:'implemented and tested',evidence:[],updated_nodes:[],
+        if(code.candidate){
+          assert.match(mission,/merge CODE.current_main/);
+          try{git(code.worktree,'merge','--no-edit',code.current_main);}catch{
+            conflicts.push(task);assert.match(readFileSync(join(code.worktree,'shared.txt'),'utf8'),/<<<<<<</);
+            writeFileSync(join(code.worktree,'shared.txt'),'A+B\n');git(code.worktree,'add','shared.txt');
+            git(code.worktree,'commit','-m','fixture: owning worker resolves conflict');
+          }
+        }else{
+          writeFileSync(join(code.worktree,'shared.txt'),task===A?'A\n':'B\n');git(code.worktree,'add','shared.txt');
+          git(code.worktree,'commit','-m','fixture: worker implements');
+        }
+        let evidence:string[]=[],disposition='candidate';
+        try{evidence=await G.runCodeChecks(f.config,code,'candidate',git(code.worktree,'rev-parse','HEAD'),code.current_main,join(args.reportFile,'..'));}
+        catch{disposition='blocked';}
+        r={version:1,role:'worker',disposition,summary:disposition==='candidate'?'Worker reports implementation and assigned tests passed':'Worker reports assigned test failure',evidence,updated_nodes:[],
           code:{worktree:code.worktree,branch:code.branch,base:code.base,candidate:git(code.worktree,'rev-parse','HEAD')}};
       }else{
         const s=JSON.parse(readFileSync(field(mission,'STATE')!,'utf8'));
         if(!s.tasks.length)r=dispatcher([order(A,'oss'),order(B,'codex-1')]);
         else{
           if(field(mission,'PREVIOUS'))previous.push(field(mission,'PREVIOUS')!);
-          const completed:any[]=[];
+          // Scheduling reads statuses/receipts only: no source read, test, semantic review or Git operation.
+          for(const row of s.tasks.filter((t:any)=>t.status==='worked'))if(!integrated.includes(row.node_id))integrated.push(row.node_id);
+          const completed:any[]=[],recover:any[]=[];
           for(const row of s.tasks.filter((t:any)=>t.status==='merge_queued')){
-            assert(!integrated.includes(row.node_id),'handoff must not repeat an accepted integration');
-            const c=row.code,oldMain=git(f.repo,'rev-parse','HEAD');
-            try{git(c.worktree,'merge','--no-edit',oldMain);}catch{
-              conflicts.push(row.node_id);assert.match(readFileSync(join(c.worktree,'shared.txt'),'utf8'),/<<<<<<</);
-              writeFileSync(join(c.worktree,'shared.txt'),'A+B\n');git(c.worktree,'add','shared.txt');
-              git(c.worktree,'commit','-m','fixture: dispatcher resolves conflict');
-            }
-            const candidate=git(c.worktree,'rev-parse','HEAD');
-            let logs;try{logs=await G.runCodeChecks(f.config,c,'candidate',candidate,oldMain,join(args.reportFile,'..'));}
-            catch{r={...dispatcher([],'blocked'),blockers:[{node_id:row.node_id,kind:'platform',required:'repair failed test'}]};break;}
-            git(f.repo,'merge','--ff-only',candidate);
-            logs.push(...await G.runCodeChecks(f.config,c,'main',candidate,oldMain,join(args.reportFile,'..')));
-            completed.push({node_id:row.node_id,candidate,main:candidate,checks:logs});integrated.push(row.node_id);
+            assert(!integrated.includes(row.node_id),'handoff must not repeat publication');
+            if(row.code.publication_blocked)recover.push({node_id:row.node_id,reason:'Owning worker must reconcile current main in retained draft'});
+            else completed.push({node_id:row.node_id,candidate:row.code.candidate,report:row.last_report});
             if(options.handoff&&!handed){handed=true;r=dispatcher([],'continue',completed);break;}
           }
-          r??=dispatcher([],s.tasks.every((t:any)=>t.status==='worked'||completed.some(c=>c.node_id===t.node_id))?'done':'tasks',completed);
+          if(s.tasks.some((t:any)=>t.status==='blocked'))r={...dispatcher([],'blocked'),blockers:[{node_id:A,kind:'platform',required:'Worker reports failed assigned test; repair affected task'}]};
+          r??={...dispatcher([],s.tasks.every((t:any)=>t.status==='worked')?'done':'tasks',completed),recover};
         }
       }
       writeFileSync(args.reportFile,JSON.stringify(r));
@@ -81,7 +86,7 @@ function transport(f:ReturnType<typeof fixture>,options:any={}) {
   return {deps,launches,conflicts,integrated,previous};
 }
 
-test('agents integrate two concurrent overlapping worktrees, ordinary conflict, no global missing-observer gate, dispatcher handoff',async()=>{
+test('dispatcher schedules trusted workers, controller publishes receipts, owning worker resolves conflict, no global audit gate',async()=>{
   const f=fixture();try{
     const t=transport(f,{handoff:true}),ctl=new ParallelController(f.dir,t.deps);
     await ctl.start();
@@ -90,10 +95,11 @@ test('agents integrate two concurrent overlapping worktrees, ordinary conflict, 
     assert.equal(await ctl.run(),'done');
     assert.equal(readFileSync(join(f.repo,'shared.txt'),'utf8'),'A+B\n');
     assert.equal(readFileSync(join(f.repo,'law.txt'),'utf8'),'frozen\n');
-    assert.equal(t.launches.filter(l=>l.task).length,2,'one worker session per task');
+    assert.equal(t.launches.filter(l=>l.task).length,3,'two implementations plus unchanged owning-worker conflict recovery');
     assert.deepEqual(t.conflicts,[B]);assert.equal(t.previous.length,1);
     assert.deepEqual(t.integrated,[A,B]);assert.equal(ctl.state.merge,null);
-    assert(ctl.state.tasks[B].code.main_checks.every(existsSync));
+    assert.equal(ctl.state.tasks[B].code.verification,'worker_report');
+    assert.equal(ctl.state.tasks[B].code.main_checks,undefined,'no controller/dispatcher acceptance test logs');
     assert.equal(ctl.state.code_main,git(f.repo,'rev-parse','HEAD'));
     assert.equal(await new ParallelController(f.dir,t.deps).run(),'done');
     assert.equal(t.integrated.length,2,'resume does not redo completed work');
@@ -122,10 +128,10 @@ test('current RUN migration orders need no stale contract amendment receipt; rea
     assert.match(mission,/technical references\/test recipes, not runtime permission sources/);
     assert.match(mission,/state the conflict and proceed with a bounded order/);
     assert.match(mission,/Stale prose alone never requires an outer operator rewrite, scoped policy-hash update or installed amendment receipt/);
-    assert.match(mission,/supersedes duplicate installation prerequisites in ROLE, RUN, owners and PREVIOUS for that mismatch only/);
-    assert.match(mission,/Do not ignore changed input bytes\/hashes or actual runtime incompatibility/);
+    assert.match(mission,/supersedes conflicting dispatcher duties and factory admission prerequisites/);
+    assert.match(mission,/SCHEDULING ONLY/);
     assert.match(mission,/real missing task prerequisite, unresolved current human choice, safety\/privacy violation/);
-    assert.match(mission,/code-config pins.*frozen laws.*source privacy.*mandatory Qwen/);
+    assert.match(mission,/code-config pins.*frozen-source Git ownership.*source privacy.*mandatory Qwen/);
     const fresh=ctl.state.attempts[ctl.state.dispatcher.attempt];
     // A supplied dispatcher decision, not a model-behavior simulation or controller interpretation of prose.
     const admitted=P.validateDispatcherReport({...dispatcher([order(A,'oss')]),summary:'Current RUN authorizes private two-tree migration; old six-only contract prose is superseded. Assign bounded in-fence implementation with frozen checks; no hosted mutation.'});
@@ -144,7 +150,8 @@ test('current RUN migration orders need no stale contract amendment receipt; rea
     assert.deepEqual(P.planAssignments(ctl.state,f.config,7),[],'missing real prerequisite cannot launch');
     for(const [kind,required,question] of [
       ['authority','Current RUN leaves the public license undecided','Which license is approved?'],
-      ['platform','Private source appears in the proposed public payload; repair/audit before release',null],
+      ['platform','Private source appears in the proposed public payload; obtain actual publication authority',null],
+      ['platform','Actual authenticated read denied by platform RLS; no bypass or tenant substitution',null],
     ]){
       await settle({...dispatcher([],'blocked'),blockers:[{node_id:A,kind,required}],questions_for_jack:question?[question]:[]});
       assert.deepEqual(P.planAssignments(ctl.state,f.config,8),[],'genuine human/safety blocker is not bypassed');
@@ -162,13 +169,13 @@ test('current RUN migration orders need no stale contract amendment receipt; rea
   }finally{f.cleanup();}
 });
 
-test('dispatcher sees failing real tests and does not merge or credit candidates',async()=>{
+test('dispatcher sees failing worker tests and does not merge or credit candidates',async()=>{
   const f=fixture(true);try{const t=transport(f),ctl=new ParallelController(f.dir,t.deps);
     assert.equal(await ctl.run(),'blocked');assert.equal(git(f.repo,'rev-parse','HEAD'),f.config.code.main_head);
-    assert.equal(t.integrated.length,0);assert.equal(ctl.state.tasks[A].status,'merge_queued');
+    assert.equal(t.integrated.length,0);assert.equal(ctl.state.tasks[A].status,'blocked');
   }finally{f.cleanup();}
 });
-test('integration reports cannot credit running tasks, invented main or missing test logs; old code pins cannot silently migrate',async()=>{
+test('historical integration reports cannot credit running tasks, invented main or missing test logs; old code pins cannot silently migrate',async()=>{
   const f=fixture();try{const ctl=new ParallelController(f.dir,transport(f).deps);await ctl.start();
     const log=join(f.dir,'test.log');writeFileSync(log,'passed');
     const item={node_id:A,candidate:f.config.code.main_head,main:f.config.code.main_head,checks:[log]};
@@ -184,5 +191,42 @@ test('integration reports cannot credit running tasks, invented main or missing 
     assert.equal(ctl.state.tasks[A].code.candidate,item.candidate,'repair retains candidate history');
     const config=structuredClone(f.config);delete config.code.integration;save(join(f.dir,'config.json'),config);
     await assert.rejects(ctl.codeMainCheck(),/configuration changed/);
+  }finally{f.cleanup();}
+});
+
+test('scheduling trusts exact settled worker receipt without audit logs and releases independent work',async()=>{
+  const f=fixture(true);try{
+    const t=transport(f),ctl=new ParallelController(f.dir,t.deps);await ctl.start();
+    const listed=order(A,'oss');ctl.state.tasks[A]={...listed,status:'queued',attempts:[],continues:0};
+    ctl.state.order=[A];ctl.state.scopes[A]=[A,OWNER];
+    const code=G.allocation(f.config,listed);ctl.state.tasks[A].code=code;await G.prepareCode(f.config,code);
+    writeFileSync(join(code.worktree,'shared.txt'),'A\n');git(code.worktree,'add','shared.txt');git(code.worktree,'commit','-m','fixture: worker contribution');
+    const candidate=git(code.worktree,'rev-parse','HEAD'),path=join(f.dir,'worker.json');
+    const worker=P.validateWorkerReport({version:1,role:'worker',disposition:'candidate',summary:'Worker claims assigned tests passed; no independent verification',evidence:[],updated_nodes:[],code:{...code,candidate}});
+    save(path,worker);
+    const a=P.startAttempt(ctl.state,{kind:'worker',engine:'pi',seat:'oss',seat_kind:'oss',task:A});
+    await ctl.codeOutcome(a,{kind:'report',report:worker},2);
+    P.finishWorker(ctl.state,a.id,{kind:'report',report:worker,reportPath:path},2);
+    const completion={node_id:A,candidate,report:path};
+    const report=P.validateDispatcherReport({...dispatcher([{...order(B,'codex-1'),depends_on:[A]}],'tasks',[completion]),summary:'Trust worker completion claim; schedule next work, not independently verified'});
+    const mission=P.dispatcherPrompt({role:OWNER,run:RUN,events:'/events',state:'/state',report:'/report',tools:'tools'});
+    assert.match(mission,/SCHEDULING ONLY/);assert.match(mission,/two-tree-only allowlist/);
+    assert.match(mission,/authentication, RLS and read-only transactions/);
+    await assert.rejects(ctl.dispatcherCodeOutcome({completed:[{...completion,report:join(f.dir,'other.json')}]}),/worker report identity/);
+    await assert.rejects(ctl.dispatcherCodeOutcome({completed:[{...completion,candidate:'f'.repeat(40)}]}),/worker candidate identity/);
+    assert.throws(()=>P.validateDispatcherReport(dispatcher([],'tasks',[{...completion,report:join(f.dir,'absent.json')}])),/existing absolute report/);
+    ctl.state.tasks[A].status='running';
+    await assert.rejects(ctl.dispatcherCodeOutcome(report),/settled/);ctl.state.tasks[A].status='merge_queued';
+    ctl.state.stop={requested:2};await assert.rejects(ctl.dispatcherCodeOutcome(report),/human STOP/);ctl.state.stop=null;
+    writeFileSync(join(code.worktree,'shared.txt'),'unreported change\n');
+    await assert.rejects(ctl.dispatcherCodeOutcome(report),/dirty/);git(code.worktree,'restore','shared.txt');
+    await ctl.dispatcherCodeOutcome(report);
+    assert.equal(ctl.state.tasks[A].status,'worked');assert.equal(ctl.state.tasks[A].code.verification,'worker_report');
+    assert.equal(git(f.repo,'rev-parse','HEAD'),candidate,'controller executes ff-only receipt, not tests');
+    const d=P.startAttempt(ctl.state,{kind:'dispatcher',engine:'fallback',events:[],receipt:{session_label:'fixture-dispatcher'}});
+    await ctl.settle(d,{kind:'report',report,reportPath:join(f.dir,'dispatcher.json')},3);
+    assert.deepEqual(P.planAssignments(ctl.state,f.config,4),[{seat:'codex-1',task:B}]);
+    assert.equal(existsSync(join(f.dir,'candidate-check-0.log')),false,'configured failing audit never runs');
+    ctl.state.stop={requested:5};assert.deepEqual(P.planAssignments(ctl.state,f.config,6),[]);
   }finally{f.cleanup();}
 });
