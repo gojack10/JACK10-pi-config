@@ -30,10 +30,14 @@ test('RUN parsing takes only the labelled OWNER and read-only repository lines',
 test('config fills OSS first and allows per-run route overrides', () => {
   const luna = { provider: 'openai-codex-personal', model: 'gpt-5.6-luna', thinking: 'high' };
   const c = buildConfig({ runNode: RUN, owner: OWNER, directory: '/r', cwd: '/h', overrides: { routes: { oss: luna, codex: luna, fallback: luna } } });
-  assert.deepEqual(c.seats.map(seat => seat.id), ['oss', 'codex-1', 'codex-2', 'codex-3']);
+  assert.deepEqual(c.seats.map(seat => seat.id), ['oss', 'codex-1', 'codex-2', 'codex-3', 'codex-4', 'codex-5', 'codex-6']);
   assert.ok(c.seats.every(seat => seat.route.model === 'gpt-5.6-luna'));
   assert.equal(c.dispatcher.fallback.model, 'gpt-5.6-luna');
   const defaults = buildConfig({ runNode: RUN, owner: OWNER, directory: '/r', cwd: '/h' });
+  for (const count of [0, 1, 3, 4, 6]) {
+    assert.equal(buildConfig({ runNode: RUN, owner: OWNER, directory: '/r', cwd: '/h', overrides: { codex_seats: count } }).seats.length, count + 1);
+  }
+  for (const count of [-1, 7, 1.5]) assert.throws(() => buildConfig({ runNode: RUN, owner: OWNER, directory: '/r', cwd: '/h', overrides: { codex_seats: count } }), /codex_seats/);
   assert.equal(defaults.seats[0].route.model, 'qwen3.8-flash-next');
   assert.equal(defaults.dispatcher.engine, 'fallback');
   assert.deepEqual(defaults.dispatcher.fallback, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high' });
@@ -43,6 +47,9 @@ test('config fills OSS first and allows per-run route overrides', () => {
 test('dispatcher reports follow the role-node schema', () => {
   const base = { version: 1, role: 'dispatcher', disposition: 'tasks', summary: 'x', tasks: [{ node_id: id(1), depends_on: [], scope: id(1) }] };
   assert.equal(validateDispatcherReport(JSON.stringify(base)).tasks.length, 1);
+  assert.deepEqual(validateDispatcherReport({ ...base, tasks: [{ ...base.tasks[0], seats: ['codex-4', 'codex-5', 'codex-6'] }] }).tasks[0].seats,
+    ['codex-4', 'codex-5', 'codex-6']);
+  assert.throws(() => validateDispatcherReport({ ...base, tasks: [{ ...base.tasks[0], seats: ['codex-7'] }] }), /seat IDs/);
   for (const bad of [
     { ...base, role: 'worker' }, { ...base, disposition: 'next' }, { ...base, summary: '' },
     { ...base, tasks: [{ node_id: 'x', depends_on: [], scope: id(1) }] },
