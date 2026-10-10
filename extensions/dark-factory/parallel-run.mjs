@@ -21,7 +21,7 @@ const lines = (file, args) => {
   try { return execFileSync(file, args, { encoding: 'utf8' }).trim().split('\n').filter(Boolean); }
   catch { return []; }
 };
-const usage = 'Usage: node parallel-run.mjs <start-parallel --run <RUN node> [--config overrides.json] | status | wake [--note text] | answer --task <TASK node> --text <answer> | stop [--now] | resume> [--run <RUN node>]';
+const usage = 'Usage: node parallel-run.mjs <start-parallel --run <RUN node> [--config overrides.json] | status | wake [--reconcile] [--note text] | answer --task <TASK node> --text <answer> | stop [--now] | resume> [--run <RUN node>]';
 
 function runDirectory() {
   const run = flag('--run');
@@ -80,6 +80,7 @@ function summary(directory) {
     directory, run_node: config.run_node, owner: config.owner,
     status: state.status, controller_alive: controllerAlive(directory), attention: state.attention ?? undefined,
     primary_required: state.primary_required ?? false, awaiting_input: state.awaiting_input ?? [],
+    admission_hold: state.admission_hold ?? null,
     dispatcher: { configured_engine: config.dispatcher.engine ?? 'claude', route: config.dispatcher.fallback,
       running: state.dispatcher.attempt ? state.attempts[state.dispatcher.attempt].engine : null, wakes: state.dispatcher.wakes,
       last: state.dispatcher.last, claude_resting_until: state.dispatcher.claude_resting_until && new Date(state.dispatcher.claude_resting_until).toISOString() },
@@ -173,7 +174,7 @@ if (command === 'controller') {
   console.log(JSON.stringify(summary(runDirectory()), null, 2));
 } else if (command === 'wake') {
   const directory = runDirectory();
-  inbox(directory, { type: 'wake', note: flag('--note') ?? 'factory wake' });
+  inbox(directory, { type: 'wake', note: flag('--note') ?? 'factory wake', ...(rest.includes('--reconcile') ? { reconcile: true } : {}) });
   const session = controllerAlive(directory) ? undefined : resume(directory);
   console.log(JSON.stringify({ directory, woke: true, resumed_controller: session ?? null }));
 } else if (command === 'answer') {

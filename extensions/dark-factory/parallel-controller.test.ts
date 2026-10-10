@@ -12,6 +12,60 @@ const A = 'aaaaaaaa-0000-4000-8000-000000000000', B = 'bbbbbbbb-0000-4000-8000-0
 const C = 'cccccccc-0000-4000-8000-000000000000', D = 'dddddddd-0000-4000-8000-000000000000';
 const field = (text: string, key: string) => new RegExp(`^${key}: (\\S+)`, 'm').exec(text)?.[1];
 
+test('reconcile wake consumes old settlements without admission until a fresh task decision', async () => {
+  const directory = setup({});
+  try {
+    const config = JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8'));
+    const state = initialState(config, 1);
+    state.seq = 2;
+    state.tasks[A] = { node_id: A, scope: A, seats: ['oss'], depends_on: [], status: 'running', continues: 0, attempts: ['1'] };
+    state.order = [A];
+    state.scopes[A] = [A, OWNER];
+    state.seats.oss.attempt = '1';
+    state.attempts['1'] = { id: '1', kind: 'worker', seat: 'oss', seat_kind: 'oss', route: config.seats[0].route,
+      task: A, status: 'running', engine: 'fallback', receipt: { session_label: 'old-worker' } };
+    state.attempts['2'] = { id: '2', kind: 'dispatcher', status: 'running', engine: 'fallback', events: [],
+      receipt: { session_label: 'old-dispatcher' } };
+    state.dispatcher.attempt = '2';
+    save(join(directory, 'state.json'), state);
+    mkdirSync(join(directory, 'inbox'));
+    save(join(directory, 'inbox', 'wake.json'), { type: 'wake', reconcile: true, note: 'reconcile current ownership' });
+    const { deps } = harness(directory);
+    const controller = new ParallelController(directory, deps);
+    await controller.start();
+    await controller.readInbox(2);
+    const worker = { kind: 'report', reportPath: '/retained-worker', report: { disposition: 'continue', summary: 'unfinished assigned check' } };
+    await controller.settle(controller.state.attempts['1'], worker, 3);
+    const report = { disposition: 'tasks', summary: 'old proposal partitions', tasks: [{ node_id: B, scope: B, depends_on: [], seats: ['codex-1'] }], stop_running: [] };
+    await controller.settle(controller.state.attempts['2'], { kind: 'report', report, reportPath: '/retained-dispatcher' }, 4);
+    assert.equal(controller.state.tasks[A].previous, '/retained-worker');
+    assert.equal(controller.state.tasks[A].status, 'queued');
+    assert.ok(controller.state.admission_hold);
+    assert.deepEqual(planAssignments(controller.state, config, 5), []);
+    controller.persist();
+    const resumed = new ParallelController(directory, deps);
+    await resumed.start();
+    assert.ok(resumed.state.admission_hold, 'hold survives restart');
+    const fresh = id => ({ id, kind: 'dispatcher', status: 'running', engine: 'fallback', events: [], receipt: { session_label: 'fresh-' + id } });
+    for (const [id, outcome] of [
+      ['3', { kind: 'error', summary: 'failed transport' }],
+      ['4', { kind: 'report', report: { ...report, disposition: 'continue', tasks: [] }, reportPath: '/handoff' }],
+      ['5', { kind: 'report', report: { ...report, tasks: [{ node_id: OWNER, scope: OWNER, depends_on: [] }] }, reportPath: '/rejected' }],
+    ]) {
+      resumed.state.attempts[id] = fresh(id);
+      await resumed.settle(resumed.state.attempts[id], outcome, 6);
+      assert.ok(resumed.state.admission_hold, 'failure/continue/rejection cannot release hold');
+    }
+    resumed.state.attempts['6'] = fresh('6');
+    await resumed.settle(resumed.state.attempts['6'], { kind: 'report', report: { ...report, tasks: [], stop_running: [A] }, reportPath: '/fresh' }, 7);
+    assert.equal(resumed.state.admission_hold, undefined);
+    assert.equal(resumed.state.tasks[A].status, 'stopped');
+    assert.deepEqual(planAssignments(resumed.state, config, 8), [{ seat: 'codex-1', task: B }]);
+    assert.equal(resumed.state.attempts['1'].outcome.disposition, 'continue');
+    assert.equal(resumed.state.attempts['2'].outcome.disposition, 'tasks');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 // Simulated seats on a simulated clock: no tmux, models or tree access.
 function harness(directory: string, { dirty = false, needsInputTask, primaryRequired = false, solOnlyPlan = false }: { dirty?: boolean; needsInputTask?: string; primaryRequired?: boolean; solOnlyPlan?: boolean } = {}) {
   let t = 1_000_000_000_000;

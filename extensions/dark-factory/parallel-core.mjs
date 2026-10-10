@@ -231,7 +231,7 @@ const ready = state => state.order.map(id => state.tasks[id])
   .sort((a, b) => Number(!!b.front) - Number(!!a.front));
 
 export function planAssignments(state, config, now) {
-  if (state.status !== 'running' || state.stop || state.attention || state.awaiting_input?.length) return [];
+  if (state.status !== 'running' || state.stop || state.attention || state.admission_hold || state.awaiting_input?.length) return [];
   if (['done', 'blocked'].includes(state.dispatcher.last?.disposition)) return [];
   if (state.primary_required && config.code?.integration !== 'dispatcher') {
     const primary = config.seats.find(seat => seat.kind === 'oss');
@@ -463,6 +463,7 @@ export function dispatcherSnapshot(state, config, now) {
     baseline: state.baseline ?? null,
     integration_handoff: state.integration_handoff ?? null,
     recovery_policy: 'A terminal quiet task may start a fresh guarded attempt. Historical route verdicts are not required.',
+    admission_hold: state.admission_hold ?? null,
     previous_dispatcher: state.dispatcher.previous ?? null,
     setup: state.setup ?? null,
     checks: Object.fromEntries(Object.entries(state.checks ?? {}).map(([id, entry]) => [id, { task: entry.task, observer: entry.observer,
