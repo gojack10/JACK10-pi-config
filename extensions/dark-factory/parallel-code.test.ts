@@ -408,7 +408,13 @@ test('worker guard validates identity and prevents private worked or tree public
     installParallelGuard(pi, { report: path, route: P.ROUTES.oss, role: 'worker', code });
     const check = handlers.at(-1), event = { toolName: 'report_outcome', input: { outcome: 'completed' } };
     save(path, report(A, code, 'worked'));
-    assert.match(check(event).reason, /private candidate/);
+    const rejection = check(event).reason;
+    assert.match(rejection, /private candidate/);
+    assert.match(rejection, /SAME explicit assignment/);
+    assert.match(rejection, /finished tree contribution uses worked and finished code uses candidate/);
+    assert.match(rejection, /all registered work has drained/);
+    assert.match(rejection, /ordinary assistant text/);
+    assert.match(rejection, /attempt is inactive/);
     save(path, report(A, { ...code, candidate: f.code.main_head }, 'candidate'));
     assert.equal(check(event), undefined);
     save(path, report(A, { ...code, worktree: f.repo, candidate: f.code.main_head }, 'candidate'));
