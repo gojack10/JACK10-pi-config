@@ -32,8 +32,8 @@ export function buildConfig({ runNode, owner, repos = [], directory, cwd, overri
   const fallback = overrides.routes?.fallback ?? routes.codex;
   const dispatcherEngine = overrides.dispatcher_engine ?? 'fallback';
   if (!['fallback', 'claude'].includes(dispatcherEngine)) throw Error('dispatcher_engine must be fallback or claude');
-  const codexSeats = overrides.codex_seats ?? 3;
-  if (!Number.isInteger(codexSeats) || codexSeats < 0 || codexSeats > 3) throw Error('codex_seats must be 0-3');
+  const codexSeats = overrides.codex_seats ?? 6;
+  if (!Number.isInteger(codexSeats) || codexSeats < 0 || codexSeats > 6) throw Error('codex_seats must be 0-6');
   // OSS first, then Codex: seat order is the fill order.
   const seats = [{ id: 'oss', kind: 'oss', route: routes.oss },
     ...Array.from({ length: codexSeats }, (_, i) => ({ id: `codex-${i + 1}`, kind: 'codex', route: routes.codex }))];
@@ -92,7 +92,7 @@ export function validateDispatcherReport(text) {
     if (seen.has(task.node_id)) throw Error(`task ${task.node_id} is listed twice`);
     seen.add(task.node_id);
     if (task.seats !== undefined && (!Array.isArray(task.seats) || !task.seats.length ||
-        !task.seats.every(seat => typeof seat === 'string' && /^(oss|codex-[1-3])$/.test(seat)))) throw Error('seats must list explicit worker seat IDs');
+        !task.seats.every(seat => typeof seat === 'string' && /^(oss|codex-[1-6])$/.test(seat)))) throw Error('seats must list explicit worker seat IDs');
     if (task.code && (typeof task.code !== 'object' || Object.keys(task.code).some(key => key !== 'files'))) throw Error('task.code accepts only files; controller owns Git identities');
     if (task.checks !== undefined && !Array.isArray(task.checks)) throw Error(`tasks[${index}].checks must be an array`);
     const checks = (task.checks ?? []).map(check => {
