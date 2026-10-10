@@ -172,12 +172,6 @@ export class ParallelController {
     await this.requestStops(now);
     for (const attempt of P.running(this.state)) {
       if (attempt.status !== 'running') continue;
-      if (attempt.awaiting_input) {
-        if (!(await this.alive(attempt, attempt.receipt.session_label, now))) {
-          await this.settle(attempt, { kind: 'error', summary: 'worker transport lost while awaiting human input; retain draft and verify background-work drain before retry' }, now);
-        }
-        continue;
-      }
       // Do not sample main mid-publication. Settled sibling code reports wait for the grant holder.
       const publisher = this.state.merge?.task;
       if (publisher && publisher !== attempt.task && this.state.tasks[publisher]?.code.phase === 'publish' &&
@@ -190,7 +184,7 @@ export class ParallelController {
     const assignments = P.planAssignments(this.state, this.config, now);
     for (const assignment of assignments) this.launchWorker(assignment, now);
     P.ossIdle(this.state, this.config, now, assignments);
-    if (this.state.wake && !this.state.dispatcher.attempt && this.state.status === 'running' && !this.state.stop && !this.state.attention && !(this.state.awaiting_input?.length)) {
+    if (this.state.wake && !this.state.dispatcher.attempt && this.state.status === 'running' && !this.state.stop && !this.state.attention && (!(this.state.awaiting_input?.length) || P.running(this.state).some(a => a.interruption))) {
       this.launchDispatcher(now);
     }
     this.flushEvents();
@@ -242,7 +236,7 @@ export class ParallelController {
       return;
     }
     const attempt = this.state.attempts[pending.attempt];
-    if (!attempt || attempt.status !== 'running' || !attempt.awaiting_input || !this.deps.followupPi) {
+    if (!attempt || attempt.status !== 'running' || attempt.interruption || !attempt.awaiting_input || !this.deps.followupPi) {
       this.log('worker_input_rejected', { task: command.task, attempt: pending.attempt, reason: 'saved worker cannot be safely continued' });
       return;
     }
@@ -531,10 +525,18 @@ export class ParallelController {
         : this.state.merge?.task === request.node_id ? 'a publication reservation is held'
         : unresolved ? `attempt ${unresolved.id} is ${unresolved.status}` : null;
       if (refusal) {
-        this.log('recovery_refused', { task: request.node_id, reason: refusal, requested: request.reason });
-        P.addEvent(this.state, { type: 'recovery_refused', task: request.node_id, reason: refusal }, now);
+        // An unchanged refusal is an observation, not new evidence for another dispatcher wake.
+        const identity = JSON.stringify([refusal, task?.attempts?.at(-1), unresolved?.id, unresolved?.receipt?.attempt_id,
+          unresolved?.interruption?.event, this.state.merge?.task === request.node_id ? this.state.merge : null]);
+        this.state.recovery_refusals ??= {};
+        if (this.state.recovery_refusals[request.node_id] !== identity) {
+          this.state.recovery_refusals[request.node_id] = identity;
+          this.log('recovery_refused', { task: request.node_id, reason: refusal, requested: request.reason });
+          P.addEvent(this.state, { type: 'recovery_refused', task: request.node_id, reason: refusal }, now);
+        }
         continue;
       }
+      if (this.state.recovery_refusals) delete this.state.recovery_refusals[request.node_id];
       // Historical route receipts are not eligibility for a new attempt. The new guard checks its own route.
       Object.assign(task, { status: 'queued', front: true, continues: 0, recovered_at: now, route_check: 'fresh attempt only' });
       // The retained draft and its identity survive: recovery resumes the same assignment, never a replacement.
@@ -770,9 +772,11 @@ export class ParallelController {
   }
 
   async alive(attempt, label, now) {
-    if (now - (this.checked.get(attempt.id) ?? 0) < ALIVE_MS) return true;
-    this.checked.set(attempt.id, now);
-    return this.deps.sessionAlive(label);
+    const cached = this.checked.get(attempt.id);
+    if (cached && now - cached.at < ALIVE_MS) return cached.alive;
+    const alive = await this.deps.sessionAlive(label);
+    this.checked.set(attempt.id, { at: now, alive });
+    return alive;
   }
 
   async pollPi(attempt, now) {
@@ -780,9 +784,42 @@ export class ParallelController {
     if (!result) {
       if (await this.alive(attempt, attempt.receipt.session_label, now)) return;
       result = await this.deps.piOutcome(attempt.receipt) ??
-        { status: 'failed', source: 'transport', summary: 'tmux session disappeared without a durable outcome' };
+        { status: 'interrupted', source: 'transport', summary: 'session absent without canonical settlement/loss; retain ownership until lifecycle and background drain are verified',
+          lifecycle: { event: 'missing-lifecycle', state: 'unknown' } };
+    }
+    if (['active', 'needs_input', 'interrupted'].includes(result.status) && result.lifecycle?.state !== 'transport_lost' &&
+        !(await this.alive(attempt, attempt.receipt.session_label, now))) {
+      result = { status: 'interrupted', source: 'transport', summary: 'nonfinal receipt but session absent; lifecycle and background drain remain unverified',
+        lifecycle: { ...result.lifecycle, event: `missing-lifecycle:${result.lifecycle?.event ?? result.status}`, state: 'unknown' } };
+    }
+    if (result.status === 'interrupted' || (result.status === 'needs_input' && attempt.kind === 'dispatcher')) {
+      const event = result.lifecycle?.event ?? result.status;
+      if (attempt.interruption?.event !== event) {
+        attempt.interruption = { ...result.lifecycle, event, summary: result.summary, at: now };
+        const detail = { type: `${attempt.kind}_interrupted`, attempt: attempt.id, task: attempt.task, seat: attempt.seat,
+          job: attempt.receipt.job, transport_attempt: attempt.receipt.attempt_id, session: attempt.receipt.session_id,
+          report: attempt.report, session_file: attempt.receipt.session_file, manifest: attempt.receipt.manifest_file,
+          background: attempt.receipt.monitor_log, ...attempt.interruption };
+        P.addEvent(this.state, detail, now);
+        this.log('attempt_interrupted', { interruption: detail });
+        this.persist();
+      }
+      return;
+    }
+    if (result.status === 'active') {
+      if (attempt.interruption) {
+        // Stale active receipts cannot erase loss/unknown ownership or a different context pause.
+        if (attempt.interruption.state !== 'context_paused' || !attempt.interruption.pause_id ||
+            result.lifecycle?.event === attempt.interruption.event || result.lifecycle?.pause_id !== attempt.interruption.pause_id) return;
+        delete attempt.interruption;
+        P.addEvent(this.state, { type: `${attempt.kind}_resumed`, attempt: attempt.id, task: attempt.task,
+          transport_attempt: attempt.receipt.attempt_id }, now);
+        this.persist();
+      }
+      return;
     }
     if (result.status === 'needs_input') {
+      if (attempt.awaiting_input) return;
       attempt.awaiting_input = { at: now, question: result.summary };
       this.state.awaiting_input ??= [];
       const existing = this.state.awaiting_input.find(item => item.attempt === attempt.id);
@@ -849,6 +886,8 @@ export class ParallelController {
   }
 
   async settle(attempt, outcome, now) {
+    if (attempt.status === 'finished') return; // Replayed receipts must not requeue events or consume retries.
+    delete attempt.interruption;
     // Vet before closing: a failed tree lookup retries next tick with the session intact.
     if (attempt.kind === 'dispatcher' && outcome.kind === 'report') {
       try { await this.dispatcherCodeOutcome(outcome.report); }

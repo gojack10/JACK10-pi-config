@@ -81,6 +81,8 @@ function summary(directory) {
     status: state.status, controller_alive: controllerAlive(directory), attention: state.attention ?? undefined,
     primary_required: state.primary_required ?? false, awaiting_input: state.awaiting_input ?? [],
     admission_hold: state.admission_hold ?? null,
+    interruptions: Object.values(state.attempts).filter(attempt => attempt.interruption).map(attempt => ({
+      attempt: attempt.id, task: attempt.task, report: attempt.report, receipt: attempt.receipt, ...attempt.interruption })),
     dispatcher: { configured_engine: config.dispatcher.engine ?? 'claude', route: config.dispatcher.fallback,
       running: state.dispatcher.attempt ? state.attempts[state.dispatcher.attempt].engine : null, wakes: state.dispatcher.wakes,
       last: state.dispatcher.last, claude_resting_until: state.dispatcher.claude_resting_until && new Date(state.dispatcher.claude_resting_until).toISOString() },

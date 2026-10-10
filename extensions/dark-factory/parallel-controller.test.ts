@@ -66,6 +66,145 @@ test('reconcile wake consumes old settlements without admission until a fresh ta
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+for (const kind of ['worker', 'dispatcher']) test(`${kind} interruptions retain identity and emit once, not terminal/report-only completion`, async () => {
+  const directory = setup({});
+  try {
+    const { deps, killed, followups } = harness(directory);
+    const controller = new ParallelController(directory, deps);
+    await controller.start();
+    const code = { worktree: '/retained/draft', branch: 'retained-branch', base: 'a'.repeat(40), candidate: 'b'.repeat(40) };
+    const receipt = { job: 'retained-job', attempt_id: 'retained-attempt', session_id: 'retained-session', session_label: 'retained-pane',
+      session_file: '/retained/session', manifest_file: '/retained/manifest', monitor_log: '/retained/monitor' };
+    const attempt: any = { id: '1', kind, seat: kind === 'worker' ? 'oss' : undefined, task: kind === 'worker' ? A : undefined,
+      seat_kind: 'oss', route: controller.config.seats[0].route, status: 'running', engine: 'fallback', report: '/retained/report', receipt };
+    controller.state.attempts['1'] = attempt;
+    controller.state.tasks[A] = { node_id: A, scope: A, seats: ['oss'], depends_on: [], status: 'running', continues: 0, attempts: ['1'], code };
+    controller.state.tasks[B] = { node_id: B, scope: B, seats: ['codex-1'], depends_on: [], status: 'queued', continues: 0, attempts: [] };
+    controller.state.order = [A, B];
+    controller.state.scopes[A] = [A, OWNER];
+    controller.state.scopes[B] = [B, OWNER];
+    controller.state.merge = { task: A, candidate: code.candidate };
+    if (kind === 'worker') controller.state.seats.oss.attempt = '1'; else controller.state.dispatcher.attempt = '1';
+    let outcome: any = { status: 'interrupted', summary: 'context limit', lifecycle: { event: 'pause-event', state: 'context_paused', pause_id: 'pause-id' } };
+    deps.piOutcome = async () => outcome;
+    await controller.pollPi(attempt, 10);
+    const retained = structuredClone(controller.state);
+    await controller.pollPi(attempt, 11);
+    assert.deepEqual(controller.state, retained, 'duplicate pause consumes nothing');
+    assert.equal(attempt.status, 'running');
+    assert.equal(killed.size, 0);
+    assert.deepEqual(attempt.receipt, receipt);
+    assert.deepEqual(controller.state.tasks[A].code, code);
+    assert.equal(controller.state.merge.task, A);
+    assert.deepEqual(planAssignments(controller.state, controller.config, 12), [{ seat: 'codex-1', task: B }],
+      'retained interruption blocks replacement, not genuinely independent authorized work');
+    const event = controller.state.pending_events.find(e => e.type === `${kind}_interrupted`);
+    assert.equal(event.transport_attempt, receipt.attempt_id);
+    assert.equal(event.report, attempt.report);
+    assert.equal(event.background, receipt.monitor_log);
+    if (kind === 'worker') {
+      attempt.awaiting_input = { question: 'old question' };
+      controller.state.awaiting_input = [{ task: A, attempt: '1', question: 'old question' }];
+      await controller.answerWorker({ task: A, text: 'old answer' }, 12);
+      assert.equal(followups.length, 0, 'an interrupted question cannot admit a fresh attempt');
+      delete attempt.awaiting_input;
+      controller.state.awaiting_input = [];
+    }
+    await controller.applyRecoveries([{ node_id: A, reason: 'recover retained task' }], 13);
+    const events = controller.state.pending_events.length;
+    controller.state.pending_events = []; controller.state.wake = false;
+    await controller.applyRecoveries([{ node_id: A, reason: 'same refusal, different prose' }], 14);
+    assert.equal(controller.state.pending_events.length, 0, 'unchanged refusal is not a new wake');
+    assert.equal(controller.state.wake, false);
+    assert.ok(events > 0);
+    // Reload retains the reservation and pause; there is no concurrent replacement.
+    controller.persist();
+    const reloaded = new ParallelController(directory, deps);
+    await reloaded.start();
+    assert.deepEqual(reloaded.state.attempts['1'].interruption, attempt.interruption);
+    assert.deepEqual(reloaded.state.tasks[A].code, code);
+    await reloaded.applyRecoveries([{ node_id: A, reason: 'unchanged after reload' }], 14);
+    assert.equal(reloaded.state.pending_events.length, 0, 'identical refusal remains deduplicated across reload');
+    controller.state.merge.candidate = 'c'.repeat(40);
+    await controller.applyRecoveries([{ node_id: A, reason: 'reservation evidence changed' }], 14);
+    assert.equal(controller.state.pending_events.at(-1).type, 'recovery_refused', 'changed owned reservation is new evidence');
+    outcome = { status: 'active', lifecycle: { event: 'stale-active', state: 'active', pause_id: 'different-pause' } };
+    await controller.pollPi(attempt, 14);
+    assert.ok(attempt.interruption, 'a stale active receipt cannot erase the pause');
+    outcome = { status: 'active', lifecycle: { event: 'resume-event', state: 'active', pause_id: 'pause-id' } };
+    await controller.pollPi(attempt, 15);
+    assert.equal(attempt.interruption, undefined);
+    assert.equal(controller.state.pending_events.at(-1).type, `${kind}_resumed`);
+    outcome = { status: 'interrupted', summary: 'maintenance refused', lifecycle: { event: 'maintenance-event', state: 'context_paused', maintenance_id: 'maintenance-id' } };
+    await controller.pollPi(attempt, 15);
+    outcome = { status: 'active', lifecycle: { event: 'old-active', state: 'active' } };
+    await controller.pollPi(attempt, 15);
+    assert.equal(attempt.interruption.maintenance_id, 'maintenance-id', 'an older active projection is not maintenance recovery');
+    outcome = { status: 'interrupted', summary: 'actual transport loss, background drain unknown', lifecycle: { event: 'loss-event', state: 'transport_lost' } };
+    await controller.pollPi(attempt, 16);
+    assert.equal(attempt.status, 'running');
+    assert.equal(killed.size, 0);
+    assert.equal(controller.state.tasks[A].code, code);
+    outcome = { status: 'active', lifecycle: { event: 'stale-after-loss', state: 'active' } };
+    await controller.pollPi(attempt, 17);
+    assert.equal(attempt.interruption.state, 'transport_lost', 'loss cannot be erased by an old active projection');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('absent pane without lifecycle cannot finish/free a worker; replayed completed handoff cannot duplicate continuation', async () => {
+  const directory = setup({});
+  try {
+    const { deps, killed } = harness(directory);
+    const controller = new ParallelController(directory, deps);
+    await controller.start();
+    const attempt: any = { id: '1', kind: 'worker', seat: 'oss', task: A, status: 'running', engine: 'fallback',
+      report: '/retained/report', receipt: { session_label: 'missing-pane', attempt_id: 'owned-attempt' } };
+    controller.state.tasks[A] = { node_id: A, status: 'running', attempts: ['1'], continues: 0 };
+    controller.state.attempts['1'] = attempt; controller.state.seats.oss.attempt = '1';
+    deps.piOutcome = async () => undefined;
+    deps.sessionAlive = async () => false;
+    await controller.pollPi(attempt, 100_000);
+    assert.equal(attempt.interruption.state, 'unknown');
+    assert.equal(controller.state.seats.oss.attempt, '1');
+    assert.equal(killed.size, 0);
+    deps.piOutcome = async () => ({ status: 'interrupted', summary: 'context limit', lifecycle: { event: 'pause-event', state: 'context_paused', pause_id: 'pause-id' } });
+    await controller.pollPi(attempt, 120_000);
+    const absent = structuredClone(controller.state);
+    await controller.pollPi(attempt, 120_001);
+    await controller.pollPi(attempt, 135_001);
+    assert.deepEqual(controller.state, absent, 'cached absent health cannot flap into new pause/loss wakes');
+    const outcome = { kind: 'report', reportPath: attempt.report, report: { disposition: 'continue', summary: 'unfinished assigned check', next_action: 'finish that check' } };
+    await controller.settle(attempt, outcome, 100_001);
+    const state = structuredClone(controller.state);
+    await controller.settle(attempt, outcome, 100_002);
+    assert.deepEqual(controller.state, state);
+    assert.equal(controller.state.tasks[A].continues, 1);
+    assert.equal(controller.state.tasks[A].previous, attempt.report);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('only replayed dispatcher handoffs are deduplicated, not a new unfinished continuation', async () => {
+  const directory = setup({});
+  try {
+    const { deps } = harness(directory);
+    const controller = new ParallelController(directory, deps);
+    await controller.start();
+    for (const id of ['1', '2']) {
+      const attempt = { id, kind: 'dispatcher', status: 'running', engine: 'fallback', events: [], receipt: { session_label: 'retained-' + id } };
+      controller.state.attempts[id] = attempt;
+      controller.state.dispatcher.attempt = id;
+      const outcome = { kind: 'report', reportPath: '/handoff-' + id,
+        report: { disposition: 'continue', summary: 'unfinished assigned integration', tasks: [], stop_running: [] } };
+      await controller.settle(attempt, outcome, 10);
+      const settled = structuredClone(controller.state);
+      await controller.settle(attempt, outcome, 11);
+      assert.deepEqual(controller.state, settled, 'same receipt does not emit another continuation');
+    }
+    assert.equal(controller.state.pending_events.filter(event => event.type === 'dispatcher_continued').length, 2);
+    assert.equal(controller.state.dispatcher.previous, '/handoff-2');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 // Simulated seats on a simulated clock: no tmux, models or tree access.
 function harness(directory: string, { dirty = false, needsInputTask, primaryRequired = false, solOnlyPlan = false }: { dirty?: boolean; needsInputTask?: string; primaryRequired?: boolean; solOnlyPlan?: boolean } = {}) {
   let t = 1_000_000_000_000;
@@ -236,7 +375,7 @@ test('needs_input pauses admissions, preserves the worker, and resumes the same 
     assert.equal(followups[0].sessionWasLive, true);
     assert.equal(followups[0].route.model, 'gpt-5.6-luna');
     assert.deepEqual(JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')).awaiting_input, []);
-    assert.ok(!messages.some(message => message.includes('FACTORY CONTROLLER: stop now')));
+    assert.ok(!messages.some(message => message.includes('FACTORY CONTROLLER: stop')));
     assert.equal(rows.some(row => row.type === 'worker_launch' && row.task === C && row.t > waiting.t && row.t < resumed.t), false,
       'no new task is admitted before the primary receives its answer');
   } finally { rmSync(directory, { recursive: true, force: true }); }
