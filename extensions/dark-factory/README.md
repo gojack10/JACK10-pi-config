@@ -30,7 +30,7 @@ The loop stops at its task-specific human boundary, `blocked`, an invalid report
 cd ~/.pi/agent
 node extensions/dark-factory/parallel-run.mjs start-parallel --run <RUN node> [--config overrides.json]
 node extensions/dark-factory/parallel-run.mjs status [--run <RUN node>]
-node extensions/dark-factory/parallel-run.mjs wake [--run <RUN node>] [--note text]
+node extensions/dark-factory/parallel-run.mjs wake [--run <RUN node>] [--reconcile] [--note text]
 node extensions/dark-factory/parallel-run.mjs answer --run <RUN node> --task <TASK node> --text 'human answer'
 node extensions/dark-factory/parallel-run.mjs stop [--run <RUN node>] [--now]
 node extensions/dark-factory/parallel-run.mjs resume [--run <RUN node>]
@@ -48,6 +48,7 @@ Hosted tree operations use `~/.local/bin/sifttext-mcp`; `sifttext` remains the n
 - **Human input.** A real `needs_input` question preserves its worker/session and pauses new admissions; `status` shows the exact task and question. Answer only that task with `answer --run <RUN> --task <TASK> --text '...'`; the controller continues the same saved session on its unchanged route with a fresh report. If registered background work is still running, the worker must wait for its completion notification and must not declare `needs_input` as a yield.
 - **Friendly stop.** `continue` requeues the same task with `PREVIOUS`, OSS first. A third continue is a dispatcher event. `stop_running` and `stop --now` type a stop request into the worker's pane.
 - **Fence guard.** After every worker attempt, each read-only repository must have empty `git status --porcelain` and an unchanged HEAD. Otherwise the controller asks running workers to report and stops as `needs_attention`.
+- **Recovery admission.** `wake --reconcile` holds new worker admissions while retained outcomes are consumed. Only a newer dispatcher’s valid `tasks` decision with no rejected orders releases the hold; context handoffs, failures and old dispatcher reports do not. Running workers and their reports are preserved. The hold is visible in status and dispatcher STATE and survives restart. Use it when task instructions/ownership must be reconciled before a continuation can safely run.
 - **Terminal states.** `done`, `blocked` and `idle` (nothing can start) end the controller; `wake` restarts it. `stop` is graceful: running attempts finish and nothing new launches. `resume` restarts from `state.json` and re-adopts running workers through their durable task-outcome receipts.
 - **Smoke-only faults.** `faults.seat_usage_limit: {seat, launches, minutes}` makes that seat's first launches fail with a usage-limit provider error. `faults.claude_failure: {wake}` launches that wake's Claude dispatcher on a nonexistent model.
 
