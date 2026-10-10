@@ -12,7 +12,7 @@ import { preflightCode } from './parallel-code.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const root = join(home, 'factory-runs', 'parallel');
-const SIFTTEXT = join(homedir(), '.local/bin/sifttext');
+const SIFTTEXT = join(homedir(), '.local/bin/sifttext-mcp');
 const [command, ...rest] = process.argv.slice(2);
 const flag = name => { const i = rest.indexOf(name); return i === -1 ? undefined : rest[i + 1]; };
 const quote = x => `'${x.replaceAll("'", "'\\''")}'`;
