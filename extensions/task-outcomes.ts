@@ -14,7 +14,7 @@ export default function taskOutcomes(pi: ExtensionAPI) {
     name: "report_outcome",
     label: "report_outcome",
     description:
-      "Declare the explicit outcome of the active task attempt. The active launch contract supplies the job, attempt, and report path; do not invent or select another job. In task mode, completed requires a readable nonempty report and no registered child/background work still running. A declaration is provisional until the declaring turn settles cleanly; clean dialogue responses are returned separately and verbatim.",
+      "Declare the explicit outcome of the active task attempt. The active launch contract supplies the job, attempt, and report path; do not invent or select another job. Every outcome requires registered child/background work to drain. In task mode, completed also requires a readable nonempty report. Terminal declarations are provisional until the declaring turn settles cleanly; needs_input is a nonfinal human-answer pause. Clean dialogue responses are returned separately and verbatim.",
     parameters: Type.Object({
       outcome: StringEnum(outcomes, { description: "completed, blocked, needs_input, or failed" }),
       summary: Type.String({ description: "Honest outcome and current findings; no length limit", minLength: 1 }),
@@ -22,7 +22,7 @@ export default function taskOutcomes(pi: ExtensionAPI) {
     async execute(_id, { outcome, summary }, _signal, _onUpdate, ctx) {
       const result = await getTaskOutcomeManager(pi, ctx).declare(outcome as DeclaredOutcome, summary);
       return {
-        content: [{ type: "text", text: `${result.outcome} declared for ${result.jobId}/${result.attemptId}; settlement will finalize it.` }],
+        content: [{ type: "text", text: `${result.outcome} declared for ${result.jobId}/${result.attemptId}; ${result.provisional ? "settlement will finalize it" : "paused for a human answer; not final"}.` }],
         details: result,
         terminate: result.terminate,
       };
