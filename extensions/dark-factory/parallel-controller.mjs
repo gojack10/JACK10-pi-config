@@ -13,7 +13,7 @@ export const save = (path, value) => {
   renameSync(`${path}.tmp`, path);
 };
 const readJson = path => JSON.parse(readFileSync(path, 'utf8'));
-const STOP_TEXT = 'FACTORY CONTROLLER: stop now. Write your continue report to REPORT as the Worker Role\'s Friendly stop section says, then call report_outcome and end your turn.';
+const STOP_TEXT = 'FACTORY CONTROLLER: stop new work and preserve the owned draft. Drain registered checks. Write REPORT: continue only for unfinished work in this same assignment; a finished tree contribution uses worked and finished code uses candidate (legacy granted publication uses worked). Then declare the honest outcome and end your turn.';
 const ALIVE_MS = 15_000;
 const EXTERNAL_MS = 60_000;
 export const CLAUDE_IDLE_MS = 30 * 60_000;

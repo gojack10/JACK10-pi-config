@@ -27,7 +27,8 @@ export function installParallelGuard(pi: ExtensionAPI, policy: Policy) {
     } catch (error) {
       // A validation error is not fresh permission to declare: it previously induced wait-as-outcome retries.
       return { block: true, reason: `Factory report check: ${error instanceof Error ? error.message : String(error)}. ` +
-        `Repair the JSON at ${policy.report} from the work already done. Retry report_outcome only when the task contract permits that outcome and all registered work has drained. ` +
+        `Repair the JSON at ${policy.report} from the work already done. Continue only unfinished work in the SAME explicit assignment; a finished tree contribution uses worked and finished code uses candidate (legacy granted publication uses worked). An unfinished parent or file/tree fence is not permission for another batch. ` +
+        'Retry report_outcome only when the task contract permits that outcome and all registered work has drained. ' +
         'If work is still running, end this turn with ordinary assistant text and wait for its completion notification; do not substitute another outcome value. ' +
         'If the attempt is inactive, preserve the report and return the refusal to the controller instead of retrying or starting more task work.' };
     }
