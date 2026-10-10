@@ -711,7 +711,7 @@ export class ParallelController {
     attempt.setup_packet = join(attempt.dir, 'setup-packet.json');
     const prompt = P.dispatcherPrompt({ role: this.config.roles.dispatcher, run: this.config.run_node, events: eventsPath,
       state: statePath, report: attempt.report, setup: this.config.code?.integration === 'dispatcher' ? undefined : attempt.setup_packet,
-      previous: this.state.dispatcher.previous, tools: engine === 'claude' ? 'the `sifttext` CLI through Bash' : 'your SiftText tools' });
+      previous: this.state.dispatcher.previous, tools: engine === 'claude' ? 'the `sifttext-mcp` CLI through Bash' : 'your SiftText tools' });
     const missionFile = join(attempt.dir, 'mission.md');
     writeFileSync(missionFile, prompt);
     const fault = engine === 'claude' && this.config.faults?.claude_failure?.wake === this.state.dispatcher.wakes;

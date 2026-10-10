@@ -14,7 +14,7 @@ import { closeIdleWatches } from './watch.mjs';
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
-const SIFTTEXT = join(homedir(), '.local/bin/sifttext');
+const SIFTTEXT = join(homedir(), '.local/bin/sifttext-mcp');
 const CLAUDE = join(homedir(), '.local/bin/claude');
 // One pre-trusted, otherwise empty directory: dispatchers load no project memory or CLAUDE.md from it.
 export const CLAUDE_CWD = join(homedir(), '.pi/agent/factory-runs/parallel/claude-dispatcher');
