@@ -247,7 +247,7 @@ export class ParallelController {
     const report = join(dir, 'report.json');
     const codePath = attempt.code ? join(dir, 'code.json') : undefined;
     if (codePath) save(codePath, { ...this.config.code, ...attempt.code, task: attempt.task, seat: attempt.seat,
-      merge: this.state.merge?.task === attempt.task ? this.state.merge : null });
+      current_main: this.state.code_main, merge: this.state.merge?.task === attempt.task ? this.state.merge : null });
     const mission = join(dir, 'mission.md');
     const input = command.text.trim();
     const prompt = P.workerPrompt({ role: this.config.roles.worker, run: this.config.run_node, task: attempt.task,
@@ -325,7 +325,7 @@ export class ParallelController {
     mkdirSync(artifacts, { recursive: true });
     const mission = join(attempt.dir, 'mission.md');
     const codePath = record.code ? join(attempt.dir, 'code.json') : undefined;
-    if (codePath) save(codePath, { ...this.config.code, ...attempt.code, task, seat, merge: attempt.merge });
+    if (codePath) save(codePath, { ...this.config.code, ...attempt.code, task, seat, current_main: this.state.code_main, merge: attempt.merge });
     writeFileSync(mission, P.workerPrompt({ role: this.config.roles.worker, run: this.config.run_node, task,
       report: attempt.report, previous: attempt.previous, artifacts, code: codePath,
       routeVerdict: join(attempt.dir, 'route-verdict.json') }));
@@ -399,7 +399,7 @@ export class ParallelController {
   }
 
   async setupTransition(attempt, setup, now) {
-    if (this.config.code?.integration === 'dispatcher') throw Error('tree-forward dispatchers own tests; check registration is not part of this pipeline');
+    if (this.config.code?.integration === 'dispatcher') throw Error('tree-forward workers own tests; check registration is not part of this pipeline');
     const reject = reason => {
       this.log('setup_rejected', { attempt: attempt.id, task: setup.task, action: setup.action, reason });
       P.addEvent(this.state, { type: 'setup_rejected', task: setup.task, action: setup.action, reason }, now);
@@ -554,7 +554,7 @@ export class ParallelController {
   async codeMainCheck(allowPublished = false) {
     if (!this.config.code) return;
     if (G.codePin(readJson(join(this.dir, 'config.json'))) !== this.state.code_pin) throw Error('code configuration changed while running');
-    // The sole dispatcher owns integration. Workers may develop while it tests/updates main.
+    // Tree-forward publication is receipt-driven; do not run acceptance gates or compare product meaning.
     if (this.config.code.integration === 'dispatcher') return;
     const head = await G.mainIdentity(this.config.code);
     const merge = this.state.merge;
@@ -619,11 +619,12 @@ export class ParallelController {
       if (!identity || identity.worktree !== code.worktree || identity.branch !== code.branch || identity.base !== code.base) {
         throw new G.TaskFault('worker report does not match owned worktree/branch/base');
       }
-      if (r.disposition === 'worked') throw new G.TaskFault('dispatcher integrates code; worker must return candidate');
+      if (r.disposition === 'worked') throw new G.TaskFault('controller publishes selected receipts; worker must return candidate');
       if (r.disposition === 'candidate') {
         await G.candidateIdentity(this.config, code, identity.candidate, code.base, this.state.code_main);
         if (code.candidate) await G.git(code.worktree, 'merge-base', '--is-ancestor', code.candidate, identity.candidate);
         code.candidate = identity.candidate;
+        delete code.publication_blocked;
       } else await G.worktreeIdentity(this.config, code);
       return;
     }
@@ -681,27 +682,63 @@ export class ParallelController {
     }
   }
 
-  // Agents run tests and reconcile ordinary Git conflicts. The scheduler consumes their integration result,
-  // checks the shared Git identity once, and releases dependencies; it never reruns tests or selects packets.
+  // Dispatcher selects settled receipts; controller executes Git instructions, never content tests/review.
   async dispatcherCodeOutcome(report) {
     const completed = report.completed ?? [];
     if (!completed.length) return;
     if (this.config.code?.integration !== 'dispatcher') throw Error('dispatcher integration is not enabled');
-    const head = await G.mainIdentity(this.config.code);
+    await this.codeMainCheck();
+    let head = await G.mainIdentity(this.config.code);
+    // Validate the whole instruction batch before publishing anything.
     for (const item of completed) {
       const task = this.state.tasks[item.node_id];
       if (!task?.code || !['merge_queued', 'worked'].includes(task.status)) throw Error('integration result needs a settled code candidate');
-      await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', task.code.candidate, item.candidate);
-      await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', item.candidate, item.main);
-      await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', item.main, head);
+      if (item.report) {
+        const worker = this.state.attempts[task.attempts.at(-1)];
+        if (task.last_report !== item.report || worker?.status !== 'finished' || worker.task !== item.node_id ||
+            worker.outcome?.kind !== 'report' || worker.outcome.disposition !== 'candidate' || worker.outcome.report !== item.report) {
+          throw Error('worker report identity does not match the current settled task');
+        }
+        if (task.code.candidate !== item.candidate) throw Error('worker candidate identity does not match the settled report');
+        if (this.state.stop) throw Error('human STOP prevents publication');
+        if (head !== this.state.code_main && head !== item.candidate) throw Error('main moved outside the selected worker receipt');
+        await G.candidateIdentity(this.config, task.code, item.candidate, task.code.base, head);
+      } else {
+        // Historical already-issued integration result: retain its published history without rerunning checks.
+        await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', task.code.candidate, item.candidate);
+        await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', item.candidate, item.main);
+        await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', item.main, head);
+      }
     }
     for (const item of completed) {
       const task = this.state.tasks[item.node_id];
+      const newlyWorked = task.status !== 'worked';
+      if (item.report && !newlyWorked) continue; // Receipt replay cannot change the original publication credit.
+      if (item.report) {
+        try { await G.git(this.config.code.repo, 'merge-base', '--is-ancestor', head, item.candidate); }
+        catch {
+          // No conflict resolution or automatic successor: the dispatcher may recover the owning worker.
+          if (task.code.publication_blocked !== head) {
+            task.code.publication_blocked = head;
+            P.addEvent(this.state, { type: 'candidate_needs_reconciliation', task: item.node_id, main: head, report: item.report }, this.deps.now());
+          }
+          continue;
+        }
+        await G.git(this.config.code.repo, 'merge', '--ff-only', item.candidate);
+        head = await G.mainIdentity(this.config.code);
+        if (head !== item.candidate) throw Error('main differs from selected worker candidate');
+      }
       task.status = 'worked';
-      Object.assign(task.code, { phase: 'landed', candidate: item.candidate, accepted_main: item.main, main_checks: item.checks });
-      this.log('dispatcher_integrated', { task: item.node_id, ...item });
+      delete task.code.publication_blocked;
+      Object.assign(task.code, { phase: 'landed', candidate: item.candidate, accepted_main: item.main ?? head,
+        ...(item.report ? { verification: 'worker_report', worker_report: item.report } : { main_checks: item.checks }) });
+      this.log(item.report ? 'worker_report_published' : 'dispatcher_integrated', { task: item.node_id, ...item, main: item.main ?? head,
+        ...(item.report ? { verification: 'worker_report' } : {}) });
+      this.state.code_main = head;
+      if (item.report && newlyWorked) P.addEvent(this.state, { type: 'task_finished', task: item.node_id,
+        report: item.report, main: head, verification: 'worker_report' }, this.deps.now());
+      this.persist();
     }
-    this.state.code_main = head;
   }
 
   seatFault(seat) {
