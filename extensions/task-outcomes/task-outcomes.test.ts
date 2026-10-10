@@ -591,10 +591,11 @@ test("launcher ingestion preserves durable dynamic child membership", { timeout:
   });
   await h.call("task_outcomes_consumer", { action: "close", batch_id: "P-batch" });
   await writeFile(join(h.dir, "P-p1.md"), "provisional report");
-  await assert.rejects(
-    h.call("report_outcome", { outcome: "completed", summary: "premature" }),
-    /premature|pending work|Registered work is still running/,
-  );
+  for (const outcome of ["completed", "blocked", "needs_input", "failed"]) {
+    await assert.rejects(h.call("report_outcome", { outcome, summary: "premature" }),
+      /Registered work is still running/);
+  }
+  assert.equal(h.persisted.filter(e => e.data.kind === "declaration").length, 0);
   await h.settle();
   assert.equal(h.messages.length, 0);
   assert.equal((await h.snapshot()).outcomes.length, 0);
@@ -608,6 +609,8 @@ test("launcher ingestion preserves durable dynamic child membership", { timeout:
   assert.match(h.messages[0].text, /No background or child jobs remain running for this attempt/);
   await writeFile(join(h.dir, "P-p1.md"), "full report");
   await h.settle({ outcome: "completed", summary: "P synthesized" });
+  assert.equal(h.persisted.find(e => e.data.kind === "declaration").data.declarationSequence, 0,
+    "all pending-work rejections leave the first declaration sequence unused");
   await until(() => h.messages.length === 2);
   assert.match(h.messages[1].text, /P synthesized/);
   assert.match(h.messages[1].text, /job_1|exit 0/);
@@ -1691,6 +1694,82 @@ test("durable pause wins report-validation race; final-first rejects pause and d
   await h.manager.onAgentSettled(false);
   assert.equal(JSON.parse(await readFile(path, "utf8")).revision, final.revision);
   assert.equal(h.manager.snapshot().outcomes.filter(o => o.final).length, 1);
+});
+
+test("async declaration validation cannot overwrite another declaration or consume a rejected sequence", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "declare-race", "a1"));
+  const original = h.manager.verifyReport;
+  let release!: () => void;
+  h.manager.verifyReport = () => new Promise<void>(resolve => { release = resolve; });
+  const completion = h.manager.declare("completed", "racing completion");
+  await h.manager.declare("blocked", "missing authority");
+  release();
+  await assert.rejects(completion, /declaration changed/);
+  const declarations = h.sm.getEntries().filter(e => e.type === "custom" && (e.data as any)?.kind === "declaration");
+  assert.equal(declarations.length, 1);
+  assert.equal((declarations[0].data as any).declarationSequence, 0);
+  assert.equal(h.manager.snapshot().active.declaration.outcome, "blocked");
+  h.manager.verifyReport = original;
+});
+
+for (const drained of [false, true]) test(`new child during async validation (drained=${drained}) rejects before persistence`, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "validation-work", "a1"));
+  let release!: () => void;
+  h.manager.verifyReport = () => new Promise<void>(resolve => { release = resolve; });
+  const completion = h.manager.declare("completed", "too early");
+  h.manager.registerChild("validation-work", "new-child");
+  if (drained) h.manager.recordChildOutcome("validation-work", "new-child", "completed", "done");
+  release();
+  await assert.rejects(completion, /Registered work is still running|work started while validating/);
+  assert.equal(h.manager.snapshot().active.state, "active");
+  assert.equal(h.manager.snapshot().active.declaration, undefined);
+  assert.equal(h.sm.getEntries().filter(e => e.type === "custom" && (e.data as any)?.kind === "declaration").length, 0);
+});
+
+for (const outcome of ["completed", "blocked", "failed"] as const) test(`${outcome} settlement invalidates when child work starts after declaration`, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "settlement-work", "a1"));
+  await writeFile(join(h.dir, "settlement-work-a1.md"), "report");
+  await h.manager.declare(outcome, "provisional");
+  h.manager.registerChild("settlement-work", "late-child");
+  await h.manager.onAgentSettled(false);
+  assert.equal(h.manager.snapshot().active.state, "active");
+  assert.equal(h.manager.snapshot().active.declaration, undefined);
+  assert.equal(h.manager.snapshot().outcomes.length, 0);
+  h.manager.recordChildOutcome("settlement-work", "late-child", "completed", "done");
+  await h.manager.declare(outcome, "after drain");
+  await h.manager.onAgentSettled(false);
+  assert.equal(h.manager.snapshot().outcomes.at(-1).outcome, outcome);
+});
+
+for (const failValidation of [false, true]) test(`work appearing during settlement validation invalidates and wakes after drain (validation failure=${failValidation})`, async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "settle-validation", "a1"));
+  await writeFile(join(h.dir, "settle-validation-a1.md"), "report");
+  await h.manager.declare("completed", "before race");
+  let release!: () => void;
+  h.manager.verifyReport = async () => { await new Promise<void>(resolve => { release = resolve; }); if (failValidation) throw Error("report changed"); };
+  const settling = h.manager.onAgentSettled(false);
+  h.manager.registerChild("settle-validation", "new-child");
+  release(); await settling;
+  assert.equal(h.manager.snapshot().active.declaration, undefined);
+  assert.equal(h.manager.snapshot().outcomes.length, 0);
+  h.manager.recordChildOutcome("settle-validation", "new-child", "completed", "done");
+  await until(() => h.messages.some(m => /No background or child jobs remain/.test(m.text)));
+});
+
+test("async missing-declaration validation must not correct a worker waiting for new child work", async t => {
+  const h = await harness(t);
+  await h.call("task_outcomes_consumer", contract(h.dir, "correction-work", "a1"));
+  let release!: () => void;
+  h.manager.verifyReport = () => new Promise<void>(resolve => { release = resolve; });
+  const settling = h.manager.onAgentSettled(false);
+  h.manager.registerChild("correction-work", "new-child");
+  release(); await settling;
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.manager.snapshot().active.state, "active");
 });
 
 test("every direct transition helper call has a declared method", async () => {

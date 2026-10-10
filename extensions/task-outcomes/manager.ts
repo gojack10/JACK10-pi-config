@@ -624,20 +624,17 @@ export class TaskOutcomeManager {
 
     // Registered work gates every transition, not only completion: an accepted needs_input used to pause
     // the attempt while the agent's own checks were still running, which stranded the real result.
-    const pendingAtDeclaration = this.pendingWork(contract);
-    if (pendingAtDeclaration.length > 0) {
-      throw new Error(`Registered work is still running: ${pendingAtDeclaration.join(", ")}. ` +
-        "No outcome was recorded and the attempt remains active. " +
-        "End this turn with ordinary assistant text and wait for the automatic completion notification; do not retry with another outcome value.");
-    }
+    this.assertNoPendingWork(contract);
 
     if (outcome === "completed") {
       await this.verifyReport(contract);
-      if (this.maintenanceState || this.activeContract() !== contract || contract.state !== "active") {
-        throw new Error("maintenance or finality changed while validating the report");
+      if (this.maintenanceState || this.activeContract() !== contract || contract.state !== "active" || contract.declaration) {
+        throw new Error("maintenance, finality or declaration changed while validating the report");
       }
-      const pending = this.pendingWork(contract);
-      if (pending.length > 0) throw new Error(`completed is premature; pending work: ${pending.join(", ")}`);
+      this.assertNoPendingWork(contract);
+      if (this.background().workGeneration() !== declarationWorkGeneration || contract.childGeneration !== declarationChildGeneration) {
+        throw new Error("work started while validating the report; no outcome was recorded, read its results before declaring");
+      }
     }
 
     const declarationSequence = contract.declarationSequence;
@@ -738,6 +735,7 @@ A failing check inside your authorized fence returns to diagnosis, revision and 
 Write your report to ${JSON.stringify(contract.reportPath)}. This file is already reserved: write into it without deleting, replacing, or renaming it.
 Then call report_outcome with an honest outcome and summary. Use completed only after writing a readable nonempty report and finishing all tracked child/background work. Use needs_input only when a specific human answer is required to continue; use blocked for a missing external prerequisite or authority; use failed for a terminal failure. Include partial findings in the report when possible. Never invent success to satisfy this contract.
 Do not start more work after an accepted declaration: completed, blocked and failed await clean settlement, while an accepted needs_input pauses the attempt for a human answer and is not a final result.
+If report validation rejects, repair the report from existing work and retry only when the active contract permits the outcome and all registered work has drained. An inactive-attempt refusal is a stop, not permission to rearm yourself.
 Wait for registered work instead of declaring to avoid a corrective turn.
 After work drains, a task turn that ends without an accepted outcome can receive at most two corrective turns before protocol failure.`;
   }
@@ -1073,34 +1071,19 @@ After work drains, a task turn that ends without an accepted outcome can receive
     if (this.runtime.sessionFile && !pathEntryExists(this.runtime.sessionFile)) return;
 
     if (this.lastRunFailure) {
+      if (this.pendingWork(contract).length > 0) return;
       this.finalize(contract, "failed", "technical", `provider/transport failure: ${this.lastRunFailure}`);
       return;
     }
 
     const declaration = contract.declaration;
     if (declaration) {
-      const pending = this.pendingWork(contract);
-      const workStartedAfterDeclaration = this.background().workGeneration() > declaration.workGeneration;
-      const childWorkStartedAfterDeclaration = contract.childGeneration > declaration.childGeneration;
-      if (declaration.outcome === "completed" &&
-          (pending.length > 0 || workStartedAfterDeclaration || childWorkStartedAfterDeclaration)) {
-        this.persist({
-          kind: "declaration_invalidated",
-          jobId: contract.jobId,
-          attemptId: contract.attemptId,
-          declarationSequence: declaration.sequence,
-          summary: pending.length > 0
-            ? `work remained at settlement: ${pending.join(", ")}`
-            : "work started after the completed declaration",
-        }, this.operationEventId("declaration_invalidated", contract, String(declaration.sequence)));
-        contract.declaration = undefined;
-        void this.wakeIfReady(contract);
-        return;
-      }
+      if (this.invalidateDeclarationForWork(contract, declaration)) return;
       if (declaration.outcome === "completed") {
         try {
           await this.verifyReport(contract);
         } catch (error) {
+          if (this.invalidateDeclarationForWork(contract, declaration)) return;
           if (this.maintenanceState || this.cancellation || this.activeContract() !== contract || contract.state !== "active" ||
               contract.declaration !== declaration || this.pendingWork(contract).length > 0 ||
               this.background().workGeneration() !== declaration.workGeneration || contract.childGeneration !== declaration.childGeneration) return;
@@ -1109,9 +1092,7 @@ After work drains, a task turn that ends without an accepted outcome can receive
         }
       }
       if (this.maintenanceState || this.cancellation || this.activeContract() !== contract || contract.state !== "active") return;
-      if (contract.declaration !== declaration || (declaration.outcome === "completed" &&
-          (this.pendingWork(contract).length > 0 || this.background().workGeneration() !== declaration.workGeneration ||
-           contract.childGeneration !== declaration.childGeneration))) return;
+      if (contract.declaration !== declaration || this.invalidateDeclarationForWork(contract, declaration)) return;
       this.finalize(contract, declaration.outcome, "model", declaration.summary);
       return;
     }
@@ -1139,13 +1120,15 @@ After work drains, a task turn that ends without an accepted outcome can receive
     try { await this.verifyReport(contract); }
     catch (error) { missing += ` Report validation: ${errorMessage(error)}.`; }
     // Recheck after asynchronous validation in case shutdown or another callback intervened.
-    if (this.activeContract() !== contract || contract.state !== "active" || this.maintenanceState || this.cancellation || this.corrections.get(key)?.run === this.run) return;
+    if (this.activeContract() !== contract || contract.state !== "active" || this.maintenanceState || this.cancellation ||
+        contract.declaration || this.pendingWork(contract).length > 0 || this.corrections.get(key)?.run === this.run) return;
     const correctionNumber = (previous?.count ?? 0) + 1;
     this.corrections.set(key, { count: correctionNumber, run: this.run });
     const admissionKey = this.operationEventId("outcome", contract, `correction:${correctionNumber}`);
-    const admissionGuard = () => this.activeContract() === contract && contract.state === "active";
+    const admissionGuard = () => this.activeContract() === contract && contract.state === "active" &&
+      !contract.declaration && this.pendingWork(contract).length === 0;
     const failed = (error: unknown) => {
-      if (this.activeContract() === contract && contract.state === "active") {
+      if (admissionGuard()) {
         this.finalize(contract, "failed", "protocol", `protocol-incomplete: cannot queue task correction: ${errorMessage(error)}`);
       }
     };
@@ -1216,6 +1199,28 @@ After work drains, a task turn that ends without an accepted outcome can receive
     const running = this.background().stats().running;
     if (running > 0) pending.push(`background:${running} running job(s)`);
     return pending;
+  }
+
+  private invalidateDeclarationForWork(contract: ContractState, declaration: NonNullable<ContractState["declaration"]>): boolean {
+    if (this.maintenanceState || this.cancellation || this.activeContract() !== contract || contract.state !== "active" ||
+        contract.declaration !== declaration) return false;
+    const pending = this.pendingWork(contract);
+    if (pending.length === 0 && this.background().workGeneration() === declaration.workGeneration &&
+        contract.childGeneration === declaration.childGeneration) return false;
+    this.persist({ kind: "declaration_invalidated", jobId: contract.jobId, attemptId: contract.attemptId,
+      declarationSequence: declaration.sequence,
+      summary: pending.length > 0 ? `work remained at settlement: ${pending.join(", ")}` : "work started after the declaration",
+    }, this.operationEventId("declaration_invalidated", contract, String(declaration.sequence)));
+    contract.declaration = undefined;
+    void this.wakeIfReady(contract);
+    return true;
+  }
+
+  private assertNoPendingWork(contract: ContractState): void {
+    const pending = this.pendingWork(contract);
+    if (pending.length > 0) throw new Error(`Registered work is still running: ${pending.join(", ")}. ` +
+      "No outcome was recorded and the attempt remains active. " +
+      "End this turn with ordinary assistant text and wait for the automatic completion notification; do not retry with another outcome value.");
   }
 
   private async verifyReport(contract: ContractState): Promise<void> {
