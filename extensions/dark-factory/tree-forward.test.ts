@@ -99,6 +99,69 @@ test('agents integrate two concurrent overlapping worktrees, ordinary conflict, 
     assert.equal(t.integrated.length,2,'resume does not redo completed work');
   }finally{f.cleanup();}
 });
+test('current RUN migration orders need no stale contract amendment receipt; real boundaries still hold',async()=>{
+  const f=fixture();try{
+    const old='Six bounded outcomes only; no live-source migration. Require an outer operator installed amendment receipt.\n';
+    for(const name of ['run-contract.md','acceptance-contract.md'])writeFileSync(join(f.dir,name),old);
+    const currentRun='Human authorizes copy-based private import of exactly two selected trees and new dogfood scope. No hosted writes or private/public leakage. Qwen participation is mandatory throughout active factory work.';
+    writeFileSync(join(f.dir,'current-run.txt'),currentRun);
+    f.config.acceptance={root:f.dir,paths:['run-contract.md','acceptance-contract.md'],spec_scope:OWNER};
+    save(join(f.dir,'config.json'),f.config);
+    const saved=P.initialState(f.config,1);
+    saved.seq=250;saved.code_pin=G.codePin(f.config);saved.status='blocked';
+    saved.dispatcher.last={attempt:'250',disposition:'blocked',at:1};
+    save(join(f.dir,'state.json'),saved);
+    mkdirSync(join(f.dir,'inbox'));
+    save(join(f.dir,'inbox','wake.json'),{type:'wake',reconcile:true});
+    const t=transport(f),ctl=new ParallelController(f.dir,t.deps);
+    await ctl.start();await ctl.readInbox(2);ctl.launchDispatcher(3);
+    await Promise.all(ctl.inflight);
+    const mission=t.launches[0].mission;
+    assert.equal(field(mission,'RUN'),RUN);
+    assert.match(mission,/Current human RUN decisions and applicable current tree owners govern/);
+    assert.match(mission,/technical references\/test recipes, not runtime permission sources/);
+    assert.match(mission,/state the conflict and proceed with a bounded order/);
+    assert.match(mission,/Stale prose alone never requires an outer operator rewrite, scoped policy-hash update or installed amendment receipt/);
+    assert.match(mission,/supersedes duplicate installation prerequisites in ROLE, RUN, owners and PREVIOUS for that mismatch only/);
+    assert.match(mission,/Do not ignore changed input bytes\/hashes or actual runtime incompatibility/);
+    assert.match(mission,/real missing task prerequisite, unresolved current human choice, safety\/privacy violation/);
+    assert.match(mission,/code-config pins.*frozen laws.*source privacy.*mandatory Qwen/);
+    const fresh=ctl.state.attempts[ctl.state.dispatcher.attempt];
+    // A supplied dispatcher decision, not a model-behavior simulation or controller interpretation of prose.
+    const admitted=P.validateDispatcherReport({...dispatcher([order(A,'oss')]),summary:'Current RUN authorizes private two-tree migration; old six-only contract prose is superseded. Assign bounded in-fence implementation with frozen checks; no hosted mutation.'});
+    await ctl.settle(fresh,{kind:'report',report:admitted,reportPath:join(f.dir,'order.json')},4);
+    assert.equal(ctl.state.admission_hold,undefined);
+    assert.deepEqual(P.planAssignments(ctl.state,f.config,5),[{seat:'oss',task:A}]);
+    assert.equal(saved.dispatcher.last.disposition,'blocked','original blocked decision is not rewritten');
+    for(const name of ['run-contract.md','acceptance-contract.md'])assert.equal(readFileSync(join(f.dir,name),'utf8'),old);
+    assert.equal(readFileSync(join(f.dir,'current-run.txt'),'utf8'),currentRun);
+    assert.equal(await G.mainIdentity(f.config.code),f.config.code.main_head,'no candidate/main credit from admission');
+    const settle=async(report:any)=>{
+      const a=P.startAttempt(ctl.state,{kind:'dispatcher',engine:'fallback',events:[],receipt:{session_label:'fixture-dispatcher'}});
+      await ctl.settle(a,{kind:'report',report:P.validateDispatcherReport(report),reportPath:join(f.dir,'negative.json')},6);
+    };
+    await settle(dispatcher([{...order(A,'oss'),depends_on:[B]}]));
+    assert.deepEqual(P.planAssignments(ctl.state,f.config,7),[],'missing real prerequisite cannot launch');
+    for(const [kind,required,question] of [
+      ['authority','Current RUN leaves the public license undecided','Which license is approved?'],
+      ['platform','Private source appears in the proposed public payload; repair/audit before release',null],
+    ]){
+      await settle({...dispatcher([],'blocked'),blockers:[{node_id:A,kind,required}],questions_for_jack:question?[question]:[]});
+      assert.deepEqual(P.planAssignments(ctl.state,f.config,8),[],'genuine human/safety blocker is not bypassed');
+      assert.equal(P.terminalStatus(ctl.state,f.config,8),'blocked');
+    }
+    const rejected=await ctl.vetTasks(P.validateDispatcherReport(dispatcher([{...order(A,'oss'),code:{files:['private-export.json']}}])));
+    assert.match(rejected.get(A)!,/outside code.allowed_paths/,'new scope cannot broaden actual code/privacy fences');
+    assert.throws(()=>P.validateDispatcherReport({...dispatcher([],'blocked'),blockers:[]}),/blocker/);
+    save(join(f.dir,'config.json'),{...f.config,code:{...f.config.code,candidate_checks:[[process.execPath,'-e','process.exit(0)']]}});
+    await assert.rejects(ctl.codeMainCheck(),/code configuration changed/,'current RUN cannot excuse code-pin tampering');
+    const resumed=new ParallelController(f.dir,t.deps);await resumed.start();
+    assert.match(resumed.state.attention.reason,/code configuration removed\/changed/);
+    assert.deepEqual(P.planAssignments(resumed.state,resumed.config,9),[]);
+    assert.equal(t.launches.length,1,'no worker/model or replacement launch in this regression');
+  }finally{f.cleanup();}
+});
+
 test('dispatcher sees failing real tests and does not merge or credit candidates',async()=>{
   const f=fixture(true);try{const t=transport(f),ctl=new ParallelController(f.dir,t.deps);
     assert.equal(await ctl.run(),'blocked');assert.equal(git(f.repo,'rev-parse','HEAD'),f.config.code.main_head);

@@ -486,10 +486,12 @@ export function dispatcherSnapshot(state, config, now) {
   };
 }
 
-// Prompts carry pointers only; every instruction lives in the role nodes.
+// Tree nodes own task meaning; the shared bootstrap establishes their authority over stale disk copies.
 export function dispatcherPrompt({ role, run, events, state, report, setup, previous, tools }) {
   return [
-    `You are a factory dispatcher. Read the ROLE node with ${tools} and follow it exactly.`,
+    `You are a factory dispatcher. Read the ROLE node with ${tools} and follow it under the authority precedence below.`,
+    'AUTHORITY: Current human RUN decisions and applicable current tree owners govern work, scope, priority and authorized migration. Read maintained run-contract.md and acceptance-contract.md as technical references/test recipes, not runtime permission sources. If their policy prose conflicts with current human RUN authority, state the conflict and proceed with a bounded order where technically possible. Stale prose alone never requires an outer operator rewrite, scoped policy-hash update or installed amendment receipt before admission; this supersedes duplicate installation prerequisites in ROLE, RUN, owners and PREVIOUS for that mismatch only. You own ordinary input/dependency reconciliation and planning; the controller owns lifecycle/transport, not policy comparison.',
+    'Preserve STOP, code-config pins, exact code/tree fences, frozen laws, required deterministic tests, exact-candidate/rebuilt-main publication, Git/draft ownership, source privacy, route/seat/spend restrictions and mandatory Qwen. Do not ignore changed input bytes/hashes or actual runtime incompatibility. Block affected work for a real missing task prerequisite, unresolved current human choice, safety/privacy violation or required out-of-fence/config/route change, not merely stale admission text. Release independent useful work; do not turn a failed check into acceptance.',
     `ROLE: ${role}`, `RUN: ${run}`, `EVENTS: ${events}`, `STATE: ${state}`, `REPORT: ${report}`,
     ...(previous ? [`PREVIOUS: ${previous}`] : []),
     ...(setup ? [`SETUP_PACKET: ${setup} (the only path this attempt may write for a setup proposal or review)`] : []),
