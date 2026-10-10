@@ -222,7 +222,13 @@ export class ParallelController {
       let command;
       try { command = readJson(path); } catch { continue; }
       rmSync(path, { force: true });
-      if (command.type === 'wake') P.addEvent(this.state, { type: 'human_wake', note: command.note ?? 'factory wake' }, now);
+      if (command.type === 'wake') {
+        if (command.reconcile === true) {
+          this.state.admission_hold = { after: this.state.seq, at: now };
+          this.log('admission_held', this.state.admission_hold);
+        }
+        P.addEvent(this.state, { type: 'human_wake', note: command.note ?? 'factory wake' }, now);
+      }
       else if (command.type === 'stop') this.state.stop = { requested: now, now: !!command.now };
       else if (command.type === 'answer') await this.answerWorker(command, now);
       this.log('inbox', { command: command.type === 'answer' ? { type: command.type, task: command.task, text: '[redacted]' } : { command } });
@@ -563,7 +569,7 @@ export class ParallelController {
   }
 
   async advanceMerge(now) {
-    if (!this.config.code || this.config.code.integration === 'dispatcher' || this.state.stop || this.state.attention || this.state.awaiting_input?.length || this.state.status !== 'running' ||
+    if (!this.config.code || this.config.code.integration === 'dispatcher' || this.state.stop || this.state.attention || this.state.admission_hold || this.state.awaiting_input?.length || this.state.status !== 'running' ||
         ['done', 'blocked'].includes(this.state.dispatcher.last?.disposition)) return;
     try {
       if (this.state.merge && this.state.tasks[this.state.merge.task]?.status === 'running') return;
@@ -898,6 +904,13 @@ export class ParallelController {
       if (outcome.kind === 'report' && outcome.report.setup) await this.setupTransition(attempt, outcome.report.setup, now);
       const effects = P.finishDispatcher(this.state, attempt.id, outcome, now, rejected);
       if (outcome.kind === 'report' && outcome.report.recover?.length) await this.applyRecoveries(outcome.report.recover, now);
+      // Retained dispatcher outcomes cannot release an operator's recovery barrier. A fresh
+      // valid task decision (not a context handoff or rejected order) owns the next admissions.
+      if (this.state.admission_hold && Number(attempt.id) > this.state.admission_hold.after &&
+          outcome.kind === 'report' && outcome.report.disposition === 'tasks' && !effects.rejected.length) {
+        delete this.state.admission_hold;
+        this.log('admission_released', { attempt: attempt.id });
+      }
       this.log('dispatcher_finish', { attempt: attempt.id, engine: attempt.engine, outcome: outcome.kind,
         disposition: outcome.report?.disposition, summary: outcome.report?.summary ?? outcome.summary ?? outcome.reason,
         tasks: outcome.report?.tasks, questions_for_jack: outcome.report?.questions_for_jack, effects,
