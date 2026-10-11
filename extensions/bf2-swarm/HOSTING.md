@@ -7,9 +7,10 @@ Secure, HttpOnly, SameSite=Strict, host-only. No account database, Google Access
 policy, shared VEGA secret or public capability URL is needed.
 
 All room/static/bootstrap routes require that cookie. The bootstrap script gives
-only an authenticated browser the existing run capability in sessionStorage;
-it precedes the unchanged room module. API requests still require the exact Bearer
-header and run. Login Basic is never forwarded to the room. External Host/Origin
+only an authenticated browser with exact `Sec-Fetch-Site: same-origin` the
+existing run capability in sessionStorage; it precedes the unchanged room module.
+Browsers without Fetch Metadata cannot bootstrap (fail closed). API requests
+still require the exact Bearer header and run. Login Basic is never forwarded to the room. External Host/Origin
 and Fetch Metadata are checked before Origin is translated to the loopback room.
 POST requires exact HTTPS Origin and JSON. No identity, executable, proxy header,
 DB path or new API enters the room. The adapter forwards only bounded existing
