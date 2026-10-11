@@ -1,0 +1,6 @@
+tunnel: 36388b9d-6ef3-4234-9da7-86a92e47f604
+credentials-file: /etc/cloudflared/credentials.json
+ingress:
+  - hostname: factory.10server.net
+    service: http://127.0.0.1:16474
+  - service: http_status:404
