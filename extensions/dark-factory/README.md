@@ -22,6 +22,16 @@ Advancement requires a structured task outcome, readable JSON report, durable re
 
 The loop stops at its task-specific human boundary, `blocked`, an invalid report/receipt, repeated assignment, explicit `STOP`, or technical failure. Real attempts have no factory wall-clock deadline. It never treats pane exit, prose, process survival, or completed decomposition as project success.
 
+## Shared room UI
+
+The accepted C-layout chat assets live in `room/` (plain HTML/CSS/JS and fonts),
+headed **Dark Factory**. `../bf2-swarm/room/` retains per-file relative symlinks for
+existing static-server paths and module imports; browser asset URLs are unchanged.
+The BF2 board, controller, room HTTP server and hosting adapter still belong to
+`../bf2-swarm/`. This relocation does **not** give the sequential/parallel factories
+or legacy BF2 runs the BF2 room API. No runtime, storage keys or auth identities
+were generalized. See [room compatibility and live integration](room/README.md).
+
 ## Parallel factory
 
 `parallel-run.mjs` runs the Parallel Execution Contract (SiftText `d96507db`) beside the sequential lanes; it imports but never changes the sequential lane modules. A deterministic controller (no model turns) owns seats, the event queue, launches, report validation and friendly-stop handoffs. Dispatchers and workers get tree pointers; their task instructions live in the Dispatcher Role and Worker Role nodes. The shared dispatcher bootstrap supplies the current human scheduling-only/trust-workers override directly, above conflicting tree role or stale maintained contract prose.
