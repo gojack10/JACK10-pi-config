@@ -115,7 +115,7 @@ export function openFloor(id, { root = DEFAULT_ROOT } = {}) {
     },
     snapshot(after = 0) {
       const state = board.lifecycle.status();
-      return { ...board.roomSnapshot(after), floor: { id, ...state.floor }, workers: state.workers, slots: state.floor.slots };
+      return { ...board.roomSnapshot(after), floor: { id, ...state.floor }, workers: state.workers, slots: state.floor.slots, jobs: board.jobs.list() };
     },
     command: (key, action, value = null) => board.lifecycle.ownerCommand(key, action, value),
     close: () => board.close() };
