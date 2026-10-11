@@ -34,6 +34,7 @@ export function openBoard(config) {
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
     if (tables.some(t => !['board_run', 'board_sessions', 'board_posts'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    db.exec('PRAGMA journal_mode=WAL');
     transaction(() => {
       db.exec(`CREATE TABLE IF NOT EXISTS board_run (id INTEGER PRIMARY KEY CHECK(id=1), run TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS board_sessions (

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { configuration, openBoard, HISTORY_LIMIT } from './board.mjs';
 import { main } from './cli.mjs';
 
@@ -87,6 +88,15 @@ test('stdout failure does not consume startup; snapshot excludes posts arriving 
   await main(['read'], env, { write(_text, callback) { peer.post('during stdout'); callback(); } });
   assert.match(board.pending().text, /during stdout/);
   assert.doesNotMatch(board.pending().text, /"old"/);
+});
+
+test('dedicated board uses persistent WAL mode across CLI opens', t => {
+  const { env } = fixture(t);
+  assert.equal(cli(env, 'post', 'WAL').status, 0);
+  const db = new DatabaseSync(env.BF2_BOARD_DB);
+  try { assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal'); }
+  finally { db.close(); }
+  assert.equal(cli(env, 'read').status, 0);
 });
 
 test('concurrent independent CLI processes preserve unique numbered posts', async t => {
