@@ -3,7 +3,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   const exists = () => !!db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get();
   const status = () => {
     if (!exists()) throw new Error('this board has no experimental lifecycle');
-    if (!db.prepare("PRAGMA table_info(swarm_workers)").all().some(c => c.name === 'cleaned')) throw new Error('legacy separate-session run; start a fresh run');
+    if (!db.prepare("PRAGMA table_info(swarm_workers)").all().some(c => c.name === 'tmux_session')) throw new Error('legacy tmux layout; start a fresh run with its original code retained for inspection');
     const run = db.prepare('SELECT * FROM swarm_run').get();
     return { ...run, config: JSON.parse(run.config), workers: db.prepare('SELECT * FROM swarm_workers ORDER BY rowid').all() };
   };
@@ -19,11 +19,11 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     initialize(settings) {
       if (exists()) throw new Error('run already initialized; use status/resume');
       transaction(() => {
-        db.exec(`CREATE TABLE swarm_run (id INTEGER PRIMARY KEY CHECK(id=1), status TEXT NOT NULL, request INTEGER, config TEXT NOT NULL, controller INTEGER);
+        db.exec(`CREATE TABLE swarm_run (id INTEGER PRIMARY KEY CHECK(id=1), status TEXT NOT NULL, request INTEGER, config TEXT NOT NULL, controller INTEGER, tmux_parent TEXT);
           CREATE TABLE swarm_workers (session TEXT PRIMARY KEY, sender TEXT NOT NULL UNIQUE, pane TEXT NOT NULL,
-            state TEXT NOT NULL, handoff INTEGER, vote INTEGER, cleaned INTEGER NOT NULL DEFAULT 0);
+            state TEXT NOT NULL, handoff INTEGER, vote INTEGER, cleaned INTEGER NOT NULL DEFAULT 0, tmux_session TEXT);
           CREATE UNIQUE INDEX swarm_live_panes ON swarm_workers(pane) WHERE cleaned=0;`);
-        db.prepare("INSERT INTO swarm_run VALUES (1, 'running', NULL, ?, NULL)").run(JSON.stringify(settings));
+        db.prepare("INSERT INTO swarm_run VALUES (1, 'running', NULL, ?, NULL, NULL)").run(JSON.stringify(settings));
       });
     },
     addWorker(session, sender, pane, launch) {
@@ -36,10 +36,12 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         // No model, admission await, or agent turn runs inside this transaction.
         if (launch) {
           try {
-            const paneId = launch();
-            db.prepare('UPDATE swarm_workers SET pane=? WHERE session=?').run(paneId, session);
+            launch(receipt => {
+              db.prepare('UPDATE swarm_workers SET pane=?, tmux_session=? WHERE session=?').run(receipt.pane, receipt.session, session);
+            });
           } catch (error) {
-            db.prepare("UPDATE swarm_workers SET state='launch-failed', cleaned=1 WHERE session=?").run(session);
+            // A created but unreleased child still occupies capacity if cleanup failed.
+            db.prepare("UPDATE swarm_workers SET state='launch-failed', cleaned=? WHERE session=?").run(error.ownedChild ? 0 : 1, session);
             system(`${sender} launch failed: ${String(error.message).slice(0, 1000)}. Retrying after ordinary delay.`);
           }
         }
@@ -110,7 +112,13 @@ export function lifecycleStore(db, transaction, config, insertPost) {
             `${row.sender} exited after handoff #${row.handoff}, without safe settlement evidence.`);
       });
     },
-    controllerSetup(launch) { return transaction(launch); }, // Serialize native setup/recovery, not agent work.
+    controllerSetup(launch) {
+      return transaction(() => {
+        const parent = launch(status().tmux_parent);
+        db.prepare('UPDATE swarm_run SET tmux_parent=?').run(parent);
+        return parent;
+      });
+    }, // Serialize native setup/recovery, not agent work.
     claimController(pid) {
       transaction(() => {
         const previous = status().controller;

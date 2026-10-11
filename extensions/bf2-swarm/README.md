@@ -47,11 +47,14 @@ it does not add the global optional `rlm-friendly-stop.ts`. Explicit friendly-st
 configuration is rejected. Use normal project trust; unexpected input-transforming
 or lifecycle-changing extensions remain outside this experiment's tested path.
 
-Each new run has exactly one named tmux parent `bf2-<run UUID>`, created with a
-`controller` window before workers. Each worker is a normal saved interactive Pi in
-another named window of that same parent, with an explicit UUID Pi session and a
-fresh unique eight-hex sender (SQLite rejects any collision). Stable native `%pane`
-handles drive health/capture/cleanup regardless of base indices or selected window.
+Each new run has one controller session `bf2-<run UUID>` and three separate child
+sessions `bf2-<run UUID>-<sender>`. tmux-oil nests those sessions under the controller:
+each child's session-scoped `@pi_subagent_parent_id` is the controller's native `$session`
+ID, published before Pi starts. No task/job/attempt metadata is fabricated. Each peer
+is a normal saved interactive Pi with an explicit UUID session and a fresh unique
+eight-hex sender (SQLite rejects collisions). Stored native `$session` and `%pane`
+handles drive ownership/health/capture/cleanup regardless of base indices, selected
+windows or session renames. The controller itself retains one `controller` window.
 Route is the explicit configured selector provider plus fixed model/high; the
 launcher performs only offline model-list preflight before its first start. It
 passes board env and the checkout's bin directory on PATH. It strips inherited task
@@ -87,17 +90,25 @@ retirement. Do not run two Pi processes/receivers for one saved session.
 The loop maintains three occupied workers only while running. `retired` records
 safe settlement, not shutdown completion: the row still occupies capacity until
 Pi actually exits and its owned pane is removed. The controller then records
-`cleaned=1` and creates one replacement window in the same parent. A disappeared/dead
-pane becomes `exited`, broadcasts `[system] <id> exited without a retirement message.`,
-and is removed before replacement. A final handoff without the safe marker is
+`cleaned=1` and creates one replacement child tagged to the current native parent ID.
+A disappeared/dead pane becomes `exited`, broadcasts
+`[system] <id> exited without a retirement message.`, and its owned child is removed
+before replacement. A final handoff without the safe marker is
 `exited-with-handoff`, with an accurate notice, not clean retirement and not the
 no-message notice. Cleanup retries are idempotent; history/IDs/handoffs, boot files,
 logs, session JSONL and workspaces remain. Launch failures retry at the ordinary
-two-second tick, never a crash-count pause. Only owned dead worker panes are closed;
-no still-running worker is killed for posting done. Tmux creation is serialized
-with DB stop/vote decisions; no model await is inside it. A stop during creation
-cannot release an unregistered worker. Old separate-session run versions are not
-adopted/migrated; use their original code for read-only inspection.
+two-second tick, never a crash-count pause. Only the exact stored dead worker pane
+inside the identity-tagged child with the correct parent tag is closed; its sole-pane
+session disappears naturally. No still-running worker is killed for posting done.
+User-added windows/extra panes survive as an ungrouped session: their parent tag is
+removed, capacity is released once, and the user closes those shells manually.
+Tmux creation/metadata/boot release is serialized with DB stop/vote decisions; no
+model await is inside it. A stop during creation cannot release an unregistered worker.
+Failed pre-boot setup removes the gated child; if that removal itself fails, capacity
+stays occupied for inspection rather than spawning orphan duplicates. A successful
+creation without a valid native receipt likewise holds capacity and never releases
+its gated boot; operator inspection is required.
+Older tmux layouts are not adopted/migrated; inspect retained runs with their original code.
 
 Votes require registered **active** session IDs with their launch identity and an
 existing committed request number. A normal post is a proposal; content is not
@@ -111,18 +122,25 @@ without replacement. The controller remains visibly waiting and shows the experi
 node for Jack. **Waiting is not BF2 success.** No desktop/chat notification.
 
 Human `stop` is distinct `stopped`, with the same deliberate no-respawn/wrapup.
-After workers safely settle/exit and their panes close, the controller exits
-naturally with remain-on-exit off: the last experiment window/parent disappears.
-No forced worker kill or deletion of durable evidence occurs. Waiting instead keeps
-one controller/status window after workers drain. After all old panes are cleaned,
+`status` returns saved JSON, including `tmux_parent`, each worker's `tmux_session`/
+`pane`, retirement state and `cleaned`; `stopped` or `waiting` does not itself mean
+workers have exited. After workers settle/exit and owned children close, explicit
+stop lets the controller exit naturally with remain-on-exit off: its sole-window
+parent disappears. No forced worker kill or deletion of durable evidence occurs.
+Waiting instead keeps the visible controller/status session after peers drain.
+After all old children are cleaned,
 `resume` clears votes/request and starts fresh capacity, recreating the same named
 parent after stop if needed. Resume refuses while SAFE-but-still-live workers remain.
 `run` ensures/recovers only the controller, without changing stored stop/wait state
 or restarting healthy workers. A stored controller pane is health-checked and a dead
 one respawned without `-k`; if vanished, only a controller window is restored inside
 the existing parent. Selected worker/inspection windows are never mistaken for it.
-Manually added inspection panes/windows are not owned and are preserved; close them
-manually if the experiment parent should disappear. No unrelated session, old run,
+Manually added controller inspection panes/windows are preserved; close them manually
+if the parent should disappear. Moving owned panes to other sessions or changing
+ownership tags is unsupported: cleanup refuses and retains capacity. Renaming parent
+or child sessions is supported. Deleting the whole parent while peers are undrained
+refuses recovery rather than creating a second parent; preserve its controller pane
+and use normal stop. No unrelated session, old run,
 factory or global tmux setting is touched. An atomic DB controller-PID claim refuses
 duplicate/reused live PIDs; inspect that run's state manually rather than force-killing
 anything. All experimental state
@@ -294,7 +312,9 @@ env -u BF2_SWARM_WORKER -u BF2_BOARD_DB -u BF2_BOARD_RUN -u BF2_BOARD_SESSION -u
 
 The tests use temporary SQLite files, real separate CLI processes, fake Pi protocol
 inputs and an isolated native tmux server (unique socket/config, both base indices 1).
-Its processes are harmless shells only. It checks one parent + three workers,
+Its processes are harmless shells only. It checks one controller + three nested
+child sessions against the installed tmux-oil snapshot/model contract, startup tags,
+session renames, preserved user windows/extra panes,
 selected-window independence, safe settlement versus actual exit, bounded replacement,
 vanished/dead cleanup, controller recovery, unanimous waiting, stop-during-creation,
 stop drain and idempotent cleanup. Each test kills only its isolated server and checks
