@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { openBoard } from './board.mjs';
-import { tick, workerCommand, bootMission, validateLaunch, settingsFor, quote, openRun, main } from './controller.mjs';
+import { tick, workerCommand, bootMission, validateLaunch, settingsFor, quote, openRun, main, parentSession } from './controller.mjs';
 import { installWorker, handoffTool, wrapup, warningType } from './worker.mjs';
 import { receiver } from './receiver.mjs';
 
@@ -24,17 +24,18 @@ function fixture(t) {
   writeFileSync(join(dir, 'run.json'), JSON.stringify({ run: config.run }));
   const board = openBoard(config); board.lifecycle.initialize(settings);
   t.after(() => board.close());
-  const calls = [], panes = new Map(); let failNext = false;
+  const calls = [], panes = new Map(); let failNext = false, nextPane = 1;
   const execute = args => {
     calls.push(args);
-    if (args[0] === 'new-session') {
+    if (args[0] === 'new-window') {
       if (failNext) { failNext = false; return { status: 1, stdout: '', stderr: 'synthetic launch error' }; }
       assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{pane_id}');
-      const paneId = `%${panes.size + 1}`;
+      const paneId = `%${nextPane++}`;
       panes.set(paneId, true);
       return { status: 0, stdout: `${paneId}\n`, stderr: '' };
     }
-    if (args[0] === 'display-message') return { status: 0, stdout: panes.get(args[args.indexOf('-t') + 1]) ? '0\n' : '1\n', stderr: '' };
+    if (args[0] === 'display-message') return { status: 0, stdout: `${panes.get(args[args.indexOf('-t') + 1]) ? '0' : '1'} ${parentSession(config)}\n`, stderr: '' };
+    if (args[0] === 'kill-pane') panes.delete(args.at(-1));
     return { status: 0, stdout: '', stderr: '' };
   };
   const workerBoard = worker => {
@@ -81,7 +82,8 @@ test('three fake tmux boots have normal route/env, unique durable sessions, mini
     assert.match(worker.sender, /^[a-f0-9]{8}$/);
     assert.match(worker.pane, /^%\d+$/);
     const name = `bf2-${h.config.run}-${worker.sender}`;
-    const call = h.calls.find(a => a[0] === 'new-session' && a.includes(name));
+    const call = h.calls.find(a => a[0] === 'new-window' && a.includes(name));
+    assert.equal(call[call.indexOf('-t') + 1], `=${parentSession(h.config)}:`);
     assert.ok(h.calls.some(a => a[0] === 'pipe-pane' && a[a.indexOf('-t') + 1] === worker.pane));
     assert.equal(call[call.indexOf('-c') + 1], h.settings.cwd);
     const command = call.at(-1);
@@ -123,12 +125,12 @@ test('capture failure is diagnostic and still registers the launch pane ID', t =
 
 test('missing pane receipts fail registration; legacy names never probe a selected window', t => {
   const h = fixture(t);
-  tick(h.board, h.config, args => args[0] === 'new-session' ? { status: 0, stdout: '', stderr: '' } : h.execute(args));
+  tick(h.board, h.config, args => args[0] === 'new-window' ? { status: 0, stdout: '', stderr: '' } : h.execute(args));
   assert.ok(h.board.lifecycle.status().workers.every(w => w.state === 'launch-failed'));
-  assert.equal(h.calls.length, 0, 'no empty-target capture or health commands');
+  assert.deepEqual(h.calls.map(a => a[0]), ['has-session'], 'no empty-target capture or health commands');
   h.board.lifecycle.addWorker('legacy-session', 'eeeeeeee', 'legacy-name');
   assert.throws(() => tick(h.board, h.config, h.execute), /stable tmux pane ID.*fresh run/);
-  assert.equal(h.calls.length, 0);
+  assert.deepEqual(h.calls.map(a => a[0]), ['has-session']);
 });
 
 test('controller health and recovery retain a stable pane ID, not the selected window', async t => {
@@ -140,7 +142,7 @@ test('controller health and recovery retain a stable pane ID, not the selected w
     if (args[0] === 'show-options') result.stdout = paneId;
     if (args[0] === 'display-message') {
       assert.equal(args[args.indexOf('-t') + 1], paneId);
-      result.stdout = dead ? '1' : '0';
+      result.stdout = `${dead ? '1' : '0'} ${parentSession(h.config)}`;
     }
     if (['new-session', 'new-window'].includes(args[0])) {
       assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{pane_id}');
@@ -154,32 +156,31 @@ test('controller health and recovery retain a stable pane ID, not the selected w
   const resume = () => main(['resume', '--run-dir', h.dir], {}, execute);
   await resume(); assert.equal(paneId, '%41');
   await resume(); assert.equal(calls.filter(a => a[0] === 'new-session').length, 1);
-  dead = true; await resume(); assert.equal(paneId, '%42');
-  assert.equal(calls.filter(a => a[0] === 'new-window').length, 1);
-  assert.ok(calls.filter(a => a[0] === 'has-session').every(a => a.at(-1) === `bf2-${h.config.run}-controller`));
+  dead = true; await resume(); assert.equal(paneId, '%41');
+  assert.equal(calls.filter(a => a[0] === 'new-window').length, 0);
+  assert.equal(calls.filter(a => a[0] === 'respawn-pane').length, 1);
+  assert.ok(calls.filter(a => a[0] === 'has-session').every(a => a.at(-1) === `=${parentSession(h.config)}`));
 });
 
-test('isolated real tmux with window/pane indices 1 keeps capture and death on the original pane', async t => {
+test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waiting and stop', async t => {
   const h = fixture(t), tmuxDir = mkdtempSync(join(tmpdir(), 'bf2-tmux-'));
   const socket = join(tmuxDir, 'tmux.sock'), conf = join(tmuxDir, 'tmux.conf');
   writeFileSync(conf, 'set -g base-index 1\nset -g pane-base-index 1\n');
   const live = args => spawnSync('tmux', ['-S', socket, '-f', conf, ...args], { encoding: 'utf8' });
-  // Only this socket is ever killed; no host tmux options or sessions are touched.
   t.after(() => {
     try {
-      const killed = live(['kill-server']); assert.equal(killed.status, 0, killed.stderr);
+      live(['kill-server']); // Only this unique test socket, even after a failed assertion.
       assert.notEqual(live(['list-sessions']).status, 0);
+      console.log(`isolated tmux cleaned: ${socket}; no server remains`);
     } finally { rmSync(tmuxDir, { recursive: true, force: true }); }
   });
   const checked = args => { const r = live(args); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
   const calls = [];
   const execute = args => {
     calls.push(args);
-    if (['new-session', 'new-window'].includes(args[0])) {
-      // Exercise the worker's remain-on-exit prefix; all actual processes are
-      // harmless shells, NEVER Pi, models, or an experiment controller loop.
-      const command = args.at(-1);
-      args = [...args.slice(0, -1), command.includes(' && exec ') ? command.split(' && exec ')[0] + ' && exec /bin/sh' : '/bin/sh'];
+    if (['new-session', 'new-window', 'respawn-pane'].includes(args[0])) {
+      // Actual children are harmless interactive shells, never Pi or models.
+      args = [...args.slice(0, -1), `tmux -S ${quote(socket)} set-option -w -t "$TMUX_PANE" remain-on-exit on && exec /bin/sh`];
     }
     return live(args);
   };
@@ -187,59 +188,140 @@ test('isolated real tmux with window/pane indices 1 keeps capture and death on t
     for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)); }
     assert.fail('isolated tmux did not reach expected shell state');
   };
-  const resume = () => main(['resume', '--run-dir', h.dir], {}, execute);
-  const controllerName = `bf2-${h.config.run}-controller`;
-  await resume();
-  const controllerId = checked(['show-options', '-v', '-t', controllerName, '@bf2_controller_pane']);
-  assert.equal(checked(['display-message', '-p', '-t', controllerId, '#{window_index}.#{pane_index}']), '1.1');
-  checked(['set-option', '-w', '-t', controllerId, 'remain-on-exit', 'on']);
-  const inspectionId = checked(['new-window', '-P', '-F', '#{pane_id}', '-t', controllerName, '/bin/sh']);
-  await resume();
-  assert.equal(calls.filter(a => ['new-session', 'new-window'].includes(a[0])).length, 1, 'controller survives selection change');
-  checked(['send-keys', '-t', controllerId, 'exit', 'Enter']);
-  await eventually(() => checked(['display-message', '-p', '-t', controllerId, '#{pane_dead}']) === '1');
-  await resume();
-  assert.notEqual(checked(['show-options', '-v', '-t', controllerName, '@bf2_controller_pane']), controllerId);
-  assert.equal(calls.filter(a => a[0] === 'new-window').length, 1, 'dead controller replaced despite live selected shell');
-  assert.equal(checked(['display-message', '-p', '-t', inspectionId, '#{pane_dead}']), '0');
+  const parent = parentSession(h.config), target = `=${parent}`;
+  const recover = () => main(['run', '--run-dir', h.dir], {}, execute);
+  const windows = () => checked(['list-windows', '-t', target, '-F', '#{window_name}']).split('\n');
+  const sessions = () => checked(['list-sessions', '-F', '#{session_name}']).split('\n');
+  const exit = async pane => {
+    checked(['send-keys', '-t', pane, 'exit', 'Enter']);
+    await eventually(() => checked(['display-message', '-p', '-t', pane, '#{pane_dead}']) === '1');
+  };
+  await recover();
+  let controller = checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']);
+  assert.equal(checked(['display-message', '-p', '-t', controller, '#{window_index}.#{pane_index}']), '1.1');
   tick(h.board, h.config, execute);
   const workers = h.board.lifecycle.status().workers;
-  assert.equal(workers.length, 3);
+  assert.equal(workers.length, 3); assert.equal(windows().length, 4); assert.deepEqual(sessions(), [parent]);
   for (const worker of workers) {
-    assert.equal(worker.state, 'launching'); assert.match(worker.pane, /^%\d+$/);
-    assert.equal(checked(['display-message', '-p', '-t', worker.pane, '#{window_index}.#{pane_index}']), '1.1');
     h.workerBoard(worker).lifecycle.ready();
+    assert.equal(checked(['display-message', '-p', '-t', worker.pane, '#{session_name} #{pane_index}']), `${parent} 1`);
   }
-  const worker = workers[0], name = `bf2-${h.config.run}-${worker.sender}`;
-  const oldCapture = live(['pipe-pane', '-t', `${name}:0.0`]);
-  assert.notEqual(oldCapture.status, 0, 'old zero address reproduces capture failure');
-  assert.match(oldCapture.stderr, /can't find window: 0/);
-  await eventually(() => checked(['show-options', '-w', '-v', '-t', worker.pane, 'remain-on-exit']) === 'on');
-  const other = checked(['new-window', '-P', '-F', '#{pane_id}', '-t', name, '-n', 'inspection', '/bin/sh']);
-  assert.notEqual(other, worker.pane);
-  assert.equal(checked(['display-message', '-p', '-t', name, '#{pane_id}']), other);
-  assert.ok(checked(['list-sessions', '-F', '#{session_name}']).split('\n').includes(name));
-  assert.ok(checked(['list-panes', '-s', '-t', name, '-F', '#{pane_id}']).split('\n').includes(worker.pane));
-  checked(['send-keys', '-t', other, 'printf "selected-window-only\\n"', 'Enter']);
+  // Selection changes never affect worker health, capture or controller recovery.
+  checked(['select-window', '-t', workers[2].pane]);
+  await recover(); assert.equal(calls.filter(a => a[0] === 'new-session').length, 1);
+  const inspection = checked(['new-window', '-P', '-F', '#{pane_id}', '-t', `${target}:`, '-n', 'inspection', '/bin/sh']);
+  await exit(controller); await recover();
+  assert.equal(checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']), controller);
+  assert.equal(calls.filter(a => a[0] === 'respawn-pane').length, 1);
+  assert.equal(windows().length, 5, 'controller reuses its window, not selected inspection shell');
+  assert.equal(checked(['display-message', '-p', '-t', inspection, '#{pane_dead}']), '0');
+  const worker = workers[0], peer = h.workerBoard(worker);
+  checked(['send-keys', '-t', inspection, 'printf "inspection-only\\n"', 'Enter']);
   checked(['send-keys', '-t', worker.pane, 'printf "stable-worker-output\\n"', 'Enter']);
   const log = join(h.dir, `${worker.session}.pane.log`);
   await eventually(() => existsSync(log) && readFileSync(log, 'utf8').includes('stable-worker-output'));
-  assert.doesNotMatch(readFileSync(log, 'utf8'), /selected-window-only/);
-  assert.match(checked(['capture-pane', '-p', '-t', worker.pane]), /stable-worker-output/);
+  assert.doesNotMatch(readFileSync(log, 'utf8'), /inspection-only/);
+  peer.lifecycle.done('Final tree handoff'); tick(h.board, h.config, execute);
+  peer.lifecycle.settled(); tick(h.board, h.config, execute);
+  assert.equal(h.board.lifecycle.status().workers.length, 3, 'SAFE marker cannot kill a still-live process');
+  assert.throws(() => h.board.lifecycle.resume(), /finish\/exit/);
+  checked(['send-keys', '-t', worker.pane, `printf orderly-completion > ${quote(join(h.dir, 'preserved'))}`, 'Enter']);
+  await exit(worker.pane); tick(h.board, h.config, execute);
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retired');
+  assert.equal(h.board.lifecycle.status().workers[0].cleaned, 1);
+  assert.equal(live(['display-message', '-p', '-t', worker.pane, '#{pane_dead}']).stdout.trim(), '');
+  assert.equal(readFileSync(join(h.dir, 'preserved'), 'utf8'), 'orderly-completion');
+  assert.ok(existsSync(log)); assert.equal(windows().length, 5); assert.deepEqual(sessions(), [parent]);
+  assert.equal(h.board.lifecycle.status().workers.length, 4);
+  // Retained dead panes and already-removed panes both produce exactly one accurate notice.
+  await exit(workers[1].pane); tick(h.board, h.config, execute);
+  checked(['kill-pane', '-t', workers[2].pane]); tick(h.board, h.config, execute);
+  tick(h.board, h.config, execute); tick(h.board, h.config, execute);
+  assert.equal(windows().length, 5); assert.equal(h.board.lifecycle.status().workers.length, 6);
+  for (const old of workers.slice(1)) {
+    assert.equal(h.board.history({ limit: 100 }).posts.filter(p => p.text === `${old.sender} exited without a retirement message.`).length, 1);
+    assert.equal(live(['display-message', '-p', '-t', old.pane, '#{pane_dead}']).stdout.trim(), '');
+  }
+  // Remove the explicitly test-owned inspection window; waiting retains only controller.
+  checked(['kill-pane', '-t', inspection]);
+  checked(['select-window', '-t', h.board.lifecycle.status().workers.at(-1).pane]);
+  checked(['kill-pane', '-t', controller]); await recover();
+  controller = checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']);
+  assert.equal(windows().length, 4, 'vanished controller restored within existing parent');
+  const current = h.board.lifecycle.status().workers.filter(w => !w.cleaned), peers = current.map(h.workerBoard);
+  peers.forEach(p => p.lifecycle.ready());
+  const request = peers[0].post('One waiting request / tree pointer');
+  peers.forEach(p => p.lifecycle.vote(request, 'same request'));
+  assert.equal(h.board.lifecycle.status().status, 'waiting');
+  await exit(controller); await recover(); tick(h.board, h.config, execute);
+  assert.equal(h.board.lifecycle.status().status, 'waiting'); assert.equal(windows().length, 4);
+  for (let i = 0; i < peers.length; i++) {
+    peers[i].lifecycle.done('Waiting tree checkpoint'); peers[i].lifecycle.settled();
+    tick(h.board, h.config, execute); // Live SAFE peer stays until real shell exit.
+    await exit(current[i].pane); tick(h.board, h.config, execute);
+  }
+  tick(h.board, h.config, execute); assert.deepEqual(windows(), ['controller']);
+  assert.equal(h.board.lifecycle.status().workers.length, 6);
+  await exit(controller); await recover(); assert.deepEqual(windows(), ['controller']);
+  await main(['resume', '--run-dir', h.dir], {}, execute);
+  // A human stop starts while new-window is still inside the allocation transaction.
+  // It may win between allocations, but every released shell must be registered.
+  let stopper;
+  const attempted = join(h.dir, 'stop-attempted');
+  tick(h.board, h.config, args => {
+    if (args[0] === 'new-window' && !stopper) {
+      stopper = spawn(process.execPath, ['--input-type=module', '-e', `
+        import { writeFileSync } from 'node:fs';
+        import { openBoard } from ${JSON.stringify(new URL('./board.mjs', import.meta.url).href)};
+        writeFileSync(${JSON.stringify(attempted)}, 'stop requested');
+        const b = openBoard(${JSON.stringify(h.config)});
+        try { b.lifecycle.stop(); } finally { b.close(); }
+      `], { stdio: 'pipe' });
+      t.after(() => { if (stopper.exitCode === null) stopper.kill(); });
+      const deadline = Date.now() + 2000;
+      while (!existsSync(attempted) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      assert.ok(existsSync(attempted));
+    }
+    return execute(args);
+  });
+  await new Promise((resolve, reject) => {
+    stopper.once('error', reject); stopper.once('exit', code => code === 0 ? resolve() : reject(new Error(`stop child exit ${code}`)));
+  });
+  const released = h.board.lifecycle.status().workers.filter(w => !w.cleaned);
+  assert.ok(released.length >= 1 && released.length <= 3);
+  assert.equal(windows().length, released.length + 1);
   tick(h.board, h.config, execute);
-  assert.equal(h.board.lifecycle.status().workers.length, 3, 'selected shell cannot cause false loss');
-  checked(['send-keys', '-t', worker.pane, 'exit', 'Enter']);
-  await eventually(() => checked(['display-message', '-p', '-t', worker.pane, '#{pane_dead}']) === '1');
-  assert.equal(checked(['display-message', '-p', '-t', name, '#{pane_dead}']), '0', 'selected inspection shell stays alive');
+  assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, released.length);
+  const stopping = h.board.lifecycle.status().workers.filter(w => !w.cleaned);
+  stopping.forEach(w => h.workerBoard(w).lifecycle.ready());
+  await main(['stop', '--run-dir', h.dir], {}, execute);
+  await exit(controller); await recover(); // Recovery respects persisted human stop.
+  for (const w of stopping) {
+    const p = h.workerBoard(w); p.lifecycle.done('Human stop handoff'); p.lifecycle.settled();
+    tick(h.board, h.config, execute); await exit(w.pane); tick(h.board, h.config, execute);
+  }
+  tick(h.board, h.config, execute); tick(h.board, h.config, execute);
+  assert.equal(h.board.lifecycle.status().status, 'stopped');
+  assert.ok(h.board.lifecycle.status().workers.every(w => w.cleaned));
+  assert.deepEqual(windows(), ['controller']); assert.equal(calls.filter(a => a[0] === 'new-session').length, 1);
+  // Exercise the real controller's final drain path (no workers/model calls).
+  await main(['run', '--run-dir', h.dir], { BF2_SWARM_CONTROLLER: '1' }, execute);
+  assert.equal(checked(['show-options', '-w', '-v', '-t', controller, 'remain-on-exit']), 'off');
+  checked(['send-keys', '-t', controller, 'exit', 'Enter']);
+  await eventually(() => live(['has-session', '-t', target]).status !== 0);
+  assert.notEqual(live(['list-sessions']).status, 0, 'explicit stop leaves no parent or worker residue');
+  // A new server can reuse %pane numbers: historical rows must not block fresh capacity.
+  await main(['resume', '--run-dir', h.dir], {}, execute); tick(h.board, h.config, execute);
+  assert.equal(windows().length, 4);
+  assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, 3);
+  h.board.lifecycle.stop();
+  for (const w of h.board.lifecycle.status().workers.filter(w => !w.cleaned)) await exit(w.pane);
   tick(h.board, h.config, execute);
-  const state = h.board.lifecycle.status();
-  assert.equal(state.workers[0].state, 'exited'); assert.equal(state.workers.length, 4);
-  assert.equal(state.workers[3].state, 'launching');
-  assert.ok(h.board.history({ limit: 100 }).posts.some(p => p.text === `${worker.sender} exited without a retirement message.`));
-  checked(['kill-session', '-t', `bf2-${h.config.run}-${workers[1].sender}`]);
-  tick(h.board, h.config, execute);
-  assert.equal(h.board.lifecycle.status().workers[1].state, 'exited', 'missing pane is not a healthy shell');
-  assert.equal(h.board.lifecycle.status().workers.length, 5);
+  controller = checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']);
+  await main(['run', '--run-dir', h.dir], { BF2_SWARM_CONTROLLER: '1' }, execute);
+  checked(['send-keys', '-t', controller, 'exit', 'Enter']);
+  await eventually(() => live(['has-session', '-t', target]).status !== 0);
+  assert.notEqual(live(['list-sessions']).status, 0);
 });
 
 test('first activation broadcasts one system join; repeated session_start and reconstruction never repost', async t => {
@@ -291,8 +373,8 @@ test('real compound bash done stores one handoff; replacement waits agent_settle
   assert.equal(readFileSync(join(h.dir, 'artifact'), 'utf8'), 'preserved');
   assert.equal(JSON.parse(readFileSync(join(h.dir, 'compound-status.json'), 'utf8')).workers[0].state, 'retiring');
   assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
-  const before = h.calls.filter(a => a[0] === 'new-session').length;
-  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
+  const before = h.calls.filter(a => a[0] === 'new-window').length;
+  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-window').length, before);
   await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.shuts(), 0);
   f.draining(true);
   f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
@@ -301,6 +383,11 @@ test('real compound bash done stores one handoff; replacement waits agent_settle
   f.draining(false);
   f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
   assert.equal(f.shuts(), 1);
+  assert.throws(() => h.board.lifecycle.resume(), /finish\/exit/);
+  tick(h.board, h.config, h.execute);
+  assert.equal(h.board.lifecycle.status().workers.length, 3, 'SAFE is not shutdown completion');
+  assert.equal(h.calls.some(a => a[0] === 'kill-pane'), false);
+  h.panes.set(worker.pane, false);
   tick(h.board, h.config, h.execute);
   const state = h.board.lifecycle.status();
   assert.equal(state.workers[0].state, 'retired');
@@ -348,6 +435,22 @@ test('unexpected exit posts accurate system notice and replaces; launch failure 
   assert.ok(!posts.some(p => p.text === `${workers[1].sender} exited without a retirement message.`));
 });
 
+test('cleanup retry is idempotent, occupies capacity until removal, and never touches a foreign pane', t => {
+  const h = fixture(t), workers = h.boot();
+  h.panes.set(workers[0].pane, false);
+  assert.throws(() => tick(h.board, h.config, args => args[0] === 'kill-pane' ? { status: 1, stderr: 'cleanup failure' } : h.execute(args)), /cleanup failure/);
+  assert.equal(h.board.lifecycle.status().workers[0].cleaned, 0);
+  assert.throws(() => h.board.lifecycle.resume(), /finish\/exit/);
+  tick(h.board, h.config, h.execute); tick(h.board, h.config, h.execute);
+  assert.equal(h.board.lifecycle.status().workers.length, 4);
+  assert.equal(h.board.history({ limit: 100 }).posts.filter(p => p.text === `${workers[0].sender} exited without a retirement message.`).length, 1);
+  const before = h.calls.length;
+  assert.throws(() => tick(h.board, h.config, args => args[0] === 'display-message' ? { status: 1, stderr: 'health unavailable' } : h.execute(args)), /health unavailable/);
+  assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, 3, 'transport failure is not process death');
+  assert.throws(() => tick(h.board, h.config, args => args[0] === 'display-message' ? { status: 0, stdout: '1 unrelated-session' } : h.execute(args)), /outside.*owned parent/);
+  assert.equal(h.calls.length, before, 'no foreign cleanup or replacement');
+});
+
 test('CLI votes need three current active IDs and same request; withdraw and replacement invalidate old vote', t => {
   const h = fixture(t), workers = h.boot(), peers = workers.map(h.workerBoard);
   const first = peers[0].post('Waiting proposal; node pointer'), second = peers[1].post('Different proposal');
@@ -372,9 +475,12 @@ test('CLI votes need three current active IDs and same request; withdraw and rep
   assert.equal(h.board.lifecycle.status().request, first);
   assert.throws(() => peers[0].lifecycle.withdraw(), /running/);
   const recovered = openRun(h.dir); try { assert.equal(recovered.board.lifecycle.status().status, 'waiting'); } finally { recovered.board.close(); }
-  const before = h.calls.filter(a => a[0] === 'new-session').length;
-  for (const worker of [workers[0], workers[1], replacement]) { const peer = h.workerBoard(worker); peer.lifecycle.done('Waiting state recorded on tree'); peer.lifecycle.settled(); }
-  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
+  const before = h.calls.filter(a => a[0] === 'new-window').length;
+  for (const worker of [workers[0], workers[1], replacement]) {
+    const peer = h.workerBoard(worker); peer.lifecycle.done('Waiting state recorded on tree'); peer.lifecycle.settled();
+    h.panes.set(worker.pane, false);
+  }
+  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-window').length, before);
   h.board.lifecycle.resume(); tick(h.board, h.config, h.execute);
   const state = h.board.lifecycle.status();
   assert.equal(state.status, 'running'); assert.equal(state.request, null);
@@ -401,7 +507,7 @@ test('human stop differs from waiting; safe wrapup input only, unfinished board 
   w.lifecycle.done('stopped handoff'); f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
   assert.deepEqual(f.handlers.get('input')({ source: 'extension', text: 'late input' }, f.ctx), { action: 'handled' });
   assert.deepEqual(w.pending(), pending);
-  for (const worker of workers.slice(1)) { h.panes.set(worker.pane, false); }
+  for (const worker of workers) { h.panes.set(worker.pane, false); }
   tick(h.board, h.config, h.execute); assert.equal(h.board.lifecycle.status().status, 'stopped');
   h.board.lifecycle.resume(); tick(h.board, h.config, h.execute);
   assert.equal(h.board.lifecycle.status().workers.filter(w => w.state === 'launching').length, 3);
@@ -495,8 +601,8 @@ test('real operator CLI preflight/start/status/stop/resume uses fake Pi/tmux onl
   assert.equal(JSON.parse(run('status', '--run-dir', runDir).stdout).status, 'running');
   const commands = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
   assert.ok(commands.filter(a => a[0] === 'pi').every(a => a[1] === '--offline' && a[2] === '--list-models' && a[3] === 'openai-codex-test/gpt-6.1-sol'));
-  assert.equal(commands.filter(a => a[0] === 'tmux' && a[1] === 'new-session').length, 2);
-  assert.ok(commands.filter(a => a[0] === 'tmux' && a[1] === 'new-session').every(a => a.at(-1).includes('bf2-swarm') && !a.at(-1).includes('@')));
+  assert.equal(commands.filter(a => a[0] === 'tmux' && a[1] === 'new-session').length, 3);
+  assert.ok(commands.filter(a => a[0] === 'tmux' && a[1] === 'new-session').every(a => a.at(-1).includes('bf2-swarm') && !a.at(-1).includes("'@")));
   assert.equal(existsSync(join(h.settings.cwd, '.pi')), false, 'no repo settings installation');
 });
 
