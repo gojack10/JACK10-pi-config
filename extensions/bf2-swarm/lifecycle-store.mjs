@@ -24,7 +24,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   };
   const cancelDeparture = session => {
     const vote = openVote();
-    if (vote?.electorate.some(v => v.session === session)) closeVote(vote, 'cancelled', 'Voter left, work continues');
+    if (vote?.electorate.some(v => v.session === session)) closeVote(vote, 'cancelled', 'Electorate changed, work continues');
   };
   const queuedStart = () => {
     const run = status();
