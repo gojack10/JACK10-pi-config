@@ -38,7 +38,12 @@ export function receiver(pi, config, ctx) {
         // branch entry alone could survive a failed write; require disk evidence.
         // ponytail: scan JSONL only for a matching pending entry; index if large sessions make this costly.
         const persisted = selected && readFileSync(ctx.sessionManager.getSessionFile(), 'utf8')
-          .trim().split('\n').some(line => { const entry = JSON.parse(line); return entry.id === selected.id && matches(entry); });
+          .split('\n').some(line => {
+            let entry;
+            try { entry = JSON.parse(line); }
+            catch { return false; } // Pi's loader skips blank/malformed physical lines too.
+            return entry?.id === selected.id && matches(entry);
+          });
         if (persisted) {
           board.confirmPersisted(batch.key);
           admitted = undefined;

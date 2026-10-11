@@ -118,6 +118,46 @@ test('admitted but unpersisted batch survives restart; persisted pending reconci
   assert.equal(h.board.pending(), null);
 });
 
+test('torn and blank JSONL lines do not block persisted pending reconciliation after reconstruction', async t => {
+  const h = fixture(t); h.startup(); h.peer.post('first');
+  let r = h.start(); await r.pump();
+  const first = h.board.pending();
+  appendFileSync(h.ctx.sessionManager.getSessionFile(), '{"type":"message"\n\n   \n');
+  h.persist(h.calls[0]); h.peer.post('second');
+  r.close(); r = h.start(); await r.pump();
+  assert.equal(h.calls.length, 2, 'persisted first batch must not resend; second must be admitted');
+  assert.notEqual(h.board.pending().key, first.key);
+  assert.match(h.calls[1].message.content[0].text, /"second"/);
+  assert.doesNotMatch(h.calls[1].message.content[0].text, /"first"/);
+  h.persist(h.calls[1]); await r.pump();
+  assert.equal(h.board.pending(), null);
+});
+
+test('native Pi resumes a torn tail and receiver reconciles later USER persistence', { skip: !process.env.PI_PACKAGE_DIR }, async t => {
+  const h = fixture(t);
+  const { SessionManager } = await import(`${process.env.PI_PACKAGE_DIR}/dist/core/session-manager.js`);
+  const file = h.ctx.sessionManager.getSessionFile();
+  writeFileSync(file, JSON.stringify({ type: 'session', version: 3, id: h.config.session,
+    timestamp: new Date().toISOString(), cwd: process.cwd() }) + '\n{"type":"message"');
+  h.ctx.sessionManager = SessionManager.open(file);
+  h.pi.sendUserMessage = async text => {
+    h.calls.push(text);
+    h.ctx.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
+    return { status: 'admitted', delivery: 'turn' };
+  };
+  h.startup(); h.peer.post('first');
+  let r = h.start(); await r.pump();
+  const first = h.board.pending();
+  assert.equal(h.ctx.sessionManager.getBranch().at(-1).message.content[0].text, first.text);
+  h.peer.post('second'); r.close();
+  h.ctx.sessionManager = SessionManager.open(file);
+  r = h.start(); await r.pump();
+  assert.equal(h.calls.length, 2);
+  assert.match(h.calls[1], /"second"/);
+  assert.doesNotMatch(h.calls[1], /"first"/);
+  await r.pump(); assert.equal(h.board.pending(), null);
+});
+
 test('in-memory branch entry is insufficient if Pi file append did not succeed', async t => {
   const h = fixture(t); h.startup(); h.peer.post('must persist');
   const r = h.start(); await r.pump();
@@ -126,6 +166,26 @@ test('in-memory branch entry is insufficient if Pi file append did not succeed',
   await r.pump(); assert.ok(h.board.pending());
   r.close(); const next = h.start(); await next.pump();
   assert.equal(h.calls.length, 2);
+});
+
+test('disk confirmation still requires current-branch ID, USER role and exact payload; read failure retains pending', async t => {
+  const h = fixture(t); h.startup(); h.peer.post('exact evidence');
+  const r = h.start(); await r.pump();
+  const pending = h.board.pending(), file = h.ctx.sessionManager.getSessionFile();
+  const entry = { type: 'message', id: 'selected', message: h.calls[0].message };
+  h.branch.push(entry);
+  for (const other of [
+    { ...entry, id: 'other-branch' },
+    { ...entry, message: { ...entry.message, role: 'assistant' } },
+    { ...entry, message: { role: 'user', content: `prefix ${pending.text} suffix` } },
+  ]) {
+    writeFileSync(file, JSON.stringify(other) + '\n');
+    await r.pump(); assert.deepEqual(h.board.pending(), pending);
+  }
+  rmSync(file); await r.pump(); assert.deepEqual(h.board.pending(), pending);
+  assert.equal(h.calls.length, 1);
+  writeFileSync(file, JSON.stringify(entry) + '\n'); await r.pump();
+  assert.equal(h.board.pending(), null);
 });
 
 test('bounded batches drain in order, never skip newly posted messages', async t => {
