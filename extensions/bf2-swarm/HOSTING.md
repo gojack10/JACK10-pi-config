@@ -70,6 +70,31 @@ NPM Basic-auth collision, firewall opening, paid provisioning or private-service
 broadcast. A proxied CNAME points only this hostname to the factory tunnel UUID.
 Keep tunnel credential files private and outside source control.
 
+## Deployed configuration custody
+
+`hosting-config/` holds the nonsecret installed Mac LaunchAgent plists and
+factory-only cloudflared ingress. Their paths are machine-specific; the private
+JSON, password and tunnel credentials are deliberately NOT tracked. The adapter
+runs a durable source copy at `~/.local/state/bf2-room-hosting/runtime/hosting.mjs`,
+independent of this implementation worktree. Update that copy only after review.
+The two Mac labels are `com.jack.factory-room-ingress` and
+`com.jack.factory-room-tunnel`. Logs live below the owned private directory.
+
+On 10SERVER, the owned config/credential mount is
+`/home/jack/.cloudflared/factory-room` (0700; files 0600). The factory container is
+`factory-room-cloudflared`, image `cloudflare/cloudflared:2026.6.0`, host networking
+but **no published port**, existing user UID/GID, read-only config mount,
+`--restart unless-stopped`, `--log-driver none`. Its command is:
+
+```sh
+tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+```
+
+This does not edit the shared `vega-config.yml`, NPM hosts or existing containers.
+DNS is one proxied factory CNAME to the UUID in `factory-cloudflared.yml`. The
+exact creation, acceptance evidence and credential locator belong to the private
+execution report, never a tracked password or capability.
+
 ## Checks and recovery
 
 ```sh
