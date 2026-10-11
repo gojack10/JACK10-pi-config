@@ -9,8 +9,14 @@ export const MAX_BATCH_BYTES = 65536;
 export const MAX_TEXT_BYTES = 16384;
 
 export function configuration(env = process.env) {
-  const config = { database: env.BF2_BOARD_DB, run: env.BF2_BOARD_RUN,
-    session: env.BF2_BOARD_SESSION, sender: env.BF2_BOARD_SENDER };
+  const factory = ['FACTORY_FLOOR', 'FACTORY_DB', 'FACTORY_SESSION', 'FACTORY_SENDER'].some(key => env[key] !== undefined);
+  if (factory && !['FACTORY_FLOOR', 'FACTORY_DB', 'FACTORY_SESSION', 'FACTORY_SENDER'].every(key => env[key])) throw new Error('factory worker identity must include floor, DB, session and sender');
+  const config = { database: env.FACTORY_DB ?? env.BF2_BOARD_DB, run: env.BF2_BOARD_RUN ?? env.FACTORY_FLOOR,
+    session: env.FACTORY_SESSION ?? env.BF2_BOARD_SESSION, sender: env.FACTORY_SENDER ?? env.BF2_BOARD_SENDER,
+    ...(factory ? { floor: env.FACTORY_FLOOR } : {}) };
+  for (const [modern, legacy] of [['FACTORY_DB','BF2_BOARD_DB'], ['FACTORY_SESSION','BF2_BOARD_SESSION'], ['FACTORY_SENDER','BF2_BOARD_SENDER']]) {
+    if (env[modern] && env[legacy] && env[modern] !== env[legacy]) throw new Error('conflicting factory/legacy worker identity');
+  }
   if (!config.database || !isAbsolute(config.database)) throw new Error('BF2_BOARD_DB must be an explicit absolute SQLite path (parent directory must exist)');
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(config.run ?? '')) throw new Error('BF2_BOARD_RUN must be an explicit run ID (1-128 letters, digits, ._- )');
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/.test(config.session ?? '')) throw new Error('BF2_BOARD_SESSION must match the explicitly launched Pi session ID');
@@ -34,7 +40,8 @@ export function openBoard(config) {
     db.exec('PRAGMA busy_timeout=5000');
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    if (config.floor && (!tables.some(t => t.name === 'floor_settings') || db.prepare('SELECT id FROM floor_settings').get()?.id !== config.floor)) throw new Error('database belongs to another floor');
     if (tables.some(t => t.name === 'board_run') && db.prepare('SELECT run FROM board_run').get()?.run !== config.run) throw new Error('database belongs to another run');
     if (tables.some(t => t.name === 'swarm_run') && !db.prepare('PRAGMA table_info(swarm_run)').all().some(c => c.name === 'room_token')) throw new Error('legacy swarm format; use its original code for history and start a fresh room run');
     // Cold concurrent openers can race the DELETE -> WAL change; SQLite may
