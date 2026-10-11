@@ -1,11 +1,124 @@
-# BF2 broadcast board — communication slice only
+# BF2 board and opt-in three-peer swarm
 
-Dependency-free Node 24 `node:sqlite` CLI plus an optional Pi USER-input receiver.
-One dedicated database is one broadcast run. No model calls in the CLI; no broker,
-routing, ACK rules, subscriptions, threads, joining/retirement, votes, replacement
-controller, or 80% stop policy. Existing factory/outcome/settings code is untouched.
+Dependency-free Node 24 SQLite CLI, optional Pi USER-input receiver, and a separate
+experimental three-peer lifecycle. The board still works alone. The swarm never
+uses the existing factory/task-report contract. No dispatcher, routing, assigned
+tasks, subscriptions, ACK rules, tree-status interpretation or dependencies.
+Existing factory/outcome/friendly-stop/settings sources remain untouched.
 
-## Later launch setup (instructions, not an executed live trial)
+## Swarm controls (later authorized live trial only)
+
+Keep this launcher checkout, the BF2 checkout, session JSONL and run DB durable.
+The launcher does **not** initialize or modify the BF2 checkout. Set the provider
+variable to the exact human-authorized account route; do not infer it from registry
+order. This experiment fixes the model/thinking to `gpt-6.1-sol` / `high`.
+The parent supplies the real BF2 root and experiment-instruction UUIDs. A UUID
+placeholder is acceptable for build checks, not a live instruction node.
+
+```sh
+SWARM_CODE=/absolute/path/to/durable/agent-checkout
+BF2_REPO=/absolute/path/to/durable/BF2-checkout
+# Set BF2_SWARM_PROVIDER, BF2_ROOT_NODE, BF2_EXPERIMENT_NODE explicitly first.
+"$SWARM_CODE/bin/bf2-swarm" start --cwd "$BF2_REPO" \
+  --root "$BF2_ROOT_NODE" --instructions "$BF2_EXPERIMENT_NODE" \
+  --provider "$BF2_SWARM_PROVIDER"
+# Start prints a fresh durable RUN path and named tmux controller attachment.
+"$SWARM_CODE/bin/bf2-swarm" status --run-dir "$RUN"
+"$SWARM_CODE/bin/bf2-swarm" stop --run-dir "$RUN"
+"$SWARM_CODE/bin/bf2-swarm" resume --run-dir "$RUN"
+# If only the controller process was interrupted, recover the running loop:
+"$SWARM_CODE/bin/bf2-swarm" run --run-dir "$RUN"
+"$SWARM_CODE/bin/bf2-swarm" -h
+```
+
+`start --run-dir /absolute/new/run` selects another fresh namespace. Default is
+`~/.local/state/bf2-swarm/<new UUID>`, never `factory-runs`. Existing run directories
+are rejected by start. `status`, `stop`, `resume` and recovery require the saved
+run.json and DB; they never create a missing DB. The DB stores authoritative config,
+worker identities, votes, handoffs and running/waiting/stopped state. Session files,
+boot USER @files and tmux pane logs stay in that run directory. No PATH installation.
+
+Before start, **new sessions** need Pi's native `steeringMode` and `followUpMode`
+both `all` in current settings (the parent's separate queue change). The launcher
+checks current settings; the opt-in extension independently checks effective Pi
+settings before releasing startup input. Do not reload old runs. Ordinary extensions
+and skills autoload. Swarm adds `optional-extensions/bf2-swarm.ts` then `bf2-board.ts`;
+it does not add the global optional `rlm-friendly-stop.ts`. Explicit friendly-stop
+configuration is rejected. Use normal project trust; unexpected input-transforming
+or lifecycle-changing extensions remain outside this experiment's tested path.
+
+Each worker is a normal saved interactive Pi in its own named tmux session, with
+an explicit UUID session and a fresh unique eight-hex sender (SQLite rejects any
+collision). Route is the explicit configured provider plus fixed model/high; the
+launcher performs only offline model-list preflight before its first start. It
+passes board env and the checkout's bin directory on PATH. It strips inherited task
+manifest, old board and RLM env. There is no task launch contract or report. The
+minimal native USER @file points to SiftText Read, BF2 root and instruction node,
+then `board -h`/startup `board read`; actual BF2 work policy lives on the tree. The
+parent authors it. The boot asks for no nested workers, without adding enforcement.
+
+## Retirement, votes and human waiting
+
+```sh
+board post 'Waiting proposal; reason and experiment-node pointer' # prints #NUMBER
+board vote NUMBER 'Reason / node pointer'
+board vote --withdraw
+# Complete tree work and any background jobs first, then one handoff:
+board done 'What peers need next; durable tree pointer'
+# Compound Bash remains legal; retirement does not kill the command halfway:
+board done 'handoff'; git status
+```
+
+`messaged_outcome({handoff: "..."})` is a genuine opt-in Pi tool using the same DB
+operation as `board done`. It returns `terminate: true`, not a second report/proof.
+Both store the nonempty handoff and request retirement atomically. No retirement
+is inferred from prose, pane output or ordinary settled turns. New board inputs
+stop once retirement is requested, preserving pending DB batches. Already-running
+tools/queued work drain. The extension marks `retired` **only** at a clean
+`agent_settled` boundary with no running registered background jobs, then asks Pi
+for orderly shutdown. Background-result input remains allowed so that work can
+drain; no tool is blocked. CLI done may still require an ordinary final model
+followup before settlement. A failed/interrupted settling turn does not mark clean
+retirement. Do not run two Pi processes/receivers for one saved session.
+
+The loop maintains three occupied sessions only while running. A safely retired
+session frees capacity; a disappeared/dead pane becomes `exited`, broadcasts
+`[system] <id> exited without a retirement message.`, then gets a fresh replacement.
+A final handoff without the safe marker is `exited-with-handoff`, with an accurate
+notice, not clean retirement and not the no-message notice. Launch failures are
+recorded and retried at the ordinary two-second tick, never a crash-count pause.
+No panes, workspaces, unrelated host processes or old runs are killed/cleaned.
+Tmux setup is serialized with DB stop/vote decisions; no model await is inside it.
+
+Votes require registered **active** session IDs with their launch identity and an
+existing committed request number. A normal post is a proposal; content is not
+interpreted. No inheritance by replacements. Exactly three current active peers
+must vote for the same request; two votes during a replacement gap or mixed
+requests cannot pause. Workers can keep working and withdraw while running.
+Unanimity atomically persists `waiting` and a system broadcast, halting replacement.
+Each survivor receives one normal wrapup USER message, stops ordinary board wakes,
+records waiting/inspection state on the tree following its instructions, and retires
+without replacement. The controller remains visibly waiting and shows the experiment
+node for Jack. **Waiting is not BF2 success.** No desktop/chat notification.
+
+Human `stop` is distinct `stopped`, with the same deliberate no-respawn/wrapup.
+After old occupied sessions finish or exit, `resume` clears votes/request and starts
+fresh capacity. Resume refuses while old workers are still wrapping up. A running
+loop can recover after controller interruption with `run`, without restarting
+healthy workers. An atomic DB controller-PID claim refuses duplicate/reused live
+PIDs; inspect that run's state manually rather than force-killing anything. All experimental state
+is local-user trusted, not authentication or an OS sandbox.
+
+## Advisory 80% warning
+
+At a safe `turn_end`, known context usage at least 80% produces **one** ordinary
+steering USER warning encouraging tree progress and sensible retirement. A custom
+session entry remembers that warning across restart. Unknown/nonfinite usage does
+not warn. No tool block, forced stop, report, automatic compact/clean, continuation
+loop, or automatic rollover. Normal Pi compaction/limits remain separate native
+behavior. Agents decide when to hand off; code does not audit their tree work.
+
+## Board-only setup (instructions, not an executed live trial)
 
 The launcher/operator, **not agent-authored post text**, assigns configuration.
 Use the same DB/run for peers, a distinct session/sender for each Pi process, and
@@ -126,18 +239,17 @@ exact batch and remains pending (in-process resend is suppressed). Branch/messag
 forgery is not defended against. Scanning matching entries in large JSONL files is
 linear; no transcript indexing or prefix rewriting is added.
 
-## Integration surface for the next lifecycle slice
+## Tree integration and evidence boundary
 
-Stable surface: the four `BF2_BOARD_*` variables, executable `bin/board` with
-`post`, `read`, help/history options, and explicit optional extension path
-`optional-extensions/bf2-board.ts`. Launch with `--session-id` matching the env,
-keep session JSONL durable, and pass a normal USER mission containing the startup
-read sequence above. The lifecycle owner assigns identities, starts/stops peers,
-and separately implements completion/voting/warning policy. A board post is not
-`report_outcome`, `messaged_outcome`, or a finish/vote signal. No live launch is
-performed or authorized by these docs. DB helper exports/schema are implementation
-details, not a controller protocol. No existing controller needs changing for this
-CLI/optional-receiver slice.
+The parent supplies two node UUIDs (`--root`, `--instructions`). Instruction-node
+policy owns autonomous BF2/SiftText/Git work, tree/message distinction, safe handoff,
+waiting/inspection and no nested workers. It should reference `board -h` rather
+than mirror CLI help. No code decides whether BF2 succeeded or validates node status.
+No tree write, live swarm launch, game launch, real BF2 mutation, or model request
+was performed or authorized by these docs. DB helpers/schema are internal.
+Fake Pi/tmux and isolated SQLite evidence are not live-provider qualification.
+A separate authorized live trial must test startup, real USER delivery/settlement,
+background drain, voluntary handoff/replacement and three-peer waiting inspection.
 
 ## Isolated checks
 
@@ -152,7 +264,16 @@ env -u BF2_BOARD_DB -u BF2_BOARD_RUN -u BF2_BOARD_SESSION -u BF2_BOARD_SENDER \
   pi -e "$PWD/optional-extensions/bf2-board.ts" --list-models '<provider/model>'
 ```
 
-The tests use temporary SQLite files, real separate CLI processes, and fake Pi
+Add both opt-ins for the swarm discovery check (still no experiment env):
+
+```sh
+env -u BF2_SWARM_WORKER -u BF2_BOARD_DB -u BF2_BOARD_RUN -u BF2_BOARD_SESSION -u BF2_BOARD_SENDER \
+  PI_CODING_AGENT_DIR="$PWD" PI_OFFLINE=1 \
+  pi -e "$PWD/optional-extensions/bf2-swarm.ts" \
+  -e "$PWD/optional-extensions/bf2-board.ts" --list-models '<provider/model>'
+```
+
+The tests use temporary SQLite files, real separate CLI processes, and fake Pi/tmux
 USER/admission/session-file inputs. Discovery uses the full normal worktree path
 plus the optional receiver, not `--no-extensions`. No env means the receiver
 registers nothing and opens no DB; partial env refuses before opening. Loading
