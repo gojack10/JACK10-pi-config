@@ -150,9 +150,9 @@ test('single global OSS lease: move waits for real exit and cleanup across floor
   selectOssFloor(null, { root: h.root }); assert.ok(two.snapshot().workers.find(w => w.session === lease.session).retire_requested);
 });
 
-test('owner-approved prompt gate, per-occupant advisory threshold and known JSONL failure locators', async t => {
+test('required launch-text gate, per-occupant advisory threshold and known JSONL failure locators', async t => {
   const h = fixture(t), unapproved = h.create('two', { bootstrap: null });
-  assert.throws(() => unapproved.command('start', 'start'), /owner-approved/); assert.equal(unapproved.snapshot().status, 'stopped');
+  assert.throws(() => unapproved.command('start', 'start'), /launch settings: bootstrap/); assert.equal(unapproved.snapshot().status, 'stopped');
   unapproved.command('preapproval-message', 'message', 'Fixture owner input before approval');
   assert.equal(unapproved.snapshot().status, 'stopped');
   assert.ok(unapproved.snapshot().posts.some(p => p.role === 'owner' && p.text === 'Fixture owner input before approval'));
@@ -181,6 +181,39 @@ test('owner-approved prompt gate, per-occupant advisory threshold and known JSON
   assert.equal(shutdown, 1); assert.ok(floor.snapshot().posts.some(p => p.role === 'system' && p.text.includes(path) && p.text.includes('Fixture provider error')));
   tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.length, 2);
   h.panes.get(w.pane).live = false; tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.length, 3);
+});
+
+test('staged floors refuse Start without side effects, retain chat without launching, then configured Start works', t => {
+  for (const key of ['instructions','voteCondition','bootstrap','warningText','wrapupText']) {
+    const h = fixture(t), floor = h.create('one', { [key]: null });
+    const before = floor.snapshot();
+    assert.throws(() => floor.command('start', 'start'), new RegExp(`launch settings: ${key}`));
+    assert.deepEqual(floor.snapshot(), before, 'no posts, running state or queue persisted');
+    const db = new DatabaseSync(floor.database);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM swarm_commands').get().n, 0); db.close();
+    floor.command('chat', 'message', 'Fixture pending input');
+    assert.equal(floor.snapshot().status, 'stopped'); assert.equal(floor.snapshot().pending, false);
+    tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.length, 0);
+    floor.configure({ [key]: h.settings[key] });
+    assert.equal(h.boot(floor).length, 2);
+  }
+});
+
+test('live, queued and draining floors cannot erase required launch inputs; stopped floor can', t => {
+  const h = fixture(t), floor = h.create('one'), workers = h.boot(floor);
+  for (const phase of ['running', 'stopping', 'queued']) {
+    if (phase === 'stopping') floor.command('stop', 'stop');
+    if (phase === 'queued') floor.command('restart', 'start');
+    for (const key of ['instructions','voteCondition','bootstrap','warningText','wrapupText']) {
+      const before = floor.snapshot();
+      assert.throws(() => floor.configure({ [key]: null }), /launch settings/);
+      assert.deepEqual(floor.snapshot(), before, 'refusal preserves config, ballots, posts and graceful stop');
+    }
+  }
+  floor.command('cancel-restart', 'stop');
+  for (const w of workers) h.panes.get(w.pane).live = false;
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().status, 'stopped');
+  assert.equal(floor.configure({ voteCondition: null }).voteCondition, null);
 });
 
 test('ordinary additive BF2 adoption preserves original history, IDs and actual session paths', t => {

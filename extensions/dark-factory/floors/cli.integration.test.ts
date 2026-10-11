@@ -143,10 +143,10 @@ test('real worker board binding, history startup boundary, outside scope and cro
   assert.equal(worker.lifecycle.status().workers.find(w => w.session === 'session-a').state, 'retiring');
 });
 
-test('start rejects absent approved prompts; saved command recovery failure is truthful and retryable', async t => {
+test('start rejects absent launch text; saved command recovery failure is truthful and retryable', async t => {
   const f = fixture(t);
   await f.run('create', '--floor', 'alpha', '--settings', f.input({ ...f.settings, bootstrap: null }));
-  await assert.rejects(f.run('start', '--floor', 'alpha'), /owner-approved/);
+  await assert.rejects(f.run('start', '--floor', 'alpha'), /launch settings: bootstrap/);
   assert.equal((await f.run('status', '--floor', 'alpha')).result.status, 'stopped');
   const floor = runtime.openFloor('alpha', { root: f.root });
   try { floor.configure({ bootstrap: f.settings.bootstrap }); } finally { floor.close(); }
@@ -171,12 +171,14 @@ test('copied generic legacy BF2 adoption preserves DB/history, stays stopped and
   const copied = join(f.dir, 'legacy-copy'); mkdirSync(copied);
   copyFileSync(originalDB, join(copied, 'board.sqlite'));
   writeFileSync(join(copied, 'run.json'), JSON.stringify({ run: 'legacy-fixture' }));
-  await f.run('adopt', '--floor', 'legacy', '--run-dir', copied, '--settings', f.input(f.settings));
+  const pendingSettings = { ...f.settings, voteCondition: null, wrapupText: null };
+  await f.run('adopt', '--floor', 'legacy', '--run-dir', copied, '--settings', f.input(pendingSettings));
   assert.equal(realpathSync(join(f.root, 'legacy/floor.sqlite')), realpathSync(join(copied, 'board.sqlite')));
   let status = (await f.run('status', '--floor', 'legacy')).result;
+  assert.equal(status.floor.voteCondition, null); assert.equal(status.floor.wrapupText, null);
   assert.equal(status.status, 'stopped'); assert.equal(status.workers.length, 1); assert.equal(status.workers[0].state, 'retired');
   assert.equal(status.workers[0].cleaned, 1); assert.equal(status.posts.some(p => p.text === 'retained generic history'), true);
-  await f.run('adopt', '--floor', 'legacy', '--run-dir', copied, '--settings', f.input(f.settings));
+  await f.run('adopt', '--floor', 'legacy', '--run-dir', copied, '--settings', f.input(pendingSettings));
   status = (await f.run('status', '--floor', 'legacy')).result;
   assert.equal(status.workers.length, 1); assert.equal(f.calls.length, 0);
   await assert.rejects(f.run('adopt', '--floor', 'legacy', '--run-dir', originalDir, '--settings', f.input(f.settings)));

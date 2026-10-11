@@ -96,9 +96,13 @@ function notify(current, next) {
   current.loaded ||= next.length < 100;
 }
 function controls() {
-  $('#factory-control').disabled = busy || !state;
-  $('#factory-control').textContent = state?.status === 'stopped' || (state?.status === 'waiting' && !state.draining) ? 'start factory' : 'stop factory';
-  $('#send').textContent = state?.status === 'stopped' ? 'send & start' : state?.status === 'waiting' ? 'send & resume' : 'send';
+  const missing = state?.settings?.missingLaunchSettings ?? [];
+  const starting = state?.status === 'stopped' || (state?.status === 'waiting' && !state.draining);
+  $('#factory-control').disabled = busy || !state || (starting && missing.length > 0);
+  $('#factory-control').textContent = starting ? 'start factory' : 'stop factory';
+  $('#launch-readiness').hidden = !missing.length;
+  $('#launch-readiness').textContent = missing.length ? `Not configured for Start: ${missing.join(', ')}. Set the vote condition in settings; set instruction entry and launch text with factory config. Messages are saved without starting.` : '';
+  $('#send').textContent = missing.length ? 'send (no start)' : state?.status === 'stopped' ? 'send & start' : state?.status === 'waiting' ? 'send & resume' : 'send';
   $('#send').disabled = busy || !state || !$('#message').value.trim();
   $('#settings-toggle').hidden = !multi;
   $('#settings-toggle').disabled = busy || !state;
@@ -219,7 +223,7 @@ function openSettings() {
   panelFloor = selected;
   $('#settings-panel').hidden = false;
   $('#slot-fields').innerHTML = state.settings.slots.map(slotMarkup).join('');
-  $('#vote-condition').value = state.settings.voteCondition;
+  $('#vote-condition').value = state.settings.voteCondition ?? '';
   $('#oss-status').textContent = oss ? `OSS floor: ${oss.selectedFloor ?? oss.floorId ?? 'none'} · ${oss.status ?? (oss.draining ? 'draining' : oss.moving ? 'moving, waiting for drain' : 'status unknown')}` : 'OSS status unavailable';
   $('#settings-error').textContent = ''; slotControls();
 }
@@ -243,7 +247,7 @@ $('#slot-settings').addEventListener('submit', async e => {
 });
 $('#condition-settings').addEventListener('submit', async e => {
   e.preventDefault(); if (panelFloor !== selected) return;
-  if (await mutate('condition', { condition: $('#vote-condition').value }) && panelFloor === selected) openSettings();
+  if (await mutate('condition', { condition: $('#vote-condition').value.trim() ? $('#vote-condition').value : null }) && panelFloor === selected) openSettings();
 });
 $('#oss-select').addEventListener('click', async () => {
   if (panelFloor !== selected) return;

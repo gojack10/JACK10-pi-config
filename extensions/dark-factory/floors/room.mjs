@@ -3,6 +3,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import { missingFloorLaunchSettings } from '../../bf2-swarm/lifecycle-store.mjs';
+
 const assets = new URL('../room/', import.meta.url);
 const files = { '/': ['index.html', 'text/html; charset=utf-8'], '/room.js': ['room.js', 'text/javascript'],
   '/markup.mjs': ['markup.mjs', 'text/javascript'], '/colors_and_type.css': ['colors_and_type.css', 'text/css'],
@@ -12,7 +14,8 @@ const fields = (value, keys) => Object.fromEntries(keys.filter(k => value?.[k] !
 const slot = s => ({ ...fields(s, ['id','provider','model','thinking','role']), contextWarningPercent: s.contextWarning });
 export function publicSnapshot(snapshot) {
   return { ...fields(snapshot, ['status','draining','pending','known','members','posts','vote']),
-    settings: { name: snapshot.floor.name, voteCondition: snapshot.floor.voteCondition, slots: snapshot.slots.map(slot) },
+    settings: { name: snapshot.floor.name, voteCondition: snapshot.floor.voteCondition, slots: snapshot.slots.map(slot),
+      missingLaunchSettings: missingFloorLaunchSettings(snapshot.floor) },
     workers: snapshot.workers.map(w => ({ ...fields(w, ['sender','cleaned']), slotId: w.slot,
       ...fields(w.launch_config, ['provider','model','thinking','role']), contextWarningPercent: w.launch_config?.contextWarning,
       phase: w.retire_requested ? 'retirement requested' : w.state, contextPercent: w.context_percent ?? null })) };
@@ -87,7 +90,7 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
       }
       return send(200, { saved: true });
     } catch (error) {
-      const message = error.message?.includes('owner-approved') ? 'Floor start requires owner-approved launch instructions' :
+      const message = error.message?.startsWith('floor start requires launch settings:') ? error.message :
         error.message?.includes('approved provider/model/thinking') ? 'Choose an approved model and thinking route' :
         error.message?.includes('needs an OSS slot') ? 'Configure one local Qwen slot on this floor first' : 'Operation refused; check floor settings and availability';
       if (!response.headersSent) send(400, { error: message }); else response.end();

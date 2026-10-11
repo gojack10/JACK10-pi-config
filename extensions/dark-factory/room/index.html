@@ -31,13 +31,14 @@ h1,h2,h3,p{margin:0}h1{font-size:15px;font-weight:500;color:var(--fg0)}h2{font-s
   <header class="room-header"><div class="heading"><span class="brand">SiftText</span><h1>Dark Factory</h1></div><div class="controls"><span class="status" id="status" role="status">connecting</span><button id="settings-toggle" type="button" hidden>settings</button><button id="notification-toggle" type="button" aria-pressed="true">enable alerts</button><button id="sound-toggle" class="sound-toggle" type="button" aria-label="Mute message sounds" aria-pressed="true" title="Sounds enabled; click to unlock audio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4Z"/><path class="sound-on" d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/><path class="sound-off" d="m16 9 6 6m0-6-6 6"/></svg></button><button id="factory-control" type="button" disabled>stop factory</button></div></header>
   <nav id="floor-tabs" class="floor-tabs" role="tablist" aria-label="Factory floors" hidden></nav>
   <div id="floor-name" class="floor-name"></div>
+  <p id="launch-readiness" class="error" role="status" hidden></p>
   <div class="room-body">
     <section class="conversation" aria-label="Conversation">
       <section id="settings-panel" class="settings-panel" aria-label="Floor settings" hidden>
         <button id="settings-close" type="button">close settings</button>
         <p>Configuration applies to the next occupant. Removed slots drain safely. Configure 2–10 slots.</p>
         <form id="slot-settings"><h2>Worker slots</h2><div id="slot-fields"></div><button id="add-slot" type="button">add slot</button> <button type="submit">save next configuration</button><p id="settings-error" class="error" role="status"></p></form>
-        <form id="condition-settings"><h2>Owner vote condition</h2><p>Editing clears old votes and informs workers. Unanimous yes pauses and drains.</p><label for="vote-condition">Condition</label><textarea id="vote-condition" maxlength="16384" required></textarea><button type="submit">save condition</button></form>
+        <form id="condition-settings"><h2>Owner vote condition</h2><p>Editing clears old votes and informs workers. Unanimous yes pauses and drains.</p><label for="vote-condition">Condition</label><textarea id="vote-condition" maxlength="16384"></textarea><button type="submit">save condition</button></form>
         <section><h2>Single managed OSS worker</h2><p id="oss-status"></p><p>Configure one local Qwen slot, then select this floor. The previous OSS occupant must finish draining before the next spawns; unrelated local sessions are not managed.</p><button id="oss-select" type="button">move OSS here safely</button></section>
       </section>
       <div id="transcript" class="transcript" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text" tabindex="0"></div>
