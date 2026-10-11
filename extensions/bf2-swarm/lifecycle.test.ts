@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { openBoard } from './board.mjs';
 import { tick, workerCommand, bootMission, validateLaunch, settingsFor, quote, openRun } from './controller.mjs';
 import { installWorker, handoffTool, wrapup, warningType } from './worker.mjs';
@@ -100,6 +101,45 @@ test('three fake tmux boots have normal route/env, unique durable sessions, mini
   assert.ok(!scrubbed.includes('/old/task'));
 });
 
+test('first activation broadcasts one system join; repeated session_start and reconstruction never repost', async t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const workers = h.board.lifecycle.status().workers, peers = workers.slice(1).map(h.workerBoard);
+  for (const peer of peers) { peer.lifecycle.ready(); peer.finishStartup(peer.history().highwater); }
+  const worker = workers[0], f = fakePi(t, h, worker);
+  await f.handlers.get('session_start')({}, f.ctx);
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'active');
+  const joined = `${worker.sender} joined.`;
+  const posts = () => h.board.history({ limit: 100 }).posts.filter(p => p.text === joined);
+  assert.equal(posts().length, 1); assert.equal(posts()[0].sender, '[system]');
+  for (const peer of peers) {
+    const batch = peer.pending();
+    assert.match(batch.text, /\[system\]/);
+    assert.ok(batch.text.includes(JSON.stringify(joined)));
+    assert.equal(batch.through, posts()[0].number);
+  }
+  await f.handlers.get('session_start')({}, f.ctx);
+  f.handlers.get('session_shutdown')({}, f.ctx);
+  const reloaded = fakePi(t, h, worker); await reloaded.handlers.get('session_start')({}, reloaded.ctx);
+  const reopened = h.workerBoard(worker); reopened.lifecycle.ready();
+  assert.equal(posts().length, 1);
+  reopened.lifecycle.done('final handoff'); reopened.lifecycle.settled();
+  assert.equal(h.board.history({ limit: 100 }).posts.length, 4, 'normal retirement needs no redundant system post');
+});
+
+test('join post and activation roll back together on insertion failure', t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const worker = h.board.lifecycle.status().workers[0], peer = h.workerBoard(worker);
+  const db = new DatabaseSync(h.config.database); t.after(() => db.close());
+  db.exec(`CREATE TRIGGER reject_join BEFORE INSERT ON board_posts
+    BEGIN SELECT RAISE(ABORT, 'synthetic insert failure'); END;`);
+  assert.throws(() => peer.lifecycle.ready(), /synthetic insert failure/);
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'launching');
+  assert.equal(h.board.history().posts.length, 0);
+  db.exec('DROP TRIGGER reject_join'); peer.lifecycle.ready();
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'active');
+  assert.equal(h.board.history().posts[0].text, `${worker.sender} joined.`);
+});
+
 test('real compound bash done stores one handoff; replacement waits agent_settled and background drain', async t => {
   const h = fixture(t); tick(h.board, h.config, h.execute);
   const worker = h.board.lifecycle.status().workers[0], f = fakePi(t, h, worker);
@@ -141,9 +181,9 @@ test('ordinary settlement is not retirement; genuine tool alias terminates witho
   await assert.rejects(tool.execute('1', { handoff: '' }, undefined, undefined, f.ctx), /nonempty/);
   const result = await tool.execute('1', { handoff: 'Tree node updated; inspect commit.' }, undefined, undefined, f.ctx);
   assert.equal(result.terminate, true); assert.equal(f.shuts(), 0);
-  assert.deepEqual(result.details, { number: 1 });
+  assert.deepEqual(result.details, { number: 2 }); // First activation already posted join #1.
   assert.doesNotMatch(result.content[0].text, /Tree node updated/);
-  assert.equal(h.board.history().posts[0].text, 'Tree node updated; inspect commit.');
+  assert.equal(h.board.history().posts.find(p => p.number === result.details.number).text, 'Tree node updated; inspect commit.');
   f.handlers.get('agent_settled')({ outcome: 'failed' }, f.ctx); assert.equal(f.shuts(), 0);
   f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx); assert.equal(f.shuts(), 1);
 });
@@ -274,7 +314,7 @@ test('installed Pi loader registers the actual opt-in tool and settles it withou
   assert.equal(result.terminate, true); assert.equal(shutdown, 0);
   await fire('agent_settled', { outcome: 'completed' });
   assert.equal(shutdown, 1);
-  assert.equal(h.board.history().posts[0].text, 'Actual loader handoff');
+  assert.equal(h.board.history().posts.find(p => p.number === result.details.number).text, 'Actual loader handoff');
 });
 
 test('worker independently refuses native one-at-a-time queues before startup USER mission', async t => {
