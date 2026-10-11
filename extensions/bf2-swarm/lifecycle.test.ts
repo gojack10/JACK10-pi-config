@@ -13,7 +13,7 @@ import { receiver } from './receiver.mjs';
 const executable = resolve('bin/board');
 const root = '11111111-1111-4111-8111-111111111111';
 const instructions = '22222222-2222-4222-8222-222222222222';
-function fixture(t) {
+function fixture(t, controller = true) {
   const dir = mkdtempSync(join(tmpdir(), 'bf2-lifecycle-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const cwd = join(dir, "BF2 repo's checkout"), agentDir = join(dir, 'agent');
@@ -24,19 +24,33 @@ function fixture(t) {
   writeFileSync(join(dir, 'run.json'), JSON.stringify({ run: config.run }));
   const board = openBoard(config); board.lifecycle.initialize(settings);
   t.after(() => board.close());
-  const calls = [], panes = new Map(); let failNext = false, nextPane = 1;
+  if (controller) board.lifecycle.controllerSetup(() => '$0');
+  const calls = [], panes = new Map(), children = new Map(), options = new Map([['$0:@bf2_swarm_run', config.run]]); let failNext = false, nextPane = 1;
   const execute = args => {
     calls.push(args);
-    if (args[0] === 'new-window') {
+    const target = args[args.indexOf('-t') + 1];
+    let stdout = '';
+    if (args[0] === 'new-session') {
       if (failNext) { failNext = false; return { status: 1, stdout: '', stderr: 'synthetic launch error' }; }
-      assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{pane_id}');
-      const paneId = `%${nextPane++}`;
-      panes.set(paneId, true);
-      return { status: 0, stdout: `${paneId}\n`, stderr: '' };
+      assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{session_id} #{pane_id}');
+      const paneId = `%${nextPane}`, child = `$${nextPane++}`;
+      panes.set(paneId, true); children.set(child, paneId);
+      stdout = `${child} ${paneId}\n`;
     }
-    if (args[0] === 'display-message') return { status: 0, stdout: `${panes.get(args[args.indexOf('-t') + 1]) ? '0' : '1'} ${parentSession(config)}\n`, stderr: '' };
-    if (args[0] === 'kill-pane') panes.delete(args.at(-1));
-    return { status: 0, stdout: '', stderr: '' };
+    if (args[0] === 'display-message') {
+      const owner = [...children].find(([, pane]) => pane === target)?.[0];
+      stdout = owner ? `${panes.get(target) ? '0' : '1'} ${owner}\n` : '';
+    }
+    if (args[0] === 'set-option') options.set(`${target}:${args.at(-2)}`, args.at(-1));
+    if (args[0] === 'show-options') stdout = options.get(`${target}:${args.at(-1)}`) ?? '';
+    if (args[0] === 'list-sessions') stdout = ['$0', ...children.keys()].join('\n');
+    if (args[0] === 'list-panes') stdout = children.get(target) ?? '';
+    if (args[0] === 'kill-pane') {
+      panes.delete(target);
+      for (const [id, pane] of children) if (pane === target) children.delete(id);
+    }
+    if (args[0] === 'kill-session') { panes.delete(children.get(target)); children.delete(target); }
+    return { status: 0, stdout, stderr: '' };
   };
   const workerBoard = worker => {
     const w = openBoard({ ...config, session: worker.session, sender: worker.sender });
@@ -82,12 +96,14 @@ test('three fake tmux boots have normal route/env, unique durable sessions, mini
     assert.match(worker.sender, /^[a-f0-9]{8}$/);
     assert.match(worker.pane, /^%\d+$/);
     const name = `bf2-${h.config.run}-${worker.sender}`;
-    const call = h.calls.find(a => a[0] === 'new-window' && a.includes(name));
-    assert.equal(call[call.indexOf('-t') + 1], `=${parentSession(h.config)}:`);
+    const call = h.calls.find(a => a[0] === 'new-session' && a.includes(name));
+    assert.equal(call[call.indexOf('-s') + 1], name);
+    assert.match(worker.tmux_session, /^\$\d+$/);
+    assert.ok(h.calls.some(a => a[0] === 'set-option' && a.at(-2) === '@pi_subagent_parent_id' && a.at(-1) === '$0' && a[a.indexOf('-t') + 1] === worker.tmux_session));
     assert.ok(h.calls.some(a => a[0] === 'pipe-pane' && a[a.indexOf('-t') + 1] === worker.pane));
     assert.equal(call[call.indexOf('-c') + 1], h.settings.cwd);
     const command = call.at(-1);
-    assert.match(command, /^tmux set-option -w -t "\$TMUX_PANE" remain-on-exit on && exec /);
+    assert.match(command, /^tmux wait-for 'bf2-boot-.*' && tmux set-option -w -t "\$TMUX_PANE" remain-on-exit on && exec /);
     assert.ok(command.includes(`'--name' ${quote(name)}`));
     assert.ok(command.includes("'--provider' 'openai-codex-test' '--model' 'gpt-6.1-sol' '--thinking' 'high'"));
     assert.ok(command.includes(`'BF2_BOARD_SESSION=${worker.session}'`));
@@ -125,32 +141,32 @@ test('capture failure is diagnostic and still registers the launch pane ID', t =
 
 test('missing pane receipts fail registration; legacy names never probe a selected window', t => {
   const h = fixture(t);
-  tick(h.board, h.config, args => args[0] === 'new-window' ? { status: 0, stdout: '', stderr: '' } : h.execute(args));
-  assert.ok(h.board.lifecycle.status().workers.every(w => w.state === 'launch-failed'));
-  assert.deepEqual(h.calls.map(a => a[0]), ['has-session'], 'no empty-target capture or health commands');
-  h.board.lifecycle.addWorker('legacy-session', 'eeeeeeee', 'legacy-name');
-  assert.throws(() => tick(h.board, h.config, h.execute), /stable tmux pane ID.*fresh run/);
-  assert.deepEqual(h.calls.map(a => a[0]), ['has-session']);
+  tick(h.board, h.config, args => args[0] === 'new-session' ? { status: 0, stdout: '', stderr: '' } : h.execute(args));
+  assert.ok(h.board.lifecycle.status().workers.every(w => w.state === 'launch-failed' && !w.cleaned));
+  assert.deepEqual(h.calls.map(a => a[0]), ['has-session', 'show-options'], 'no empty-target capture or health commands');
+  assert.throws(() => tick(h.board, h.config, h.execute), /stable tmux IDs.*fresh run/);
+  const legacy = fixture(t);
+  legacy.board.lifecycle.addWorker('legacy-session', 'eeeeeeee', 'legacy-name');
+  assert.throws(() => tick(legacy.board, legacy.config, legacy.execute), /stable tmux IDs.*fresh run/);
+  assert.deepEqual(legacy.calls, []);
 });
 
 test('controller health and recovery retain a stable pane ID, not the selected window', async t => {
-  const h = fixture(t), calls = []; let paneId, dead = false;
+  const h = fixture(t, false), calls = []; let paneId, dead = false;
   const execute = args => {
     calls.push(args);
     const result = { status: 0, stdout: '', stderr: '' };
     if (args[0] === 'has-session') result.status = paneId ? 0 : 1;
-    if (args[0] === 'show-options') result.stdout = paneId;
+    if (args[0] === 'show-options') result.stdout = args.at(-1) === '@bf2_swarm_run' ? h.config.run : paneId;
     if (args[0] === 'display-message') {
-      assert.equal(args[args.indexOf('-t') + 1], paneId);
-      result.stdout = `${dead ? '1' : '0'} ${parentSession(h.config)}`;
+      assert.equal(args[args.indexOf('-t') + 1], paneId ?? '%41');
+      result.stdout = args.at(-1) === '#{session_id}' ? '$0' : `${dead ? '1' : '0'} $0`;
     }
     if (['new-session', 'new-window'].includes(args[0])) {
       assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{pane_id}');
       result.stdout = dead ? '%42' : '%41';
     }
-    if (args[0] === 'set-option') {
-      assert.equal(args.at(-2), '@bf2_controller_pane'); paneId = args.at(-1);
-    }
+    if (args[0] === 'set-option' && args.at(-2) === '@bf2_controller_pane') paneId = args.at(-1);
     return result;
   };
   const resume = () => main(['resume', '--run-dir', h.dir], {}, execute);
@@ -159,11 +175,11 @@ test('controller health and recovery retain a stable pane ID, not the selected w
   dead = true; await resume(); assert.equal(paneId, '%41');
   assert.equal(calls.filter(a => a[0] === 'new-window').length, 0);
   assert.equal(calls.filter(a => a[0] === 'respawn-pane').length, 1);
-  assert.ok(calls.filter(a => a[0] === 'has-session').every(a => a.at(-1) === `=${parentSession(h.config)}`));
+  assert.deepEqual(calls.filter(a => a[0] === 'has-session').map(a => a.at(-1)), [`=${parentSession(h.config)}`, '$0', '$0']);
 });
 
-test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waiting and stop', async t => {
-  const h = fixture(t), tmuxDir = mkdtempSync(join(tmpdir(), 'bf2-tmux-'));
+test('isolated real tmux: controller + three nested children, cleanup/replacement/recovery/wait/stop', async t => {
+  const h = fixture(t, false), tmuxDir = mkdtempSync(join(tmpdir(), 'bf2-tmux-'));
   const socket = join(tmuxDir, 'tmux.sock'), conf = join(tmuxDir, 'tmux.conf');
   writeFileSync(conf, 'set -g base-index 1\nset -g pane-base-index 1\n');
   const live = args => spawnSync('tmux', ['-S', socket, '-f', conf, ...args], { encoding: 'utf8' });
@@ -178,8 +194,16 @@ test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waitin
   const calls = [];
   const execute = args => {
     calls.push(args);
-    if (['new-session', 'new-window', 'respawn-pane'].includes(args[0])) {
-      // Actual children are harmless interactive shells, never Pi or models.
+    if (args[0] === 'new-session' && args[args.indexOf('-F') + 1] === '#{session_id} #{pane_id}') {
+      // Preserve the real boot barrier and prove tags already exist at shell startup.
+      const id = args.at(-1).match(/'BF2_BOARD_SESSION=([^']+)'/)[1];
+      const parent = h.board.lifecycle.status().tmux_parent;
+      args = [...args.slice(0, -1), args.at(-1).split(' && exec ')[0] +
+        ` && test "$(tmux show-options -qv -t "$TMUX_PANE" @pi_subagent_parent_id)" = ${quote(parent)}` +
+        ` && test "$(tmux show-options -qv -t "$TMUX_PANE" @bf2_swarm_session)" = ${quote(id)}` +
+        ` && printf tagged > ${quote(join(h.dir, `${id}.booted`))} && exec /bin/sh`];
+    } else if (['new-session', 'new-window', 'respawn-pane'].includes(args[0])) {
+      // Controller is also just a harmless shell, never Pi or models.
       args = [...args.slice(0, -1), `tmux -S ${quote(socket)} set-option -w -t "$TMUX_PANE" remain-on-exit on && exec /bin/sh`];
     }
     return live(args);
@@ -188,8 +212,12 @@ test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waitin
     for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)); }
     assert.fail('isolated tmux did not reach expected shell state');
   };
-  const parent = parentSession(h.config), target = `=${parent}`;
-  const recover = () => main(['run', '--run-dir', h.dir], {}, execute);
+  let parent, target;
+  const recover = async () => {
+    await main(['run', '--run-dir', h.dir], {}, execute);
+    parent = target = h.board.lifecycle.status().tmux_parent;
+  };
+  const unrelated = checked(['new-session', '-d', '-P', '-F', '#{session_id}', '-s', 'unrelated', '/bin/sh']);
   const windows = () => checked(['list-windows', '-t', target, '-F', '#{window_name}']).split('\n');
   const sessions = () => checked(['list-sessions', '-F', '#{session_name}']).split('\n');
   const exit = async pane => {
@@ -201,19 +229,30 @@ test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waitin
   assert.equal(checked(['display-message', '-p', '-t', controller, '#{window_index}.#{pane_index}']), '1.1');
   tick(h.board, h.config, execute);
   const workers = h.board.lifecycle.status().workers;
-  assert.equal(workers.length, 3); assert.equal(windows().length, 4); assert.deepEqual(sessions(), [parent]);
+  assert.equal(workers.length, 3); assert.equal(windows().length, 1); assert.equal(sessions().length, 5);
   for (const worker of workers) {
     h.workerBoard(worker).lifecycle.ready();
-    assert.equal(checked(['display-message', '-p', '-t', worker.pane, '#{session_name} #{pane_index}']), `${parent} 1`);
+    await eventually(() => existsSync(join(h.dir, `${worker.session}.booted`)));
+    assert.equal(checked(['display-message', '-p', '-t', worker.pane, '#{session_id} #{window_index}.#{pane_index}']), `${worker.tmux_session} 1.1`);
+    assert.equal(checked(['show-options', '-qv', '-t', worker.tmux_session, '@pi_subagent_parent_id']), parent);
   }
   // Selection changes never affect worker health, capture or controller recovery.
   checked(['select-window', '-t', workers[2].pane]);
-  await recover(); assert.equal(calls.filter(a => a[0] === 'new-session').length, 1);
+  checked(['rename-session', '-t', parent, 'renamed-controller']);
+  checked(['rename-session', '-t', workers[0].tmux_session, 'renamed-peer']);
+  await recover(); assert.equal(calls.filter(a => a[0] === 'new-session' && a.includes('controller')).length, 1);
+  const oilCheck = join(h.dir, 'oil.lua');
+  writeFileSync(oilCheck, `local s = tmux_oil.snapshot()\n` + workers.map(w =>
+    `assert(s.parent_by_id[${JSON.stringify(w.tmux_session)}] == ${JSON.stringify(parent)})\nassert(s.tree_prefix_by_id[${JSON.stringify(w.tmux_session)}] ~= '')\n`).join('') +
+    `assert(s.parent_by_id[${JSON.stringify(unrelated)}] == nil)\nprint('installed tmux-oil model groups all three peers by native parent ID')\n`);
+  const oil = spawnSync('/Users/jack/.local/bin/tmux-oil', [], { env: { ...process.env, TMUX: `${socket},0,0`, TMUX_OIL_TEST_LUA: oilCheck }, encoding: 'utf8' });
+  assert.equal(oil.status, 0, oil.stderr);
+  console.log('installed tmux-oil model verified native-ID nesting after parent/peer renames');
   const inspection = checked(['new-window', '-P', '-F', '#{pane_id}', '-t', `${target}:`, '-n', 'inspection', '/bin/sh']);
   await exit(controller); await recover();
   assert.equal(checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']), controller);
   assert.equal(calls.filter(a => a[0] === 'respawn-pane').length, 1);
-  assert.equal(windows().length, 5, 'controller reuses its window, not selected inspection shell');
+  assert.equal(windows().length, 2, 'controller reuses its window, not selected inspection shell');
   assert.equal(checked(['display-message', '-p', '-t', inspection, '#{pane_dead}']), '0');
   const worker = workers[0], peer = h.workerBoard(worker);
   checked(['send-keys', '-t', inspection, 'printf "inspection-only\\n"', 'Enter']);
@@ -231,45 +270,49 @@ test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waitin
   assert.equal(h.board.lifecycle.status().workers[0].cleaned, 1);
   assert.equal(live(['display-message', '-p', '-t', worker.pane, '#{pane_dead}']).stdout.trim(), '');
   assert.equal(readFileSync(join(h.dir, 'preserved'), 'utf8'), 'orderly-completion');
-  assert.ok(existsSync(log)); assert.equal(windows().length, 5); assert.deepEqual(sessions(), [parent]);
+  assert.ok(existsSync(log)); assert.equal(windows().length, 2); assert.equal(sessions().length, 5);
+  assert.equal(live(['has-session', '-t', worker.tmux_session]).status, 1);
   assert.equal(h.board.lifecycle.status().workers.length, 4);
   // Retained dead panes and already-removed panes both produce exactly one accurate notice.
-  await exit(workers[1].pane); tick(h.board, h.config, execute);
+  process.kill(Number(checked(['display-message', '-p', '-t', workers[1].pane, '#{pane_pid}'])), 'SIGKILL');
+  await eventually(() => checked(['display-message', '-p', '-t', workers[1].pane, '#{pane_dead}']) === '1');
+  tick(h.board, h.config, execute);
   checked(['kill-pane', '-t', workers[2].pane]); tick(h.board, h.config, execute);
   tick(h.board, h.config, execute); tick(h.board, h.config, execute);
-  assert.equal(windows().length, 5); assert.equal(h.board.lifecycle.status().workers.length, 6);
+  assert.equal(windows().length, 2); assert.equal(sessions().length, 5); assert.equal(h.board.lifecycle.status().workers.length, 6);
   for (const old of workers.slice(1)) {
     assert.equal(h.board.history({ limit: 100 }).posts.filter(p => p.text === `${old.sender} exited without a retirement message.`).length, 1);
     assert.equal(live(['display-message', '-p', '-t', old.pane, '#{pane_dead}']).stdout.trim(), '');
   }
-  // Remove the explicitly test-owned inspection window; waiting retains only controller.
-  checked(['kill-pane', '-t', inspection]);
+  // Keep inspection alive while removing controller: tmux destroys a session's last pane.
   checked(['select-window', '-t', h.board.lifecycle.status().workers.at(-1).pane]);
   checked(['kill-pane', '-t', controller]); await recover();
   controller = checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']);
-  assert.equal(windows().length, 4, 'vanished controller restored within existing parent');
+  checked(['kill-pane', '-t', inspection]);
+  assert.equal(windows().length, 1, 'vanished controller restored within existing parent');
   const current = h.board.lifecycle.status().workers.filter(w => !w.cleaned), peers = current.map(h.workerBoard);
   peers.forEach(p => p.lifecycle.ready());
   const request = peers[0].post('One waiting request / tree pointer');
   peers.forEach(p => p.lifecycle.vote(request, 'same request'));
   assert.equal(h.board.lifecycle.status().status, 'waiting');
   await exit(controller); await recover(); tick(h.board, h.config, execute);
-  assert.equal(h.board.lifecycle.status().status, 'waiting'); assert.equal(windows().length, 4);
+  assert.equal(h.board.lifecycle.status().status, 'waiting'); assert.equal(windows().length, 1);
   for (let i = 0; i < peers.length; i++) {
     peers[i].lifecycle.done('Waiting tree checkpoint'); peers[i].lifecycle.settled();
     tick(h.board, h.config, execute); // Live SAFE peer stays until real shell exit.
     await exit(current[i].pane); tick(h.board, h.config, execute);
   }
   tick(h.board, h.config, execute); assert.deepEqual(windows(), ['controller']);
+  assert.equal(sessions().length, 2, 'unanimity drains to parent plus unrelated session');
   assert.equal(h.board.lifecycle.status().workers.length, 6);
   await exit(controller); await recover(); assert.deepEqual(windows(), ['controller']);
   await main(['resume', '--run-dir', h.dir], {}, execute);
-  // A human stop starts while new-window is still inside the allocation transaction.
+  // A human stop starts while new-session is still inside the allocation transaction.
   // It may win between allocations, but every released shell must be registered.
   let stopper;
   const attempted = join(h.dir, 'stop-attempted');
   tick(h.board, h.config, args => {
-    if (args[0] === 'new-window' && !stopper) {
+    if (args[0] === 'new-session' && !stopper) {
       stopper = spawn(process.execPath, ['--input-type=module', '-e', `
         import { writeFileSync } from 'node:fs';
         import { openBoard } from ${JSON.stringify(new URL('./board.mjs', import.meta.url).href)};
@@ -289,7 +332,8 @@ test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waitin
   });
   const released = h.board.lifecycle.status().workers.filter(w => !w.cleaned);
   assert.ok(released.length >= 1 && released.length <= 3);
-  assert.equal(windows().length, released.length + 1);
+  assert.equal(windows().length, 1);
+  assert.equal(sessions().length, released.length + 2, 'every released child has one registered capacity row');
   tick(h.board, h.config, execute);
   assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, released.length);
   const stopping = h.board.lifecycle.status().workers.filter(w => !w.cleaned);
@@ -303,25 +347,70 @@ test('isolated real tmux: one parent, safe cleanup/replacement, recovery, waitin
   tick(h.board, h.config, execute); tick(h.board, h.config, execute);
   assert.equal(h.board.lifecycle.status().status, 'stopped');
   assert.ok(h.board.lifecycle.status().workers.every(w => w.cleaned));
-  assert.deepEqual(windows(), ['controller']); assert.equal(calls.filter(a => a[0] === 'new-session').length, 1);
+  assert.deepEqual(windows(), ['controller']); assert.equal(calls.filter(a => a[0] === 'new-session' && a.includes('controller')).length, 1);
   // Exercise the real controller's final drain path (no workers/model calls).
   await main(['run', '--run-dir', h.dir], { BF2_SWARM_CONTROLLER: '1' }, execute);
   assert.equal(checked(['show-options', '-w', '-v', '-t', controller, 'remain-on-exit']), 'off');
   checked(['send-keys', '-t', controller, 'exit', 'Enter']);
   await eventually(() => live(['has-session', '-t', target]).status !== 0);
-  assert.notEqual(live(['list-sessions']).status, 0, 'explicit stop leaves no parent or worker residue');
+  assert.deepEqual(sessions(), ['unrelated'], 'explicit stop leaves no parent or worker residue, preserves unrelated');
+  checked(['kill-session', '-t', unrelated]);
   // A new server can reuse %pane numbers: historical rows must not block fresh capacity.
-  await main(['resume', '--run-dir', h.dir], {}, execute); tick(h.board, h.config, execute);
-  assert.equal(windows().length, 4);
+  await main(['resume', '--run-dir', h.dir], {}, execute);
+  parent = target = h.board.lifecycle.status().tmux_parent;
+  tick(h.board, h.config, execute);
+  assert.equal(windows().length, 1); assert.equal(sessions().length, 4);
   assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, 3);
+  // Repeated clean retirements never accumulate terminal child sessions.
+  for (let i = 0; i < 3; i++) {
+    const w = h.board.lifecycle.status().workers.find(w => !w.cleaned);
+    await eventually(() => existsSync(join(h.dir, `${w.session}.booted`)));
+    const p = h.workerBoard(w); p.lifecycle.ready(); p.lifecycle.done('repeat checkpoint'); p.lifecycle.settled();
+    await exit(w.pane); tick(h.board, h.config, execute);
+    assert.equal(live(['has-session', '-t', w.tmux_session]).status, 1);
+    assert.equal(sessions().length, 4);
+  }
+  // Foreign windows and extra panes survive as roots, without trapping capacity.
+  const modified = h.board.lifecycle.status().workers.filter(w => !w.cleaned).slice(0, 2);
+  const foreign = [
+    checked(['new-window', '-d', '-P', '-F', '#{pane_id}', '-t', `${modified[0].tmux_session}:`, '-n', 'user-window', '/bin/sh']),
+    checked(['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', modified[1].pane, '/bin/sh']),
+  ];
+  for (let i = 0; i < modified.length; i++) {
+    const w = modified[i];
+    await eventually(() => existsSync(join(h.dir, `${w.session}.booted`)));
+    const p = h.workerBoard(w); p.lifecycle.ready(); p.lifecycle.done('modified child checkpoint'); p.lifecycle.settled();
+    await exit(w.pane); tick(h.board, h.config, execute); tick(h.board, h.config, execute);
+    assert.equal(checked(['display-message', '-p', '-t', foreign[i], '#{pane_dead}']), '0');
+    assert.equal(checked(['show-options', '-qv', '-t', w.tmux_session, '@pi_subagent_parent_id']), '');
+    assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, 3);
+    checked(['kill-pane', '-t', foreign[i]]); // Explicitly test-owned; production never kills it.
+    assert.equal(sessions().length, 4);
+  }
   h.board.lifecycle.stop();
-  for (const w of h.board.lifecycle.status().workers.filter(w => !w.cleaned)) await exit(w.pane);
+  for (const w of h.board.lifecycle.status().workers.filter(w => !w.cleaned)) {
+    await eventually(() => existsSync(join(h.dir, `${w.session}.booted`)));
+    await exit(w.pane);
+  }
   tick(h.board, h.config, execute);
   controller = checked(['show-options', '-v', '-t', parent, '@bf2_controller_pane']);
   await main(['run', '--run-dir', h.dir], { BF2_SWARM_CONTROLLER: '1' }, execute);
   checked(['send-keys', '-t', controller, 'exit', 'Enter']);
   await eventually(() => live(['has-session', '-t', target]).status !== 0);
   assert.notEqual(live(['list-sessions']).status, 0);
+});
+
+test('boot setup failure removes gated child before capacity release; parent loss never creates a second parent', async t => {
+  const h = fixture(t);
+  tick(h.board, h.config, args => args[0] === 'set-option' && args.at(-2) === '@pi_subagent_parent_id' ?
+    { status: 1, stderr: 'synthetic metadata failure' } : h.execute(args));
+  assert.equal(h.panes.size, 0);
+  assert.ok(h.board.lifecycle.status().workers.every(w => w.state === 'launch-failed' && w.cleaned));
+  assert.equal(h.calls.some(a => a[0] === 'wait-for'), false, 'failed metadata never releases a process');
+  tick(h.board, h.config, h.execute);
+  const before = h.calls.length;
+  await assert.rejects(main(['run', '--run-dir', h.dir], {}, args => args[0] === 'has-session' ? { status: 1 } : h.execute(args)), /undrained children.*second parent/);
+  assert.equal(h.calls.length, before);
 });
 
 test('first activation broadcasts one system join; repeated session_start and reconstruction never repost', async t => {
@@ -373,8 +462,8 @@ test('real compound bash done stores one handoff; replacement waits agent_settle
   assert.equal(readFileSync(join(h.dir, 'artifact'), 'utf8'), 'preserved');
   assert.equal(JSON.parse(readFileSync(join(h.dir, 'compound-status.json'), 'utf8')).workers[0].state, 'retiring');
   assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
-  const before = h.calls.filter(a => a[0] === 'new-window').length;
-  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-window').length, before);
+  const before = h.calls.filter(a => a[0] === 'new-session').length;
+  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
   await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.shuts(), 0);
   f.draining(true);
   f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
@@ -447,7 +536,7 @@ test('cleanup retry is idempotent, occupies capacity until removal, and never to
   const before = h.calls.length;
   assert.throws(() => tick(h.board, h.config, args => args[0] === 'display-message' ? { status: 1, stderr: 'health unavailable' } : h.execute(args)), /health unavailable/);
   assert.equal(h.board.lifecycle.status().workers.filter(w => !w.cleaned).length, 3, 'transport failure is not process death');
-  assert.throws(() => tick(h.board, h.config, args => args[0] === 'display-message' ? { status: 0, stdout: '1 unrelated-session' } : h.execute(args)), /outside.*owned parent/);
+  assert.throws(() => tick(h.board, h.config, args => args[0] === 'display-message' ? { status: 0, stdout: '1 unrelated-session' } : h.execute(args)), /outside.*owned child/);
   assert.equal(h.calls.length, before, 'no foreign cleanup or replacement');
 });
 
@@ -475,12 +564,12 @@ test('CLI votes need three current active IDs and same request; withdraw and rep
   assert.equal(h.board.lifecycle.status().request, first);
   assert.throws(() => peers[0].lifecycle.withdraw(), /running/);
   const recovered = openRun(h.dir); try { assert.equal(recovered.board.lifecycle.status().status, 'waiting'); } finally { recovered.board.close(); }
-  const before = h.calls.filter(a => a[0] === 'new-window').length;
+  const before = h.calls.filter(a => a[0] === 'new-session').length;
   for (const worker of [workers[0], workers[1], replacement]) {
     const peer = h.workerBoard(worker); peer.lifecycle.done('Waiting state recorded on tree'); peer.lifecycle.settled();
     h.panes.set(worker.pane, false);
   }
-  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-window').length, before);
+  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
   h.board.lifecycle.resume(); tick(h.board, h.config, h.execute);
   const state = h.board.lifecycle.status();
   assert.equal(state.status, 'running'); assert.equal(state.request, null);
@@ -579,7 +668,7 @@ test('real operator CLI preflight/start/status/stop/resume uses fake Pi/tmux onl
   const h = fixture(t), bin = join(h.dir, 'fake-bin'), log = join(h.dir, 'fake.log'), runDir = join(h.dir, 'new-run');
   mkdirSync(bin);
   writeFileSync(join(bin, 'pi'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['pi', ...process.argv.slice(2)]) + '\\n'); console.log('openai-codex-test gpt-6.1-sol fixture');\n`, { mode: 0o755 });
-  writeFileSync(join(bin, 'tmux'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['tmux', ...process.argv.slice(2)]) + '\\n'); if (process.argv[2] === 'has-session') process.exitCode = 1; if (process.argv[2] === 'new-session') console.log('%1');\n`, { mode: 0o755 });
+  writeFileSync(join(bin, 'tmux'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['tmux', ...process.argv.slice(2)]) + '\\n'); if (process.argv[2] === 'has-session') process.exitCode = 1; if (process.argv[2] === 'new-session') console.log('%1'); if (process.argv[2] === 'display-message') console.log('$0');\n`, { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, PI_CODING_AGENT_DIR: h.settings.agentDir };
   const run = (...args) => spawnSync(resolve('bin/bf2-swarm'), args, { env, encoding: 'utf8' });
   const start = ['start', '--cwd', h.settings.cwd, '--root', root, '--instructions', instructions, '--provider', h.settings.provider, '--run-dir', runDir];
