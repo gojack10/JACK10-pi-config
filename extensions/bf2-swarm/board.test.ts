@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync, existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+const fixtureRoot = join(homedir(), '.local/state/bf2-room-tests');
+mkdirSync(fixtureRoot, { recursive: true });
 import { join, resolve } from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -10,7 +12,7 @@ import { main } from './cli.mjs';
 
 const executable = resolve('bin/board');
 function fixture(t) {
-  const dir = mkdtempSync(join(tmpdir(), 'bf2-board-'));
+  const dir = mkdtempSync(join(fixtureRoot, 'bf2-board-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const env = { ...process.env, BF2_BOARD_DB: join(dir, 'board.sqlite'), BF2_BOARD_RUN: 'test-run',
     BF2_BOARD_SESSION: 'session-a', BF2_BOARD_SENDER: 'aaaaaaaa' };
