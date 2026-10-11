@@ -150,7 +150,7 @@ test('single global OSS lease: move waits for real exit and cleanup across floor
   selectOssFloor(null, { root: h.root }); assert.ok(two.snapshot().workers.find(w => w.session === lease.session).retire_requested);
 });
 
-test('required launch-text gate, per-occupant advisory threshold and known JSONL failure locators', async t => {
+test('required launch-text gate, per-occupant context-stop threshold and known JSONL failure locators', async t => {
   const h = fixture(t), unapproved = h.create('two', { bootstrap: null });
   assert.throws(() => unapproved.command('start', 'start'), /launch settings: bootstrap/); assert.equal(unapproved.snapshot().status, 'stopped');
   unapproved.command('preapproval-message', 'message', 'Fixture owner input before approval');
@@ -171,6 +171,7 @@ test('required launch-text gate, per-occupant advisory threshold and known JSONL
   for (const value of [undefined, NaN, 59]) { percent = value; await handlers.get('turn_end')({}, ctx); }
   percent = 60; await handlers.get('turn_end')({}, ctx); await handlers.get('turn_end')({}, ctx);
   assert.deepEqual(sent, ['Fixture warning 60']); assert.equal(shutdown, 0);
+  assert.equal(floor.snapshot().workers[0].retire_requested, 'context threshold');
   assert.equal(floor.snapshot().workers[0].session_file, path); assert.equal(floor.snapshot().workers[0].context_percent, 60);
   handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'Fixture retryable error' } }, ctx);
   handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'stop' } }, ctx);
