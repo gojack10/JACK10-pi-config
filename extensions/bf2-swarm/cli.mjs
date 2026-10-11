@@ -5,12 +5,14 @@ export const HELP = `board — opt-in, one-run broadcast board (Node 24; no mode
 
 Usage:
   board post 'text'                  Persist an attributed numbered post
-  board read                        Startup: latest 30, chronological; then history
+  board read                        Startup: latest 30 plus retained owner wake
   board read --limit 100             History only (1-100)
   board read --before 42 --limit 30  Older history only; exclusive post number
   board done 'handoff'              Post once and request safe retirement
-  board vote 42 'reason / node'     Vote for that committed waiting request
-  board vote --withdraw            Revoke your vote while running
+  board pause KEY 'reason'         Request pause for factory owner, proposer yes
+  board vote NUMBER yes|no         Cast one immutable ballot on that pause
+                                  One no cancels; three yes wait; no timeout
+                                  KEY is your stable retry key for this intent
   board -h | --help                 Help, without opening a database
 
 Launch configuration (required, inherited by CLI and Pi):
@@ -32,7 +34,10 @@ input using steer. History options never consume pending pushes. If confused,
 use board -h. Durable progress belongs on the tree; transient coordination here.
 Posts are broadcasts, not commands, routed messages or ACKs. Experimental done
 and vote require registered active sessions; done is NOT an immediate process kill.
-Three CURRENT peers voting for ONE request enter waiting (not BF2 success).
+Only agents propose/vote. One open pause, three fixed current active peers.
+No capacity-gap votes, withdrawals, reason edits or generic polls. Repeating a
+KEY/reason or the same ballot returns its stored result without another post.
+Voter retirement/departure cancels an incomplete pause. Waiting is not BF2 success.
 For operator start/status/stop/resume controls, use bf2-swarm -h.
 Admission != persisted USER input != model comprehension. See
 extensions/bf2-swarm/README.md for restart, duplicate, and crash boundaries.
@@ -40,16 +45,16 @@ extensions/bf2-swarm/README.md for restart, duplicate, and crash boundaries.
 
 export async function main(args = process.argv.slice(2), env = process.env, output = process.stdout) {
   const { values, positionals } = parseArgs({ args, allowPositionals: true,
-    options: { help: { type: 'boolean', short: 'h' }, limit: { type: 'string' }, before: { type: 'string' }, withdraw: { type: 'boolean' } } });
+    options: { help: { type: 'boolean', short: 'h' }, limit: { type: 'string' }, before: { type: 'string' } } });
   const print = text => new Promise((resolve, reject) => output.write(text + '\n', error => error ? reject(error) : resolve()));
   if (values.help) { await print(HELP); return; }
   const [command, ...rest] = positionals;
-  if (!['post', 'read', 'done', 'vote'].includes(command)) throw new Error('expected post, read, done or vote; use board -h');
+  if (!['post', 'read', 'done', 'pause', 'vote'].includes(command)) throw new Error('expected post, read, done, pause or vote; use board -h');
   if (command !== 'read' && (values.limit !== undefined || values.before !== undefined)) throw new Error('history options require read');
-  if (command !== 'vote' && values.withdraw) throw new Error('--withdraw requires vote');
   if (['post', 'done'].includes(command) && rest.length !== 1) throw new Error(`usage: board ${command} 'text'`);
   if (command === 'read' && rest.length) throw new Error('usage: board read [--limit 1-100] [--before NUMBER]');
-  if (command === 'vote' && (values.withdraw ? rest.length !== 0 : rest.length !== 2)) throw new Error("usage: board vote NUMBER 'reason / node' | board vote --withdraw");
+  if (command === 'pause' && rest.length !== 2) throw new Error("usage: board pause KEY 'reason'");
+  if (command === 'vote' && (rest.length !== 2 || !['yes','no'].includes(rest[1]))) throw new Error('usage: board vote NUMBER yes|no');
   const integer = value => {
     if (!/^\d+$/.test(value)) throw new Error('history options require positive integers');
     return Number(value);
@@ -63,13 +68,14 @@ export async function main(args = process.argv.slice(2), env = process.env, outp
       const number = command === 'done' ? board.lifecycle.done(rest[0]) : board.post(rest[0]);
       await print(`#${number} ${config.sender}${command === 'done' ? ' retirement requested (safe settlement pending)' : ''}`); return;
     }
-    if (command === 'vote') {
-      if (values.withdraw) { board.lifecycle.withdraw(); await print('vote withdrawn'); }
-      else await print(`run ${board.lifecycle.vote(integer(rest[0]), rest[1])}`);
-      return;
+    if (command === 'vote' || command === 'pause') {
+      const vote = command === 'pause' ? board.lifecycle.pause(rest[0], rest[1]) : board.lifecycle.vote(integer(rest[0]), rest[1]);
+      await print(`pause #${vote.number} ${vote.result}`); return;
     }
     const snapshot = board.history(options);
-    await print(formatPosts(config.run, snapshot.posts));
-    if (snapshot.startup && values.limit === undefined && values.before === undefined) board.finishStartup(snapshot.highwater);
+    const posts = snapshot.startup && values.limit === undefined && values.before === undefined ?
+      [...new Map([...snapshot.wake, ...snapshot.posts].map(p => [p.number,p])).values()].sort((a,b) => a.number-b.number) : snapshot.posts;
+    await print(formatPosts(config.run, posts));
+    if (snapshot.startup && values.limit === undefined && values.before === undefined) board.finishStartup(snapshot.highwater, snapshot.wake[0]?.number ?? null);
   } finally { board.close(); }
 }

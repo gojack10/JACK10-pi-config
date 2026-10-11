@@ -115,7 +115,7 @@ export function tick(board, config, execute = tmux, env = process.env) {
     // Release capacity only after the child is removed (or user-owned panes detached).
     board.lifecycle.cleaned(worker.session);
   }
-  state = board.lifecycle.status();
+  state = board.lifecycle.advanceDrain();
   if (state.status !== 'running') return state;
   validateLaunch(state.config, { ...env, PI_CODING_AGENT_DIR: state.config.agentDir });
   checked(execute, ['has-session', '-t', parent]);
@@ -164,7 +164,11 @@ export const HELP = `bf2-swarm — separate opt-in three-peer experiment, no dis
   bf2-swarm stop --run-dir /durable/run       Deliberate no-respawn; workers wrap up
   bf2-swarm resume --run-dir /durable/run     After old workers drain; clear votes
   bf2-swarm run --run-dir /durable/run        Recover controller in owned parent
+  bf2-swarm room --run-dir /durable/run       Reopen the persistent localhost room
+  bf2-swarm room-close --run-dir /durable/run Close room service only
   bf2-swarm -h
+Start opens Chrome once; --no-open starts service without opening a browser.
+Room survives controller stop; room reopens it without starting peers.
 Start defaults run dir to ~/.local/state/bf2-swarm/<new UUID>. Cwd may use BF2_REPO.
 Uses gpt-6.1-sol/high and your explicit authorized Codex provider. Preflight is
 --offline --list-models, never a model call. Requires native all/all settings.
@@ -207,15 +211,21 @@ function startController(config, settings, execute, env, savedParent, occupied =
   checked(execute, ['set-option', '-t', parent, '@bf2_controller_pane', launched]);
   return parent;
 }
+export function ensureController(board, config, execute = tmux, env = process.env) {
+  return board.lifecycle.controllerSetup(parent => {
+    const state = board.lifecycle.status();
+    return startController(config, state.config, execute, env, parent, state.workers.some(w => !w.cleaned));
+  });
+}
 export async function main(args = process.argv.slice(2), env = process.env, execute = tmux) {
   const { values, positionals } = parseArgs({ args, allowPositionals: true, options: {
-    help: { type: 'boolean', short: 'h' }, 'run-dir': { type: 'string' }, cwd: { type: 'string' },
+    help: { type: 'boolean', short: 'h' }, 'no-open': { type: 'boolean' }, 'run-dir': { type: 'string' }, cwd: { type: 'string' },
     root: { type: 'string' }, instructions: { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' }, thinking: { type: 'string' },
   } });
   if (values.help) { console.log(HELP); return; }
   const [command] = positionals;
-  if (positionals.length !== 1 || !['start', 'status', 'stop', 'resume', 'run'].includes(command)) throw new Error('expected start/status/stop/resume; use bf2-swarm -h');
-  if (command !== 'start' && Object.keys(values).some(k => !['run-dir', 'help'].includes(k))) throw new Error('launch options require start');
+  if (positionals.length !== 1 || !['start', 'status', 'stop', 'resume', 'run', 'room', 'room-close'].includes(command)) throw new Error('expected start/status/stop/resume; use bf2-swarm -h');
+  if (command !== 'start' && Object.keys(values).some(k => !['run-dir', 'help', ...(command === 'room' ? ['no-open'] : [])].includes(k))) throw new Error('launch options require start');
   let runDir = values['run-dir'];
   if (command === 'start') {
     const settings = validateLaunch(values, env);
@@ -234,19 +244,24 @@ export async function main(args = process.argv.slice(2), env = process.env, exec
       const pane = board.lifecycle.controllerSetup(parent => startController(config, settings, execute, env, parent));
       console.log(`Run ${runDir}\nController: tmux attach -t ${pane}\nExperiment node: ${settings.instructions}`);
     } finally { board.close(); }
+    const { ensureRoom } = await import('./room.mjs');
+    await ensureRoom(runDir, !values['no-open']);
+    return;
+  }
+  if (command === 'room' || command === 'room-close') {
+    const { ensureRoom, closeRoom } = await import('./room.mjs');
+    if (command === 'room') await ensureRoom(runDir, !values['no-open']);
+    else await closeRoom(runDir);
     return;
   }
   const { config, board } = openRun(runDir);
   try {
-    const controller = () => board.lifecycle.controllerSetup(parent => {
-      const state = board.lifecycle.status();
-      return startController(config, state.config, execute, env, parent, state.workers.some(w => !w.cleaned));
-    });
+    const controller = () => ensureController(board, config, execute, env);
     if (command === 'status') { console.log(JSON.stringify(board.lifecycle.status(), null, 2)); return; }
     if (command === 'stop') {
       board.lifecycle.stop();
       controller();
-      console.log('stopped; no replacements; workers finish safely; parent exits after drain'); return;
+      console.log('stop requested; no replacements; workers finish safely; stopped only after actual cleanup'); return;
     }
     if (command === 'resume') {
       const settings = board.lifecycle.status().config;

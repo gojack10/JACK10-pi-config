@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="darkreader-lock">
+<title>Factory room | SiftText</title>
+<link rel="stylesheet" href="colors_and_type.css">
+<style>
+*{box-sizing:border-box;border-radius:0}
+body{margin:0;height:100dvh;display:flex;flex-direction:column;background:var(--bg-deep);color:var(--fg1);font:300 13px/1.7 var(--font-mono)}
+button,textarea,select{font:inherit;color:inherit}button,select{cursor:pointer}button{background:var(--bg2);border:1px solid var(--accent);padding:7px 13px;font-size:12px}button:hover{background:var(--bg3);border-color:var(--focus)}button:disabled{opacity:.45;cursor:default}button:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+h1,h2,h3,p{margin:0}h1{font-size:15px;font-weight:500;color:var(--fg0)}h2{font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:500;color:var(--fg2)}h3{font-size:13px;font-weight:500;color:var(--fg0)}[hidden]{display:none!important}
+.jack{color:#c9a86a!important;font-style:italic;font-weight:400}.muted{color:var(--fg2)}
+.room{width:100%;max-width:1480px;margin:0 auto;flex:1;min-height:0;display:flex;flex-direction:column;background:var(--bg0);border-inline:1px solid #282828}
+.room-header{padding:20px 28px;background:var(--bg1);border-bottom:1px solid var(--accent);display:flex;align-items:center;justify-content:space-between;gap:20px;flex:none}.heading{display:flex;align-items:baseline;gap:18px}.brand{font-size:12px;color:var(--fg2)}.controls{display:flex;align-items:center;gap:22px}.status{font-size:11px;color:var(--fg2)}.status[data-state="running"]{color:var(--success)}.status[data-state="waiting"]{color:var(--warning)}
+.room-body{display:grid;grid-template-columns:minmax(0,1fr) 290px;flex:1;min-height:0}.conversation{display:flex;flex-direction:column;min-height:0;min-width:0;position:relative}.transcript{overflow-y:auto;min-height:0;flex:1;padding:28px 32px;scrollbar-width:thin;scrollbar-color:var(--accent) var(--bg0)}
+.avatar{height:34px;width:34px;display:inline-flex;flex:none;align-items:center;background:#252525;color:#9a9a9a;border:1px solid #414141}.avatar svg{height:100%;width:100%}.avatar.owner{color:#b9ac91}
+.message{display:grid;grid-template-columns:34px minmax(0,1fr);gap:13px;margin-bottom:24px}.message-header{display:flex;align-items:baseline;gap:12px;margin-bottom:4px}.name{font-size:12px;font-weight:500;color:var(--fg0)}time{font-size:10px;color:var(--fg2);margin-left:auto;white-space:nowrap}.body{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.8}.mention{border:0;padding:0;background:none;color:#a9bbce;font:inherit;line-height:inherit}.mention:hover{background:none;color:var(--fg0);text-decoration:underline}.body code{font:inherit;background:var(--bg2);padding:0 3px}.event{display:flex;align-items:baseline;gap:12px;margin:0 0 21px 47px;color:var(--fg2);font-size:11px}.event .mention{color:var(--fg1)}.event span{overflow-wrap:anywhere;white-space:pre-wrap}.reason{white-space:pre-wrap}
+.composer{flex:none;padding:20px 32px;border-top:1px solid var(--accent);background:var(--bg1)}.compose-row{display:flex;gap:10px;align-items:stretch}.compose-row textarea{flex:1;min-width:0;resize:none;min-height:48px;background:var(--bg0);border:1px solid var(--accent);padding:11px 14px;line-height:1.7;font-size:13px}.compose-row textarea::placeholder{color:var(--fg2)}.compose-row button{min-width:72px}
+.sidebar{border-left:1px solid var(--accent);background:var(--bg1);padding:26px 24px;display:flex;flex-direction:column;gap:28px;min-width:0}.members{display:flex;flex-direction:column;gap:15px;margin-top:17px}.member{display:flex;gap:11px;align-items:center;min-width:0}.member .avatar{width:30px;height:30px}.member .name{font-size:12px}.member .role{font-size:10px;color:var(--fg2);line-height:1.5}.request{border-top:1px solid var(--accent);padding-top:22px}.request h2{margin-bottom:12px;color:var(--warning)}.request h3{margin-bottom:8px}.reason{font-size:12px;line-height:1.75;margin-bottom:10px}.called-by{font-size:10px;color:var(--fg2);margin-bottom:17px}.ballots{display:flex;flex-direction:column;gap:8px}.ballot{display:flex;justify-content:space-between;gap:12px;font-size:11px}.ballot .answer{color:var(--success)}.ballot .pending{color:var(--fg2)}.vote-footer{display:flex;justify-content:space-between;gap:10px;font-size:10px;color:var(--fg2);margin-top:15px}.new-messages{position:absolute;bottom:104px;left:50%;transform:translateX(-50%);background:var(--bg3)}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+@media(max-width:1000px){.room-body{grid-template-columns:minmax(0,1fr) 250px}.sidebar{padding:20px}.transcript{padding:24px}.composer{padding:16px 24px}.room-header{padding:16px 24px}.heading{gap:12px}.controls{gap:12px}}
+@media(max-width:700px){.room-header{padding:12px 14px;gap:10px}.heading{display:block}.brand{font-size:10px}h1{font-size:12px}.controls{gap:9px}.controls button{padding:6px 8px;font-size:11px}.status{font-size:10px}.room-body{display:flex;flex-direction:column}.sidebar{order:-1;flex:none;display:block;border-left:0;border-bottom:1px solid var(--accent);padding:12px 14px}.members{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:9px}.member{display:block}.member .avatar{display:none}.member .name{font-size:10px}.member .role{font-size:8px}.request{margin-top:12px;padding-top:12px}.request h2{margin-bottom:5px}.request h3{font-size:12px;margin-bottom:4px}.reason{font-size:11px;line-height:1.5;margin-bottom:5px}.called-by{font-size:9px;margin-bottom:7px}.ballots{flex-direction:row;gap:12px;flex-wrap:wrap}.ballot{font-size:9px;gap:5px}.vote-footer{font-size:9px;margin-top:6px}.conversation{flex:1}.transcript{padding:18px 14px}.message{grid-template-columns:28px minmax(0,1fr);gap:10px;margin-bottom:19px}.message>.avatar{width:28px;height:28px}.message .body{font-size:12px}.event{margin-left:38px;font-size:10px}.composer{padding:12px 14px}.compose-row textarea{font-size:12px}.new-messages{bottom:86px}}
+</style>
+</head>
+<body>
+<main class="room">
+  <header class="room-header"><div class="heading"><span class="brand">SiftText</span><h1>BF2 factory room</h1></div><div class="controls"><span class="status" id="status" role="status">connecting</span><button id="factory-control" type="button" disabled>stop factory</button></div></header>
+  <div class="room-body">
+    <section class="conversation" aria-label="Conversation">
+      <div id="transcript" class="transcript" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text" tabindex="0"></div>
+      <button id="new-messages" class="new-messages" hidden type="button">new messages</button>
+      <form id="composer" class="composer"><div class="compose-row"><label class="sr-only" for="message">Message the room</label><textarea id="message" rows="1" maxlength="16384" placeholder="Message the room"></textarea><button id="send" type="submit" disabled>send</button></div></form>
+    </section>
+    <aside class="sidebar" aria-label="Room members and current vote"><section><h2>In this room</h2><div id="members" class="members"></div></section><section id="request" class="request" hidden aria-label="Current pause request"></section></aside>
+  </div>
+</main>
+<script type="module" src="room.js"></script>
+</body>
+</html>

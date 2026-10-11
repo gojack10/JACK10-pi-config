@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+const fixtureRoot = join(homedir(), '.local/state/bf2-room-tests');
+mkdirSync(fixtureRoot, { recursive: true });
 import { join } from 'node:path';
 import { configuration, openBoard, BATCH_LIMIT } from './board.mjs';
 import { receiver, installReceiver } from './receiver.mjs';
@@ -19,7 +21,7 @@ function loadExtension(pi, env) {
 }
 
 function fixture(t) {
-  const dir = mkdtempSync(join(tmpdir(), 'bf2-receiver-'));
+  const dir = mkdtempSync(join(fixtureRoot, 'bf2-receiver-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const env = { BF2_BOARD_DB: join(dir, 'board.sqlite'), BF2_BOARD_RUN: 'test-run',
     BF2_BOARD_SESSION: 'session-a', BF2_BOARD_SENDER: 'aaaaaaaa' };
