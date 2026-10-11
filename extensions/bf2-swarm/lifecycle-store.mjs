@@ -3,12 +3,14 @@ import { randomBytes } from 'node:crypto';
 
 export function lifecycleStore(db, transaction, config, insertPost) {
   const exists = () => !!db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get();
+  const floor = () => db.prepare("SELECT name FROM sqlite_master WHERE name='floor_settings'").get() ?
+    JSON.parse(db.prepare('SELECT settings FROM floor_settings').get().settings) : null;
   const getVote = row => row && { ...row, electorate: JSON.parse(row.electorate) };
   const openVote = () => getVote(db.prepare("SELECT * FROM swarm_votes WHERE result='open'").get());
   const status = () => {
     if (!exists()) throw new Error('this board has no experimental lifecycle');
     const run = db.prepare('SELECT * FROM swarm_run').get();
-    return { ...run, config: JSON.parse(run.config), vote: openVote(), workers: db.prepare('SELECT * FROM swarm_workers ORDER BY rowid').all() };
+    return { ...run, config: JSON.parse(run.config), floor: floor(), vote: openVote(), workers: db.prepare('SELECT * FROM swarm_workers ORDER BY rowid').all().map(w => ({ ...w, ...(w.launch_config ? { launch_config: JSON.parse(w.launch_config) } : {}) })) };
   };
   const worker = () => {
     status();
@@ -22,6 +24,17 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     db.prepare('UPDATE swarm_votes SET result=? WHERE number=? AND result=\'open\'').run(result, vote.number);
     system(`Pause request #${vote.number}: ${JSON.stringify(vote.reason)}. ${text}`);
   };
+  const ownerBallot = () => {
+    const settings = floor();
+    if (!settings || openVote()) return openVote();
+    const run = status(), peers = run.workers.filter(w => !w.cleaned);
+    if (run.status !== 'running' || peers.length !== settings.slots.length || peers.some(w => w.state !== 'active' || w.retire_requested) ||
+      settings.slots.some(s => !peers.some(w => w.slot === s.id))) return;
+    const number = system(`Owner ballot: ${settings.voteCondition}`);
+    db.prepare("INSERT INTO swarm_votes VALUES (?,?,?,?,?,'open')").run(number, 'controller', `round-${number}`, settings.voteCondition,
+      JSON.stringify(peers.map(w => ({ session: w.session, sender: w.sender, answer: null }))));
+    return openVote();
+  };
   const cancelDeparture = session => {
     const vote = openVote();
     if (vote?.electorate.some(v => v.session === session)) closeVote(vote, 'cancelled', 'Electorate changed, work continues');
@@ -29,6 +42,8 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   const queuedStart = () => {
     const run = status();
     if (run.status === 'running') return;
+    const settings = floor();
+    if (settings && (!settings.bootstrap || !settings.warningText || !settings.wrapupText)) throw new Error('floor start requires owner-approved bootstrap, warningText and wrapupText');
     db.prepare('UPDATE swarm_run SET reconvene=1').run();
     if (!run.workers.some(w => !w.cleaned)) advanceDrain();
   };
@@ -72,18 +87,26 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         db.prepare("INSERT INTO swarm_run(id,status,config,room_token) VALUES (1,'running',?,?)").run(JSON.stringify(settings), randomBytes(32).toString('hex'));
       });
     },
-    addWorker(session, sender, pane, launch) {
+    addWorker(session, sender, pane, launch, allocation = {}) {
       return transaction(() => {
         if (status().status !== 'running') return false;
-        if (db.prepare('SELECT COUNT(*) AS n FROM swarm_workers WHERE cleaned=0').get().n >= 3) return false;
+        const settings = floor();
+        if (db.prepare('SELECT COUNT(*) AS n FROM swarm_workers WHERE cleaned=0').get().n >= (settings?.slots.length ?? 3)) return false;
+        const slot = settings?.slots.find(s => s.id === allocation.slot);
+        if (settings && (!slot || db.prepare('SELECT session FROM swarm_workers WHERE slot=? AND cleaned=0').get(allocation.slot) ||
+          Object.keys(slot).some(k => slot[k] !== allocation.launchConfig?.[k]))) return false;
+        const vote = openVote();
+        if (vote) closeVote(vote, 'cancelled', 'Electorate changed, work continues');
         db.prepare('INSERT INTO board_sessions(session,sender) VALUES (?,?)').run(session, sender);
-        db.prepare("INSERT INTO swarm_workers(session,sender,pane,state) VALUES (?,?,?,'launching')").run(session, sender, pane);
+        if (settings) db.prepare("INSERT INTO swarm_workers(session,sender,pane,state,slot,launch_config) VALUES (?,?,?,'launching',?,?)").run(session, sender, pane, allocation.slot, JSON.stringify(allocation.launchConfig));
+        else db.prepare("INSERT INTO swarm_workers(session,sender,pane,state) VALUES (?,?,?,'launching')").run(session, sender, pane);
         // Synchronous tmux setup, never agent work inside this transaction.
         if (launch) {
           try { launch(receipt => db.prepare('UPDATE swarm_workers SET pane=?, tmux_session=? WHERE session=?').run(receipt.pane, receipt.session, session)); }
           catch (error) {
             db.prepare("UPDATE swarm_workers SET state='launch-failed', cleaned=? WHERE session=?").run(error.ownedChild ? 0 : 1, session);
-            system(`${sender} launch failed: ${String(error.message).slice(0, 1000)}. Retrying after ordinary delay.`);
+            system(settings ? `${sender} launch failed: ${String(error.message).slice(0, 1000)}. Session ID: ${session}; JSONL not registered (Pi startup not established). Replacement waits for actual cleanup.` :
+              `${sender} launch failed: ${String(error.message).slice(0, 1000)}. Retrying after ordinary delay.`);
           }
         }
         return true;
@@ -94,6 +117,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const changed = db.prepare("UPDATE swarm_workers SET state='active' WHERE session=? AND state='launching'").run(config.session).changes;
         if (changed) system(`${config.sender} joined`);
         else if (worker().state !== 'active') throw new Error('worker is not launchable');
+        ownerBallot();
       });
     },
     done(text) {
@@ -123,12 +147,19 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     acceptsInput() {
       if (!exists()) return true;
       const run = status();
-      return run.status === 'running' && run.workers.some(w => w.session === config.session && w.state === 'active');
+      return run.status === 'running' && run.workers.some(w => w.session === config.session && w.state === 'active' && !w.retire_requested);
     },
     pause(key, reason) {
       return transaction(() => {
         keyCheck(key);
         const run = status();
+        if (run.floor) {
+          worker();
+          if (reason !== run.floor.voteCondition) throw new Error('only the owner may configure the floor ballot condition');
+          const vote = ownerBallot();
+          if (!vote) throw new Error('ballot requires all configured current active peers, no capacity gaps');
+          return vote;
+        }
         const prior = getVote(db.prepare('SELECT * FROM swarm_votes WHERE proposer=? AND key=?').get(config.session, key));
         if (prior) {
           if (prior.reason !== reason) throw new Error('request key already has an immutable reason');
@@ -165,7 +196,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         system(`${config.sender} voted ${answer} on pause request #${number}`);
         if (answer === 'no') closeVote(vote, 'rejected', 'One no, work continues');
         else if (vote.electorate.every(v => v.answer === 'yes')) {
-          closeVote(vote, 'agreed', 'Three yes, waiting for JACK');
+          closeVote(vote, 'agreed', floor() ? 'Unanimous yes, waiting for JACK' : 'Three yes, waiting for JACK');
           db.prepare("UPDATE swarm_run SET status='waiting', request=?, reconvene=0, wake_from=NULL").run(number);
         }
         return getVote(db.prepare('SELECT * FROM swarm_votes WHERE number=?').get(number));
@@ -178,7 +209,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const prior = db.prepare('SELECT * FROM swarm_commands WHERE key=?').get(key);
         if (prior) {
           if (prior.action !== action || prior.text !== text) throw new Error('command key already used with different input');
-          return prior;
+          return { ...prior };
         }
         const run = status();
         let number = null;
@@ -186,7 +217,10 @@ export function lifecycleStore(db, transaction, config, insertPost) {
           number = insertPost(text, 'owner', 'JACK', 'owner');
           if (run.status !== 'running') {
             db.prepare('UPDATE swarm_run SET wake_from=COALESCE(wake_from,?)').run(number);
-            queuedStart();
+            const settings = floor();
+            // Owner input is durable even before new-floor prompt approval; it
+            // cannot bypass that launch gate and is delivered after explicit start.
+            if (!settings || (settings.bootstrap && settings.warningText && settings.wrapupText)) queuedStart();
           }
         } else if (action === 'start') queuedStart();
         else stop();
@@ -199,11 +233,60 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const row = db.prepare('SELECT * FROM swarm_workers WHERE session=?').get(session);
         if (!row || !['launching','active','retiring'].includes(row.state)) return;
         cancelDeparture(session);
-        const state = launchError ? 'launch-failed' : row.handoff === null ? 'exited' : 'exited-with-handoff';
+        const state = launchError ? (floor() && row.state !== 'launching' ? 'exited-with-error' : 'launch-failed') : row.handoff === null ? 'exited' : 'exited-with-handoff';
         db.prepare('UPDATE swarm_workers SET state=? WHERE session=?').run(state, session);
+        if (floor()) {
+          system(`${row.sender} ${launchError ? `${row.state === 'launching' ? 'launch failed' : 'failed'}: ${String(launchError).slice(0, 1000)}` : `exited (${state})`}. Session: ${row.session_file ?? 'JSONL not registered; Pi may not have started'}; session ID: ${row.session}. Replacement ${status().status === 'running' ? 'pending after actual cleanup' : 'disabled while floor is not running'}.`);
+          return;
+        }
         system(launchError ? `${row.sender} launch failed: ${launchError}. Retrying after ordinary delay.` :
           row.handoff === null ? `${row.sender} exited without a retirement message.` :
             `${row.sender} exited after handoff #${row.handoff}, without safe settlement evidence.`);
+      });
+    },
+    recordUsage(percent) {
+      if (!floor()) return;
+      db.prepare('UPDATE swarm_workers SET context_percent=? WHERE session=?').run(typeof percent === 'number' && Number.isFinite(percent) ? percent : null, config.session);
+    },
+    recordError(error) {
+      if (!floor()) return;
+      transaction(() => {
+        const row = status().workers.find(w => w.session === config.session), known = error ? String(error).slice(0, 1000) : null;
+        if (!row || row.last_error === known) return;
+        db.prepare('UPDATE swarm_workers SET last_error=? WHERE session=?').run(known, config.session);
+        if (known) system(`${row.sender} reported an assistant error: ${known}. Session: ${row.session_file ?? 'JSONL not registered'}; session ID: ${row.session}. Recovery/exit not yet established.`);
+      });
+    },
+    registerSessionFile(path) {
+      if (typeof path !== 'string' || !path.startsWith('/') || /[\0\n\r]/.test(path)) throw new Error('session JSONL must be an absolute path');
+      if (!floor()) return; // Legacy schema and prompts remain compatible.
+      const row = status().workers.find(w => w.session === config.session && ['launching','active','retiring'].includes(w.state));
+      if (!row) throw new Error('JSONL locator requires a registered worker');
+      if (row.session_file && row.session_file !== path) throw new Error('worker JSONL locator is immutable');
+      db.prepare('UPDATE swarm_workers SET session_file=? WHERE session=?').run(path, config.session);
+    },
+    requestRetirement(session, reason) {
+      controller();
+      return transaction(() => {
+        if (!floor()) throw new Error('slot retirement requires a floor');
+        cancelDeparture(session);
+        return db.prepare("UPDATE swarm_workers SET retire_requested=COALESCE(retire_requested,?) WHERE session=? AND cleaned=0").run(reason, session).changes > 0;
+      });
+    },
+    configureFloor(settings, launchSettings) {
+      controller();
+      return transaction(() => {
+        if (!floor()) throw new Error('not a floor');
+        const old = floor(), vote = openVote();
+        if (vote && (old.voteCondition !== settings.voteCondition || JSON.stringify(old.slots.map(s => s.id).sort()) !== JSON.stringify(settings.slots.map(s => s.id).sort()))) closeVote(vote, 'cancelled', 'Owner condition or configured membership changed; old votes invalidated');
+        db.prepare('UPDATE floor_settings SET settings=?').run(JSON.stringify(settings));
+        db.prepare('UPDATE swarm_run SET config=?').run(JSON.stringify(launchSettings));
+        for (const w of status().workers.filter(w => !w.cleaned && !settings.slots.some(s => s.id === w.slot))) {
+          db.prepare('UPDATE swarm_workers SET retire_requested=COALESCE(retire_requested,?) WHERE session=?').run('slot removed', w.session);
+        }
+        if (old.voteCondition !== settings.voteCondition) system(`Owner changed ballot condition: ${settings.voteCondition}. Old votes invalidated.`);
+        ownerBallot();
+        return floor();
       });
     },
     controllerSetup(launch) {
