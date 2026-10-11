@@ -18,6 +18,9 @@ export function ensureFloorController(floor, execute = tmux, env = process.env) 
   return ensureController(floor.board, floor.config, execute, env);
 }
 export function tickFloor(floor, execute = tmux, env = process.env) {
+  // Independent-job observation cannot hold worker cleanup/replacement hostage.
+  try { floor.board.jobs.observe(); }
+  catch (error) { console.error(`Factory job observation unavailable: ${error.message}; receipts/effects remain uncertain`); }
   // Reconcile only proven cleanup, including a crash between cleanup and lease release.
   const lease = ossStatus({ root: floor.root });
   if (lease.floor === floor.id) {

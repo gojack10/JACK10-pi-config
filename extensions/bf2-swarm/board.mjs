@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { lifecycleStore } from './lifecycle-store.mjs';
+import { jobStore } from './jobs.mjs';
 
 export const HISTORY_LIMIT = 30;
 export const BATCH_LIMIT = 100;
@@ -40,7 +41,7 @@ export function openBoard(config) {
     db.exec('PRAGMA busy_timeout=5000');
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings', 'floor_retirement_input'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings', 'factory_jobs', 'floor_retirement_input'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
     if (config.floor && (!tables.some(t => t.name === 'floor_settings') || db.prepare('SELECT id FROM floor_settings').get()?.id !== config.floor)) throw new Error('database belongs to another floor');
     if (tables.some(t => t.name === 'board_run') && db.prepare('SELECT run FROM board_run').get()?.run !== config.run) throw new Error('database belongs to another run');
     if (tables.some(t => t.name === 'swarm_run') && !db.prepare('PRAGMA table_info(swarm_run)').all().some(c => c.name === 'room_token')) throw new Error('legacy swarm format; use its original code for history and start a fresh room run');
@@ -102,13 +103,16 @@ export function openBoard(config) {
     const key = randomUUID();
     return { key, through: posts.at(-1).number, text: `BF2 board batch ${key}\n${formatPosts(config.run, posts)}`, ...extra };
   };
-  const wakingBatch = (after, until) => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE role='owner' AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT), { wakeUntil: until });
+  const jobs = jobStore(db, transaction, config, insertPost);
+  const retainedJobs = () => jobs.terminalNumbers();
+  const wakingBatch = (after, until, wakeFrom) => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE ((role='owner' AND number>=?) OR number IN (${retainedJobs().join(',') || 'NULL'})) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(wakeFrom ?? Number.MAX_SAFE_INTEGER, after, until, BATCH_LIMIT), { wakeUntil: until, wakeFrom });
   const retirementInput = () => config.floor && db.prepare('SELECT * FROM floor_retirement_input WHERE session=? AND override_reason IS NULL').get(config.session);
   const ownerBatch = after => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE role='owner' AND number>? ORDER BY number LIMIT ?`).all(after, BATCH_LIMIT), { retirementOwner: true });
   return {
     close: () => db.close(),
     post: text => insertPost(text),
     lifecycle: lifecycleStore(db, transaction, config, insertPost),
+    jobs,
     ownerInputAllowed(text) {
       const row = retirementInput();
       if (!row?.pending) return false;
@@ -120,7 +124,7 @@ export function openBoard(config) {
       return transaction(() => ({
         posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number < ? ORDER BY number DESC LIMIT ?`).all(before, limit).reverse(),
         wake: before === Number.MAX_SAFE_INTEGER && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get() ?
-          db.prepare(`SELECT ${columns} FROM board_posts WHERE role='owner' AND number >= (SELECT wake_from FROM swarm_run) AND number < ? ORDER BY number`).all(before) : [],
+          db.prepare(`SELECT ${columns} FROM board_posts WHERE ((role='owner' AND number >= (SELECT wake_from FROM swarm_run)) OR number IN (${retainedJobs().join(',') || 'NULL'})) AND number < ? ORDER BY number`).all(before) : [],
         highwater: db.prepare('SELECT COALESCE(MAX(number), 0) AS n FROM board_posts').get().n,
         startup: state().cursor === null,
       }));
@@ -143,8 +147,9 @@ export function openBoard(config) {
         const changed = db.prepare('UPDATE board_sessions SET cursor=? WHERE session=? AND cursor IS NULL').run(highwater, config.session).changes;
         if (changed && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get()) {
           const from = wakeFrom === undefined ? db.prepare('SELECT wake_from FROM swarm_run').get().wake_from : wakeFrom;
-          if (from !== null) {
-            const batch = wakingBatch(from - 1, highwater);
+          const terminals = retainedJobs();
+          if (from !== null || terminals.length) {
+            const batch = wakingBatch(Math.min(from ?? Infinity, ...terminals) - 1, highwater, from);
             if (batch) db.prepare('UPDATE board_sessions SET pending=? WHERE session=?').run(JSON.stringify(batch), config.session);
           }
         }
@@ -182,7 +187,7 @@ export function openBoard(config) {
         const pending = JSON.parse(current.pending);
         if (pending.key !== key) throw new Error('pending batch changed');
         if (pending.wakeUntil !== undefined) {
-          const next = wakingBatch(pending.through, pending.wakeUntil);
+          const next = wakingBatch(pending.through, pending.wakeUntil, pending.wakeFrom);
           db.prepare('UPDATE board_sessions SET pending=? WHERE session=?').run(next ? JSON.stringify(next) : null, config.session);
         } else db.prepare('UPDATE board_sessions SET cursor=?, pending=NULL WHERE session=?').run(pending.through, config.session);
       });

@@ -97,6 +97,78 @@ occupants. Editing the owner's condition invalidates old votes and notifies peer
 membership changes invalidate an unfinished ballot. Unanimous yes pauses/drains
 for that condition, not controller-defined product completion.
 
+### Context retirement and independent jobs
+
+Floor workers persist a context-stop request at the configured threshold before
+admitting another tool, and at `turn_end`. Lifecycle inputs render the occupant's
+launch-snapshot `warningText`/`wrapupText`; install the approved event/node-locator
+text from Factory Control Lifecycle, not a behavior copied into source. All five
+existing placeholders are available. Existing occupants retain their launch text;
+source changes and tree persistence alone do not install approved settings.
+Unadopted legacy BF2 retains its old advisory warning.
+
+Retirement prevents new machine-job launches, ballots and new orchestration tools.
+Native read/shell/edit/write, tree operations, tool discovery, background-result
+inspection/cancellation and final `messaged_outcome` remain available for capture
+and real settlement. Runtime cannot distinguish an artifact-preserving shell/edit
+from substantive project work: that purpose, required reads and final coordination
+message remain instruction-node behavior, not software-certified compliance.
+Ordinary peer pushes stop without clearing their backlog; a separate durable
+owner-input channel permits runtime-attributed human input, including while idle.
+Direct interactive/RPC human input also remains available until final done. Neither
+clears the retirement state. Idle cache warming stops during retirement.
+
+`bin/factory-job -h` describes the native launcher/control surface. It does not
+start a model or controller. For separately authorized machine work:
+
+```sh
+# Retain a fresh UUID KEY before any launch; FILE contains the exact shell command.
+/absolute/agent-checkout/bin/factory-job launch --floor project-a --key "$KEY" \
+  --command-file /durable/command.sh --owner "$WORK_NODE_UUID"
+/absolute/agent-checkout/bin/factory-job list --floor project-a
+/absolute/agent-checkout/bin/factory-job status --floor project-a --key "$KEY"
+# Outside operator only, and only with explicit cancellation authority for this job:
+/absolute/agent-checkout/bin/factory-job cancel --floor project-a --key "$KEY"
+```
+
+Workers omit `--floor` and keep their launch binding. Launch defaults to the floor's
+Git cwd and records its actual HEAD; dirty drafts are not reset or snapshotted.
+The retained job directory contains the immutable command/cwd/revision/origin/owner
+manifest, runner/process identity, local control capability, output/runner logs and
+atomic receipts. It is separate from worker tmux sessions and chat-scoped `bash_bg`.
+A native group leader pins command-group identity until normal descendants drain.
+Commands must not detach descendants outside that group: such work requires its
+own separately verified control/drain contract. This is trusted local-user runtime,
+not a process sandbox or power-loss/exactly-once external-effects guarantee.
+
+The independent runner writes one global `[system]` terminal post transactionally
+with its job terminal record, without originating-worker credentials or a named
+recipient. Nonzero/signal exits, cancellation and abnormal/missing receipts remain
+distinct from acceptance. Runner death without a terminal receipt reports unknown
+effects/drain when observed by the supervisor or `factory-job status/list`; missing
+START produces a retained abnormal/uncertain event, not an inferred process exit,
+and never relaunches automatically.
+Publication retries and receipt reconciliation deduplicate the terminal event.
+Results/events remain in SQLite/artifacts while stopped or without peers. Fresh
+peers' startup history and bounded USER batches include retained terminal events,
+even beyond latest-30 history; this is not an ACK, assignment or acceptance system.
+Completion never starts workers. Worker retirement, cleanup and floor Stop never
+signal independent jobs. Explicit cancellation addresses the runner's identity-bound
+control endpoint, verifies process-group drain and preserves output; absent or
+ambiguous control refuses rather than signalling a possibly reused PID.
+
+An authorized outside human may use `factory-job override-context --floor ID
+--session UUID --reason 'explicit scope'` for this context-stopped occupant only.
+It retains the reason and suppresses repeated observations of this occupant's same
+threshold, not future workers. Instruction nodes govern the human's stated scope.
+It cannot undo final done, owner Stop or another retirement request.
+
+This source implementation is **not live rollout**. Inspect and preserve/migrate
+existing independent jobs and legacy callbacks under separate authority first;
+there is no automatic adoption of private wrappers. Then install approved lifecycle
+signals and validate new occupants under separately authorized live trials. Native
+fixtures do not establish model compliance or provider/platform reliability.
+
 ### Worker board scope and BF2 adoption
 
 The launcher supplies `FACTORY_FLOOR`, `FACTORY_DB`, `FACTORY_SESSION`,
