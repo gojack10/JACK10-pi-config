@@ -46,7 +46,8 @@ that same key; do not assume workers started.
 
 `--settings` imports a JSON object once; the file is not a live configuration.
 Creation requires name, existing absolute Git checkout cwd, nonempty starting-node
-UUIDs, instruction-entry UUID, owner vote condition and 2–10 slots. Two slots may
+UUIDs and 2–10 slots. Instruction-entry UUID and owner vote condition may be null
+or omitted while preparing a stopped floor. Two slots may
 use the same model. This generic example is input structure, not an approved
 project/instruction/account route:
 
@@ -80,7 +81,12 @@ stopped floor does not start it.
 
 Creation is **stopped**. New production bootstrap/warning/wrapup/role instructions
 must be shown exactly to Jack and approved before installation. Null launch text
-permits creation/configuration but blocks start. The CLI does not load a packaged
+and pending instruction/vote settings permit stopped creation/adoption/configuration
+but block Start before saving any start command, changing state or spawning.
+Chat on a pending stopped floor is saved without starting; it cannot bypass the gate.
+The website lists missing launch fields; configure the vote there and other launch
+inputs with `factory config`. Live, queued or draining floors cannot clear these
+prerequisites, preserving graceful stop. The CLI does not load a packaged
 skill or persist any tree instructions. Use fixture text only in isolated checks.
 
 Config accepts a partial object; supplied arrays replace those arrays atomically.

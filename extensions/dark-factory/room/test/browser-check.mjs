@@ -1,7 +1,7 @@
 // Disposable fixture only. Run with browser-harness installed; no workers/models.
 import { execFile } from 'node:child_process';
 import { serveFloors } from '../../floors/room.mjs';
-const settings = id => ({ name: id, voteCondition: `${id} dogfood`, slots: [1,2].map(n => ({ id: `slot-${n}`, provider: 'fixture', model: 'sol', thinking: 'high', role: '', contextWarning: 80 })) });
+const settings = id => ({ name: id, instructions: id === 'beta' ? null : '11111111-1111-4111-8111-111111111111', bootstrap: 'Fixture boot', warningText: 'Fixture warning', wrapupText: 'Fixture drain', voteCondition: `${id} dogfood`, slots: [1,2].map(n => ({ id: `slot-${n}`, provider: 'fixture', model: 'sol', thinking: 'high', role: '', contextWarning: 80 })) });
 const floors = new Map(['alpha','beta'].map(id => [id, { floor: settings(id), status: 'stopped', draining: false, posts: [], known: ['aaaaaaaa'], members: ['aaaaaaaa'], workers: [{ sender: 'aaaaaaaa', slot: 'slot-1', launch_config: { provider: 'fixture', model: 'old', thinking: 'high', role: 'current', contextWarning: 80 }, state: 'active' }] }]));
 let selectedFloor = 'alpha';
 const runtime = { ROUTES: [{ provider: 'fixture', model: 'sol', thinking: 'high' }, { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }],
@@ -23,9 +23,10 @@ try:
         result = js(expression, target_id=target)
         if str(result).lower() != 'true':
             raise Exception('Fixture assertion failed: ' + expression + ' => ' + str(result))
-    check("document.querySelectorAll('[data-floor]').length === 2")
+    check("document.querySelectorAll('[data-floor]').length === 2 && !document.querySelector('#factory-control').disabled && document.querySelector('#launch-readiness').hidden")
     js("document.title = 'dark-factory-fixture'; document.querySelector('#message').value = 'alpha draft'; document.querySelector('#message').dispatchEvent(new Event('input')); document.querySelector('[data-floor=beta]').click()", target_id=target)
     check("document.querySelector('#message').value === '' && document.querySelector('#request').textContent.includes('beta dogfood')")
+    check("document.querySelector('#factory-control').disabled && !document.querySelector('#launch-readiness').hidden && document.querySelector('#launch-readiness').textContent.includes('instructions') && document.querySelector('#send').textContent === 'send (no start)'")
     js("document.querySelector('#message').value = 'beta fixture input'; document.querySelector('#message').dispatchEvent(new Event('input')); document.querySelector('#composer').requestSubmit()", target_id=target)
     wait(1)
     check("document.querySelector('#transcript').textContent.includes('beta fixture input')")
@@ -48,7 +49,10 @@ try:
     check("document.querySelector('#message').value === 'alpha draft'")
     js("document.querySelector('[data-floor=beta]').click(); document.querySelector('#settings-toggle').click()", target_id=target)
     check("document.querySelector('#vote-condition').value === 'beta dogfood' && document.querySelectorAll('#slot-fields fieldset').length === 2")
-    print('PASS hidden-browser fixture: tabs, scoped messages/drafts/reload, current-next settings, 2–10 slot controls, condition isolation')
+    js("document.querySelector('#vote-condition').value = ''; document.querySelector('#condition-settings').requestSubmit()", target_id=target)
+    wait(1)
+    check("document.querySelector('#vote-condition').value === '' && document.querySelector('#launch-readiness').textContent.includes('voteCondition')")
+    print('PASS hidden-browser fixture: pending/ready Start controls, missing fields, blank condition, saved chat, tabs, scoped drafts/reload, current-next settings, 2–10 slots, isolation')
 finally:
     cdp('Target.closeTarget', targetId=target)
 `;
