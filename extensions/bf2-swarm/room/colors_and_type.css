@@ -1,7 +1,1 @@
-/* SiftText tokens transcribed from ~/projects/sifttext-design/DESIGN.md.
-   The reference directory's documented colors_and_type.css is absent. */
-@font-face{font-family:"JetBrains Mono";src:url("fonts/JetBrainsMono-Light.woff2") format("woff2");font-weight:300;font-style:normal;font-display:swap}
-@font-face{font-family:"JetBrains Mono";src:url("fonts/JetBrainsMono-Medium.woff2") format("woff2");font-weight:400 500;font-style:normal;font-display:swap}
-@font-face{font-family:"JetBrains Mono";src:url("fonts/JetBrainsMono-SemiBold.woff2") format("woff2");font-weight:600 700;font-style:normal;font-display:swap}
-@font-face{font-family:"JetBrains Mono";src:url("fonts/JetBrainsMono-Italic.woff2") format("woff2");font-weight:400;font-style:italic;font-display:swap}
-:root{color-scheme:dark;--bg-deep:#0a0a0a;--bg0:#0f0f0f;--bg1:#151515;--bg2:#1e1e1e;--bg3:#282828;--fg0:#fff;--fg1:#d0d0d0;--fg2:#8a8a8a;--accent:#3a3a3a;--focus:#6f6f6f;--urgent:#b85450;--warning:#b8853d;--success:#6b9b7a;--info:#5a8cc7;--purple:#7a5a8b;--font-mono:"JetBrains Mono",monospace}
+../../dark-factory/room/colors_and_type.css

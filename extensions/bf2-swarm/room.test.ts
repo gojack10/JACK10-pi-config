@@ -10,7 +10,7 @@ import { openBoard, formatPosts } from './board.mjs';
 import { tick } from './controller.mjs';
 import { serveRoom, ensureRoom, closeRoom } from './room.mjs';
 import { receiver } from './receiver.mjs';
-import { textMarkup, messageMarkup } from './room/markup.mjs';
+import { textMarkup, messageMarkup } from '../dark-factory/room/markup.mjs';
 
 const root = join(homedir(), '.local/state/bf2-room-tests');
 mkdirSync(root, { recursive: true });
