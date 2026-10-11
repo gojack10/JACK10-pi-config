@@ -40,7 +40,7 @@ export function openBoard(config) {
     db.exec('PRAGMA busy_timeout=5000');
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings', 'floor_retirement_input'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
     if (config.floor && (!tables.some(t => t.name === 'floor_settings') || db.prepare('SELECT id FROM floor_settings').get()?.id !== config.floor)) throw new Error('database belongs to another floor');
     if (tables.some(t => t.name === 'board_run') && db.prepare('SELECT run FROM board_run').get()?.run !== config.run) throw new Error('database belongs to another run');
     if (tables.some(t => t.name === 'swarm_run') && !db.prepare('PRAGMA table_info(swarm_run)').all().some(c => c.name === 'room_token')) throw new Error('legacy swarm format; use its original code for history and start a fresh room run');
@@ -66,6 +66,7 @@ export function openBoard(config) {
           number INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
           session TEXT NOT NULL, sender TEXT NOT NULL, created TEXT NOT NULL, text TEXT NOT NULL,
           role TEXT NOT NULL DEFAULT 'peer' CHECK(role IN ('peer','owner','system')));`);
+      if (config.floor) db.exec(`CREATE TABLE IF NOT EXISTS floor_retirement_input (session TEXT PRIMARY KEY, cursor INTEGER NOT NULL, pending TEXT, override_reason TEXT);`);
       db.prepare('INSERT OR IGNORE INTO board_run VALUES (1, ?)').run(config.run);
       if (db.prepare('SELECT run FROM board_run').get().run !== config.run) throw new Error('database belongs to another run');
       const identity = db.prepare('SELECT sender FROM board_sessions WHERE session=?').get(config.session);
@@ -102,10 +103,17 @@ export function openBoard(config) {
     return { key, through: posts.at(-1).number, text: `BF2 board batch ${key}\n${formatPosts(config.run, posts)}`, ...extra };
   };
   const wakingBatch = (after, until) => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE role='owner' AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT), { wakeUntil: until });
+  const retirementInput = () => config.floor && db.prepare('SELECT * FROM floor_retirement_input WHERE session=? AND override_reason IS NULL').get(config.session);
+  const ownerBatch = after => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE role='owner' AND number>? ORDER BY number LIMIT ?`).all(after, BATCH_LIMIT), { retirementOwner: true });
   return {
     close: () => db.close(),
     post: text => insertPost(text),
     lifecycle: lifecycleStore(db, transaction, config, insertPost),
+    ownerInputAllowed(text) {
+      const row = retirementInput();
+      if (!row?.pending) return false;
+      return JSON.parse(row.pending).text === text;
+    },
     history({ limit = HISTORY_LIMIT, before = Number.MAX_SAFE_INTEGER } = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('limit must be 1-100');
       if (!Number.isSafeInteger(before) || before < 1) throw new Error('before must be a positive post number');
@@ -144,6 +152,13 @@ export function openBoard(config) {
     },
     pending() {
       return transaction(() => {
+        const retirement = retirementInput();
+        if (retirement) {
+          if (retirement.pending) return JSON.parse(retirement.pending);
+          const batch = ownerBatch(retirement.cursor);
+          if (batch) db.prepare('UPDATE floor_retirement_input SET pending=? WHERE session=?').run(JSON.stringify(batch), config.session);
+          return batch;
+        }
         const current = state();
         if (current.cursor === null) return null; // Wait for the agent's first `board read`.
         if (current.pending) return JSON.parse(current.pending);
@@ -157,6 +172,11 @@ export function openBoard(config) {
     },
     confirmPersisted(key) {
       return transaction(() => {
+        const retirement = retirementInput();
+        if (retirement?.pending && JSON.parse(retirement.pending).key === key) {
+          db.prepare('UPDATE floor_retirement_input SET cursor=?,pending=NULL WHERE session=?').run(JSON.parse(retirement.pending).through, config.session);
+          return;
+        }
         const current = state();
         if (!current.pending) return;
         const pending = JSON.parse(current.pending);

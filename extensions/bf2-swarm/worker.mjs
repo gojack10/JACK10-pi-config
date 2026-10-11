@@ -7,8 +7,10 @@ export const wrapup = (run, state) => `BF2 swarm ${run}: ${state.status}. Finish
 const expand = (text, values) => text.replace(/\{(percent|status|instructions|floor|reason)\}/g, (match, key) => String(values[key] ?? match));
 export function workerWrapup(run, state, session) {
   const row = state.workers.find(w => w.session === session);
-  return state.floor ? expand(row?.launch_config?.wrapupText ?? state.floor.wrapupText, { status: state.status, instructions: state.config.instructions,
-    floor: state.config.floorId, reason: row?.retire_requested ?? state.status }) : wrapup(run, state);
+  const contextStop = state.status === 'running' && row?.retire_requested === 'context threshold';
+  return state.floor ? expand(contextStop ? row.launch_config.warningText : row?.launch_config?.wrapupText ?? state.floor.wrapupText,
+    { percent: row?.launch_config?.contextWarning, status: state.status, instructions: state.config.instructions,
+      floor: state.config.floorId, reason: row?.retire_requested ?? state.status }) : wrapup(run, state);
 }
 
 export function handoffTool(worker, parameters) {
@@ -33,14 +35,15 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     if (!live(ctx) || notifying) return;
     const state = board.lifecycle.status();
     const row = state.workers.find(w => w.session === config.session);
-    const notice = row?.retire_requested ?? state.status;
+    const notice = `${state.status}:${row?.retire_requested ?? ''}`;
     if (!row || row.state !== 'active' || (state.status === 'running' && !row.retire_requested) || pausedNotice === notice) return;
     notifying = true;
     try {
       const receipt = await pi.sendUserMessage(workerWrapup(config.run, state, config.session), {
         deliverAs: 'steer', expandPromptTemplates: false,
+        admissionKey: `factory-retirement:${config.session}:${notice}`,
         admissionGuard: () => !!live(ctx) && board.lifecycle.status().status === state.status &&
-          board.lifecycle.status().workers.some(w => w.session === config.session && w.state === 'active'),
+          board.lifecycle.status().workers.some(w => w.session === config.session && w.state === 'active' && w.retire_requested === row.retire_requested),
       });
       if (receipt.status === 'admitted') pausedNotice = notice;
     } finally { notifying = false; }
@@ -71,25 +74,43 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     // Results of already-started work must drain; they are not new board inputs.
     if (event.source === 'extension' && event.text.startsWith('SYSTEM (background-jobs): All ') &&
       state.workers.some(w => w.session === config.session && ['active', 'retiring'].includes(w.state))) return;
-    // Allow exactly the wrapup USER input while paused, not ordinary board wakes.
+    if (config.floor && board.lifecycle.canReceiveOwner() && (['interactive','rpc'].includes(event.source) ||
+      (event.source === 'extension' && board.ownerInputAllowed(event.text)))) return;
+    // Allow exactly the lifecycle USER input while paused, not ordinary board wakes.
     if (!board.lifecycle.acceptsInput() && !(event.source === 'extension' &&
       event.text === workerWrapup(config.run, state, config.session) &&
       state.workers.some(w => w.session === config.session && w.state === 'active'))) return { action: 'handled' };
   });
   pi.on('turn_end', async (_event, ctx) => {
     if (!live(ctx)) return;
-    await notifyPause(ctx);
     const percent = ctx.getContextUsage()?.percent;
-    const state = board.lifecycle.status(), row = state.workers.find(w => w.session === config.session);
     board.lifecycle.recordUsage(percent);
+    board.lifecycle.contextStop(percent);
+    await notifyPause(ctx);
+    const state = board.lifecycle.status(), row = state.workers.find(w => w.session === config.session);
     const threshold = row?.launch_config?.contextWarning ?? 80;
-    if (!warned && typeof percent === 'number' && Number.isFinite(percent) && percent >= threshold && board.lifecycle.acceptsInput()) {
+    if (!state.floor && !warned && typeof percent === 'number' && Number.isFinite(percent) && percent >= threshold && board.lifecycle.acceptsInput()) {
       warned = true;
       pi.appendEntry(warningType, { warned: true });
-      const warning = state.floor ? expand(row.launch_config.warningText, { percent: threshold }) : WARNING;
-      await pi.sendUserMessage(warning, { deliverAs: 'steer', expandPromptTemplates: false,
+      await pi.sendUserMessage(WARNING, { deliverAs: 'steer', expandPromptTemplates: false,
         admissionGuard: () => !!live(ctx) && board.lifecycle.acceptsInput() });
     }
+  });
+  if (config.floor) pi.on('tool_call', async (event, ctx) => {
+    if (!live(ctx)) return;
+    board.lifecycle.contextStop(ctx.getContextUsage()?.percent);
+    await notifyPause(ctx);
+    const state = board.lifecycle.status(), row = state.workers.find(w => w.session === config.session);
+    if (!row || (state.status === 'running' && !row.retire_requested && row.state === 'active')) return;
+    // Preserve native artifact/knowledge capture, discovery and real tool settlement.
+    // Purpose of a shell/edit/tree write remains node-owned, not guessed by code.
+    const allowed = ['read','bash','powershell','edit','write','grep','find','ls','codemode','tool_search',
+      'get_current_session','bash_tail','bash_jobs','bash_kill','messaged_outcome'];
+    if (allowed.includes(event.toolName) || event.toolName.startsWith('sifttext_')) return;
+    return { block: true, reason: workerWrapup(config.run, state, config.session) };
+  });
+  pi.on('cache_warming_decision', (_event, ctx) => {
+    if (live(ctx) && !board.lifecycle.acceptsInput()) return { action: 'stop' };
   });
   pi.on('message_end', (event, ctx) => {
     if (live(ctx) && event.message?.role === 'assistant') board.lifecycle.recordError(event.message.stopReason === 'error' ? event.message.errorMessage ?? 'assistant ended with error; no further diagnosis available' : null);

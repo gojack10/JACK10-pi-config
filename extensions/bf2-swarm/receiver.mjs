@@ -14,7 +14,8 @@ export function receiver(pi, config, ctx) {
   let running = false;
   let admitted;
   let lastError;
-  const current = () => !closed && ctx.sessionManager.getSessionId() === config.session && board.lifecycle.acceptsInput();
+  const current = () => !closed && ctx.sessionManager.getSessionId() === config.session &&
+    (board.lifecycle.acceptsInput() || board.lifecycle.canReceiveOwner());
   const warn = error => {
     const message = `BF2 board: ${error.message ?? error}`;
     if (lastError !== message) {

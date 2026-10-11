@@ -52,12 +52,17 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     db.prepare('UPDATE swarm_run SET reconvene=1').run();
     if (!run.workers.some(w => !w.cleaned)) advanceDrain();
   };
+  const retirementInput = session => {
+    if (!config.floor) return;
+    db.prepare('INSERT INTO floor_retirement_input(session,cursor) VALUES (?, (SELECT COALESCE(MAX(number),0) FROM board_posts)) ON CONFLICT(session) DO UPDATE SET override_reason=NULL').run(session);
+  };
   const stop = () => {
     const run = status();
     const vote = openVote();
     if (vote) closeVote(vote, 'cancelled', 'JACK stopped the factory');
     const next = run.workers.some(w => !w.cleaned) ? 'stopping' : 'stopped';
     db.prepare('UPDATE swarm_run SET status=?, request=NULL, reconvene=0').run(next);
+    for (const peer of run.workers.filter(w => !w.cleaned)) retirementInput(peer.session);
     if (run.status !== next || run.reconvene) system('JACK requested a stop, agents finish safely with no replacements');
   };
   const advanceDrain = () => {
@@ -160,6 +165,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const run = status();
         if (run.floor) {
           worker();
+          if (!this.acceptsInput()) throw new Error('ballots are unavailable during retirement');
           if (reason !== run.floor.voteCondition) throw new Error('only the owner may configure the floor ballot condition');
           const vote = ownerBallot();
           if (!vote) throw new Error('ballot requires all configured current active peers, no capacity gaps');
@@ -195,7 +201,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         }
         if (vote.result !== 'open') throw new Error(`pause request is ${vote.result}`);
         const run = status();
-        if (run.status !== 'running' || worker().state !== 'active') throw new Error('votes require a current active worker');
+        if (run.status !== 'running' || worker().state !== 'active' || (run.floor && !this.acceptsInput())) throw new Error('votes require a current working active worker');
         voter.answer = answer;
         db.prepare('UPDATE swarm_votes SET electorate=? WHERE number=?').run(JSON.stringify(vote.electorate), number);
         system(`${config.sender} voted ${answer} on pause request #${number}`);
@@ -203,6 +209,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         else if (vote.electorate.every(v => v.answer === 'yes')) {
           closeVote(vote, 'agreed', floor() ? 'Unanimous yes, waiting for JACK' : 'Three yes, waiting for JACK');
           db.prepare("UPDATE swarm_run SET status='waiting', request=?, reconvene=0, wake_from=NULL").run(number);
+          for (const peer of run.workers.filter(w => !w.cleaned)) retirementInput(peer.session);
         }
         return getVote(db.prepare('SELECT * FROM swarm_votes WHERE number=?').get(number));
       });
@@ -270,12 +277,41 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       if (row.session_file && row.session_file !== path) throw new Error('worker JSONL locator is immutable');
       db.prepare('UPDATE swarm_workers SET session_file=? WHERE session=?').run(path, config.session);
     },
+    contextStop(percent) {
+      if (!config.floor) return false; // Unadopted BF2 retains its advisory contract.
+      return transaction(() => {
+        const run = status(), row = run.workers.find(w => w.session === config.session);
+        const overridden = db.prepare('SELECT override_reason FROM floor_retirement_input WHERE session=?').get(config.session)?.override_reason;
+        if (run.status !== 'running' || !row || row.state !== 'active' || row.retire_requested || overridden || typeof percent !== 'number' || !Number.isFinite(percent) || percent < row.launch_config.contextWarning) return false;
+        cancelDeparture(config.session);
+        db.prepare("UPDATE swarm_workers SET retire_requested='context threshold' WHERE session=?").run(config.session);
+        retirementInput(config.session);
+        return true;
+      });
+    },
+    canReceiveOwner() {
+      return !!config.floor && status().workers.some(w => w.session === config.session && w.state === 'active' && !w.cleaned);
+    },
+    overrideContextStop(session, reason) {
+      controller();
+      if (!config.floor || typeof reason !== 'string' || !reason.trim() || reason.length > 1000) throw new Error('context override needs a floor and explicit bounded human reason');
+      return transaction(() => {
+        const row = status().workers.find(w => w.session === session);
+        if (status().status !== 'running' || row?.state !== 'active' || row.retire_requested !== 'context threshold') throw new Error('override requires the current context-stopped active worker, not a stopped floor or final done');
+        db.prepare('UPDATE floor_retirement_input SET override_reason=? WHERE session=?').run(reason, session);
+        db.prepare('UPDATE swarm_workers SET retire_requested=NULL WHERE session=?').run(session);
+        system(`Human context override for session ${session}: ${reason}`);
+        return true;
+      });
+    },
     requestRetirement(session, reason) {
       controller();
       return transaction(() => {
         if (!floor()) throw new Error('slot retirement requires a floor');
+        if (typeof reason !== 'string' || !reason.trim()) throw new Error('retirement requires a reason');
         cancelDeparture(session);
-        return db.prepare("UPDATE swarm_workers SET retire_requested=COALESCE(retire_requested,?) WHERE session=? AND cleaned=0").run(reason, session).changes > 0;
+        retirementInput(session);
+        return db.prepare("UPDATE swarm_workers SET retire_requested=CASE WHEN retire_requested='context threshold' THEN ? ELSE COALESCE(retire_requested,?) END WHERE session=? AND cleaned=0").run(reason, reason, session).changes > 0;
       });
     },
     configureFloor(settings, launchSettings) {
@@ -291,7 +327,8 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         db.prepare('UPDATE floor_settings SET settings=?').run(JSON.stringify(settings));
         db.prepare('UPDATE swarm_run SET config=?').run(JSON.stringify(launchSettings));
         for (const w of status().workers.filter(w => !w.cleaned && !settings.slots.some(s => s.id === w.slot))) {
-          db.prepare('UPDATE swarm_workers SET retire_requested=COALESCE(retire_requested,?) WHERE session=?').run('slot removed', w.session);
+          db.prepare('UPDATE swarm_workers SET retire_requested=? WHERE session=?').run('slot removed', w.session);
+          retirementInput(w.session);
         }
         if (old.voteCondition !== settings.voteCondition) system(`Owner changed ballot condition: ${settings.voteCondition}. Old votes invalidated.`);
         ownerBallot();
