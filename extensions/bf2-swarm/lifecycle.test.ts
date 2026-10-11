@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { openBoard } from './board.mjs';
-import { tick, workerCommand, bootMission, validateLaunch, settingsFor, quote, openRun } from './controller.mjs';
+import { tick, workerCommand, bootMission, validateLaunch, settingsFor, quote, openRun, main } from './controller.mjs';
 import { installWorker, handoffTool, wrapup, warningType } from './worker.mjs';
 import { receiver } from './receiver.mjs';
 
@@ -29,9 +29,12 @@ function fixture(t) {
     calls.push(args);
     if (args[0] === 'new-session') {
       if (failNext) { failNext = false; return { status: 1, stdout: '', stderr: 'synthetic launch error' }; }
-      panes.set(args[args.indexOf('-s') + 1], true);
+      assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{pane_id}');
+      const paneId = `%${panes.size + 1}`;
+      panes.set(paneId, true);
+      return { status: 0, stdout: `${paneId}\n`, stderr: '' };
     }
-    if (args[0] === 'display-message') return { status: 0, stdout: panes.get(args[args.indexOf('-t') + 1].split(':')[0]) ? '0\n' : '1\n', stderr: '' };
+    if (args[0] === 'display-message') return { status: 0, stdout: panes.get(args[args.indexOf('-t') + 1]) ? '0\n' : '1\n', stderr: '' };
     return { status: 0, stdout: '', stderr: '' };
   };
   const workerBoard = worker => {
@@ -76,9 +79,14 @@ test('three fake tmux boots have normal route/env, unique durable sessions, mini
   assert.equal(new Set(workers.map(w => w.sender)).size, 3);
   for (const worker of workers) {
     assert.match(worker.sender, /^[a-f0-9]{8}$/);
-    const call = h.calls.find(a => a[0] === 'new-session' && a.includes(worker.pane));
+    assert.match(worker.pane, /^%\d+$/);
+    const name = `bf2-${h.config.run}-${worker.sender}`;
+    const call = h.calls.find(a => a[0] === 'new-session' && a.includes(name));
+    assert.ok(h.calls.some(a => a[0] === 'pipe-pane' && a[a.indexOf('-t') + 1] === worker.pane));
     assert.equal(call[call.indexOf('-c') + 1], h.settings.cwd);
     const command = call.at(-1);
+    assert.match(command, /^tmux set-option -w -t "\$TMUX_PANE" remain-on-exit on && exec /);
+    assert.ok(command.includes(`'--name' ${quote(name)}`));
     assert.ok(command.includes("'--provider' 'openai-codex-test' '--model' 'gpt-6.1-sol' '--thinking' 'high'"));
     assert.ok(command.includes(`'BF2_BOARD_SESSION=${worker.session}'`));
     assert.ok(command.includes(`'BF2_BOARD_SENDER=${worker.sender}'`));
@@ -99,6 +107,139 @@ test('three fake tmux boots have normal route/env, unique durable sessions, mini
   assert.match(scrubbed, /'-u' 'PI_SUBAGENT_MANIFEST'/);
   assert.match(scrubbed, /'-u' 'PI_RLM_FRIENDLY_STOP'/);
   assert.ok(!scrubbed.includes('/old/task'));
+});
+
+test('capture failure is diagnostic and still registers the launch pane ID', t => {
+  const h = fixture(t), errors = [];
+  t.mock.method(console, 'error', message => errors.push(message));
+  tick(h.board, h.config, args => args[0] === 'pipe-pane' ? { status: 1, stdout: '', stderr: 'synthetic capture failure' } : h.execute(args));
+  assert.equal(errors.length, 3);
+  assert.ok(errors.every(e => /BF2 swarm pane capture: synthetic capture failure/.test(e)));
+  assert.ok(h.board.lifecycle.status().workers.every(w => w.state === 'launching' && /^%\d+$/.test(w.pane)));
+  tick(h.board, h.config, h.execute);
+  assert.equal(h.board.lifecycle.status().workers.length, 3);
+  assert.ok(h.calls.filter(a => a[0] === 'display-message').every(a => /^%\d+$/.test(a[a.indexOf('-t') + 1])));
+});
+
+test('missing pane receipts fail registration; legacy names never probe a selected window', t => {
+  const h = fixture(t);
+  tick(h.board, h.config, args => args[0] === 'new-session' ? { status: 0, stdout: '', stderr: '' } : h.execute(args));
+  assert.ok(h.board.lifecycle.status().workers.every(w => w.state === 'launch-failed'));
+  assert.equal(h.calls.length, 0, 'no empty-target capture or health commands');
+  h.board.lifecycle.addWorker('legacy-session', 'eeeeeeee', 'legacy-name');
+  assert.throws(() => tick(h.board, h.config, h.execute), /stable tmux pane ID.*fresh run/);
+  assert.equal(h.calls.length, 0);
+});
+
+test('controller health and recovery retain a stable pane ID, not the selected window', async t => {
+  const h = fixture(t), calls = []; let paneId, dead = false;
+  const execute = args => {
+    calls.push(args);
+    const result = { status: 0, stdout: '', stderr: '' };
+    if (args[0] === 'has-session') result.status = paneId ? 0 : 1;
+    if (args[0] === 'show-options') result.stdout = paneId;
+    if (args[0] === 'display-message') {
+      assert.equal(args[args.indexOf('-t') + 1], paneId);
+      result.stdout = dead ? '1' : '0';
+    }
+    if (['new-session', 'new-window'].includes(args[0])) {
+      assert.ok(args.includes('-P')); assert.equal(args[args.indexOf('-F') + 1], '#{pane_id}');
+      result.stdout = dead ? '%42' : '%41';
+    }
+    if (args[0] === 'set-option') {
+      assert.equal(args.at(-2), '@bf2_controller_pane'); paneId = args.at(-1);
+    }
+    return result;
+  };
+  const resume = () => main(['resume', '--run-dir', h.dir], {}, execute);
+  await resume(); assert.equal(paneId, '%41');
+  await resume(); assert.equal(calls.filter(a => a[0] === 'new-session').length, 1);
+  dead = true; await resume(); assert.equal(paneId, '%42');
+  assert.equal(calls.filter(a => a[0] === 'new-window').length, 1);
+  assert.ok(calls.filter(a => a[0] === 'has-session').every(a => a.at(-1) === `bf2-${h.config.run}-controller`));
+});
+
+test('isolated real tmux with window/pane indices 1 keeps capture and death on the original pane', async t => {
+  const h = fixture(t), tmuxDir = mkdtempSync(join(tmpdir(), 'bf2-tmux-'));
+  const socket = join(tmuxDir, 'tmux.sock'), conf = join(tmuxDir, 'tmux.conf');
+  writeFileSync(conf, 'set -g base-index 1\nset -g pane-base-index 1\n');
+  const live = args => spawnSync('tmux', ['-S', socket, '-f', conf, ...args], { encoding: 'utf8' });
+  // Only this socket is ever killed; no host tmux options or sessions are touched.
+  t.after(() => {
+    try {
+      const killed = live(['kill-server']); assert.equal(killed.status, 0, killed.stderr);
+      assert.notEqual(live(['list-sessions']).status, 0);
+    } finally { rmSync(tmuxDir, { recursive: true, force: true }); }
+  });
+  const checked = args => { const r = live(args); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
+  const calls = [];
+  const execute = args => {
+    calls.push(args);
+    if (['new-session', 'new-window'].includes(args[0])) {
+      // Exercise the worker's remain-on-exit prefix; all actual processes are
+      // harmless shells, NEVER Pi, models, or an experiment controller loop.
+      const command = args.at(-1);
+      args = [...args.slice(0, -1), command.includes(' && exec ') ? command.split(' && exec ')[0] + ' && exec /bin/sh' : '/bin/sh'];
+    }
+    return live(args);
+  };
+  const eventually = async check => {
+    for (let i = 0; i < 100; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)); }
+    assert.fail('isolated tmux did not reach expected shell state');
+  };
+  const resume = () => main(['resume', '--run-dir', h.dir], {}, execute);
+  const controllerName = `bf2-${h.config.run}-controller`;
+  await resume();
+  const controllerId = checked(['show-options', '-v', '-t', controllerName, '@bf2_controller_pane']);
+  assert.equal(checked(['display-message', '-p', '-t', controllerId, '#{window_index}.#{pane_index}']), '1.1');
+  checked(['set-option', '-w', '-t', controllerId, 'remain-on-exit', 'on']);
+  const inspectionId = checked(['new-window', '-P', '-F', '#{pane_id}', '-t', controllerName, '/bin/sh']);
+  await resume();
+  assert.equal(calls.filter(a => ['new-session', 'new-window'].includes(a[0])).length, 1, 'controller survives selection change');
+  checked(['send-keys', '-t', controllerId, 'exit', 'Enter']);
+  await eventually(() => checked(['display-message', '-p', '-t', controllerId, '#{pane_dead}']) === '1');
+  await resume();
+  assert.notEqual(checked(['show-options', '-v', '-t', controllerName, '@bf2_controller_pane']), controllerId);
+  assert.equal(calls.filter(a => a[0] === 'new-window').length, 1, 'dead controller replaced despite live selected shell');
+  assert.equal(checked(['display-message', '-p', '-t', inspectionId, '#{pane_dead}']), '0');
+  tick(h.board, h.config, execute);
+  const workers = h.board.lifecycle.status().workers;
+  assert.equal(workers.length, 3);
+  for (const worker of workers) {
+    assert.equal(worker.state, 'launching'); assert.match(worker.pane, /^%\d+$/);
+    assert.equal(checked(['display-message', '-p', '-t', worker.pane, '#{window_index}.#{pane_index}']), '1.1');
+    h.workerBoard(worker).lifecycle.ready();
+  }
+  const worker = workers[0], name = `bf2-${h.config.run}-${worker.sender}`;
+  const oldCapture = live(['pipe-pane', '-t', `${name}:0.0`]);
+  assert.notEqual(oldCapture.status, 0, 'old zero address reproduces capture failure');
+  assert.match(oldCapture.stderr, /can't find window: 0/);
+  await eventually(() => checked(['show-options', '-w', '-v', '-t', worker.pane, 'remain-on-exit']) === 'on');
+  const other = checked(['new-window', '-P', '-F', '#{pane_id}', '-t', name, '-n', 'inspection', '/bin/sh']);
+  assert.notEqual(other, worker.pane);
+  assert.equal(checked(['display-message', '-p', '-t', name, '#{pane_id}']), other);
+  assert.ok(checked(['list-sessions', '-F', '#{session_name}']).split('\n').includes(name));
+  assert.ok(checked(['list-panes', '-s', '-t', name, '-F', '#{pane_id}']).split('\n').includes(worker.pane));
+  checked(['send-keys', '-t', other, 'printf "selected-window-only\\n"', 'Enter']);
+  checked(['send-keys', '-t', worker.pane, 'printf "stable-worker-output\\n"', 'Enter']);
+  const log = join(h.dir, `${worker.session}.pane.log`);
+  await eventually(() => existsSync(log) && readFileSync(log, 'utf8').includes('stable-worker-output'));
+  assert.doesNotMatch(readFileSync(log, 'utf8'), /selected-window-only/);
+  assert.match(checked(['capture-pane', '-p', '-t', worker.pane]), /stable-worker-output/);
+  tick(h.board, h.config, execute);
+  assert.equal(h.board.lifecycle.status().workers.length, 3, 'selected shell cannot cause false loss');
+  checked(['send-keys', '-t', worker.pane, 'exit', 'Enter']);
+  await eventually(() => checked(['display-message', '-p', '-t', worker.pane, '#{pane_dead}']) === '1');
+  assert.equal(checked(['display-message', '-p', '-t', name, '#{pane_dead}']), '0', 'selected inspection shell stays alive');
+  tick(h.board, h.config, execute);
+  const state = h.board.lifecycle.status();
+  assert.equal(state.workers[0].state, 'exited'); assert.equal(state.workers.length, 4);
+  assert.equal(state.workers[3].state, 'launching');
+  assert.ok(h.board.history({ limit: 100 }).posts.some(p => p.text === `${worker.sender} exited without a retirement message.`));
+  checked(['kill-session', '-t', `bf2-${h.config.run}-${workers[1].sender}`]);
+  tick(h.board, h.config, execute);
+  assert.equal(h.board.lifecycle.status().workers[1].state, 'exited', 'missing pane is not a healthy shell');
+  assert.equal(h.board.lifecycle.status().workers.length, 5);
 });
 
 test('first activation broadcasts one system join; repeated session_start and reconstruction never repost', async t => {
@@ -332,7 +473,7 @@ test('real operator CLI preflight/start/status/stop/resume uses fake Pi/tmux onl
   const h = fixture(t), bin = join(h.dir, 'fake-bin'), log = join(h.dir, 'fake.log'), runDir = join(h.dir, 'new-run');
   mkdirSync(bin);
   writeFileSync(join(bin, 'pi'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['pi', ...process.argv.slice(2)]) + '\\n'); console.log('openai-codex-test gpt-6.1-sol fixture');\n`, { mode: 0o755 });
-  writeFileSync(join(bin, 'tmux'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['tmux', ...process.argv.slice(2)]) + '\\n'); if (process.argv[2] === 'has-session') process.exitCode = 1;\n`, { mode: 0o755 });
+  writeFileSync(join(bin, 'tmux'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['tmux', ...process.argv.slice(2)]) + '\\n'); if (process.argv[2] === 'has-session') process.exitCode = 1; if (process.argv[2] === 'new-session') console.log('%1');\n`, { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, PI_CODING_AGENT_DIR: h.settings.agentDir };
   const run = (...args) => spawnSync(resolve('bin/bf2-swarm'), args, { env, encoding: 'utf8' });
   const start = ['start', '--cwd', h.settings.cwd, '--root', root, '--instructions', instructions, '--provider', h.settings.provider, '--run-dir', runDir];
