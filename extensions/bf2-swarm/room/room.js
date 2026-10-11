@@ -7,6 +7,46 @@ if (fragmentRun && fragmentToken) {
 }
 const { run, token } = JSON.parse(sessionStorage.getItem('bf2-room') ?? '{}');
 let state, busy = false, polling = false, after = 0, posts = [], signature = '', pendingMessage;
+let soundOn = false, loaded = false, audio;
+const speaker = $('#sound-toggle');
+function soundState(on) {
+  soundOn = on;
+  speaker.setAttribute('aria-pressed', String(on));
+  speaker.title = speaker.ariaLabel = `${on ? 'Mute' : 'Enable'} message sounds`;
+}
+speaker.addEventListener('click', async () => {
+  if (soundOn) return soundState(false);
+  speaker.disabled = true;
+  try {
+    audio ??= new AudioContext();
+    await audio.resume(); // Unlock audio inside the owner's click, not a background poll.
+    soundState(true);
+  } catch { soundState(false); speaker.title = 'Audio unavailable; click to retry'; }
+  finally { speaker.disabled = false; }
+});
+function notify(next) {
+  if (loaded && soundOn && audio?.state === 'running' && next.some(p => p.role === 'peer')) {
+    try {
+      // Jack's selected Data handshake, exactly as auditioned in the sound gallery.
+      const start = audio.currentTime + .015;
+      for (const [offset, duration, from, to, level] of [[0, .09, 620, 620, .06], [.13, .14, 930, 950, .055]]) {
+        const at = start + offset, tone = audio.createOscillator(), volume = audio.createGain();
+        tone.type = 'sine';
+        tone.frequency.setValueAtTime(from, at);
+        tone.frequency.exponentialRampToValueAtTime(to, at + duration);
+        volume.gain.setValueAtTime(0, at);
+        volume.gain.linearRampToValueAtTime(level, at + .006);
+        volume.gain.exponentialRampToValueAtTime(.0001, at + duration - .006);
+        volume.gain.linearRampToValueAtTime(0, at + duration);
+        tone.connect(volume); volume.connect(audio.destination);
+        tone.onended = () => { tone.disconnect(); volume.disconnect(); };
+        tone.start(at); tone.stop(at + duration);
+      }
+    } catch { soundState(false); speaker.title = 'Audio unavailable; click to retry'; }
+  }
+  // The board serves 100 posts per page: stay silent until initial history is drained.
+  loaded ||= next.length < 100;
+}
 const api = async (action, body) => {
   const response = await fetch(`/api/${encodeURIComponent(run)}/${action}`, { method: body ? 'POST' : 'GET',
     headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
@@ -22,6 +62,7 @@ function controls() {
   $('#send').disabled = busy || !state || !$('#message').value.trim();
 }
 function render(next) {
+  notify(next.posts);
   state = next;
   const known = new Set([...state.known, 'JACK']), log = $('#transcript');
   const near = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
