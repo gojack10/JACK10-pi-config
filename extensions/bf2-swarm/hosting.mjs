@@ -51,6 +51,9 @@ export async function serveHosting({ origin, upstream, run, token, basic, port =
           ? send(303, {}, 'application/json', { Location: '/login' }) : send(401, { error: 'login required' });
       }
       if (request.method === 'GET' && url.pathname === '/hosting-bootstrap.js' && !url.search) {
+        // Even a sibling-site script in a browser without Fetch Metadata must
+        // never receive a capability-bearing classic script.
+        if (request.headers['sec-fetch-site'] !== 'same-origin') return send(403, { error: 'same-origin bootstrap required' });
         return send(200, `sessionStorage.setItem('bf2-room', ${JSON.stringify(JSON.stringify({ run, token }))});`, 'text/javascript');
       }
       if (url.pathname.startsWith('/api/')) {
