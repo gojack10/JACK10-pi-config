@@ -79,7 +79,8 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     }
   });
   pi.on('agent_settled', (event, ctx) => {
-    if (event.outcome === 'completed' && live(ctx) && drained(ctx) && board.lifecycle.settled()) ctx.shutdown();
+    // Native settlement has no outcome field; interrupted runs are not safe retirement.
+    if (!event.interruption && live(ctx) && drained(ctx) && board.lifecycle.settled()) ctx.shutdown();
   });
   pi.on('session_shutdown', close);
   return {
