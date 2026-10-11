@@ -26,10 +26,14 @@ export async function serveHosting({ origin, upstream, run, token, basic, port =
       response.end(type === 'application/json' && !Buffer.isBuffer(body) ? JSON.stringify(body) : body);
     };
     try {
+      // Allow user-clicked top-level entry links, not cross-site scripts or API requests.
+      const entryNavigation = request.method === 'GET' && ['/', '/login'].includes(request.url) &&
+        request.headers['sec-fetch-mode'] === 'navigate' && request.headers['sec-fetch-dest'] === 'document' &&
+        request.headers['sec-fetch-user'] === '?1' && !request.headers.origin;
       // Validate BEFORE translating the authenticated browser origin to loopback.
       if (request.headers.host !== publicURL.host ||
           (request.headers.origin && request.headers.origin !== origin) ||
-          ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) return send(403, { error: 'factory origin required' });
+          (['cross-site', 'same-site'].includes(request.headers['sec-fetch-site']) && !entryNavigation)) return send(403, { error: 'factory origin required' });
       // Cloudflare overwrites X-Forwarded-Proto. Only the private tunnel reaches
       // this listener; never issue a Basic challenge over a plaintext edge hop.
       if (request.headers['x-forwarded-proto'] !== 'https') return send(403, { error: 'HTTPS required' });

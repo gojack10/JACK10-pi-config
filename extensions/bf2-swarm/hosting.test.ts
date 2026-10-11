@@ -23,6 +23,11 @@ test('Basic login exchanges for a private cookie; real room retains bearer/run/O
   const api = `/api/${run}/state`;
   assert.equal((await call('/')).headers.location, '/login');
   assert.equal((await call('/login')).status, 401);
+  const entry = { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-User': '?1' };
+  assert.equal((await call('/', entry)).headers.location, '/login', 'a clicked external link can reach login');
+  assert.equal((await call('/login', entry)).status, 401);
+  assert.equal((await call('/', { ...entry, 'Sec-Fetch-User': '' })).status, 403);
+  assert.equal((await call('/login', { ...entry, 'Sec-Fetch-Dest': 'iframe' })).status, 403);
   const plaintext = await call('/login', { 'X-Forwarded-Proto': 'http', Authorization: basic });
   assert.equal(plaintext.status, 403); assert.equal(plaintext.headers['www-authenticate'], undefined);
   assert.equal((await call('/login', { 'X-Forwarded-Proto': '' })).status, 403);
@@ -51,6 +56,8 @@ test('Basic login exchanges for a private cookie; real room retains bearer/run/O
   assert.equal((await call('/api/other/state', auth)).status, 404);
   assert.equal((await call(api, { ...auth, Origin: 'https://evil.test' })).status, 403);
   assert.equal((await call(api, { ...auth, 'Sec-Fetch-Site': 'same-site' })).status, 403);
+  assert.equal((await call(api, { ...auth, ...entry })).status, 403, 'entry exception never covers API');
+  assert.equal((await call('/hosting-bootstrap.js', { Cookie, ...entry })).status, 403);
   const state = await call(api, auth);
   assert.equal(state.status, 200); assert.equal(JSON.parse(state.body).status, 'stopped');
   const message = `/api/${run}/message`, body = JSON.stringify({ key: 'synthetic', text: 'fixture only' });
