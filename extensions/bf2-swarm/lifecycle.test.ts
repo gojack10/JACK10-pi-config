@@ -1,0 +1,339 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { openBoard } from './board.mjs';
+import { tick, workerCommand, bootMission, validateLaunch, settingsFor, quote, openRun } from './controller.mjs';
+import { installWorker, handoffTool, wrapup, warningType } from './worker.mjs';
+import { receiver } from './receiver.mjs';
+
+const executable = resolve('bin/board');
+const root = '11111111-1111-4111-8111-111111111111';
+const instructions = '22222222-2222-4222-8222-222222222222';
+function fixture(t) {
+  const dir = mkdtempSync(join(tmpdir(), 'bf2-lifecycle-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const cwd = join(dir, "BF2 repo's checkout"), agentDir = join(dir, 'agent');
+  mkdirSync(cwd); mkdirSync(join(cwd, '.git')); mkdirSync(agentDir); mkdirSync(join(dir, 'sessions'));
+  writeFileSync(join(agentDir, 'settings.shared.json'), JSON.stringify({ steeringMode: 'all', followUpMode: 'all' }));
+  const settings = { cwd, agentDir, code: process.cwd(), root, instructions, provider: 'openai-codex-test', model: 'gpt-6.1-sol', thinking: 'high' };
+  const config = { database: join(dir, 'board.sqlite'), run: 'isolated-run', session: 'controller', sender: '00000000' };
+  writeFileSync(join(dir, 'run.json'), JSON.stringify({ run: config.run }));
+  const board = openBoard(config); board.lifecycle.initialize(settings);
+  t.after(() => board.close());
+  const calls = [], panes = new Map(); let failNext = false;
+  const execute = args => {
+    calls.push(args);
+    if (args[0] === 'new-session') {
+      if (failNext) { failNext = false; return { status: 1, stdout: '', stderr: 'synthetic launch error' }; }
+      panes.set(args[args.indexOf('-s') + 1], true);
+    }
+    if (args[0] === 'display-message') return { status: 0, stdout: panes.get(args[args.indexOf('-t') + 1].split(':')[0]) ? '0\n' : '1\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const workerBoard = worker => {
+    const w = openBoard({ ...config, session: worker.session, sender: worker.sender });
+    t.after(() => w.close()); return w;
+  };
+  const boot = () => {
+    tick(board, config, execute);
+    const workers = board.lifecycle.status().workers.filter(w => w.state === 'launching');
+    for (const worker of workers) workerBoard(worker).lifecycle.ready();
+    return workers;
+  };
+  const envFor = worker => ({ ...process.env, BF2_SWARM_WORKER: '1', BF2_BOARD_DB: config.database,
+    BF2_BOARD_RUN: config.run, BF2_BOARD_SESSION: worker.session, BF2_BOARD_SENDER: worker.sender });
+  return { dir, config, settings, board, calls, panes, execute, boot, workerBoard, envFor, fail: () => { failNext = true; } };
+}
+function fakePi(t, h, worker) {
+  const handlers = new Map(), messages = [], entries = []; let percent, shuts = 0, drained = true;
+  const file = join(h.dir, 'sessions', `${worker.session}.jsonl`);
+  writeFileSync(file, JSON.stringify({ type: 'session', id: worker.session }) + '\n');
+  const ctx = { sessionManager: { getSessionId: () => worker.session, getSessionFile: () => file,
+    getEntries: () => entries, getBranch: () => entries }, getContextUsage: () => ({ percent }),
+    shutdown: () => { shuts++; } };
+  const pi = { on: (event, fn) => handlers.set(event, fn), getSettings: () => ({ steeringMode: 'all', followUpMode: 'all' }),
+    appendEntry: (customType, data) => entries.push({ type: 'custom', customType, data }),
+    async sendUserMessage(text, options) {
+      if (options.admissionGuard && !options.admissionGuard()) return { status: 'rejected', reason: 'guard' };
+      const handled = handlers.get('input')?.({ source: 'extension', text }, ctx);
+      messages.push({ text, options, handled });
+      return { status: 'admitted', delivery: handled ? 'custom' : 'steer' };
+    } };
+  const api = installWorker(pi, h.envFor(worker), () => drained);
+  t.after(() => handlers.get('session_shutdown')?.({}, ctx));
+  return { pi, ctx, handlers, messages, entries, api, shuts: () => shuts,
+    usage: value => { percent = value; }, draining: value => { drained = !value; } };
+}
+
+test('three fake tmux boots have normal route/env, unique durable sessions, minimal USER @files', t => {
+  const h = fixture(t), workers = h.boot();
+  assert.equal(workers.length, 3);
+  assert.equal(new Set(workers.map(w => w.session)).size, 3);
+  assert.equal(new Set(workers.map(w => w.sender)).size, 3);
+  for (const worker of workers) {
+    assert.match(worker.sender, /^[a-f0-9]{8}$/);
+    const call = h.calls.find(a => a[0] === 'new-session' && a.includes(worker.pane));
+    assert.equal(call[call.indexOf('-c') + 1], h.settings.cwd);
+    const command = call.at(-1);
+    assert.ok(command.includes("'--provider' 'openai-codex-test' '--model' 'gpt-6.1-sol' '--thinking' 'high'"));
+    assert.ok(command.includes(`'BF2_BOARD_SESSION=${worker.session}'`));
+    assert.ok(command.includes(`'BF2_BOARD_SENDER=${worker.sender}'`));
+    assert.ok(command.includes(`'BF2_BOARD_DB=${h.config.database}'`));
+    assert.ok(command.includes(`'BF2_BOARD_RUN=${h.config.run}'`));
+    assert.match(command, /PATH=.*\/bin:/);
+    assert.ok(command.includes(quote(join(h.dir, 'sessions'))));
+    assert.match(command, /bf2-swarm\.ts/); assert.match(command, /bf2-board\.ts/);
+    for (const prohibited of ['--no-extensions', '--no-session', '--print', 'rlm-friendly-stop', 'report.md']) assert.ok(!command.includes(prohibited));
+    const mission = readFileSync(join(h.dir, `${worker.session}.boot.txt`), 'utf8');
+    assert.equal(mission, bootMission(h.settings));
+    assert.ok(mission.indexOf('5c2f91e4') < mission.indexOf(root));
+    assert.ok(mission.indexOf(root) < mission.indexOf(instructions));
+  }
+  const scrubbed = workerCommand(h.settings, { ...h.config, ...workers[0] }, workers[0].pane, '/tmp/mission', {
+    PATH: '/bin', PI_SUBAGENT_MANIFEST: '/old/task', PI_RLM_FRIENDLY_STOP: 'yes', BF2_BOARD_RUN: 'old-run', TMUX_PANE: '%old',
+  });
+  assert.match(scrubbed, /'-u' 'PI_SUBAGENT_MANIFEST'/);
+  assert.match(scrubbed, /'-u' 'PI_RLM_FRIENDLY_STOP'/);
+  assert.ok(!scrubbed.includes('/old/task'));
+});
+
+test('real compound bash done stores one handoff; replacement waits agent_settled and background drain', async t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const worker = h.board.lifecycle.status().workers[0], f = fakePi(t, h, worker);
+  await f.handlers.get('session_start')({}, f.ctx);
+  const result = spawnSync('/bin/bash', ['-c', `${quote(executable)} done 'final handoff'; printf preserved > ${quote(join(h.dir, 'artifact'))}; ${quote(executable)} read; ${quote(resolve('bin/bf2-swarm'))} status --run-dir ${quote(h.dir)} > ${quote(join(h.dir, 'compound-status.json'))}`], { env: h.envFor(worker), encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /retirement requested.*\nBoard run/s);
+  assert.equal(readFileSync(join(h.dir, 'artifact'), 'utf8'), 'preserved');
+  assert.equal(JSON.parse(readFileSync(join(h.dir, 'compound-status.json'), 'utf8')).workers[0].state, 'retiring');
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
+  const before = h.calls.filter(a => a[0] === 'new-session').length;
+  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
+  await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.shuts(), 0);
+  f.draining(true);
+  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
+  assert.equal(f.handlers.get('input')({ source: 'extension', text: 'SYSTEM (background-jobs): All 1 background job(s) in this batch finished.' }, f.ctx), undefined);
+  f.draining(false);
+  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  assert.equal(f.shuts(), 1);
+  tick(h.board, h.config, h.execute);
+  const state = h.board.lifecycle.status();
+  assert.equal(state.workers[0].state, 'retired');
+  assert.equal(state.workers.length, 4);
+  assert.notEqual(state.workers[3].sender, worker.sender);
+  assert.notEqual(state.workers[3].session, worker.session);
+  assert.equal(h.board.history({ limit: 100 }).posts.filter(p => p.text === 'final handoff').length, 1);
+  assert.ok(existsSync(join(h.dir, 'artifact')));
+});
+
+test('ordinary settlement is not retirement; genuine tool alias terminates without report duplication', async t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const worker = h.board.lifecycle.status().workers[0], f = fakePi(t, h, worker);
+  await f.handlers.get('session_start')({}, f.ctx);
+  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  tick(h.board, h.config, h.execute); assert.equal(h.board.lifecycle.status().workers.length, 3);
+  const tool = handoffTool(f.api, { type: 'object' });
+  assert.equal(tool.name, 'messaged_outcome');
+  await assert.rejects(tool.execute('1', { handoff: '' }, undefined, undefined, f.ctx), /nonempty/);
+  const result = await tool.execute('1', { handoff: 'Tree node updated; inspect commit.' }, undefined, undefined, f.ctx);
+  assert.equal(result.terminate, true); assert.equal(f.shuts(), 0);
+  assert.deepEqual(result.details, { number: 1 });
+  assert.doesNotMatch(result.content[0].text, /Tree node updated/);
+  assert.equal(h.board.history().posts[0].text, 'Tree node updated; inspect commit.');
+  f.handlers.get('agent_settled')({ outcome: 'failed' }, f.ctx); assert.equal(f.shuts(), 0);
+  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx); assert.equal(f.shuts(), 1);
+});
+
+test('unexpected exit posts accurate system notice and replaces; launch failure retries next tick', t => {
+  const h = fixture(t), workers = h.boot();
+  h.panes.set(workers[0].pane, false); h.fail();
+  tick(h.board, h.config, h.execute);
+  let state = h.board.lifecycle.status();
+  assert.equal(state.status, 'running'); assert.equal(state.workers[0].state, 'exited');
+  assert.equal(state.workers[3].state, 'launch-failed');
+  assert.ok(h.board.history({ limit: 100 }).posts.some(p => p.sender === '[system]' && p.text === `${workers[0].sender} exited without a retirement message.`));
+  tick(h.board, h.config, h.execute);
+  state = h.board.lifecycle.status(); assert.equal(state.workers[4].state, 'launching');
+  assert.equal(state.workers.filter(w => ['active', 'launching'].includes(w.state)).length, 3);
+  const handoff = h.workerBoard(workers[1]); handoff.lifecycle.done('Saved final progress'); h.panes.set(workers[1].pane, false);
+  tick(h.board, h.config, h.execute);
+  assert.equal(h.board.lifecycle.status().workers[1].state, 'exited-with-handoff');
+  const posts = h.board.history({ limit: 100 }).posts;
+  assert.ok(posts.some(p => p.text.includes('without safe settlement evidence')));
+  assert.ok(!posts.some(p => p.text === `${workers[1].sender} exited without a retirement message.`));
+});
+
+test('CLI votes need three current active IDs and same request; withdraw and replacement invalidate old vote', t => {
+  const h = fixture(t), workers = h.boot(), peers = workers.map(h.workerBoard);
+  const first = peers[0].post('Waiting proposal; node pointer'), second = peers[1].post('Different proposal');
+  const cli = (worker, ...args) => spawnSync(executable, args, { env: h.envFor(worker), encoding: 'utf8' });
+  assert.equal(cli(workers[0], 'vote', '999', 'no request').status, 1);
+  assert.equal(cli({ session: 'forged-session', sender: 'eeeeeeee' }, 'vote', String(first), 'forgery').status, 1);
+  assert.equal(cli({ ...workers[0], sender: 'eeeeeeee' }, 'vote', String(first), 'changed identity').status, 1);
+  assert.equal(cli(workers[0], 'vote', String(first), 'tree reason').status, 0);
+  assert.equal(cli(workers[1], 'vote', String(first), 'same node').status, 0);
+  assert.equal(h.board.lifecycle.status().status, 'running');
+  assert.equal(cli(workers[1], 'vote', '--withdraw').status, 0);
+  assert.equal(peers[2].lifecycle.vote(first, 'agree'), 'running');
+  assert.equal(peers[1].lifecycle.vote(second, 'other request'), 'running');
+  h.panes.set(workers[2].pane, false); tick(h.board, h.config, h.execute);
+  assert.equal(h.board.lifecycle.status().workers[2].vote, null);
+  assert.equal(cli(workers[2], 'vote', String(first), 'stale session').status, 1);
+  assert.equal(peers[1].lifecycle.vote(first, 'agree now'), 'running', 'two votes in replacement gap must not pause');
+  const replacement = h.board.lifecycle.status().workers[3], next = h.workerBoard(replacement);
+  assert.throws(() => next.lifecycle.vote(first, 'not active yet'), /active/);
+  next.lifecycle.ready(); assert.equal(h.board.lifecycle.status().status, 'running');
+  assert.equal(next.lifecycle.vote(first, 'fresh vote'), 'waiting');
+  assert.equal(h.board.lifecycle.status().request, first);
+  assert.throws(() => peers[0].lifecycle.withdraw(), /running/);
+  const recovered = openRun(h.dir); try { assert.equal(recovered.board.lifecycle.status().status, 'waiting'); } finally { recovered.board.close(); }
+  const before = h.calls.filter(a => a[0] === 'new-session').length;
+  for (const worker of [workers[0], workers[1], replacement]) { const peer = h.workerBoard(worker); peer.lifecycle.done('Waiting state recorded on tree'); peer.lifecycle.settled(); }
+  tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
+  h.board.lifecycle.resume(); tick(h.board, h.config, h.execute);
+  const state = h.board.lifecycle.status();
+  assert.equal(state.status, 'running'); assert.equal(state.request, null);
+  assert.ok(state.workers.every(w => w.vote === null));
+  assert.equal(state.workers.filter(w => w.state === 'launching').length, 3);
+});
+
+test('human stop differs from waiting; safe wrapup input only, unfinished board pending retained', async t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const workers = h.board.lifecycle.status().workers, w = h.workerBoard(workers[0]), peer = h.workerBoard(workers[1]);
+  const f = fakePi(t, h, workers[0]); await f.handlers.get('session_start')({}, f.ctx); peer.lifecycle.ready();
+  w.finishStartup(0); peer.post('unfinished pending'); const pending = w.pending();
+  const r = receiver(f.pi, { ...h.config, session: workers[0].session, sender: workers[0].sender }, f.ctx); t.after(() => r.close());
+  h.board.lifecycle.stop();
+  await r.pump(); assert.equal(f.messages.length, 0);
+  assert.deepEqual(w.pending(), pending);
+  await f.handlers.get('turn_end')({}, f.ctx); await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.messages.length, 1); assert.equal(f.messages[0].text, wrapup(h.config.run, h.board.lifecycle.status()));
+  assert.equal(f.messages[0].handled, undefined);
+  assert.deepEqual(f.handlers.get('input')({ source: 'interactive', text: 'new work' }, f.ctx), { action: 'handled' });
+  const before = h.board.lifecycle.status().workers.length;
+  tick(h.board, h.config, h.execute); assert.equal(h.board.lifecycle.status().workers.length, before);
+  assert.throws(() => h.board.lifecycle.resume(), /finish\/exit/);
+  w.lifecycle.done('stopped handoff'); f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  assert.deepEqual(f.handlers.get('input')({ source: 'extension', text: 'late input' }, f.ctx), { action: 'handled' });
+  assert.deepEqual(w.pending(), pending);
+  for (const worker of workers.slice(1)) { h.panes.set(worker.pane, false); }
+  tick(h.board, h.config, h.execute); assert.equal(h.board.lifecycle.status().status, 'stopped');
+  h.board.lifecycle.resume(); tick(h.board, h.config, h.execute);
+  assert.equal(h.board.lifecycle.status().workers.filter(w => w.state === 'launching').length, 3);
+});
+
+test('80% warning is once, known usage only, no SiftText/binary/bash blocks or forced continuation', async t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const worker = h.board.lifecycle.status().workers[0], f = fakePi(t, h, worker);
+  await f.handlers.get('session_start')({}, f.ctx);
+  for (const usage of [undefined, null, NaN, 79.9]) { f.usage(usage); await f.handlers.get('turn_end')({}, f.ctx); }
+  assert.equal(f.messages.length, 0);
+  f.usage(80); await f.handlers.get('turn_end')({}, f.ctx);
+  f.usage(99); await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.messages.length, 1); assert.equal(f.entries[0].customType, warningType);
+  assert.equal(f.messages[0].options.deliverAs, 'steer'); assert.equal(f.messages[0].handled, undefined);
+  assert.equal(f.shuts(), 0);
+  for (const toolName of ['sifttext_get_node', 'sifttext_edit_crystallization', 'binary', 'bash', 'bash_bg']) {
+    assert.equal(f.handlers.get('tool_call')?.({ toolName }, f.ctx), undefined);
+  }
+  assert.equal(f.handlers.has('agent_before_settle'), false);
+  f.handlers.get('session_shutdown')({}, f.ctx);
+  await f.handlers.get('session_start')({}, f.ctx); await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.messages.length, 1, 'metadata survives extension/session reconstruction');
+  assert.equal(installWorker({ on() { assert.fail('inert outside experiment'); } }, {}), undefined);
+});
+
+test('installed Pi loader registers the actual opt-in tool and settles it without a task contract', { skip: !process.env.PI_PACKAGE_DIR }, async t => {
+  const h = fixture(t); const worker = h.boot()[0];
+  const { loadExtensions } = await import(`${process.env.PI_PACKAGE_DIR}/dist/core/extensions/loader.js`);
+  const keys = ['BF2_SWARM_WORKER', 'BF2_BOARD_DB', 'BF2_BOARD_RUN', 'BF2_BOARD_SESSION', 'BF2_BOARD_SENDER'];
+  const previous = keys.map(key => process.env[key]);
+  let loaded;
+  try {
+    for (const key of keys) process.env[key] = h.envFor(worker)[key];
+    loaded = await loadExtensions([resolve('optional-extensions/bf2-swarm.ts')], process.cwd());
+  } finally { keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; }); }
+  assert.deepEqual(loaded.errors, []);
+  const extension = loaded.extensions[0];
+  loaded.runtime.getSettings = () => ({ steeringMode: 'all', followUpMode: 'all' });
+  const file = join(h.dir, 'sessions', 'actual-tool.jsonl'); writeFileSync(file, '{}\n');
+  let shutdown = 0;
+  const ctx = { sessionManager: { getSessionId: () => worker.session, getSessionFile: () => file, getEntries: () => [] },
+    shutdown: () => { shutdown++; } };
+  const fire = async (event, args = {}) => { for (const handler of extension.handlers.get(event) ?? []) await handler(args, ctx); };
+  t.after(() => fire('session_shutdown'));
+  await fire('session_start');
+  assert.equal(extension.tools.size, 1); assert.equal(extension.handlers.has('tool_call'), false);
+  const tool = extension.tools.get('messaged_outcome').definition;
+  assert.equal(tool.parameters.properties.handoff.type, 'string');
+  const result = await tool.execute('call', { handoff: 'Actual loader handoff' }, undefined, undefined, ctx);
+  assert.equal(result.terminate, true); assert.equal(shutdown, 0);
+  await fire('agent_settled', { outcome: 'completed' });
+  assert.equal(shutdown, 1);
+  assert.equal(h.board.history().posts[0].text, 'Actual loader handoff');
+});
+
+test('worker independently refuses native one-at-a-time queues before startup USER mission', async t => {
+  const h = fixture(t); tick(h.board, h.config, h.execute);
+  const worker = h.board.lifecycle.status().workers[0], f = fakePi(t, h, worker);
+  f.pi.getSettings = () => ({ steeringMode: 'one-at-a-time', followUpMode: 'all' });
+  await f.handlers.get('session_start')({}, f.ctx);
+  assert.deepEqual(f.handlers.get('input')({ source: 'interactive', text: bootMission(h.settings) }, f.ctx), { action: 'handled' });
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'launch-failed');
+  assert.equal(f.messages.length, 0);
+  assert.equal(f.shuts(), 1, 'startup refusal requests orderly shutdown, never a model turn');
+});
+
+test('real operator CLI preflight/start/status/stop/resume uses fake Pi/tmux only', t => {
+  const h = fixture(t), bin = join(h.dir, 'fake-bin'), log = join(h.dir, 'fake.log'), runDir = join(h.dir, 'new-run');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'pi'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['pi', ...process.argv.slice(2)]) + '\\n'); console.log('openai-codex-test gpt-6.1-sol fixture');\n`, { mode: 0o755 });
+  writeFileSync(join(bin, 'tmux'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['tmux', ...process.argv.slice(2)]) + '\\n'); if (process.argv[2] === 'has-session') process.exitCode = 1;\n`, { mode: 0o755 });
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, PI_CODING_AGENT_DIR: h.settings.agentDir };
+  const run = (...args) => spawnSync(resolve('bin/bf2-swarm'), args, { env, encoding: 'utf8' });
+  const start = ['start', '--cwd', h.settings.cwd, '--root', root, '--instructions', instructions, '--provider', h.settings.provider, '--run-dir', runDir];
+  assert.equal(run('start', '--cwd', 'relative', '--run-dir', runDir).status, 1);
+  assert.equal(existsSync(runDir), false); assert.equal(existsSync(log), false);
+  const result = run(...start); assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Controller: tmux attach.*\nExperiment node:/);
+  assert.equal(run(...start).status, 1, 'start never adopts an existing namespace');
+  assert.equal(JSON.parse(run('status', '--run-dir', runDir).stdout).status, 'running');
+  assert.equal(run('stop', '--run-dir', runDir).status, 0);
+  assert.equal(JSON.parse(run('status', '--run-dir', runDir).stdout).status, 'stopped');
+  const recovered = openRun(runDir);
+  try {
+    recovered.board.lifecycle.claimController(process.pid);
+    assert.throws(() => recovered.board.lifecycle.claimController(process.pid), /duplicate loop/);
+    recovered.board.lifecycle.releaseController(process.pid);
+  } finally { recovered.board.close(); }
+  assert.equal(run('resume', '--run-dir', runDir).status, 0);
+  assert.equal(JSON.parse(run('status', '--run-dir', runDir).stdout).status, 'running');
+  const commands = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(commands.filter(a => a[0] === 'pi').every(a => a[1] === '--offline' && a[2] === '--list-models' && a[3] === 'openai-codex-test/gpt-6.1-sol'));
+  assert.equal(commands.filter(a => a[0] === 'tmux' && a[1] === 'new-session').length, 2);
+  assert.ok(commands.filter(a => a[0] === 'tmux' && a[1] === 'new-session').every(a => a.at(-1).includes('bf2-swarm') && !a.at(-1).includes('@')));
+  assert.equal(existsSync(join(h.settings.cwd, '.pi')), false, 'no repo settings installation');
+});
+
+test('launch validation is before new namespace; old-run identities cannot change another DB', t => {
+  const h = fixture(t);
+  assert.deepEqual(validateLaunch(h.settings, { PI_CODING_AGENT_DIR: h.settings.agentDir }), { ...h.settings, cwd: realpathSync(h.settings.cwd), agentDir: realpathSync(h.settings.agentDir) });
+  for (const changes of [{ cwd: 'relative' }, { cwd: join(h.dir, 'missing') }, { root: 'placeholder' }, { instructions: '' }, { provider: 'other' }, { model: 'other' }, { thinking: 'low' }]) {
+    assert.throws(() => validateLaunch({ ...h.settings, ...changes }, { PI_CODING_AGENT_DIR: h.settings.agentDir }));
+  }
+  writeFileSync(join(h.settings.agentDir, 'settings.local.json'), JSON.stringify({ steeringMode: 'one-at-a-time' }));
+  assert.equal(settingsFor(h.settings.agentDir, h.settings.cwd).steeringMode, 'one-at-a-time');
+  assert.throws(() => validateLaunch(h.settings, { PI_CODING_AGENT_DIR: h.settings.agentDir }), /native/);
+  assert.throws(() => tick(h.board, h.config, h.execute), /native/);
+  assert.equal(h.board.lifecycle.status().status, 'running', 'bad current launch settings delay retries, not global pause');
+  assert.equal(h.calls.length, 0);
+  writeFileSync(join(h.settings.agentDir, 'settings.local.json'), JSON.stringify({ extensions: ['/x/optional-extensions/rlm-friendly-stop.ts'] }));
+  assert.throws(() => validateLaunch(h.settings, { PI_CODING_AGENT_DIR: h.settings.agentDir }), /friendly-stop/);
+  assert.throws(() => openBoard({ ...h.config, run: 'other-run' }), /another run/);
+  assert.equal(h.board.lifecycle.status().status, 'running');
+  assert.throws(() => openRun(join(h.dir, 'missing')), /ENOENT/);
+});
