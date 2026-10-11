@@ -117,6 +117,18 @@ test('2–10 next-occupant slots, invalid patches atomic, model/role edits do no
   tickFloor(floor, h.execute); assert.equal(floor.snapshot().status, 'stopped');
 });
 
+test('unavailable independent-job evidence cannot block real worker cleanup or imply job cancellation', t => {
+  const h = fixture(t), floor = h.create('one'), workers = h.boot(floor), p = h.peer(floor, workers[0]), errors = [];
+  p.lifecycle.done('Fixture continuing job locators'); p.lifecycle.settled();
+  floor.board.jobs.observe = () => { throw new Error('Fixture process evidence unavailable'); };
+  t.mock.method(console, 'error', text => errors.push(text));
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.length, 2, 'safe but live worker still owns its slot');
+  h.panes.get(workers[0].pane).live = false; tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().workers[0].cleaned, 1); assert.equal(floor.snapshot().workers.length, 3);
+  assert.ok(errors.every(text => text.includes('remain uncertain')));
+  assert.ok(h.calls.filter(c => c[0] === 'kill-pane').every(c => c.at(-1) === workers[0].pane));
+});
+
 test('unfinished ballots invalidate on slot and actual membership change; no is not controller judgment', t => {
   const h = fixture(t), floor = h.create('one'), workers = h.boot(floor), first = floor.snapshot().vote;
   h.peer(floor, workers[0]).lifecycle.vote(first.number, 'yes');

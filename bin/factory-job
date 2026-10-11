@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+(async () => {
+  const { realpathSync } = await import('node:fs');
+  const { pathToFileURL } = await import('node:url');
+  const { main } = await import(new URL('../extensions/dark-factory/floors/job-cli.mjs', pathToFileURL(realpathSync(process.argv[1]))));
+  await main();
+})().catch(error => { console.error(`factory-job: ${error.message}`); process.exitCode = 1; });
