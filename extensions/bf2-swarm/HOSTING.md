@@ -12,7 +12,8 @@ existing run capability in sessionStorage; it precedes the unchanged room module
 Browsers without Fetch Metadata cannot bootstrap (fail closed). API requests
 still require the exact Bearer header and run. Login Basic is never forwarded to the room. External Host/Origin
 and Fetch Metadata are checked before Origin is translated to the loopback room.
-POST requires exact HTTPS Origin and JSON. No identity, executable, proxy header,
+User-clicked top-level root/login links can enter from another site; that exception
+never covers scripts, iframes or API requests. POST requires exact HTTPS Origin and JSON. No identity, executable, proxy header,
 DB path or new API enters the room. The adapter forwards only bounded existing
 operations and assets; the room keeps its original validation/owner assignment.
 
