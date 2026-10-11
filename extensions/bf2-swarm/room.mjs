@@ -8,7 +8,7 @@ import { openRun, ensureController } from './controller.mjs';
 import { MAX_TEXT_BYTES } from './board.mjs';
 
 const assets = join(dirname(fileURLToPath(import.meta.url)), 'room');
-const sameToken = (actual, expected) => typeof actual === 'string' && actual.length === expected.length && timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+const sameToken = (actual, expected) => typeof actual === 'string' && Buffer.byteLength(actual) === Buffer.byteLength(expected) && timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 const roomURL = (run, port, token) => `http://127.0.0.1:${port}/#${run}/${token}`;
 
 // No browser-supplied identity, database, route or executable enters this server.
@@ -23,7 +23,7 @@ export async function serveRoom(board, config, { port = 0, controller = () => en
       response.end(type === 'application/json' ? JSON.stringify(body) : body);
     };
     try {
-      if (request.headers.host !== new URL(origin).host || (request.headers.origin && request.headers.origin !== origin)) return send(403, { error: 'local origin required' });
+      if (request.headers.host !== new URL(origin).host || (request.headers.origin && request.headers.origin !== origin) || ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) return send(403, { error: 'local origin required' });
       const url = new URL(request.url, origin);
       if (url.pathname.startsWith('/api/')) {
         if (!url.pathname.startsWith(prefix)) return send(404, { error: 'another run' });

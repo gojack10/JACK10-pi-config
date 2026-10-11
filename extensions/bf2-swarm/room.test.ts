@@ -220,6 +220,8 @@ test('localhost capability, Host/Origin/run scope, bounded mutations, owner assi
   const path=`${room.origin}/api/${h.config.run}/`, auth={Authorization:`Bearer ${room.token}`};
   const post=(action,body,headers={})=>fetch(path+action,{method:'POST',headers:{...auth,Origin:room.origin,'Content-Type':'application/json',...headers},body:JSON.stringify(body)});
   assert.equal((await fetch(path+'state')).status,403);
+  assert.equal((await fetch(path+'state',{headers:{Authorization:'Bearer '+'é'.repeat(64)}})).status,403, 'token comparison uses bytes, not UTF-16 length');
+  assert.equal((await fetch(path+'state',{headers:{...auth,'Sec-Fetch-Site':'same-site'}})).status,403);
   const badHost = await new Promise((resolveStatus,reject) => {
     const req = request(path+'state',{headers:{...auth,Host:'remote.example'}},res=>{res.resume();resolveStatus(res.statusCode);});
     req.once('error',reject); req.end();

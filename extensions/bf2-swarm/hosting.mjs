@@ -9,11 +9,11 @@ const ttl = 24 * 60 * 60 * 1000;
 
 // Separate authenticated ingress. The room remains loopback-only and still checks
 // its run capability. Never inject an API bearer or trust proxy identity headers.
-export async function serveHosting({ origin, upstream, run, token, basic, port = 0, now = Date.now }) {
+export async function serveHosting({ origin, upstream, run, token, basic, mode = 'legacy', port = 0, now = Date.now }) {
   const publicURL = new URL(origin), local = new URL(upstream);
   if (publicURL.protocol !== 'https:' || publicURL.origin !== origin ||
       local.protocol !== 'http:' || local.hostname !== '127.0.0.1' || local.origin !== upstream ||
-      !/^[a-zA-Z0-9_-]+$/.test(run) || !/^[a-f0-9]{64}$/.test(token) ||
+      !['legacy','floors'].includes(mode) || (mode === 'legacy' && !/^[a-zA-Z0-9_-]+$/.test(run)) || !/^[a-f0-9]{64}$/.test(token) ||
       !/^Basic [A-Za-z0-9+/]+={0,2}$/.test(basic)) throw new Error('invalid private hosting configuration');
   const sessions = new Map();
   const prefix = `/api/${encodeURIComponent(run)}/`;
@@ -58,21 +58,22 @@ export async function serveHosting({ origin, upstream, run, token, basic, port =
         // Even a sibling-site script in a browser without Fetch Metadata must
         // never receive a capability-bearing classic script.
         if (request.headers['sec-fetch-site'] !== 'same-origin') return send(403, { error: 'same-origin bootstrap required' });
-        return send(200, `sessionStorage.setItem('bf2-room', ${JSON.stringify(JSON.stringify({ run, token }))});`, 'text/javascript');
+        return send(200, `sessionStorage.setItem('bf2-room', ${JSON.stringify(JSON.stringify({ run: mode === 'floors' ? 'floors' : run, token, multi: mode === 'floors' }))});`, 'text/javascript');
       }
       if (url.pathname.startsWith('/api/')) {
-        if (!url.pathname.startsWith(prefix)) return send(404, { error: 'another run' });
+        const floorPath = /^\/api\/floors\/([a-zA-Z0-9_-]+)\/([a-z]+)$/.exec(url.pathname);
+        if (mode === 'legacy' ? !url.pathname.startsWith(prefix) : url.pathname !== '/api/floors' && !floorPath) return send(404, { error: 'another run' });
         if (!equal(request.headers.authorization, `Bearer ${token}`)) return send(403, { error: 'room capability required' });
-        const action = url.pathname.slice(prefix.length);
-        if (!(request.method === 'GET' && action === 'state') &&
-            !(request.method === 'POST' && ['message', 'start', 'stop', 'close'].includes(action))) return send(404, { error: 'unknown operation' });
+        const action = mode === 'floors' ? floorPath?.[2] : url.pathname.slice(prefix.length);
+        if (!(request.method === 'GET' && (action === 'state' || mode === 'floors' && url.pathname === '/api/floors' && !url.search)) &&
+            !(request.method === 'POST' && (mode === 'floors' ? ['message','start','stop','configuration','condition','oss'] : ['message','start','stop','close']).includes(action))) return send(404, { error: 'unknown operation' });
       } else if (request.method !== 'GET' || url.search || !['/', '/room.js', '/markup.mjs', '/colors_and_type.css',
           ...['Light', 'Medium', 'SemiBold', 'Italic'].map(f => `/fonts/JetBrainsMono-${f}.woff2`)].includes(url.pathname)) return send(404, { error: 'not found' });
       if (request.method === 'POST' && (request.headers.origin !== origin || request.headers['content-type'] !== 'application/json')) return send(403, { error: 'same-origin JSON required' });
       const chunks = []; let bytes = 0;
       for await (const chunk of request) {
         bytes += chunk.length;
-        if (bytes > 16384 * 6 + 1024) { send(413, { error: 'body too large' }); request.resume(); return; }
+        if (bytes > (mode === 'floors' ? 256 * 1024 : 16384 * 6 + 1024)) { send(413, { error: 'body too large' }); request.resume(); return; }
         chunks.push(chunk);
       }
       const headers = {};
@@ -96,7 +97,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     const path = process.argv[2], stat = statSync(path);
     if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error('private owned configuration required');
     const config = JSON.parse(readFileSync(path, 'utf8'));
-    const check = await fetch(`${config.upstream}/api/${encodeURIComponent(config.run)}/state?after=0`, {
+    const check = await fetch(config.mode === 'floors' ? `${config.upstream}/api/floors` : `${config.upstream}/api/${encodeURIComponent(config.run)}/state?after=0`, {
       headers: { Authorization: `Bearer ${config.token}` }, signal: AbortSignal.timeout(10000) });
     if (!check.ok) throw new Error('saved room unavailable');
     const server = await serveHosting(config);

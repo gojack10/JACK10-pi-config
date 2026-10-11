@@ -85,6 +85,6 @@ test('Basic login exchanges for a private cookie; real room retains bearer/run/O
 
 test('remote/wildcard/plaintext origin configuration refuses startup', async () => {
   const config = { origin, upstream: 'http://127.0.0.1:1234', run, token, basic };
-  for (const delta of [{ origin: 'http://factory.example.test' }, { upstream: 'http://0.0.0.0:1234' }, { run: '../other' }, { token: 'short' }, { basic: '' }])
+  for (const delta of [{ origin: 'http://factory.example.test' }, { upstream: 'http://0.0.0.0:1234' }, { run: '../other' }, { token: 'short' }, { basic: '' }, { mode: 'unknown' }])
     await assert.rejects(serveHosting({ ...config, ...delta }), /invalid private/);
 });
