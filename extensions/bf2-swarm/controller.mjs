@@ -61,7 +61,7 @@ export function workerCommand(settings, config, pane, mission, env = process.env
     '--session-id', config.session, '--session-dir', join(dirname(config.database), 'sessions'), '--name', pane,
     '-e', join(settings.code, 'optional-extensions/bf2-swarm.ts'), '-e', join(settings.code, 'optional-extensions/bf2-board.ts'),
     `@${mission}`];
-  return `tmux set-option -w -t ${quote(`${pane}:0`)} remain-on-exit on; exec ${args.map(quote).join(' ')}`;
+  return `tmux set-option -w -t "$TMUX_PANE" remain-on-exit on && exec ${args.map(quote).join(' ')}`;
 }
 export const bootMission = settings => `Read SiftText Read node 5c2f91e4-9bd5-4b45-bbc4-e69c15c1d14d first. Then read BF2 root ${settings.root}, then experiment instruction node ${settings.instructions}. Follow that node as an equal peer; it owns the work/policy. Do not launch nested workers. Use board -h for the CLI interface, then board read once after those tree reads.\n`;
 
@@ -86,8 +86,10 @@ export function openRun(runDir) {
 export function tick(board, config, execute = tmux, env = process.env) {
   let state = board.lifecycle.status();
   for (const worker of state.workers.filter(w => ['launching', 'active', 'retiring'].includes(w.state))) {
-    const result = execute(['display-message', '-p', '-t', `${worker.pane}:0.0`, '#{pane_dead}']);
-    if (result.status !== 0 || result.stdout.trim() === '1') board.lifecycle.lost(worker.session);
+    // Old name-only registrations cannot safely identify a pane after selection changes.
+    if (!/^%\d+$/.test(worker.pane)) throw new Error('worker lacks a stable tmux pane ID; start a fresh run');
+    const result = execute(['display-message', '-p', '-t', worker.pane, '#{pane_dead}']);
+    if (result.status !== 0 || result.stdout?.trim() !== '0') board.lifecycle.lost(worker.session);
   }
   state = board.lifecycle.status();
   if (state.status !== 'running') return state;
@@ -100,12 +102,14 @@ export function tick(board, config, execute = tmux, env = process.env) {
     const mission = join(dirname(config.database), `${session}.boot.txt`);
     writeFileSync(mission, bootMission(state.config), { flag: 'wx', mode: 0o600 });
     board.lifecycle.addWorker(session, sender, pane, () => {
-      checked(execute, ['new-session', '-d', '-s', pane, '-c', state.config.cwd,
+      const paneId = checked(execute, ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', pane, '-c', state.config.cwd,
         workerCommand(state.config, { ...config, session, sender }, pane, mission, env)]);
+      if (!/^%\d+$/.test(paneId)) throw new Error('tmux launch did not return a stable pane ID');
       // Capture terminal evidence without redirecting Pi out of ordinary TUI mode.
       // Failure is diagnostic only: the already-launched worker remains registered.
-      try { checked(execute, ['pipe-pane', '-o', '-t', `${pane}:0.0`, `cat >> ${quote(join(dirname(config.database), `${session}.pane.log`))}`]); }
+      try { checked(execute, ['pipe-pane', '-o', '-t', paneId, `cat >> ${quote(join(dirname(config.database), `${session}.pane.log`))}`]); }
       catch (error) { console.error(`BF2 swarm pane capture: ${error.message}`); }
+      return paneId;
     });
   }
   return board.lifecycle.status();
@@ -129,12 +133,15 @@ No forced termination, cleanup, task contract, reports, tree writes, or PATH ins
 function startController(config, settings, execute, env) {
   const pane = `bf2-${config.run}-controller`;
   const probe = execute(['has-session', '-t', pane]);
-  const alive = probe.status === 0 && execute(['display-message', '-p', '-t', pane, '#{pane_dead}']).stdout?.trim() === '0';
+  const paneId = probe.status === 0 ? execute(['show-options', '-v', '-t', pane, '@bf2_controller_pane']).stdout?.trim() : undefined;
+  const alive = /^%\d+$/.test(paneId) && execute(['display-message', '-p', '-t', paneId, '#{pane_dead}']).stdout?.trim() === '0';
   if (alive) return pane;
   const command = `exec ${[...launchEnvironment(env), `PI_CODING_AGENT_DIR=${settings.agentDir}`,
     join(settings.code, 'bin/bf2-swarm'), 'run', '--run-dir', dirname(config.database)].map(quote).join(' ')}`;
-  checked(execute, probe.status === 0 ? ['new-window', '-t', pane, '-n', 'recovery', '-c', settings.code, command] :
-    ['new-session', '-d', '-s', pane, '-c', settings.code, command]);
+  const launched = checked(execute, probe.status === 0 ? ['new-window', '-P', '-F', '#{pane_id}', '-t', pane, '-n', 'recovery', '-c', settings.code, command] :
+    ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', pane, '-c', settings.code, command]);
+  if (!/^%\d+$/.test(launched)) throw new Error('tmux controller launch did not return a stable pane ID');
+  checked(execute, ['set-option', '-t', pane, '@bf2_controller_pane', launched]);
   return pane;
 }
 export async function main(args = process.argv.slice(2), env = process.env, execute = tmux) {
