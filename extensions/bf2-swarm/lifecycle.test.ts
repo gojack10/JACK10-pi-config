@@ -466,11 +466,11 @@ test('real compound bash done stores one handoff; replacement waits agent_settle
   tick(h.board, h.config, h.execute); assert.equal(h.calls.filter(a => a[0] === 'new-session').length, before);
   await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.shuts(), 0);
   f.draining(true);
-  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  f.handlers.get('agent_settled')({ type: 'agent_settled' }, f.ctx);
   assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
   assert.equal(f.handlers.get('input')({ source: 'extension', text: 'SYSTEM (background-jobs): All 1 background job(s) in this batch finished.' }, f.ctx), undefined);
   f.draining(false);
-  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  f.handlers.get('agent_settled')({ type: 'agent_settled' }, f.ctx);
   assert.equal(f.shuts(), 1);
   assert.throws(() => h.board.lifecycle.resume(), /finish\/exit/);
   tick(h.board, h.config, h.execute);
@@ -491,7 +491,7 @@ test('ordinary settlement is not retirement; genuine tool alias terminates witho
   const h = fixture(t); tick(h.board, h.config, h.execute);
   const worker = h.board.lifecycle.status().workers[0], f = fakePi(t, h, worker);
   await f.handlers.get('session_start')({}, f.ctx);
-  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  f.handlers.get('agent_settled')({ type: 'agent_settled' }, f.ctx);
   tick(h.board, h.config, h.execute); assert.equal(h.board.lifecycle.status().workers.length, 3);
   const tool = handoffTool(f.api, { type: 'object' });
   assert.equal(tool.name, 'messaged_outcome');
@@ -501,8 +501,11 @@ test('ordinary settlement is not retirement; genuine tool alias terminates witho
   assert.deepEqual(result.details, { number: 2 }); // First activation already posted join #1.
   assert.doesNotMatch(result.content[0].text, /Tree node updated/);
   assert.equal(h.board.history().posts.find(p => p.number === result.details.number).text, 'Tree node updated; inspect commit.');
-  f.handlers.get('agent_settled')({ outcome: 'failed' }, f.ctx); assert.equal(f.shuts(), 0);
-  f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx); assert.equal(f.shuts(), 1);
+  for (const [kind, source] of [['cancel', 'escape'], ['context', 'context'], ['maintenance', 'maintenance'], ['lifecycle', 'lifecycle']]) {
+    f.handlers.get('agent_settled')({ type: 'agent_settled', interruption: { kind, source, reason: 'interrupted', runId: 1 } }, f.ctx);
+    assert.equal(f.shuts(), 0); assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
+  }
+  f.handlers.get('agent_settled')({ type: 'agent_settled' }, f.ctx); assert.equal(f.shuts(), 1);
 });
 
 test('unexpected exit posts accurate system notice and replaces; launch failure retries next tick', t => {
@@ -593,7 +596,7 @@ test('human stop differs from waiting; safe wrapup input only, unfinished board 
   const before = h.board.lifecycle.status().workers.length;
   tick(h.board, h.config, h.execute); assert.equal(h.board.lifecycle.status().workers.length, before);
   assert.throws(() => h.board.lifecycle.resume(), /finish\/exit/);
-  w.lifecycle.done('stopped handoff'); f.handlers.get('agent_settled')({ outcome: 'completed' }, f.ctx);
+  w.lifecycle.done('stopped handoff'); f.handlers.get('agent_settled')({ type: 'agent_settled' }, f.ctx);
   assert.deepEqual(f.handlers.get('input')({ source: 'extension', text: 'late input' }, f.ctx), { action: 'handled' });
   assert.deepEqual(w.pending(), pending);
   for (const worker of workers) { h.panes.set(worker.pane, false); }
@@ -648,9 +651,148 @@ test('installed Pi loader registers the actual opt-in tool and settles it withou
   assert.equal(tool.parameters.properties.handoff.type, 'string');
   const result = await tool.execute('call', { handoff: 'Actual loader handoff' }, undefined, undefined, ctx);
   assert.equal(result.terminate, true); assert.equal(shutdown, 0);
-  await fire('agent_settled', { outcome: 'completed' });
+  await fire('agent_settled', { type: 'agent_settled' });
   assert.equal(shutdown, 1);
   assert.equal(h.board.history().posts.find(p => p.number === result.details.number).text, 'Actual loader handoff');
+});
+
+// Actual installed AgentSession + optional extension, with a credential-free local stream.
+// PI_PACKAGE_DIR enables the same installed-runtime gate as the loader test above.
+async function nativePi(t, h, worker) {
+  const pkg = process.env.PI_PACKAGE_DIR;
+  const { createAgentSession, ModelRuntime, SessionManager, SettingsManager } = await import(`${pkg}/dist/index.js`);
+  const { loadExtensions } = await import(`${pkg}/dist/core/extensions/loader.js`);
+  const { EventStream, getModel } = await import(`${pkg}/../ai/dist/compat.js`);
+  const keys = ['BF2_SWARM_WORKER', 'BF2_BOARD_DB', 'BF2_BOARD_RUN', 'BF2_BOARD_SESSION', 'BF2_BOARD_SENDER'];
+  const previous = keys.map(key => process.env[key]);
+  let loaded;
+  try {
+    for (const key of keys) process.env[key] = h.envFor(worker)[key];
+    loaded = await loadExtensions([resolve('optional-extensions/bf2-swarm.ts'), resolve('extensions/background-jobs.ts')], h.settings.cwd);
+  } finally { keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; }); }
+  assert.deepEqual(loaded.errors, []);
+  const extension = loaded.extensions[0], settled = [], order = [], errors = [];
+  let ctx, shuts = 0, requests = 0;
+  extension.handlers.get('session_start').push((_event, context) => { ctx = context; });
+  extension.handlers.get('agent_settled').push(event => { settled.push(event); order.push('settled'); });
+  const modelRuntime = await ModelRuntime.create({ authPath: join(h.dir, 'auth.json'), modelsPath: join(h.dir, 'models.json') });
+  await modelRuntime.setRuntimeApiKey('anthropic', 'offline-fixture-key');
+  modelRuntime.streamSimple = () => { assert.fail('native fixture must never reach a real provider'); };
+  const { session } = await createAgentSession({
+    cwd: h.settings.cwd, agentDir: h.settings.agentDir, modelRuntime,
+    model: getModel('anthropic', 'claude-sonnet-4-5'), tools: ['messaged_outcome'],
+    sessionManager: SessionManager.create(h.settings.cwd, join(h.dir, 'sessions'), { id: worker.session }),
+    settingsManager: SettingsManager.inMemory({ steeringMode: 'all', followUpMode: 'all', compaction: { enabled: false }, retry: { enabled: false } }),
+    resourceLoader: {
+      getExtensions: () => loaded, getSkills: () => ({ skills: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: [], diagnostics: [] }), getThemes: () => ({ themes: [], diagnostics: [] }),
+      getAgentsFiles: () => ({ agentsFiles: [] }), getSystemPrompt: () => 'Offline settlement fixture',
+      getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [],
+      extendResources() {}, async reload() {},
+    },
+  });
+  t.after(async () => {
+    try {
+      if (ctx) {
+        for (const ext of loaded.extensions) {
+          for (const handler of ext.handlers.get('session_shutdown') ?? []) await handler({ type: 'session_shutdown' }, ctx);
+        }
+      }
+    } finally { session.dispose(); }
+  });
+  session.subscribe(event => { if (event.type === 'agent_end') order.push('agent_end'); });
+  await session.bindExtensions({ shutdownHandler: () => { shuts++; order.push('shutdown'); }, onError: error => errors.push(error) });
+  const respond = next => {
+    session.agent.streamFunction = model => {
+      requests++;
+      assert.ok(requests <= 3, 'offline fixture exceeded its bounded response script');
+      const stream = new EventStream(e => e.type === 'done' || e.type === 'error', e => e.message ?? e.error);
+      const content = next(requests);
+      const message = { role: 'assistant', content, api: model.api, provider: model.provider, model: model.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: content.some(c => c.type === 'toolCall') ? 'toolUse' : 'stop', timestamp: Date.now() };
+      queueMicrotask(() => { stream.push({ type: 'start', partial: message }); stream.push({ type: 'done', reason: message.stopReason, message }); });
+      return stream;
+    };
+  };
+  return { session, ctx, extension, settled, order, errors, respond, shuts: () => shuts, requests: () => requests,
+    bg: (name, args = {}) => loaded.extensions[1].tools.get(name).definition.execute('bg-fixture', args, undefined, undefined, ctx) };
+}
+const nativeOptions = { skip: !process.env.PI_PACKAGE_DIR, timeout: 10000 };
+const nativeHandoff = [{ type: 'toolCall', id: 'handoff', name: 'messaged_outcome', arguments: { handoff: 'Native final tree pointer' } }];
+const nativeFinal = [{ type: 'text', text: 'Finished safely.' }];
+
+test('native AgentSession emits no outcome and retires terminate:true only after the tool batch', nativeOptions, async t => {
+  const h = fixture(t), worker = h.boot()[0], n = await nativePi(t, h, worker);
+  n.respond(() => nativeHandoff);
+  await n.session.prompt('Retire');
+  assert.deepEqual(n.settled, [{ type: 'agent_settled', interruption: undefined }]);
+  assert.deepEqual(n.errors, []);
+  assert.equal(n.requests(), 1, 'terminate:true suppresses the automatic model follow-up');
+  assert.equal(n.session.messages.at(-1).role, 'toolResult');
+  assert.equal(n.shuts(), 1);
+  assert.ok(n.order.indexOf('agent_end') < n.order.indexOf('shutdown'));
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retired');
+});
+
+test('native AgentSession CLI done keeps compound bash work and final follow-up before retirement', nativeOptions, async t => {
+  const h = fixture(t), worker = h.boot()[0], n = await nativePi(t, h, worker);
+  const tool = n.extension.tools.get('messaged_outcome').definition;
+  tool.execute = async () => {
+    const result = spawnSync('/bin/bash', ['-c', `${quote(executable)} done 'Native CLI handoff'; printf kept > ${quote(join(h.dir, 'native-artifact'))}`], { env: h.envFor(worker), encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(n.shuts(), 0); assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
+    return { content: [{ type: 'text', text: result.stdout }], details: undefined }; // bash has no terminate flag
+  };
+  n.respond(request => request === 1 ? nativeHandoff : nativeFinal);
+  await n.session.prompt('CLI retirement');
+  assert.deepEqual(n.errors, []);
+  assert.equal(n.requests(), 2); assert.equal(n.shuts(), 1);
+  assert.equal(readFileSync(join(h.dir, 'native-artifact'), 'utf8'), 'kept');
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retired');
+});
+
+test('native retirement waits actual registered background work and its admitted completion turn', nativeOptions, async t => {
+  const h = fixture(t), worker = h.boot()[0], n = await nativePi(t, h, worker);
+  const tool = n.extension.tools.get('messaged_outcome').definition, execute = tool.execute;
+  let job;
+  tool.execute = async (...args) => {
+    job = (await n.bg('bash_bg', { command: 'exec sleep 30', label: 'isolated drain fixture' })).details;
+    return execute(...args);
+  };
+  n.respond(request => request === 1 ? nativeHandoff : nativeFinal);
+  await n.session.prompt('Retire with background work');
+  assert.equal((await n.bg('bash_jobs')).details.jobs[0].exit_code, undefined); assert.equal(n.shuts(), 0);
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
+  const finished = new Promise(resolve => {
+    const off = n.session.subscribe(event => { if (event.type === 'agent_settled') { off(); resolve(); } });
+  });
+  await n.bg('bash_kill', { job_id: job.job_id });
+  await finished;
+  assert.deepEqual(n.errors, []);
+  const completed = (await n.bg('bash_jobs')).details.jobs[0];
+  assert.notEqual(completed.exit_code, undefined); // SIGTERM completion may have a null exit code.
+  assert.equal(completed.killed, true); assert.equal(n.requests(), 2); assert.equal(n.shuts(), 1);
+  assert.equal(n.session.messages.filter(m => m.role === 'user' && JSON.stringify(m.content).includes('SYSTEM (background-jobs): All ')).length, 1);
+  assert.equal(h.board.lifecycle.status().workers[0].state, 'retired');
+});
+
+test('native interruption after handoff stays retiring; a later clean run may retire', nativeOptions, async t => {
+  const h = fixture(t), worker = h.boot()[0], n = await nativePi(t, h, worker);
+  let interrupt = true;
+  n.extension.handlers.get('turn_end').push((_event, ctx) => { if (interrupt) ctx.abort(); });
+  n.respond(() => nativeHandoff);
+  await n.session.prompt('Interrupted retirement');
+  assert.deepEqual(n.errors, []);
+  assert.equal(n.settled[0].interruption.kind, 'cancel');
+  assert.equal(n.settled[0].interruption.source, 'extension');
+  assert.equal(Object.hasOwn(n.settled[0], 'outcome'), false);
+  assert.equal(n.shuts(), 0); assert.equal(h.board.lifecycle.status().workers[0].state, 'retiring');
+  interrupt = false; n.respond(() => nativeFinal);
+  // Interactive input is intentionally fenced after done; already-started background results may resume.
+  await n.session.sendUserMessage('SYSTEM (background-jobs): All 1 background job(s) in this batch finished.', { deliverAs: 'steer' });
+  assert.equal(n.shuts(), 1); assert.equal(h.board.lifecycle.status().workers[0].state, 'retired');
 });
 
 test('worker independently refuses native one-at-a-time queues before startup USER mission', async t => {
