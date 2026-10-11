@@ -33,8 +33,10 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         // Synchronous tmux setup returns before Pi boot: serialize it with stop/vote.
         // No model, admission await, or agent turn runs inside this transaction.
         if (launch) {
-          try { launch(); }
-          catch (error) {
+          try {
+            const paneId = launch();
+            db.prepare('UPDATE swarm_workers SET pane=? WHERE session=?').run(paneId, session);
+          } catch (error) {
             db.prepare("UPDATE swarm_workers SET state='launch-failed' WHERE session=?").run(session);
             system(`${sender} launch failed: ${String(error.message).slice(0, 1000)}. Retrying after ordinary delay.`);
           }
