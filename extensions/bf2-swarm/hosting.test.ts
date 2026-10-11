@@ -42,7 +42,8 @@ test('Basic login exchanges for a private cookie; real room retains bearer/run/O
   assert.match(page.body, /hosting-bootstrap\.js.*\n<script type="module"/);
   assert.equal(page.headers['cache-control'], 'no-store');
   assert.ok(!page.body.includes(token));
-  assert.match((await call('/hosting-bootstrap.js', { Cookie })).body, new RegExp(token));
+  assert.equal((await call('/hosting-bootstrap.js', { Cookie })).status, 403);
+  assert.match((await call('/hosting-bootstrap.js', { Cookie, 'Sec-Fetch-Site': 'same-origin' })).body, new RegExp(token));
   assert.equal((await call('/hosting-bootstrap.js')).status, 401);
   assert.equal((await call(api, { Cookie })).status, 403);
   assert.equal((await call(api, { Cookie, Authorization: basic })).status, 403);
