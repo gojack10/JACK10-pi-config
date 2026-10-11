@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
+import { lifecycleStore } from './lifecycle-store.mjs';
 
 export const HISTORY_LIMIT = 30;
 export const BATCH_LIMIT = 100;
@@ -33,7 +34,7 @@ export function openBoard(config) {
     db.exec('PRAGMA busy_timeout=5000');
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
     if (tables.some(t => t.name === 'board_run') && db.prepare('SELECT run FROM board_run').get()?.run !== config.run) throw new Error('database belongs to another run');
     // Cold concurrent openers can race the DELETE -> WAL change; SQLite may
     // return BUSY immediately for that PRAGMA despite busy_timeout. Already-WAL
@@ -60,21 +61,27 @@ export function openBoard(config) {
       if (db.prepare('SELECT run FROM board_run').get().run !== config.run) throw new Error('database belongs to another run');
       const identity = db.prepare('SELECT sender FROM board_sessions WHERE session=?').get(config.session);
       if (identity && identity.sender !== config.sender) throw new Error('session already has another sender identity');
+      if (!identity && tables.some(t => t.name === 'swarm_run')) throw new Error('identity is not registered by this run controller');
       db.prepare('INSERT OR IGNORE INTO board_sessions(session, sender) VALUES (?, ?)').run(config.session, config.sender);
       if (!db.prepare('SELECT session FROM board_sessions WHERE session=?').get(config.session)) throw new Error('sender identity already belongs to another session; assign a new ID');
     });
   } catch (error) { db.close(); throw error; }
 
   const state = () => db.prepare('SELECT cursor, pending FROM board_sessions WHERE session=?').get(config.session);
+  const insertPost = (text, session = config.session, sender = config.sender) => {
+    if (typeof text !== 'string' || !text.trim() || text.includes('\0') || Buffer.byteLength(text) > MAX_TEXT_BYTES) throw new Error(`post requires nonempty text without NUL, at most ${MAX_TEXT_BYTES} UTF-8 bytes`);
+    if (session !== 'controller' && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get()) {
+      const worker = db.prepare('SELECT state FROM swarm_workers WHERE session=?').get(session);
+      if (!worker || !['active', 'retiring'].includes(worker.state)) throw new Error('post requires a registered active worker session');
+    }
+    const result = db.prepare('INSERT INTO board_posts(id, session, sender, created, text) VALUES (?, ?, ?, ?, ?)')
+      .run(randomUUID(), session, sender, new Date().toISOString(), text);
+    return Number(result.lastInsertRowid);
+  };
   return {
     close: () => db.close(),
-    post(text) {
-      if (typeof text !== 'string' || !text.trim() || text.includes('\0') || Buffer.byteLength(text) > MAX_TEXT_BYTES) throw new Error(`post requires nonempty text without NUL, at most ${MAX_TEXT_BYTES} UTF-8 bytes`);
-      const id = randomUUID();
-      const result = db.prepare('INSERT INTO board_posts(id, session, sender, created, text) VALUES (?, ?, ?, ?, ?)')
-        .run(id, config.session, config.sender, new Date().toISOString(), text);
-      return Number(result.lastInsertRowid);
-    },
+    post: text => insertPost(text),
+    lifecycle: lifecycleStore(db, transaction, config, insertPost),
     history({ limit = HISTORY_LIMIT, before = Number.MAX_SAFE_INTEGER } = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('limit must be 1-100');
       if (!Number.isSafeInteger(before) || before < 1) throw new Error('before must be a positive post number');
