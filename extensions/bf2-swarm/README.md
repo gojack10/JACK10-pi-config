@@ -22,11 +22,11 @@ BF2_REPO=/absolute/path/to/durable/BF2-checkout
 "$SWARM_CODE/bin/bf2-swarm" start --cwd "$BF2_REPO" \
   --root "$BF2_ROOT_NODE" --instructions "$BF2_EXPERIMENT_NODE" \
   --provider "$BF2_SWARM_PROVIDER"
-# Start prints a fresh durable RUN path and named tmux controller attachment.
+# Start prints a fresh durable RUN path and the single tmux parent attachment.
 "$SWARM_CODE/bin/bf2-swarm" status --run-dir "$RUN"
 "$SWARM_CODE/bin/bf2-swarm" stop --run-dir "$RUN"
 "$SWARM_CODE/bin/bf2-swarm" resume --run-dir "$RUN"
-# If only the controller process was interrupted, recover the running loop:
+# Recover only the controller window, preserving stored running/waiting/stop:
 "$SWARM_CODE/bin/bf2-swarm" run --run-dir "$RUN"
 "$SWARM_CODE/bin/bf2-swarm" -h
 ```
@@ -47,9 +47,12 @@ it does not add the global optional `rlm-friendly-stop.ts`. Explicit friendly-st
 configuration is rejected. Use normal project trust; unexpected input-transforming
 or lifecycle-changing extensions remain outside this experiment's tested path.
 
-Each worker is a normal saved interactive Pi in its own named tmux session, with
-an explicit UUID session and a fresh unique eight-hex sender (SQLite rejects any
-collision). Route is the explicit configured provider plus fixed model/high; the
+Each new run has exactly one named tmux parent `bf2-<run UUID>`, created with a
+`controller` window before workers. Each worker is a normal saved interactive Pi in
+another named window of that same parent, with an explicit UUID Pi session and a
+fresh unique eight-hex sender (SQLite rejects any collision). Stable native `%pane`
+handles drive health/capture/cleanup regardless of base indices or selected window.
+Route is the explicit configured selector provider plus fixed model/high; the
 launcher performs only offline model-list preflight before its first start. It
 passes board env and the checkout's bin directory on PATH. It strips inherited task
 manifest, old board and RLM env. There is no task launch contract or report. The
@@ -81,14 +84,20 @@ drain; no tool is blocked. CLI done may still require an ordinary final model
 followup before settlement. A failed/interrupted settling turn does not mark clean
 retirement. Do not run two Pi processes/receivers for one saved session.
 
-The loop maintains three occupied sessions only while running. A safely retired
-session frees capacity; a disappeared/dead pane becomes `exited`, broadcasts
-`[system] <id> exited without a retirement message.`, then gets a fresh replacement.
-A final handoff without the safe marker is `exited-with-handoff`, with an accurate
-notice, not clean retirement and not the no-message notice. Launch failures are
-recorded and retried at the ordinary two-second tick, never a crash-count pause.
-No panes, workspaces, unrelated host processes or old runs are killed/cleaned.
-Tmux setup is serialized with DB stop/vote decisions; no model await is inside it.
+The loop maintains three occupied workers only while running. `retired` records
+safe settlement, not shutdown completion: the row still occupies capacity until
+Pi actually exits and its owned pane is removed. The controller then records
+`cleaned=1` and creates one replacement window in the same parent. A disappeared/dead
+pane becomes `exited`, broadcasts `[system] <id> exited without a retirement message.`,
+and is removed before replacement. A final handoff without the safe marker is
+`exited-with-handoff`, with an accurate notice, not clean retirement and not the
+no-message notice. Cleanup retries are idempotent; history/IDs/handoffs, boot files,
+logs, session JSONL and workspaces remain. Launch failures retry at the ordinary
+two-second tick, never a crash-count pause. Only owned dead worker panes are closed;
+no still-running worker is killed for posting done. Tmux creation is serialized
+with DB stop/vote decisions; no model await is inside it. A stop during creation
+cannot release an unregistered worker. Old separate-session run versions are not
+adopted/migrated; use their original code for read-only inspection.
 
 Votes require registered **active** session IDs with their launch identity and an
 existing committed request number. A normal post is a proposal; content is not
@@ -102,11 +111,21 @@ without replacement. The controller remains visibly waiting and shows the experi
 node for Jack. **Waiting is not BF2 success.** No desktop/chat notification.
 
 Human `stop` is distinct `stopped`, with the same deliberate no-respawn/wrapup.
-After old occupied sessions finish or exit, `resume` clears votes/request and starts
-fresh capacity. Resume refuses while old workers are still wrapping up. A running
-loop can recover after controller interruption with `run`, without restarting
-healthy workers. An atomic DB controller-PID claim refuses duplicate/reused live
-PIDs; inspect that run's state manually rather than force-killing anything. All experimental state
+After workers safely settle/exit and their panes close, the controller exits
+naturally with remain-on-exit off: the last experiment window/parent disappears.
+No forced worker kill or deletion of durable evidence occurs. Waiting instead keeps
+one controller/status window after workers drain. After all old panes are cleaned,
+`resume` clears votes/request and starts fresh capacity, recreating the same named
+parent after stop if needed. Resume refuses while SAFE-but-still-live workers remain.
+`run` ensures/recovers only the controller, without changing stored stop/wait state
+or restarting healthy workers. A stored controller pane is health-checked and a dead
+one respawned without `-k`; if vanished, only a controller window is restored inside
+the existing parent. Selected worker/inspection windows are never mistaken for it.
+Manually added inspection panes/windows are not owned and are preserved; close them
+manually if the experiment parent should disappear. No unrelated session, old run,
+factory or global tmux setting is touched. An atomic DB controller-PID claim refuses
+duplicate/reused live PIDs; inspect that run's state manually rather than force-killing
+anything. All experimental state
 is local-user trusted, not authentication or an OS sandbox.
 
 ## Advisory 80% warning
@@ -273,8 +292,14 @@ env -u BF2_SWARM_WORKER -u BF2_BOARD_DB -u BF2_BOARD_RUN -u BF2_BOARD_SESSION -u
   -e "$PWD/optional-extensions/bf2-board.ts" --list-models '<provider/model>'
 ```
 
-The tests use temporary SQLite files, real separate CLI processes, and fake Pi/tmux
-USER/admission/session-file inputs. Discovery uses the full normal worktree path
+The tests use temporary SQLite files, real separate CLI processes, fake Pi protocol
+inputs and an isolated native tmux server (unique socket/config, both base indices 1).
+Its processes are harmless shells only. It checks one parent + three workers,
+selected-window independence, safe settlement versus actual exit, bounded replacement,
+vanished/dead cleanup, controller recovery, unanimous waiting, stop-during-creation,
+stop drain and idempotent cleanup. Each test kills only its isolated server and checks
+that no test sessions survive. This is shell lifecycle evidence, not real Pi/model
+shutdown qualification. Discovery uses the full normal worktree path
 plus the optional receiver, not `--no-extensions`. No env means the receiver
 registers nothing and opens no DB; partial env refuses before opening. Loading
 never starts a timer; only `session_start` does, and shutdown closes it. These

@@ -3,6 +3,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   const exists = () => !!db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get();
   const status = () => {
     if (!exists()) throw new Error('this board has no experimental lifecycle');
+    if (!db.prepare("PRAGMA table_info(swarm_workers)").all().some(c => c.name === 'cleaned')) throw new Error('legacy separate-session run; start a fresh run');
     const run = db.prepare('SELECT * FROM swarm_run').get();
     return { ...run, config: JSON.parse(run.config), workers: db.prepare('SELECT * FROM swarm_workers ORDER BY rowid').all() };
   };
@@ -19,15 +20,16 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       if (exists()) throw new Error('run already initialized; use status/resume');
       transaction(() => {
         db.exec(`CREATE TABLE swarm_run (id INTEGER PRIMARY KEY CHECK(id=1), status TEXT NOT NULL, request INTEGER, config TEXT NOT NULL, controller INTEGER);
-          CREATE TABLE swarm_workers (session TEXT PRIMARY KEY, sender TEXT NOT NULL UNIQUE, pane TEXT NOT NULL UNIQUE,
-            state TEXT NOT NULL, handoff INTEGER, vote INTEGER);`);
+          CREATE TABLE swarm_workers (session TEXT PRIMARY KEY, sender TEXT NOT NULL UNIQUE, pane TEXT NOT NULL,
+            state TEXT NOT NULL, handoff INTEGER, vote INTEGER, cleaned INTEGER NOT NULL DEFAULT 0);
+          CREATE UNIQUE INDEX swarm_live_panes ON swarm_workers(pane) WHERE cleaned=0;`);
         db.prepare("INSERT INTO swarm_run VALUES (1, 'running', NULL, ?, NULL)").run(JSON.stringify(settings));
       });
     },
     addWorker(session, sender, pane, launch) {
       return transaction(() => {
         if (status().status !== 'running') return false;
-        if (db.prepare("SELECT COUNT(*) AS n FROM swarm_workers WHERE state IN ('launching','active','retiring')").get().n >= 3) return false;
+        if (db.prepare("SELECT COUNT(*) AS n FROM swarm_workers WHERE cleaned=0").get().n >= 3) return false;
         db.prepare('INSERT INTO board_sessions(session,sender) VALUES (?,?)').run(session, sender);
         db.prepare("INSERT INTO swarm_workers(session,sender,pane,state) VALUES (?,?,?,'launching')").run(session, sender, pane);
         // Synchronous tmux setup returns before Pi boot: serialize it with stop/vote.
@@ -37,7 +39,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
             const paneId = launch();
             db.prepare('UPDATE swarm_workers SET pane=? WHERE session=?').run(paneId, session);
           } catch (error) {
-            db.prepare("UPDATE swarm_workers SET state='launch-failed' WHERE session=?").run(session);
+            db.prepare("UPDATE swarm_workers SET state='launch-failed', cleaned=1 WHERE session=?").run(session);
             system(`${sender} launch failed: ${String(error.message).slice(0, 1000)}. Retrying after ordinary delay.`);
           }
         }
@@ -64,6 +66,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       // ONLY called by the worker's agent_settled notification, never by polling.
       return db.prepare("UPDATE swarm_workers SET state='retired', vote=NULL WHERE session=? AND state='retiring' AND handoff IS NOT NULL").run(config.session).changes > 0;
     },
+    cleaned(session) { db.prepare('UPDATE swarm_workers SET cleaned=1 WHERE session=?').run(session); },
     acceptsInput() {
       if (!exists()) return true; // Original board-only runs retain their behavior.
       const run = status();
@@ -80,7 +83,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         insertPost(`Vote #${request}: ${reason}`);
         db.prepare('UPDATE swarm_workers SET vote=? WHERE session=?').run(request, config.session);
         const peers = db.prepare("SELECT vote FROM swarm_workers WHERE state='active'").all();
-        const occupied = db.prepare("SELECT COUNT(*) AS n FROM swarm_workers WHERE state IN ('active','launching','retiring')").get().n;
+        const occupied = db.prepare("SELECT COUNT(*) AS n FROM swarm_workers WHERE cleaned=0").get().n;
         if (occupied === 3 && peers.length === 3 && peers.every(p => p.vote === request)) {
           db.prepare("UPDATE swarm_run SET status='waiting', request=?").run(request);
           system(`Run waiting on request #${request}. Inspect experiment node ${run.config.instructions}. Waiting is not BF2 success.`);
@@ -107,6 +110,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
             `${row.sender} exited after handoff #${row.handoff}, without safe settlement evidence.`);
       });
     },
+    controllerSetup(launch) { return transaction(launch); }, // Serialize native setup/recovery, not agent work.
     claimController(pid) {
       transaction(() => {
         const previous = status().controller;
@@ -130,7 +134,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     resume() {
       transaction(() => {
         const run = status();
-        if (run.workers.some(w => ['launching','active','retiring'].includes(w.state))) throw new Error('resume requires old workers to finish/exit first; inspect status');
+        if (run.workers.some(w => !w.cleaned)) throw new Error('resume requires old workers to finish/exit first; inspect status');
         db.prepare("UPDATE swarm_run SET status='running', request=NULL").run();
         db.prepare('UPDATE swarm_workers SET vote=NULL').run();
         system('Human resumed this run with fresh capacity and cleared votes.');
