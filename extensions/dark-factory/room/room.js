@@ -1,5 +1,11 @@
 import { esc, avatar, textMarkup, messageMarkup } from './markup.mjs';
 const $ = selector => document.querySelector(selector);
+// Keep the composer above overlay keyboards; don't reflow the room during pinch zoom.
+const viewport = globalThis.visualViewport;
+if (viewport) {
+  const fitViewport = () => document.body.style.setProperty('--room-height', viewport.scale === 1 ? `${viewport.height}px` : '100dvh');
+  viewport.addEventListener('resize', fitViewport); fitViewport();
+}
 const [fragmentRun, fragmentToken] = location.hash.slice(1).split('/');
 if (fragmentRun && fragmentToken) {
   sessionStorage.setItem('bf2-room', JSON.stringify({ run: fragmentRun, token: fragmentToken, multi: fragmentRun === 'floors' }));
