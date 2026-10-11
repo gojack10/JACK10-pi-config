@@ -1,0 +1,221 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
+import { createFloor, openFloor, listFloors, adoptFloor, selectOssFloor, ossStatus, claimOss, releaseOss, ROUTES } from './runtime.mjs';
+import { tickFloor } from './supervisor.mjs';
+import { openBoard, configuration } from '../../bf2-swarm/board.mjs';
+import { installWorker } from '../../bf2-swarm/worker.mjs';
+
+const node = '11111111-1111-4111-8111-111111111111';
+const sol = id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high', role: '', contextWarning: 80 });
+const oss = id => ({ id, provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh', role: '', contextWarning: 90 });
+function fixture(t) {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'factory-floors-'))), root = join(dir, 'floors'), cwd = join(dir, 'repo'), agent = join(dir, 'agent');
+  mkdirSync(cwd); mkdirSync(join(cwd, '.git')); mkdirSync(agent);
+  writeFileSync(join(agent, 'settings.shared.json'), JSON.stringify({ steeringMode: 'all', followUpMode: 'all' }));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const settings = { name: 'Fixture floor', cwd, roots: [node], instructions: node, voteCondition: 'Fixture condition', slots: [sol('a'), sol('b')],
+    bootstrap: 'Offline fixture bootstrap', warningText: 'Fixture warning {percent}', wrapupText: 'Fixture drain {reason} {status}' };
+  const create = (id, patch = {}) => {
+    createFloor({ ...settings, ...patch }, { root, id });
+    const floor = openFloor(id, { root }); t.after(() => floor.close());
+    // Launcher infrastructure is not part of user editable floor settings.
+    const db = new DatabaseSync(floor.database);
+    const config = { ...floor.board.lifecycle.status().config, agentDir: agent };
+    db.prepare('UPDATE swarm_run SET config=?').run(JSON.stringify(config)); db.close();
+    floor.board.lifecycle.controllerSetup(() => `$${id === 'one' ? 0 : 100}`);
+    return floor;
+  };
+  let next = 1;
+  const panes = new Map(), tags = new Map(), calls = [];
+  const execute = args => {
+    calls.push(args); const target = args[args.indexOf('-t') + 1]; let stdout = '';
+    if (args[0] === 'new-session') {
+      const child = `$${next}`, pane = `%${next++}`; panes.set(pane, { child, live: true }); stdout = `${child} ${pane}`;
+    }
+    if (args[0] === 'display-message') { const p = panes.get(target); stdout = p ? `${p.live ? 0 : 1} ${p.child}` : ''; }
+    if (args[0] === 'set-option') tags.set(`${target}:${args.at(-2)}`, args.at(-1));
+    if (args[0] === 'show-options') stdout = args.at(-1) === '@bf2_swarm_run' ? (target === '$0' ? 'one' : 'two') : tags.get(`${target}:${args.at(-1)}`) ?? '';
+    if (args[0] === 'list-sessions') stdout = ['$0','$100', ...[...panes.values()].map(p => p.child)].join('\n');
+    if (args[0] === 'list-panes') stdout = [...panes].find(([, p]) => p.child === target)?.[0] ?? '';
+    if (args[0] === 'kill-pane') panes.delete(target);
+    return { status: 0, stdout, stderr: '' };
+  };
+  const peer = (floor, w) => { const b = openBoard({ ...floor.config, session: w.session, sender: w.sender }); t.after(() => b.close()); return b; };
+  const boot = floor => { floor.command(`start-${next}`, 'start'); tickFloor(floor, execute); for (const w of floor.board.lifecycle.status().workers.filter(w => w.state === 'launching')) peer(floor, w).lifecycle.ready(); return floor.board.lifecycle.status().workers.filter(w => !w.cleaned); };
+  return { dir, root, settings, create, execute, peer, boot, panes, calls };
+}
+
+test('two floors: isolated owner messages, peer identities, durable pending USER input, ballot and dynamic discovery', t => {
+  const h = fixture(t), one = h.create('one'), two = h.create('two');
+  assert.equal(one.snapshot().status, 'stopped');
+  const pendingDir = join(h.root, 'initializing'); mkdirSync(pendingDir);
+  const pending = openBoard({ database: join(pendingDir, 'floor.sqlite'), run: 'initializing', session: 'controller', sender: '00000000' });
+  pending.lifecycle.initialize({}); pending.close();
+  assert.deepEqual(listFloors({ root: h.root }).map(f => f.id), ['one','two'], 'simultaneous discovery ignores incomplete creation');
+  const a = h.boot(one), b = h.boot(two), p = h.peer(one, a[0]), q = h.peer(two, b[0]);
+  p.finishStartup(p.history().highwater); q.finishStartup(q.history().highwater);
+  const command = one.command('owner', 'message', 'Fixture owner question');
+  assert.deepEqual(one.command('owner', 'message', 'Fixture owner question'), command);
+  assert.throws(() => one.command('owner', 'message', 'Other text'), /different/);
+  assert.match(p.pending().text, /JACK \[FACTORY OWNER\].*Fixture owner question/);
+  assert.equal(q.pending(), null);
+  assert.throws(() => openBoard({ ...one.config, session: b[0].session, sender: b[0].sender }), /not registered/);
+  assert.throws(() => openBoard({ ...one.config, floor: 'two' }), /another floor/);
+  assert.throws(() => configuration({ FACTORY_FLOOR: 'one' }), /identity/);
+  assert.throws(() => configuration({ FACTORY_FLOOR: 'one', FACTORY_DB: one.database, FACTORY_SESSION: a[0].session, FACTORY_SENDER: a[0].sender, BF2_BOARD_DB: two.database }), /conflicting/);
+  const env = { FACTORY_FLOOR: 'one', FACTORY_DB: one.database, FACTORY_SESSION: a[0].session, FACTORY_SENDER: a[0].sender };
+  assert.equal(configuration(env).database, one.database);
+  const ballot = one.snapshot().vote;
+  assert.equal(ballot.reason, h.settings.voteCondition); assert.equal(ballot.electorate.length, 2);
+  assert.throws(() => p.lifecycle.pause('arbitrary', 'Peer-redefined question'), /only the owner/);
+  p.lifecycle.vote(ballot.number, 'yes');
+  one.configure({ voteCondition: 'New fixture condition' });
+  assert.throws(() => h.peer(one, a[1]).lifecycle.vote(ballot.number, 'yes'), /cancelled/);
+  const fresh = one.snapshot().vote; assert.notEqual(fresh.number, ballot.number);
+  p.lifecycle.vote(fresh.number, 'yes'); h.peer(one, a[1]).lifecycle.vote(fresh.number, 'yes');
+  assert.equal(one.snapshot().status, 'waiting'); assert.equal(two.snapshot().status, 'running');
+  const launches = h.calls.filter(c => c[0] === 'new-session'); tickFloor(one, h.execute);
+  assert.equal(h.calls.filter(c => c[0] === 'new-session').length, launches.length);
+  for (const [floor, workers] of [[one, a], [two, b]]) for (const w of workers) {
+    const launch = h.calls.find(c => c[0] === 'new-session' && c.at(-1).includes(`BF2_BOARD_SESSION=${w.session}`)).at(-1);
+    assert.ok(launch.includes(`FACTORY_FLOOR=${floor.id}`)); assert.ok(launch.includes(`FACTORY_DB=${floor.database}`));
+    assert.equal(readFileSync(join(h.root, floor.id, `${w.session}.boot.txt`), 'utf8'), 'Offline fixture bootstrap');
+  }
+});
+
+test('2–10 next-occupant slots, invalid patches atomic, model/role edits do not mutate current workers; removal safely drains', t => {
+  const h = fixture(t), floor = h.create('one'), workers = h.boot(floor);
+  for (const slots of [[sol('a')], Array.from({ length: 11 }, (_, i) => sol(String(i))), [sol('a'), sol('a')], [sol('a'), { ...sol('b'), model: 'unapproved' }], [sol('a'), { ...sol('b'), thinking: 'low' }]]) assert.throws(() => floor.configure({ slots }));
+  for (const patch of [null, [], { roots: [[node]] }, { instructions: [node] }, { bootstrap: ' ' }, { warningText: '' }, { slots: [sol('a'), { ...sol('b'), provider: ['openai-codex-fixture'] }] }]) assert.throws(() => floor.configure(patch));
+  assert.equal(floor.settings().slots.length, 2);
+  const slots = Array.from({ length: 10 }, (_, i) => sol(i === 0 ? 'a' : i === 1 ? 'b' : `s${i}`));
+  slots[0] = { ...slots[0], model: 'gpt-6-luna', role: 'Fixture specialization', contextWarning: 60 };
+  floor.configure({ slots }); tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().workers.filter(w => !w.cleaned).length, 10);
+  assert.equal(floor.snapshot().workers[0].launch_config.model, 'gpt-6.1-sol');
+  assert.equal(floor.snapshot().slots[0].model, 'gpt-6-luna');
+  const p = h.peer(floor, workers[0]); p.lifecycle.done('Fixture final message'); p.lifecycle.settled(); tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().workers.length, 10, 'settlement cannot release a still-live child');
+  h.panes.get(workers[0].pane).live = false; tickFloor(floor, h.execute);
+  const replacement = floor.snapshot().workers.at(-1);
+  assert.equal(replacement.launch_config.model, 'gpt-6-luna'); assert.equal(replacement.launch_config.contextWarning, 60);
+  assert.match(readFileSync(join(h.root, floor.id, `${replacement.session}.boot.txt`), 'utf8'), /Fixture specialization/);
+  floor.configure({ slots: slots.slice(0, 2) });
+  const removed = floor.snapshot().workers.filter(w => !w.cleaned && w.slot !== 'a' && w.slot !== 'b');
+  assert.ok(removed.every(w => w.retire_requested === 'slot removed'));
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.filter(w => !w.cleaned).length, 10);
+  for (const w of removed) h.panes.get(w.pane).live = false;
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.filter(w => !w.cleaned).length, 2);
+  floor.command('stop', 'stop'); tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().status, 'stopping');
+  for (const w of floor.snapshot().workers.filter(w => !w.cleaned)) h.panes.get(w.pane).live = false;
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().status, 'stopped');
+});
+
+test('unfinished ballots invalidate on slot and actual membership change; no is not controller judgment', t => {
+  const h = fixture(t), floor = h.create('one'), workers = h.boot(floor), first = floor.snapshot().vote;
+  h.peer(floor, workers[0]).lifecycle.vote(first.number, 'yes');
+  floor.configure({ slots: [...floor.settings().slots, sol('c')] });
+  assert.equal(floor.snapshot().vote, undefined);
+  tickFloor(floor, h.execute); const third = floor.snapshot().workers.at(-1); h.peer(floor, third).lifecycle.ready();
+  const round = floor.snapshot().vote;
+  assert.equal(round.electorate.length, 3); assert.ok(round.electorate.every(v => v.answer === null));
+  h.peer(floor, workers[0]).lifecycle.vote(round.number, 'yes');
+  h.panes.get(third.pane).live = false; tickFloor(floor, h.execute); assert.equal(floor.snapshot().vote, undefined);
+  const next = floor.snapshot().workers.at(-1); h.peer(floor, next).lifecycle.ready();
+  const current = floor.snapshot().vote; assert.notEqual(current.number, round.number);
+  assert.ok(current.electorate.every(v => v.answer === null)); assert.ok(!current.electorate.some(v => v.session === third.session));
+  h.peer(floor, workers[0]).lifecycle.vote(current.number, 'no'); assert.equal(floor.snapshot().status, 'running');
+  const again = h.peer(floor, workers[0]).lifecycle.pause('retry', floor.settings().voteCondition);
+  assert.equal(again.reason, h.settings.voteCondition); assert.ok(again.electorate.every(v => v.answer === null));
+});
+
+test('single global OSS lease: move waits for real exit and cleanup across floors, no overlap', t => {
+  const h = fixture(t), one = h.create('one', { slots: [sol('a'), oss('q')] }), two = h.create('two', { slots: [sol('a'), oss('q')] });
+  selectOssFloor('one', { root: h.root }); const a = h.boot(one); h.boot(two);
+  assert.equal(one.snapshot().workers.filter(w => !w.cleaned).length, 2); assert.equal(two.snapshot().workers.filter(w => !w.cleaned).length, 1);
+  const old = a.find(w => w.slot === 'q'); selectOssFloor('two', { root: h.root });
+  assert.equal(one.snapshot().workers.find(w => w.session === old.session).retire_requested, 'OSS floor selection changed');
+  const p = h.peer(one, old); p.lifecycle.done('Fixture OSS transfer'); p.lifecycle.settled();
+  tickFloor(one, h.execute); tickFloor(two, h.execute);
+  assert.equal(ossStatus({ root: h.root }).session, old.session); assert.equal(two.snapshot().workers.length, 1);
+  h.panes.get(old.pane).live = false; tickFloor(one, h.execute); tickFloor(two, h.execute);
+  const lease = ossStatus({ root: h.root }); assert.equal(lease.floor, 'two'); assert.notEqual(lease.session, old.session);
+  assert.equal(one.snapshot().workers.filter(w => !w.cleaned).length, 1); assert.equal(two.snapshot().workers.filter(w => !w.cleaned).length, 2);
+  selectOssFloor(null, { root: h.root }); assert.ok(two.snapshot().workers.find(w => w.session === lease.session).retire_requested);
+});
+
+test('owner-approved prompt gate, per-occupant advisory threshold and known JSONL failure locators', async t => {
+  const h = fixture(t), unapproved = h.create('two', { bootstrap: null });
+  assert.throws(() => unapproved.command('start', 'start'), /owner-approved/); assert.equal(unapproved.snapshot().status, 'stopped');
+  unapproved.command('preapproval-message', 'message', 'Fixture owner input before approval');
+  assert.equal(unapproved.snapshot().status, 'stopped');
+  assert.ok(unapproved.snapshot().posts.some(p => p.role === 'owner' && p.text === 'Fixture owner input before approval'));
+  const floor = h.create('one', { slots: [{ ...sol('a'), contextWarning: 60 }, sol('b')] });
+  floor.command('start', 'start'); tickFloor(floor, h.execute);
+  const w = floor.snapshot().workers[0], path = join(h.root, floor.id, 'sessions', `${w.session}.jsonl`);
+  writeFileSync(path, JSON.stringify({ type: 'session', id: w.session }) + '\n');
+  const handlers = new Map(), sent = [], entries = []; let percent, shutdown = 0;
+  const pi = { on: (name, fn) => handlers.set(name, fn), getSettings: () => ({ steeringMode: 'all', followUpMode: 'all' }),
+    appendEntry: (customType, data) => entries.push({ type: 'custom', customType, data }),
+    async sendUserMessage(text, options) { assert.ok(options.admissionGuard()); sent.push(text); return { status: 'admitted', delivery: 'steer' }; } };
+  const ctx = { sessionManager: { getSessionId: () => w.session, getSessionFile: () => path, getEntries: () => entries }, getContextUsage: () => ({ percent }), shutdown: () => shutdown++ };
+  const env = { FACTORY_FLOOR: floor.id, FACTORY_DB: floor.database, FACTORY_SESSION: w.session, FACTORY_SENDER: w.sender };
+  installWorker(pi, env); t.after(() => handlers.get('session_shutdown')({}, ctx));
+  await handlers.get('session_start')({}, ctx);
+  for (const value of [undefined, NaN, 59]) { percent = value; await handlers.get('turn_end')({}, ctx); }
+  percent = 60; await handlers.get('turn_end')({}, ctx); await handlers.get('turn_end')({}, ctx);
+  assert.deepEqual(sent, ['Fixture warning 60']); assert.equal(shutdown, 0);
+  assert.equal(floor.snapshot().workers[0].session_file, path); assert.equal(floor.snapshot().workers[0].context_percent, 60);
+  handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'Fixture retryable error' } }, ctx);
+  handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+  handlers.get('agent_settled')({ interruption: undefined }, ctx); assert.equal(shutdown, 0);
+  assert.ok(floor.snapshot().posts.some(p => p.text.includes('Fixture retryable error') && p.text.includes(path)));
+  handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'Fixture provider error' } }, ctx);
+  handlers.get('agent_settled')({ interruption: undefined }, ctx);
+  assert.equal(shutdown, 1); assert.ok(floor.snapshot().posts.some(p => p.role === 'system' && p.text.includes(path) && p.text.includes('Fixture provider error')));
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.length, 2);
+  h.panes.get(w.pane).live = false; tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.length, 3);
+});
+
+test('ordinary additive BF2 adoption preserves original history, IDs and actual session paths', t => {
+  const h = fixture(t), runDir = join(h.dir, 'legacy'); mkdirSync(runDir); mkdirSync(join(runDir, 'sessions'));
+  const config = { database: join(runDir, 'board.sqlite'), run: 'legacy-run', session: 'controller', sender: '00000000' };
+  writeFileSync(join(runDir, 'run.json'), JSON.stringify({ run: config.run }));
+  const b = openBoard(config); b.lifecycle.initialize({ agentDir: join(h.dir, 'agent') }); b.lifecycle.ownerCommand('history', 'message', 'Legacy owner history'); b.lifecycle.stop(); b.close();
+  adoptFloor(runDir, h.settings, { root: h.root, id: 'one' });
+  const floor = openFloor('one', { root: h.root }); t.after(() => floor.close());
+  assert.equal(floor.config.run, 'legacy-run'); assert.equal(floor.snapshot().posts[0].text, 'Legacy owner history');
+  assert.equal(floor.board.lifecycle.status().config.sessionDir, join(runDir, 'sessions'));
+  floor.command('new', 'message', 'New owner history');
+  const old = openBoard(config); try { assert.ok(old.history({ limit: 100 }).posts.some(p => p.text === 'New owner history')); } finally { old.close(); }
+  assert.throws(() => adoptFloor(runDir, h.settings, { root: h.root, id: 'again' }), /stopped/);
+});
+
+test('concurrent OSS claims serialize; ambiguous launch exceptions hold capacity until proven cleanup', async t => {
+  const h = fixture(t); h.create('one', { slots: [sol('a'), oss('q')] }); selectOssFloor('one', { root: h.root });
+  const module = new URL('./runtime.mjs', import.meta.url).href;
+  const results = await Promise.all(['first','second'].map(session => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module','-e', `import {claimOss} from ${JSON.stringify(module)}; console.log(claimOss(${JSON.stringify(h.root)},'one',${JSON.stringify(session)},()=>true));`]);
+    let out = '', error = ''; child.stdout.on('data', chunk => out += chunk); child.stderr.on('data', chunk => error += chunk);
+    child.on('error', reject); child.on('exit', code => code === 0 ? resolve(out.trim()) : reject(new Error(error)));
+  })));
+  assert.deepEqual(results.sort(), ['false','true']);
+  const lease = ossStatus({ root: h.root }); releaseOss(h.root, 'one', lease.session);
+  assert.throws(() => claimOss(h.root, 'one', 'ambiguous', () => { throw new Error('Fixture receipt lost'); }), /receipt lost/);
+  assert.equal(ossStatus({ root: h.root }).session, 'ambiguous');
+  assert.equal(claimOss(h.root, 'one', 'replacement', () => assert.fail('must not launch')), false);
+});
+
+test('all approved route shapes accepted, nonapproved thinking rejected and no private account route defaults', t => {
+  const h = fixture(t);
+  for (const [i, r] of ROUTES.entries()) {
+    const floor = h.create(`route${i}`, { slots: [sol('a'), { provider: r.providerPattern ? 'openai-codex-fixture' : r.provider, model: r.model, thinking: r.thinking, id: 'b', role: '', contextWarning: 80 }] });
+    assert.equal(floor.settings().slots[1].model, r.model);
+  }
+});
