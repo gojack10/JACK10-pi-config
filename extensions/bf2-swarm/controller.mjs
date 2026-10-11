@@ -48,7 +48,7 @@ export function validateLaunch(options, env = process.env) {
 
 // No inherited task contract, old board namespace, or global friendly-stop flags.
 export function launchEnvironment(env = process.env) {
-  const remove = Object.keys(env).filter(key => /^(BF2_|PI_SUBAGENT|PI_RLM_)/.test(key) ||
+  const remove = Object.keys(env).filter(key => /^(BF2_|FACTORY_|PI_SUBAGENT|PI_RLM_)/.test(key) ||
     ['TMUX', 'TMUX_PANE', 'PI_SESSION_FILE', 'PI_SESSION_ID'].includes(key));
   return ['env', ...remove.flatMap(key => ['-u', key])];
 }
@@ -56,9 +56,10 @@ export function workerCommand(settings, config, pane, mission, env = process.env
   const args = [...launchEnvironment(env),
     `PI_CODING_AGENT_DIR=${settings.agentDir}`, `BF2_BOARD_DB=${config.database}`, `BF2_BOARD_RUN=${config.run}`,
     `BF2_BOARD_SESSION=${config.session}`, `BF2_BOARD_SENDER=${config.sender}`, 'BF2_SWARM_WORKER=1',
+    ...(settings.floorId ? [`FACTORY_FLOOR=${settings.floorId}`, `FACTORY_ROOT=${settings.floorRoot}`, `FACTORY_DB=${config.database}`, `FACTORY_SESSION=${config.session}`, `FACTORY_SENDER=${config.sender}`] : []),
     `PATH=${join(settings.code, 'bin')}:${env.PATH ?? ''}`, 'pi',
     '--provider', settings.provider, '--model', settings.model, '--thinking', settings.thinking,
-    '--session-id', config.session, '--session-dir', join(dirname(config.database), 'sessions'), '--name', pane,
+    '--session-id', config.session, '--session-dir', settings.sessionDir ?? join(dirname(config.database), 'sessions'), '--name', pane,
     '-e', join(settings.code, 'optional-extensions/bf2-swarm.ts'), '-e', join(settings.code, 'optional-extensions/bf2-board.ts'),
     `@${mission}`];
   return `tmux set-option -w -t "$TMUX_PANE" remain-on-exit on && exec ${args.map(quote).join(' ')}`;
@@ -84,7 +85,7 @@ export function openRun(runDir) {
   return { config, board: openBoard(config) };
 }
 export const parentSession = config => `bf2-${config.run}`;
-export function tick(board, config, execute = tmux, env = process.env) {
+export function tick(board, config, execute = tmux, env = process.env, hooks = {}) {
   let state = board.lifecycle.status();
   const parent = state.tmux_parent;
   if (!/^\$\d+$/.test(parent)) throw new Error('controller lacks a native tmux parent ID; recover controller first');
@@ -114,23 +115,26 @@ export function tick(board, config, execute = tmux, env = process.env) {
     } else board.lifecycle.lost(worker.session);
     // Release capacity only after the child is removed (or user-owned panes detached).
     board.lifecycle.cleaned(worker.session);
+    hooks.cleaned?.(worker);
   }
   state = board.lifecycle.advanceDrain();
   if (state.status !== 'running') return state;
-  validateLaunch(state.config, { ...env, PI_CODING_AGENT_DIR: state.config.agentDir });
+  (hooks.validate ?? validateLaunch)(state.config, { ...env, PI_CODING_AGENT_DIR: state.config.agentDir });
   checked(execute, ['has-session', '-t', parent]);
   if (checked(execute, ['show-options', '-qv', '-t', parent, '@bf2_swarm_run']) !== config.run) throw new Error('parent ownership tag changed; refusing launch');
   const occupied = state.workers.filter(w => !w.cleaned).length;
-  for (let i = occupied; i < 3; i++) {
+  const vacancies = state.floor ? state.floor.slots.filter(s => !state.workers.some(w => !w.cleaned && w.slot === s.id)) : Array.from({ length: 3 - occupied }, () => null);
+  for (const slot of vacancies) {
     // SQLite uniqueness checks make collisions a rejected allocation, never reuse.
     const session = randomUUID(), sender = randomBytes(4).toString('hex');
     const pane = `bf2-${config.run}-${sender}`;
-    const mission = join(dirname(config.database), `${session}.boot.txt`);
-    writeFileSync(mission, bootMission(state.config), { flag: 'wx', mode: 0o600 });
-    board.lifecycle.addWorker(session, sender, pane, register => {
+    const settings = slot ? { ...state.config, ...slot } : state.config;
+    const mission = join(settings.runDir ?? dirname(config.database), `${session}.boot.txt`);
+    const allocate = () => board.lifecycle.addWorker(session, sender, pane, register => {
+      writeFileSync(mission, slot ? `${settings.bootstrap}${settings.role ? `\n${settings.role}\n` : ''}` : bootMission(settings), { flag: 'wx', mode: 0o600 });
       const barrier = `bf2-boot-${session}`;
-      const receipt = checked(execute, ['new-session', '-d', '-P', '-F', '#{session_id} #{pane_id}', '-s', pane, '-n', 'peer', '-c', state.config.cwd,
-        `tmux wait-for ${quote(barrier)} && ${workerCommand(state.config, { ...config, session, sender }, pane, mission, env)}`]);
+      const receipt = checked(execute, ['new-session', '-d', '-P', '-F', '#{session_id} #{pane_id}', '-s', pane, '-n', 'peer', '-c', settings.cwd,
+        `tmux wait-for ${quote(barrier)} && ${workerCommand(settings, { ...config, session, sender }, pane, mission, env)}`]);
       const [child, paneId] = (receipt ?? '').split(' ');
       if (!/^\$\d+$/.test(child) || !/^%\d+$/.test(paneId)) {
         // Creation succeeded but no safe cleanup handle exists. Hold capacity;
@@ -142,7 +146,7 @@ export function tick(board, config, execute = tmux, env = process.env) {
         checked(execute, ['set-option', '-t', child, '@bf2_swarm_session', session]);
         checked(execute, ['set-option', '-t', child, '@pi_subagent_parent_id', parent]);
         // Capture terminal evidence without redirecting Pi out of ordinary TUI mode.
-        try { checked(execute, ['pipe-pane', '-o', '-t', paneId, `cat >> ${quote(join(dirname(config.database), `${session}.pane.log`))}`]); }
+        try { checked(execute, ['pipe-pane', '-o', '-t', paneId, `cat >> ${quote(join(settings.runDir ?? dirname(config.database), `${session}.pane.log`))}`]); }
         catch (error) { console.error(`BF2 swarm pane capture: ${error.message}`); }
         // Metadata and registration precede Pi startup; stop cannot interleave here.
         checked(execute, ['wait-for', '-S', barrier]);
@@ -153,7 +157,9 @@ export function tick(board, config, execute = tmux, env = process.env) {
         } catch { error.ownedChild = true; }
         throw error;
       }
-    });
+    }, slot ? { slot: slot.id, launchConfig: settings } : {});
+    if (hooks.allocate) hooks.allocate(slot, session, allocate);
+    else allocate();
   }
   return board.lifecycle.status();
 }
@@ -195,7 +201,7 @@ function startController(config, settings, execute, env, savedParent, occupied =
   if (health?.status === 0 && health.stdout?.trim() !== `1 ${savedParent}`) throw new Error('controller pane is outside its owned parent; refusing recovery');
   // Publish our own handle before the loop starts; never infer it from selection.
   const command = `tmux set-option -w -t "$TMUX_PANE" remain-on-exit on && tmux set-option -t "$TMUX_PANE" @bf2_swarm_run ${quote(config.run)} && tmux set-option -t "$TMUX_PANE" @bf2_controller_pane "$TMUX_PANE" && exec ${[...launchEnvironment(env), `PI_CODING_AGENT_DIR=${settings.agentDir}`, 'BF2_SWARM_CONTROLLER=1',
-    join(settings.code, 'bin/bf2-swarm'), 'run', '--run-dir', dirname(config.database)].map(quote).join(' ')}`;
+    ...(settings.floorId ? [`FACTORY_FLOOR=${settings.floorId}`, `FACTORY_ROOT=${settings.floorRoot}`, process.execPath, join(settings.code, 'extensions/dark-factory/floors/supervisor.mjs')] : [join(settings.code, 'bin/bf2-swarm'), 'run', '--run-dir', dirname(config.database)])].map(quote).join(' ')}`;
   let launched;
   if (health?.status === 0) {
     checked(execute, ['respawn-pane', '-t', paneId, '-c', settings.code, command]); // No -k: a live process is never killed.

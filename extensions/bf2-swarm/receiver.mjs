@@ -72,7 +72,7 @@ export function receiver(pi, config, ctx) {
 }
 
 export function installReceiver(pi, env = process.env) {
-  if (!['BF2_BOARD_DB', 'BF2_BOARD_RUN', 'BF2_BOARD_SESSION', 'BF2_BOARD_SENDER'].some(key => env[key] !== undefined)) return;
+  if (!['BF2_BOARD_DB', 'BF2_BOARD_RUN', 'BF2_BOARD_SESSION', 'BF2_BOARD_SENDER', 'FACTORY_FLOOR', 'FACTORY_DB', 'FACTORY_SESSION', 'FACTORY_SENDER'].some(key => env[key] !== undefined)) return;
   const config = configuration(env); // Partial/invalid opt-in refuses before opening SQLite.
   let active;
   let timer;
