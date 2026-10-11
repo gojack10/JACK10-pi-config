@@ -83,18 +83,31 @@ export function openRun(runDir) {
   const config = { database, run, session: 'controller', sender: '00000000' };
   return { config, board: openBoard(config) };
 }
+export const parentSession = config => `bf2-${config.run}`;
 export function tick(board, config, execute = tmux, env = process.env) {
+  const parent = parentSession(config);
   let state = board.lifecycle.status();
-  for (const worker of state.workers.filter(w => ['launching', 'active', 'retiring'].includes(w.state))) {
+  for (const worker of state.workers.filter(w => !w.cleaned)) {
     // Old name-only registrations cannot safely identify a pane after selection changes.
     if (!/^%\d+$/.test(worker.pane)) throw new Error('worker lacks a stable tmux pane ID; start a fresh run');
-    const result = execute(['display-message', '-p', '-t', worker.pane, '#{pane_dead}']);
-    if (result.status !== 0 || result.stdout?.trim() !== '0') board.lifecycle.lost(worker.session);
+    const result = execute(['display-message', '-p', '-t', worker.pane, '#{pane_dead} #{session_name}']);
+    if (result.status !== 0) throw new Error(result.stderr?.trim() || 'worker health unavailable; refusing to release capacity');
+    if (result.stdout?.trim()) {
+      const [dead, owner] = result.stdout.trim().split(' ');
+      if (owner !== parent) throw new Error('worker pane is outside its owned parent; refusing cleanup');
+      if (dead === '0') continue; // Even a SAFE retired marker does not mean Pi has exited.
+      if (dead !== '1') throw new Error('unknown worker process state; refusing cleanup');
+      board.lifecycle.lost(worker.session);
+      checked(execute, ['kill-pane', '-t', worker.pane]);
+    } else board.lifecycle.lost(worker.session);
+    // Capacity is released only after the owned pane is gone, including unexpected exits.
+    board.lifecycle.cleaned(worker.session);
   }
   state = board.lifecycle.status();
   if (state.status !== 'running') return state;
   validateLaunch(state.config, { ...env, PI_CODING_AGENT_DIR: state.config.agentDir });
-  const occupied = state.workers.filter(w => ['launching', 'active', 'retiring'].includes(w.state)).length;
+  checked(execute, ['has-session', '-t', `=${parent}`]);
+  const occupied = state.workers.filter(w => !w.cleaned).length;
   for (let i = occupied; i < 3; i++) {
     // SQLite uniqueness checks make collisions a rejected allocation, never reuse.
     const session = randomUUID(), sender = randomBytes(4).toString('hex');
@@ -102,7 +115,7 @@ export function tick(board, config, execute = tmux, env = process.env) {
     const mission = join(dirname(config.database), `${session}.boot.txt`);
     writeFileSync(mission, bootMission(state.config), { flag: 'wx', mode: 0o600 });
     board.lifecycle.addWorker(session, sender, pane, () => {
-      const paneId = checked(execute, ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', pane, '-c', state.config.cwd,
+      const paneId = checked(execute, ['new-window', '-d', '-P', '-F', '#{pane_id}', '-t', `=${parent}:`, '-n', pane, '-c', state.config.cwd,
         workerCommand(state.config, { ...config, session, sender }, pane, mission, env)]);
       if (!/^%\d+$/.test(paneId)) throw new Error('tmux launch did not return a stable pane ID');
       // Capture terminal evidence without redirecting Pi out of ordinary TUI mode.
@@ -120,29 +133,42 @@ export const HELP = `bf2-swarm — separate opt-in three-peer experiment, no dis
   bf2-swarm status --run-dir /durable/run
   bf2-swarm stop --run-dir /durable/run       Deliberate no-respawn; workers wrap up
   bf2-swarm resume --run-dir /durable/run     After old workers drain; clear votes
-  bf2-swarm run --run-dir /durable/run        Foreground recovery controller
+  bf2-swarm run --run-dir /durable/run        Recover controller in owned parent
   bf2-swarm -h
 Start defaults run dir to ~/.local/state/bf2-swarm/<new UUID>. Cwd may use BF2_REPO.
 Uses gpt-6.1-sol/high and your explicit authorized Codex provider. Preflight is
 --offline --list-models, never a model call. Requires native all/all settings.
 Normal extensions autoload; global optional friendly-stop must not be configured.
-Start/resume launches named tmux controller; inspect its waiting/stopped state and
-configured experiment node there or with status. Waiting is NOT BF2 success.
-No forced termination, cleanup, task contract, reports, tree writes, or PATH install.
+Start creates ONE named tmux parent with controller and three worker windows.
+Run recovers only the controller inside that parent, preserving running/waiting/stop.
+Retired/dead worker panes close only after actual process exit; logs are retained.
+Waiting leaves a controller/status window; stop drains workers then exits the parent.
+No forced worker termination, task contract, reports, tree writes, or PATH install.
+Waiting is NOT BF2 success.
 `;
 function startController(config, settings, execute, env) {
-  const pane = `bf2-${config.run}-controller`;
-  const probe = execute(['has-session', '-t', pane]);
-  const paneId = probe.status === 0 ? execute(['show-options', '-v', '-t', pane, '@bf2_controller_pane']).stdout?.trim() : undefined;
-  const alive = /^%\d+$/.test(paneId) && execute(['display-message', '-p', '-t', paneId, '#{pane_dead}']).stdout?.trim() === '0';
-  if (alive) return pane;
-  const command = `exec ${[...launchEnvironment(env), `PI_CODING_AGENT_DIR=${settings.agentDir}`,
+  const parent = parentSession(config), target = `=${parent}`;
+  const probe = execute(['has-session', '-t', target]);
+  const paneId = probe.status === 0 ? execute(['show-options', '-v', '-t', parent, '@bf2_controller_pane']).stdout?.trim() : undefined;
+  const result = /^%\d+$/.test(paneId) ? execute(['display-message', '-p', '-t', paneId, '#{pane_dead} #{session_name}']) : undefined;
+  if (result && result.status !== 0) throw new Error(result.stderr?.trim() || 'controller health unavailable; refusing recovery');
+  const health = result?.stdout?.trim() ? result : undefined; // tmux emits empty formats for a vanished %pane.
+  if (health?.status === 0 && health.stdout?.trim() === `0 ${parent}`) return parent;
+  if (health?.status === 0 && health.stdout?.trim() !== `1 ${parent}`) throw new Error('controller pane is outside its owned parent; refusing recovery');
+  // Publish our own handle before the loop starts; never infer it from selection.
+  const command = `tmux set-option -w -t "$TMUX_PANE" remain-on-exit on && tmux set-option -t ${quote(parent)} @bf2_controller_pane "$TMUX_PANE" && exec ${[...launchEnvironment(env), `PI_CODING_AGENT_DIR=${settings.agentDir}`, 'BF2_SWARM_CONTROLLER=1',
     join(settings.code, 'bin/bf2-swarm'), 'run', '--run-dir', dirname(config.database)].map(quote).join(' ')}`;
-  const launched = checked(execute, probe.status === 0 ? ['new-window', '-P', '-F', '#{pane_id}', '-t', pane, '-n', 'recovery', '-c', settings.code, command] :
-    ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', pane, '-c', settings.code, command]);
+  let launched;
+  if (health?.status === 0) {
+    checked(execute, ['respawn-pane', '-t', paneId, '-c', settings.code, command]); // No -k: a live process is never killed.
+    launched = paneId;
+  } else {
+    launched = checked(execute, probe.status === 0 ? ['new-window', '-d', '-P', '-F', '#{pane_id}', '-t', `${target}:`, '-n', 'controller', '-c', settings.code, command] :
+      ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', parent, '-n', 'controller', '-c', settings.code, command]);
+  }
   if (!/^%\d+$/.test(launched)) throw new Error('tmux controller launch did not return a stable pane ID');
-  checked(execute, ['set-option', '-t', pane, '@bf2_controller_pane', launched]);
-  return pane;
+  checked(execute, ['set-option', '-t', parent, '@bf2_controller_pane', launched]);
+  return parent;
 }
 export async function main(args = process.argv.slice(2), env = process.env, execute = tmux) {
   const { values, positionals } = parseArgs({ args, allowPositionals: true, options: {
@@ -168,35 +194,50 @@ export async function main(args = process.argv.slice(2), env = process.env, exec
     const board = openBoard(config);
     try {
       board.lifecycle.initialize(settings);
-      const pane = startController(config, settings, execute, env);
+      const pane = board.lifecycle.controllerSetup(() => startController(config, settings, execute, env));
       console.log(`Run ${runDir}\nController: tmux attach -t ${pane}\nExperiment node: ${settings.instructions}`);
     } finally { board.close(); }
     return;
   }
   const { config, board } = openRun(runDir);
   try {
+    const controller = () => board.lifecycle.controllerSetup(() => startController(config, board.lifecycle.status().config, execute, env));
     if (command === 'status') { console.log(JSON.stringify(board.lifecycle.status(), null, 2)); return; }
-    if (command === 'stop') { board.lifecycle.stop(); console.log('stopped; no replacements; workers finish safely'); return; }
+    if (command === 'stop') {
+      board.lifecycle.stop();
+      controller();
+      console.log('stopped; no replacements; workers finish safely; parent exits after drain'); return;
+    }
     if (command === 'resume') {
       const settings = board.lifecycle.status().config;
       validateLaunch(settings, { ...env, PI_CODING_AGENT_DIR: settings.agentDir });
       board.lifecycle.resume();
-      console.log(`running; controller ${startController(config, board.lifecycle.status().config, execute, env)}`); return;
+      console.log(`running; controller ${controller()}`); return;
+    }
+    if (env.BF2_SWARM_CONTROLLER !== '1') {
+      console.log(`controller ${controller()}`); return;
     }
     // One controller per run; an atomic DB claim refuses PID reuse, never kills.
     board.lifecycle.claimController(process.pid);
-    let timer, previous;
+    let timer, previous, finish;
     const inspect = () => {
       try {
         const state = tick(board, config, execute, env);
-        const text = `${state.status}: experiment node ${state.config.instructions}; ` + state.workers.filter(w => ['active', 'launching', 'retiring'].includes(w.state)).map(w => `${w.sender}=${w.state}`).join(', ');
+        const text = `${state.status}: experiment node ${state.config.instructions}; ` + state.workers.filter(w => !w.cleaned).map(w => `${w.sender}=${w.state}`).join(', ');
         if (text !== previous) { console.log(text); previous = text; }
+        if (state.status === 'stopped' && state.workers.every(w => w.cleaned)) {
+          const paneId = checked(execute, ['show-options', '-v', '-t', parentSession(config), '@bf2_controller_pane']);
+          // Natural controller exit removes its last window, not any inspection shell.
+          checked(execute, ['set-option', '-w', '-t', paneId, 'remain-on-exit', 'off']);
+          finish();
+        }
       } catch (error) { console.error(`BF2 swarm controller: ${error.message}; retrying after ordinary delay`); }
     };
     await new Promise(resolveStop => {
       const stop = () => { clearInterval(timer); board.lifecycle.releaseController(process.pid); process.off('SIGTERM', stop); process.off('SIGINT', stop); resolveStop(); };
       process.on('SIGTERM', stop); process.on('SIGINT', stop);
-      inspect(); timer = setInterval(inspect, 2000);
+      finish = stop;
+      timer = setInterval(inspect, 2000); inspect();
     });
   } finally { board.close(); }
 }
