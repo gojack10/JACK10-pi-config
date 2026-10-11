@@ -40,7 +40,7 @@ test('canonical assets and old callers share one source; old HTTP URLs still ser
 });
 
 test('unmodified canonical and compatible room modules load, render real metadata, and retain auth/draft keys', async t => {
-  const names = ['document', 'location', 'sessionStorage', 'setInterval', 'fetch'];
+  const names = ['document', 'location', 'sessionStorage', 'localStorage', 'setInterval', 'fetch'];
   const originals = names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const);
   t.after(() => { for (const [name, descriptor] of originals) {
     if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -62,6 +62,7 @@ test('unmodified canonical and compatible room modules load, render real metadat
     const globals = { document: { querySelector: element, addEventListener() {} }, location: { hash: '' },
       sessionStorage: { getItem: key => saved.get(key) ?? null,
         setItem() { throw Error('must not rename storage or mutate saved draft'); }, removeItem() { throw Error('must not clear saved draft'); } },
+      localStorage: { getItem: () => null, setItem() {} },
       setInterval: (fn, ms) => { timers.push(ms); return 0; },
       fetch: async (path, options) => { requests.push([path, options]); return { ok: true, json: async () => snapshot }; } };
     for (const [name, value] of Object.entries(globals)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
@@ -80,6 +81,6 @@ test('unmodified canonical and compatible room modules load, render real metadat
     assert.match(element('#members').innerHTML, /swarm agent/);
     assert.match(element('#members').innerHTML, /factory owner/);
     assert.equal(element('#request').hidden, true);
-    assert.equal(element('#sound-toggle').attrs['aria-pressed'], undefined, 'sound remains default-off; no click simulated');
+    assert.equal(element('#sound-toggle').attrs['aria-pressed'], 'true', 'sounds enabled by default; no audio context before a gesture');
   }
 });

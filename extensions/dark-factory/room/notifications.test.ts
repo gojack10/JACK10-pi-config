@@ -1,50 +1,49 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { runInNewContext } from 'node:vm';
+import { page, snapshot, flushed } from './test/page.mjs';
 
-test('speaker unlocks on click, silently drains history and plays the selected handshake once per peer batch', async () => {
-  function page() {
-    const elements = new Map(), played = [], gains = [], frequencies = [];
-    let rejectAudio = false, rejectSynthesis = false, contexts = 0;
-    const element = selector => {
-      if (!elements.has(selector)) elements.set(selector, { value:'', events:{}, attrs:{},
-        addEventListener(name, fn) { this.events[name] = fn; }, setAttribute(name, value) { this.attrs[name] = value; } });
-      return elements.get(selector);
-    };
-    class AudioContext {
-      state = 'suspended'; currentTime = 0; destination = {};
-      constructor() { contexts++; }
-      async resume() { if (rejectAudio) throw Error('unavailable'); this.state = 'running'; }
-      createOscillator() {
-        if (rejectSynthesis) throw Error('audio device lost');
-        return { frequency:{setValueAtTime(hz){frequencies.push(hz);},exponentialRampToValueAtTime(){}},connect(){},disconnect(){},
-          start(at){ played.push(at); },stop(){ this.onended(); } };
-      }
-      createGain() { return { gain:{setValueAtTime(){},linearRampToValueAtTime(value){gains.push(value);},exponentialRampToValueAtTime(){}},connect(){},disconnect(){} }; }
-    }
-    const scope = { document:{querySelector:element,addEventListener(){}},location:{hash:''},sessionStorage:{getItem:()=>null},AudioContext };
-    const source = readFileSync(new URL('./room.js',import.meta.url),'utf8').replace(/^import[^\n]+\n/,'');
-    runInNewContext(source+'\nglobalThis.notificationCheck = {notify,enabled:()=>soundOn};',scope);
-    return { ...scope.notificationCheck, click:()=>element('#sound-toggle').events.click(), button:element('#sound-toggle'),
-      played,gains,frequencies,contexts:()=>contexts,fail:()=>{rejectAudio=true;},failSynthesis:()=>{rejectSynthesis=true;} };
-  }
-  const p = page();
-  assert.equal(p.enabled(),false); assert.equal(p.contexts(),0);
-  p.notify([{role:'peer'}]); assert.equal(p.played.length,0);
-  await p.click(); assert.equal(p.enabled(),true); assert.equal(p.button.attrs['aria-pressed'],'true');
-  assert.equal(p.contexts(),1); assert.equal(p.played.length,0,'no enable preview');
-  p.notify([{role:'owner'},{role:'system'}]); p.notify([]); assert.equal(p.played.length,0);
-  p.notify([{role:'peer'},{role:'peer'}]); assert.equal(p.played.length,2,'one two-note handshake, not one per post');
-  assert.deepEqual(p.frequencies,[620,930]); assert.deepEqual(p.played,[.015,.14500000000000002]);
-  assert.deepEqual(p.gains,[.06,0,.055,0]);
-  await p.click(); assert.equal(p.button.attrs['aria-pressed'],'false');
-  p.notify([{role:'peer'}]); assert.equal(p.played.length,2);
-  await p.click(); assert.equal(p.contexts(),1,'reuse unlocked context');
-  const first = page(); await first.click();
-  first.notify(Array.from({length:100},()=>({role:'peer'}))); first.notify(Array.from({length:100},()=>({role:'peer'})));
-  first.notify([{role:'peer'}]); assert.equal(first.played.length,0,'all initial history pages stay silent');
-  first.notify([{role:'peer'}]); assert.equal(first.played.length,2);
-  const failed = page(); failed.fail(); await failed.click(); assert.equal(failed.enabled(),false); assert.equal(failed.button.disabled,false);
-  p.failSynthesis(); assert.doesNotThrow(()=>p.notify([{role:'peer'}])); assert.equal(p.enabled(),false,'sound failure cannot break chat rendering');
+test('sounds/desktop default on; audio unlock and desktop permission remain gesture-only', async () => {
+  const p = page({ snapshots: { legacy: snapshot() }, permission: 'default' }); await flushed();
+  assert.equal(p.active().prefs.sound, true); assert.equal(p.active().prefs.desktop, true);
+  assert.equal(p.contexts.length, 0); assert.equal(p.permissionRequests(), 0); assert.equal(p.notices.length, 0);
+  await p.unlockAudio(); assert.equal(p.contexts.length, 1); assert.equal(p.played.length, 0);
+  await p.click('#notification-toggle'); assert.equal(p.permissionRequests(), 1);
+  p.notify(p.active(), [{ role: 'owner', text: '@JACK', number: 1 }, { role: 'system', text: '@JACK', number: 2 }]);
+  assert.equal(p.notices.length, 0); assert.equal(p.played.length, 0);
+  p.notify(p.active(), [{ role: 'peer', sender: 'peer', text: '`@JACK` https://example.test/@JACK @JACK@example.test', number: 2 }]);
+  assert.equal(p.notices.length, 0, 'code/URL/email text is not a real mention'); p.played.length = 0;
+  p.notify(p.active(), [{ role: 'peer', sender: 'peer', text: '@JACK ready', number: 3 }]);
+  assert.equal(p.played.length, 2); assert.equal(p.notices.length, 1);
+  assert.deepEqual(p.played, [.015, .14500000000000002]);
+  await p.click('#sound-toggle'); assert.equal(p.active().prefs.sound, false);
+  await p.click('#notification-toggle'); assert.equal(p.active().prefs.desktop, false);
+  p.notify(p.active(), [{ role: 'peer', sender: 'peer', text: '@JACK muted', number: 4 }]);
+  assert.equal(p.notices.length, 1); assert.equal(p.played.length, 2);
+  await p.click('#sound-toggle'); assert.equal(p.contexts.length, 1);
+  p.failSynthesis(); assert.doesNotThrow(() => p.notify(p.active(), [{ role: 'peer', text: 'audio lost', number: 5 }]));
+});
+
+test('all initial pages silent; cross-floor @JACK notifications focus destination and dedupe browser tabs', async () => {
+  const snapshots = { alpha: snapshot('alpha'), beta: snapshot('beta') }, shared = new Map();
+  snapshots.beta.posts = Array.from({ length: 100 }, (_, i) => ({ role: 'peer', sender: 'peer', text: '@JACK old history', number: i + 1 }));
+  const a = page({ multi: true, snapshots, shared }), b = page({ multi: true, snapshots, shared }); await flushed();
+  assert.equal(a.notices.length, 0); assert.equal(a.selected(), 'alpha');
+  await a.poll(); await b.poll(); // Exhaust initial 100-post page, still silent.
+  snapshots.beta.posts.push({ role: 'peer', sender: 'peer', text: '@JACK new beta mention', number: 101 });
+  await a.poll(); await b.poll();
+  assert.equal(a.notices.length, 1); assert.equal(b.notices.length, 0);
+  assert.equal(a.notices[0].title, 'beta · peer'); assert.match(a.notices[0].options.body, /new beta/);
+  a.notices[0].onclick(); assert.equal(a.selected(), 'beta'); assert.equal(a.notices[0].closed, true);
+  a.active().prefs.desktop = false;
+  snapshots.beta.posts.push({ role: 'peer', sender: 'peer', text: '@JACK muted beta', number: 102 });
+  await a.poll(); assert.equal(a.notices.length, 1);
+  snapshots.alpha.posts.push({ role: 'peer', sender: 'peer', text: '@JACK alpha', number: 1 });
+  await a.poll(); assert.equal(a.notices.length, 2, 'mute scoped to beta');
+});
+
+test('blocked permission never requests silently or produces fake desktop alerts', async () => {
+  const p = page({ snapshots: { legacy: snapshot() }, permission: 'denied' }); await flushed();
+  p.notify(p.active(), [{ role: 'peer', sender: 'peer', text: '@JACK', number: 1 }]);
+  assert.equal(p.notices.length, 0); assert.equal(p.permissionRequests(), 0);
+  assert.equal(p.element('#notification-toggle').textContent, 'alerts blocked');
 });
