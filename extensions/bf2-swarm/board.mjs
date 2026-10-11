@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path';
 
 export const HISTORY_LIMIT = 30;
 export const BATCH_LIMIT = 100;
+export const MAX_BATCH_BYTES = 65536;
 export const MAX_TEXT_BYTES = 16384;
 
 export function configuration(env = process.env) {
@@ -78,8 +79,16 @@ export function openBoard(config) {
         const current = state();
         if (current.cursor === null) return null; // Wait for the agent's first `board read`.
         if (current.pending) return JSON.parse(current.pending);
-        const posts = db.prepare('SELECT number, sender, created, text FROM board_posts WHERE number > ? AND session != ? ORDER BY number LIMIT ?')
+        const available = db.prepare('SELECT number, sender, created, text FROM board_posts WHERE number > ? AND session != ? ORDER BY number LIMIT ?')
           .all(current.cursor, config.session, BATCH_LIMIT);
+        const posts = [];
+        let bytes = 0;
+        for (const post of available) {
+          const size = Buffer.byteLength(formatPosts(config.run, [post])) + 1;
+          if (posts.length && bytes + size > MAX_BATCH_BYTES) break;
+          // Always allow one post, even when JSON escaping exceeds the budget.
+          posts.push(post); bytes += size;
+        }
         if (!posts.length) return null;
         const key = randomUUID();
         const batch = { key, through: posts.at(-1).number,
