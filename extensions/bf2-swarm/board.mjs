@@ -34,7 +34,20 @@ export function openBoard(config) {
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
     if (tables.some(t => !['board_run', 'board_sessions', 'board_posts'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
-    db.exec('PRAGMA journal_mode=WAL');
+    if (tables.some(t => t.name === 'board_run') && db.prepare('SELECT run FROM board_run').get()?.run !== config.run) throw new Error('database belongs to another run');
+    // Cold concurrent openers can race the DELETE -> WAL change; SQLite may
+    // return BUSY immediately for that PRAGMA despite busy_timeout. Already-WAL
+    // opens need no mode change. Bound only this initialization retry to 5s.
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      try {
+        if (db.prepare('PRAGMA journal_mode').get().journal_mode !== 'wal') db.exec('PRAGMA journal_mode=WAL');
+        break;
+      } catch (error) {
+        if (error.errcode !== 5 || Date.now() >= deadline) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+    }
     transaction(() => {
       db.exec(`CREATE TABLE IF NOT EXISTS board_run (id INTEGER PRIMARY KEY CHECK(id=1), run TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS board_sessions (
