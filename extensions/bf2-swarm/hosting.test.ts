@@ -44,6 +44,14 @@ test('Basic login exchanges for a private cookie; real room retains bearer/run/O
   const page = await call('/', { Cookie });
   assert.equal(page.status, 200);
   assert.match(page.body, /^<!doctype html>/i);
+  assert.match(page.body, /<h1>Dark Factory<\/h1>/);
+  for (const asset of ['/room.js', '/markup.mjs', '/colors_and_type.css',
+    ...['Light', 'Medium', 'SemiBold', 'Italic'].map(f => `/fonts/JetBrainsMono-${f}.woff2`)]) {
+    assert.equal((await call(asset)).status, 401, 'static assets still require the hosting cookie');
+    assert.equal((await call(asset, { Cookie })).status, 200, asset);
+  }
+  assert.match((await call('/room.js', { Cookie })).body, /sessionStorage\.getItem\('bf2-room'\)/);
+  assert.match((await call('/hosting-bootstrap.js', { Cookie, 'Sec-Fetch-Site': 'same-origin' })).body, /sessionStorage\.setItem\('bf2-room',/);
   assert.match(page.body, /hosting-bootstrap\.js.*\n<script type="module"/);
   assert.equal(page.headers['cache-control'], 'no-store');
   assert.ok(!page.body.includes(token));

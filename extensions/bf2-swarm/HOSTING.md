@@ -99,7 +99,7 @@ execution report, never a tracked password or capability.
 ## Checks and recovery
 
 ```sh
-node --test extensions/bf2-swarm/hosting.test.ts extensions/bf2-swarm/room.test.ts
+node --test extensions/bf2-swarm/hosting.test.ts extensions/bf2-swarm/room.test.ts extensions/dark-factory/room/*.test.ts
 ```
 
 Fixtures qualify authenticated cookie/bearer/run/Origin, wrong credentials,
@@ -110,7 +110,11 @@ state; never send synthetic JACK messages or Start/Stop/Close to test hosting.
 Verify unauthenticated root redirects to the Basic challenge, static/bootstrap/API
 are denied, and authenticated page/state load remotely. Keep secrets/private
 transcripts out of evidence. Browser refresh updates frontend assets; no room or
-controller/worker restart is needed for this adapter.
+controller/worker restart is needed for this adapter. The shared frontend now
+lives in `../dark-factory/room/`; `room/` retains per-file symlinks for the running
+room server's old static path. See [safe live integration](../dark-factory/room/README.md)
+for the asset-first fast-forward sequence; no hosting runtime/configuration change
+or ingress restart is required.
 
 Rollback: remove only factory DNS, stop/remove only the factory cloudflared
 container, boot out only the two factory LaunchAgents. Retain owned configuration,

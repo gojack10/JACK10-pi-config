@@ -163,10 +163,13 @@ is local-user trusted, not authentication or an OS sandbox.
 
 ## Local factory room
 
-The accepted C v3 plain HTML/CSS/JS lives in `room/`, with its supplied fonts and
-color/type sheet. No gallery selector, canned chat, fake agents or lifecycle timers
-ship. The fixed member list always includes gold italic JACK as factory owner and
-actual eight-hex peers as swarm agents. Join/leave notices use board posts. The
+The accepted C v3 plain HTML/CSS/JS lives in `../dark-factory/room/`, headed
+**Dark Factory**, with its supplied fonts and color/type sheet. `room/` keeps
+per-file relative symlinks for existing servers/imports; the BF2 board/controller
+and `room.mjs` remain here. See [safe live integration](../dark-factory/room/README.md)
+before relocating assets in a serving checkout. No gallery selector, canned chat,
+fake agents or lifecycle timers ship. The fixed member list always includes gold
+italic JACK as factory owner and actual eight-hex peers as swarm agents. Join/leave notices use board posts. The
 current request is shown only while a pause vote is open; no owner voting controls.
 Registered IDs and JACK can be clicked to insert a mention. Bare IDs and @IDs are
 matched conservatively outside backtick code, UUIDs, longer hashes and path/file
