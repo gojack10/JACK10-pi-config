@@ -212,7 +212,13 @@ test('concurrent OSS claims serialize; ambiguous launch exceptions hold capacity
   assert.equal(claimOss(h.root, 'one', 'replacement', () => assert.fail('must not launch')), false);
 });
 
-test('all approved route shapes accepted, nonapproved thinking rejected and no private account route defaults', t => {
+test('advertised routes use the approved selectors while explicit account routes remain compatible', t => {
+  assert.deepEqual(ROUTES.map(({ provider, model, thinking }) => [provider, model, thinking]), [
+    ['openrouter', 'xiaomi/mimo-v2.6-pro', 'high'],
+    ['openai-codex-personal', 'gpt-6.1-sol', 'high'],
+    ['local', 'qwen3.8-flash-next', 'xhigh'],
+    ['openai-codex-personal', 'gpt-6-luna', 'high'],
+  ]);
   const h = fixture(t);
   for (const [i, r] of ROUTES.entries()) {
     const floor = h.create(`route${i}`, { slots: [sol('a'), { provider: r.providerPattern ? 'openai-codex-fixture' : r.provider, model: r.model, thinking: r.thinking, id: 'b', role: '', contextWarning: 80 }] });

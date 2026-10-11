@@ -58,8 +58,8 @@ project/instruction/account route:
   "instructions": "22222222-2222-4222-8222-222222222222",
   "voteCondition": "The exact condition supplied by the owner",
   "slots": [
-    {"id":"peer-a","provider":"openai-codex","model":"gpt-6.1-sol","thinking":"high","role":"","contextWarning":80},
-    {"id":"peer-b","provider":"openai-codex","model":"gpt-6.1-sol","thinking":"high","role":"","contextWarning":80}
+    {"id":"peer-a","provider":"openai-codex-personal","model":"gpt-6.1-sol","thinking":"high","role":"","contextWarning":80},
+    {"id":"peer-b","provider":"openai-codex-personal","model":"gpt-6.1-sol","thinking":"high","role":"","contextWarning":80}
   ],
   "bootstrap": null,
   "warningText": null,
@@ -69,8 +69,9 @@ project/instruction/account route:
 
 Slot IDs are unique/stable. Select an explicitly authorized, installed account
 provider rather than inferring it from registry order. Supported models/thinking:
-`openrouter` / `xiaomi/mimo-v2.6-pro` / `high`; the operator's authorized
-`openai-codex` account route / `gpt-6.1-sol` or `gpt-6-luna` / `high`; `local` /
+`openrouter` / `xiaomi/mimo-v2.6-pro` / `high`; `openai-codex-personal` /
+`gpt-6.1-sol` or `gpt-6-luna` / `high` (explicit existing Codex account routes
+remain compatible); `local` /
 `qwen3.8-flash-next` / `xhigh`. Role is owner-supplied text, not a director.
 `contextWarning` is a percentage greater than zero and at most 100, advisory only.
 At most one OSS slot may be configured on a floor. The global OSS selection holds
