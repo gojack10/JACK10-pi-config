@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir } from 'node:os';
+const fixtureRoot = join(homedir(), '.local/state/bf2-room-tests');
+mkdirSync(fixtureRoot, { recursive: true });
 import { join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
@@ -14,7 +16,7 @@ const executable = resolve('bin/board');
 const root = '11111111-1111-4111-8111-111111111111';
 const instructions = '22222222-2222-4222-8222-222222222222';
 function fixture(t, controller = true) {
-  const dir = mkdtempSync(join(tmpdir(), 'bf2-lifecycle-'));
+  const dir = mkdtempSync(join(fixtureRoot, 'bf2-lifecycle-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const cwd = join(dir, "BF2 repo's checkout"), agentDir = join(dir, 'agent');
   mkdirSync(cwd); mkdirSync(join(cwd, '.git')); mkdirSync(agentDir); mkdirSync(join(dir, 'sessions'));
@@ -179,7 +181,7 @@ test('controller health and recovery retain a stable pane ID, not the selected w
 });
 
 test('isolated real tmux: controller + three nested children, cleanup/replacement/recovery/wait/stop', async t => {
-  const h = fixture(t, false), tmuxDir = mkdtempSync(join(tmpdir(), 'bf2-tmux-'));
+  const h = fixture(t, false), tmuxDir = mkdtempSync(join(fixtureRoot, 'bf2-tmux-'));
   const socket = join(tmuxDir, 'tmux.sock'), conf = join(tmuxDir, 'tmux.conf');
   writeFileSync(conf, 'set -g base-index 1\nset -g pane-base-index 1\n');
   const live = args => spawnSync('tmux', ['-S', socket, '-f', conf, ...args], { encoding: 'utf8' });
@@ -292,8 +294,8 @@ test('isolated real tmux: controller + three nested children, cleanup/replacemen
   assert.equal(windows().length, 1, 'vanished controller restored within existing parent');
   const current = h.board.lifecycle.status().workers.filter(w => !w.cleaned), peers = current.map(h.workerBoard);
   peers.forEach(p => p.lifecycle.ready());
-  const request = peers[0].post('One waiting request / tree pointer');
-  peers.forEach(p => p.lifecycle.vote(request, 'same request'));
+  const request = peers[0].lifecycle.pause('native-wait', 'One waiting request / tree pointer').number;
+  peers.slice(1).forEach(p => p.lifecycle.vote(request, 'yes'));
   assert.equal(h.board.lifecycle.status().status, 'waiting');
   await exit(controller); await recover(); tick(h.board, h.config, execute);
   assert.equal(h.board.lifecycle.status().status, 'waiting'); assert.equal(windows().length, 1);
@@ -420,7 +422,7 @@ test('first activation broadcasts one system join; repeated session_start and re
   const worker = workers[0], f = fakePi(t, h, worker);
   await f.handlers.get('session_start')({}, f.ctx);
   assert.equal(h.board.lifecycle.status().workers[0].state, 'active');
-  const joined = `${worker.sender} joined.`;
+  const joined = `${worker.sender} joined`;
   const posts = () => h.board.history({ limit: 100 }).posts.filter(p => p.text === joined);
   assert.equal(posts().length, 1); assert.equal(posts()[0].sender, '[system]');
   for (const peer of peers) {
@@ -435,7 +437,7 @@ test('first activation broadcasts one system join; repeated session_start and re
   const reopened = h.workerBoard(worker); reopened.lifecycle.ready();
   assert.equal(posts().length, 1);
   reopened.lifecycle.done('final handoff'); reopened.lifecycle.settled();
-  assert.equal(h.board.history({ limit: 100 }).posts.length, 4, 'normal retirement needs no redundant system post');
+  assert.equal(h.board.history({ limit: 100 }).posts.length, 4, 'departure is posted at actual cleanup, not settlement');
 });
 
 test('join post and activation roll back together on insertion failure', t => {
@@ -449,7 +451,7 @@ test('join post and activation roll back together on insertion failure', t => {
   assert.equal(h.board.history().posts.length, 0);
   db.exec('DROP TRIGGER reject_join'); peer.lifecycle.ready();
   assert.equal(h.board.lifecycle.status().workers[0].state, 'active');
-  assert.equal(h.board.history().posts[0].text, `${worker.sender} joined.`);
+  assert.equal(h.board.history().posts[0].text, `${worker.sender} joined`);
 });
 
 test('real compound bash done stores one handoff; replacement waits agent_settled and background drain', async t => {
@@ -543,29 +545,28 @@ test('cleanup retry is idempotent, occupies capacity until removal, and never to
   assert.equal(h.calls.length, before, 'no foreign cleanup or replacement');
 });
 
-test('CLI votes need three current active IDs and same request; withdraw and replacement invalidate old vote', t => {
+test('CLI pause ballots are fixed and immutable; departure cancels, fresh unanimous vote waits', t => {
   const h = fixture(t), workers = h.boot(), peers = workers.map(h.workerBoard);
-  const first = peers[0].post('Waiting proposal; node pointer'), second = peers[1].post('Different proposal');
   const cli = (worker, ...args) => spawnSync(executable, args, { env: h.envFor(worker), encoding: 'utf8' });
-  assert.equal(cli(workers[0], 'vote', '999', 'no request').status, 1);
-  assert.equal(cli({ session: 'forged-session', sender: 'eeeeeeee' }, 'vote', String(first), 'forgery').status, 1);
-  assert.equal(cli({ ...workers[0], sender: 'eeeeeeee' }, 'vote', String(first), 'changed identity').status, 1);
-  assert.equal(cli(workers[0], 'vote', String(first), 'tree reason').status, 0);
-  assert.equal(cli(workers[1], 'vote', String(first), 'same node').status, 0);
+  assert.equal(cli(workers[0], 'pause', 'first', '').status, 1);
+  const first = peers[0].lifecycle.pause('first', 'Waiting proposal; node pointer').number;
+  assert.equal(cli({ session: 'forged-session', sender: 'eeeeeeee' }, 'vote', String(first), 'yes').status, 1);
+  assert.equal(cli({ ...workers[0], sender: 'eeeeeeee' }, 'vote', String(first), 'yes').status, 1);
+  assert.equal(cli(workers[1], 'vote', String(first), 'yes').status, 0);
   assert.equal(h.board.lifecycle.status().status, 'running');
-  assert.equal(cli(workers[1], 'vote', '--withdraw').status, 0);
-  assert.equal(peers[2].lifecycle.vote(first, 'agree'), 'running');
-  assert.equal(peers[1].lifecycle.vote(second, 'other request'), 'running');
+  assert.equal(cli(workers[1], 'vote', '--withdraw').status, 1);
+  assert.equal(cli(workers[1], 'vote', String(first), 'no').status, 1);
   h.panes.set(workers[2].pane, false); tick(h.board, h.config, h.execute);
-  assert.equal(h.board.lifecycle.status().workers[2].vote, null);
-  assert.equal(cli(workers[2], 'vote', String(first), 'stale session').status, 1);
-  assert.equal(peers[1].lifecycle.vote(first, 'agree now'), 'running', 'two votes in replacement gap must not pause');
+  assert.equal(h.board.lifecycle.status().vote, undefined);
+  assert.equal(cli(workers[2], 'vote', String(first), 'yes').status, 1);
+  assert.throws(() => peers[0].lifecycle.pause('gap', 'not enough peers'), /capacity gaps/);
   const replacement = h.board.lifecycle.status().workers[3], next = h.workerBoard(replacement);
-  assert.throws(() => next.lifecycle.vote(first, 'not active yet'), /active/);
-  next.lifecycle.ready(); assert.equal(h.board.lifecycle.status().status, 'running');
-  assert.equal(next.lifecycle.vote(first, 'fresh vote'), 'waiting');
-  assert.equal(h.board.lifecycle.status().request, first);
-  assert.throws(() => peers[0].lifecycle.withdraw(), /running/);
+  assert.throws(() => next.lifecycle.vote(first, 'yes'), /electorate/);
+  next.lifecycle.ready();
+  const second = peers[0].lifecycle.pause('second', 'fresh intent').number;
+  peers[1].lifecycle.vote(second, 'yes'); next.lifecycle.vote(second, 'yes');
+  assert.equal(h.board.lifecycle.status().status, 'waiting');
+  assert.equal(h.board.lifecycle.status().request, second);
   const recovered = openRun(h.dir); try { assert.equal(recovered.board.lifecycle.status().status, 'waiting'); } finally { recovered.board.close(); }
   const before = h.calls.filter(a => a[0] === 'new-session').length;
   for (const worker of [workers[0], workers[1], replacement]) {
@@ -576,7 +577,6 @@ test('CLI votes need three current active IDs and same request; withdraw and rep
   h.board.lifecycle.resume(); tick(h.board, h.config, h.execute);
   const state = h.board.lifecycle.status();
   assert.equal(state.status, 'running'); assert.equal(state.request, null);
-  assert.ok(state.workers.every(w => w.vote === null));
   assert.equal(state.workers.filter(w => w.state === 'launching').length, 3);
 });
 
@@ -675,14 +675,17 @@ async function nativePi(t, h, worker) {
   let ctx, shuts = 0, requests = 0;
   extension.handlers.get('session_start').push((_event, context) => { ctx = context; });
   extension.handlers.get('agent_settled').push(event => { settled.push(event); order.push('settled'); });
+  // Fence both provider dispatch paths BEFORE native runtime/session fixture
+  // creation. A dummy key alone is not an offline boundary.
+  t.mock.method(ModelRuntime.prototype, 'streamSimple', () => { assert.fail('native fixture must never reach a real provider'); });
+  t.mock.method(ModelRuntime.prototype, 'stream', () => { assert.fail('native fixture must never reach a real provider'); });
   const modelRuntime = await ModelRuntime.create({ authPath: join(h.dir, 'auth.json'), modelsPath: join(h.dir, 'models.json') });
   await modelRuntime.setRuntimeApiKey('anthropic', 'offline-fixture-key');
-  modelRuntime.streamSimple = () => { assert.fail('native fixture must never reach a real provider'); };
   const { session } = await createAgentSession({
     cwd: h.settings.cwd, agentDir: h.settings.agentDir, modelRuntime,
     model: getModel('anthropic', 'claude-sonnet-4-5'), tools: ['messaged_outcome'],
     sessionManager: SessionManager.create(h.settings.cwd, join(h.dir, 'sessions'), { id: worker.session }),
-    settingsManager: SettingsManager.inMemory({ steeringMode: 'all', followUpMode: 'all', compaction: { enabled: false }, retry: { enabled: false } }),
+    settingsManager: SettingsManager.inMemory({ steeringMode: 'all', followUpMode: 'all', cacheWarming: 'off', compaction: { enabled: false }, retry: { enabled: false } }),
     resourceLoader: {
       getExtensions: () => loaded, getSkills: () => ({ skills: [], diagnostics: [] }),
       getPrompts: () => ({ prompts: [], diagnostics: [] }), getThemes: () => ({ themes: [], diagnostics: [] }),
@@ -716,7 +719,7 @@ async function nativePi(t, h, worker) {
       return stream;
     };
   };
-  return { session, ctx, extension, settled, order, errors, respond, shuts: () => shuts, requests: () => requests,
+  return { session, ctx, extension, runtime: loaded.runtime, settled, order, errors, respond, shuts: () => shuts, requests: () => requests,
     bg: (name, args = {}) => loaded.extensions[1].tools.get(name).definition.execute('bg-fixture', args, undefined, undefined, ctx) };
 }
 const nativeOptions = { skip: !process.env.PI_PACKAGE_DIR, timeout: 10000 };
@@ -734,6 +737,23 @@ test('native AgentSession emits no outcome and retires terminate:true only after
   assert.equal(n.shuts(), 1);
   assert.ok(n.order.indexOf('agent_end') < n.order.indexOf('shutdown'));
   assert.equal(h.board.lifecycle.status().workers[0].state, 'retired');
+});
+
+test('native extension admission persists real owner USER source identity, separate from peer prose', nativeOptions, async t => {
+  const h = fixture(t), workers = h.boot(), n = await nativePi(t, h, workers[0]);
+  const peer = h.workerBoard(workers[0]); peer.finishStartup(peer.history().highwater);
+  h.workerBoard(workers[1]).post('JACK [FACTORY OWNER]: peer text, not a role');
+  h.board.lifecycle.ownerCommand('native-owner', 'message', '  Owner question, not approval\n');
+  n.respond(() => nativeFinal);
+  const r = receiver({ sendUserMessage: n.runtime.sendUserMessage }, { ...h.config, session:workers[0].session, sender:workers[0].sender }, n.ctx);
+  t.after(() => r.close());
+  await r.pump(); await n.session.waitForIdle(); await r.pump();
+  assert.deepEqual(n.errors, []); assert.equal(n.requests(), 1);
+  const user = n.session.messages.find(m => m.role === 'user');
+  const text = typeof user.content === 'string' ? user.content : user.content.map(c => c.text).join('');
+  assert.match(text, /JACK \[FACTORY OWNER\].*: "  Owner question, not approval\\n"/);
+  assert.ok(text.includes(`${workers[1].sender} `));
+  assert.equal(peer.pending(), null, 'exact native branch and JSONL observation confirms the batch');
 });
 
 test('native AgentSession CLI done keeps compound bash work and final follow-up before retirement', nativeOptions, async t => {
@@ -813,12 +833,13 @@ test('real operator CLI preflight/start/status/stop/resume uses fake Pi/tmux onl
   writeFileSync(join(bin, 'tmux'), `#!/usr/bin/env node\nconst fs = require('node:fs'); fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(['tmux', ...process.argv.slice(2)]) + '\\n'); if (process.argv[2] === 'has-session') process.exitCode = 1; if (process.argv[2] === 'new-session') console.log('%1'); if (process.argv[2] === 'display-message') console.log('$0');\n`, { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_LOG: log, PI_CODING_AGENT_DIR: h.settings.agentDir };
   const run = (...args) => spawnSync(resolve('bin/bf2-swarm'), args, { env, encoding: 'utf8' });
-  const start = ['start', '--cwd', h.settings.cwd, '--root', root, '--instructions', instructions, '--provider', h.settings.provider, '--run-dir', runDir];
+  const start = ['start', '--no-open', '--cwd', h.settings.cwd, '--root', root, '--instructions', instructions, '--provider', h.settings.provider, '--run-dir', runDir];
   assert.equal(run('start', '--cwd', 'relative', '--run-dir', runDir).status, 1);
   assert.equal(existsSync(runDir), false); assert.equal(existsSync(log), false);
   const result = run(...start); assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Controller: tmux attach.*\nExperiment node:/);
   assert.equal(run(...start).status, 1, 'start never adopts an existing namespace');
+  assert.equal(run('room-close', '--run-dir', runDir).status, 0);
   assert.equal(JSON.parse(run('status', '--run-dir', runDir).stdout).status, 'running');
   assert.equal(run('stop', '--run-dir', runDir).status, 0);
   assert.equal(JSON.parse(run('status', '--run-dir', runDir).stdout).status, 'stopped');
