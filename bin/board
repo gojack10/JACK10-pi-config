@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+// ESM works without a package manifest on Node 24; no dependencies or model calls.
+(async () => {
+  const { realpathSync } = await import('node:fs');
+  const { pathToFileURL } = await import('node:url');
+  const cli = new URL('../extensions/bf2-swarm/cli.mjs', pathToFileURL(realpathSync(process.argv[1])));
+  process.stdout.on('error', () => {}); // main receives write errors, including EPIPE.
+  const { main } = await import(cli);
+  await main();
+})().catch(error => { console.error(`board: ${error.message}`); process.exitCode = 1; });
