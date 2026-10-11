@@ -1,6 +1,12 @@
 // Cooperative run state, not authentication against agents rewriting local files.
 import { randomBytes } from 'node:crypto';
 
+export const missingFloorLaunchSettings = settings => ['instructions','voteCondition','bootstrap','warningText','wrapupText'].filter(key => !settings?.[key]);
+const requireFloorLaunchSettings = settings => {
+  const missing = missingFloorLaunchSettings(settings);
+  if (missing.length) throw new Error(`floor start requires launch settings: ${missing.join(', ')}`);
+};
+
 export function lifecycleStore(db, transaction, config, insertPost) {
   const exists = () => !!db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get();
   const floor = () => db.prepare("SELECT name FROM sqlite_master WHERE name='floor_settings'").get() ?
@@ -26,7 +32,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   };
   const ownerBallot = () => {
     const settings = floor();
-    if (!settings || openVote()) return openVote();
+    if (!settings?.voteCondition || openVote()) return openVote();
     const run = status(), peers = run.workers.filter(w => !w.cleaned);
     if (run.status !== 'running' || peers.length !== settings.slots.length || peers.some(w => w.state !== 'active' || w.retire_requested) ||
       settings.slots.some(s => !peers.some(w => w.slot === s.id))) return;
@@ -40,10 +46,9 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     if (vote?.electorate.some(v => v.session === session)) closeVote(vote, 'cancelled', 'Electorate changed, work continues');
   };
   const queuedStart = () => {
-    const run = status();
+    const run = status(), settings = floor();
+    if (settings) requireFloorLaunchSettings(settings);
     if (run.status === 'running') return;
-    const settings = floor();
-    if (settings && (!settings.bootstrap || !settings.warningText || !settings.wrapupText)) throw new Error('floor start requires owner-approved bootstrap, warningText and wrapupText');
     db.prepare('UPDATE swarm_run SET reconvene=1').run();
     if (!run.workers.some(w => !w.cleaned)) advanceDrain();
   };
@@ -218,9 +223,9 @@ export function lifecycleStore(db, transaction, config, insertPost) {
           if (run.status !== 'running') {
             db.prepare('UPDATE swarm_run SET wake_from=COALESCE(wake_from,?)').run(number);
             const settings = floor();
-            // Owner input is durable even before new-floor prompt approval; it
-            // cannot bypass that launch gate and is delivered after explicit start.
-            if (!settings || (settings.bootstrap && settings.warningText && settings.wrapupText)) queuedStart();
+            // Pending floors retain owner input without starting or bypassing
+            // missing launch settings. It is delivered after a configured start.
+            if (!settings || !missingFloorLaunchSettings(settings).length) queuedStart();
           }
         } else if (action === 'start') queuedStart();
         else stop();
@@ -277,6 +282,10 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       controller();
       return transaction(() => {
         if (!floor()) throw new Error('not a floor');
+        const run = status();
+        // Live/draining workers still need these inputs for replacement and safe
+        // retirement. Refuse atomically, before votes, settings or posts change.
+        if (run.status !== 'stopped' || run.reconvene || run.workers.some(w => !w.cleaned)) requireFloorLaunchSettings(settings);
         const old = floor(), vote = openVote();
         if (vote && (old.voteCondition !== settings.voteCondition || JSON.stringify(old.slots.map(s => s.id).sort()) !== JSON.stringify(settings.slots.map(s => s.id).sort()))) closeVote(vote, 'cancelled', 'Owner condition or configured membership changed; old votes invalidated');
         db.prepare('UPDATE floor_settings SET settings=?').run(JSON.stringify(settings));

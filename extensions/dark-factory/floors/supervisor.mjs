@@ -1,15 +1,16 @@
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureController, tick, tmux, settingsFor } from '../../bf2-swarm/controller.mjs';
-import { openFloor, isOss, ossStatus, claimOss, releaseOss, validateSettings } from './runtime.mjs';
+import { openFloor, isOss, ossStatus, claimOss, releaseOss, validateSettings, missingFloorLaunchSettings } from './runtime.mjs';
 
 export function validateFloorLaunch(settings) {
   validateSettings(Object.fromEntries(['name','cwd','roots','instructions','voteCondition','slots','bootstrap','warningText','wrapupText'].map(k => [k, settings[k]])));
+  const missing = missingFloorLaunchSettings(settings);
+  if (missing.length) throw new Error(`floor start requires launch settings: ${missing.join(', ')}`);
   realpathSync(settings.agentDir);
   const pi = settingsFor(settings.agentDir, settings.cwd);
   if (pi.steeringMode !== 'all' || pi.followUpMode !== 'all') throw new Error('NEW floor sessions require native steeringMode=all and followUpMode=all');
   if ((pi.extensions ?? []).some(e => String(e).includes('rlm-friendly-stop') && !String(e).startsWith('-'))) throw new Error('global friendly-stop must not load in floor workers');
-  if (!settings.bootstrap || !settings.warningText || !settings.wrapupText) throw new Error('floor launch requires owner-approved bootstrap, warningText and wrapupText');
 }
 export function ensureFloorController(floor, execute = tmux, env = process.env) {
   const state = floor.board.lifecycle.status();

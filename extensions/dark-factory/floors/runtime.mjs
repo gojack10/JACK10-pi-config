@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { openBoard } from '../../bf2-swarm/board.mjs';
 import { openRun } from '../../bf2-swarm/controller.mjs';
+export { missingFloorLaunchSettings } from '../../bf2-swarm/lifecycle-store.mjs';
 
 export const DEFAULT_ROOT = join(homedir(), '.local/state/dark-factory/floors');
 // Personal is the public selector; private backing account identities remain untracked.
@@ -43,8 +44,8 @@ export function validateSettings(input) {
   const cwd = realpathSync(input.cwd);
   if (!statSync(cwd).isDirectory() || !existsSync(join(cwd, '.git'))) throw new Error('cwd must be an existing Git checkout');
   if (!Array.isArray(input.roots) || !input.roots.length || input.roots.length > 100 || input.roots.some(r => typeof r !== 'string' || !uuid.test(r))) throw new Error('roots must contain tree starting node UUIDs');
-  if (typeof input.instructions !== 'string' || !uuid.test(input.instructions)) throw new Error('instructions must be a tree node UUID');
-  const voteCondition = text(input.voteCondition, 'voteCondition');
+  if (input.instructions != null && (typeof input.instructions !== 'string' || !uuid.test(input.instructions))) throw new Error('instructions must be a tree node UUID or null while stopped');
+  const voteCondition = input.voteCondition == null ? null : text(input.voteCondition, 'voteCondition');
   if (!Array.isArray(input.slots) || input.slots.length < 2 || input.slots.length > 10) throw new Error('floor requires 2-10 slots');
   const slots = input.slots.map(s => {
     if (!s || Object.keys(s).some(k => !['id','provider','model','thinking','role','contextWarning'].includes(k))) throw new Error('unknown slot setting');
@@ -56,7 +57,7 @@ export function validateSettings(input) {
     return { id, provider: s.provider, model: s.model, thinking: s.thinking, role: text(s.role ?? '', 'role', true), contextWarning };
   });
   if (new Set(slots.map(s => s.id)).size !== slots.length || slots.filter(isOss).length > 1) throw new Error('slot IDs must be unique; at most one OSS slot per floor');
-  return { name, cwd, roots: [...new Set(input.roots)], instructions: input.instructions, voteCondition, slots,
+  return { name, cwd, roots: [...new Set(input.roots)], instructions: input.instructions ?? null, voteCondition, slots,
     ...Object.fromEntries(['bootstrap','warningText','wrapupText'].map(key => [key, input[key] == null ? null : text(input[key], key)])) };
 }
 const launchSettings = (settings, root, id, runDir, agentDir) => ({ ...settings, floorId: id, floorRoot: root, root: settings.roots[0],
