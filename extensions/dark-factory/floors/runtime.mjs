@@ -8,12 +8,12 @@ import { openBoard } from '../../bf2-swarm/board.mjs';
 import { openRun } from '../../bf2-swarm/controller.mjs';
 
 export const DEFAULT_ROOT = join(homedir(), '.local/state/dark-factory/floors');
-// Codex provider IDs are operator-selected account routes, never tracked account identities.
+// Personal is the public selector; private backing account identities remain untracked.
 export const ROUTES = Object.freeze([
   { provider: 'openrouter', model: 'xiaomi/mimo-v2.6-pro', thinking: 'high' },
-  { provider: 'openai-codex', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6.1-sol', thinking: 'high' },
+  { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6.1-sol', thinking: 'high' },
   { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' },
-  { provider: 'openai-codex', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6-luna', thinking: 'high' },
+  { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6-luna', thinking: 'high' },
 ]);
 export const isOss = slot => slot?.provider === 'local' && slot.model === 'qwen3.8-flash-next';
 const code = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
