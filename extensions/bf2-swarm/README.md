@@ -1,5 +1,27 @@
 # BF2 board and opt-in three-peer swarm
 
+For the generalized peer runtime, use [Dark Factory floors](../dark-factory/README.md#peer-factory-floors)
+and `bin/factory`. Its create/config/message/start/stop commands require explicit
+floor selection outside workers and share the room's SQLite source of truth.
+The commands and fixed three-peer policies below remain legacy BF2 behavior;
+no existing live run is automatically adopted or restarted.
+
+`board` recognizes modern `FACTORY_FLOOR/DB/SESSION/SENDER` launch binding (with
+legacy aliases supplied by the launcher). In that mode votes answer the owner's
+configured floor condition, not an arbitrary peer pause question. `board status`
+shows it; `board --floor ID read`/`post` are explicit outside-operator access.
+Workers cannot select another floor. BF2-only launch environments retain the
+original CLI and ballot semantics.
+
+A separately authorized `factory adopt --floor ID --run-dir PATH --settings FILE`
+registers a compatible stopped/drained BF2 run for standard floor discovery,
+retaining its existing DB/history and saved sessions. It does not start workers
+or credit previous workers as fresh product completions. Adoption requires the old
+controller to have exited; use a copied generic fixture for development, not a live
+run. After adoption use floor controls, not legacy resume. Old incompatible formats
+remain read-only with their original code. See the linked floor guide for exact
+settings, retry semantics and prompt approval requirements.
+
 Dependency-free Node 24 SQLite CLI, optional Pi USER-input receiver, and a separate
 experimental three-peer lifecycle and localhost factory room. The board still works alone. The swarm never
 uses the existing factory/task-report contract. No dispatcher, routing, assigned
@@ -40,8 +62,8 @@ BF2_REPO=/absolute/path/to/durable/BF2-checkout
 are rejected by start. `status`, `stop`, `resume` and recovery require the saved
 run.json and DB; they never create a missing DB. The DB stores authoritative config,
 worker identities, fixed pause ballots, owner commands, handoffs and
-running/waiting/stopping/stopped state. This room format requires a **fresh run**.
-Old peer runs (including 01-04) are not adopted or migrated. New code rejects their
+running/waiting/stopping/stopped state. Legacy `bf2-swarm start` requires a **fresh run**.
+Old incompatible peer formats (including 01-04) are not adopted or migrated by these legacy commands. New code rejects their
 lifecycle format before modifying it; keep the original checkout for read-only
 history inspection. Board-only legacy runs retain their original role-free behavior. Session files,
 boot USER @files and tmux pane logs stay in that run directory. No PATH installation.

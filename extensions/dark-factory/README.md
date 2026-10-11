@@ -1,5 +1,134 @@
 # Dark Factory
 
+## Peer factory floors
+
+`bin/factory` is the explicit CLI for the multi-floor peer runtime. It consumes
+`floors/runtime.mjs` and `floors/supervisor.mjs`; the existing sequential and
+parallel commands below remain separate compatibility paths, not peer controllers.
+Node 24 is required. Creation/configuration do not request a model.
+
+Each floor's SQLite is the single source of truth for settings, messages, workers
+and the owner's ballot. Default discovery is
+`~/.local/state/dark-factory/floors/<id>/floor.sqlite`. The multi-floor room reads
+that same discovery/runtime interface and picks up CLI-created floors on its next
+list refresh, without restart. No browser SQLite access or second registration
+store is needed. Configure the room in multi-floor mode; legacy BF2 room hosting
+is still a separate mode.
+
+```sh
+FACTORY=/absolute/path/to/agent-checkout/bin/factory
+"$FACTORY" -h
+"$FACTORY" create --floor project-a --settings /tmp/project-a-settings.json
+"$FACTORY" list
+"$FACTORY" status --floor project-a
+"$FACTORY" config --floor project-a
+"$FACTORY" config --floor project-a --settings /tmp/project-a-patch.json
+# Only when separately authorized and launch instructions are approved:
+"$FACTORY" start --floor project-a --key start-1
+"$FACTORY" message --floor project-a 'Please give me an overall progress update' --key update-1
+"$FACTORY" stop --floor project-a --key stop-1
+"$FACTORY" oss                    # Actual global managed OSS selection/lease
+"$FACTORY" oss --floor project-a  # Select a floor with a configured OSS slot
+"$FACTORY" oss --none             # Drain/release the managed OSS occupant
+```
+
+`--floors-dir /absolute/path` or `FACTORY_ROOT` selects another discovery root,
+primarily for isolated fixtures. Outside a launched worker, floor-scoped commands
+require `--floor`; there is no last-used fallback. Operator mutations reject
+inherited worker identities. Stable `--key` values make owner message/start/stop
+retries idempotent; changing the input for an existing key is rejected. Generated
+keys appear in output: preserve one before retrying an uncertain command. If
+controller recovery fails after persistence, output includes `controllerError`
+and the CLI exits nonzero while naming the saved key. Repair recovery and retry
+that same key; do not assume workers started.
+
+### Settings input
+
+`--settings` imports a JSON object once; the file is not a live configuration.
+Creation requires name, existing absolute Git checkout cwd, nonempty starting-node
+UUIDs, instruction-entry UUID, owner vote condition and 2–10 slots. Two slots may
+use the same model. This generic example is input structure, not an approved
+project/instruction/account route:
+
+```json
+{
+  "name": "Project A",
+  "cwd": "/absolute/existing/git-checkout",
+  "roots": ["11111111-1111-4111-8111-111111111111"],
+  "instructions": "22222222-2222-4222-8222-222222222222",
+  "voteCondition": "The exact condition supplied by the owner",
+  "slots": [
+    {"id":"peer-a","provider":"openai-codex","model":"gpt-6.1-sol","thinking":"high","role":"","contextWarning":80},
+    {"id":"peer-b","provider":"openai-codex","model":"gpt-6.1-sol","thinking":"high","role":"","contextWarning":80}
+  ],
+  "bootstrap": null,
+  "warningText": null,
+  "wrapupText": null
+}
+```
+
+Slot IDs are unique/stable. Select an explicitly authorized, installed account
+provider rather than inferring it from registry order. Supported models/thinking:
+`openrouter` / `xiaomi/mimo-v2.6-pro` / `high`; the operator's authorized
+`openai-codex` account route / `gpt-6.1-sol` or `gpt-6-luna` / `high`; `local` /
+`qwen3.8-flash-next` / `xhigh`. Role is owner-supplied text, not a director.
+`contextWarning` is a percentage greater than zero and at most 100, advisory only.
+At most one OSS slot may be configured on a floor. The global OSS selection holds
+its single lease until the old occupant actually exits/cleans up; selecting a
+stopped floor does not start it.
+
+Creation is **stopped**. New production bootstrap/warning/wrapup/role instructions
+must be shown exactly to Jack and approved before installation. Null launch text
+permits creation/configuration but blocks start. The CLI does not load a packaged
+skill or persist any tree instructions. Use fixture text only in isolated checks.
+
+Config accepts a partial object; supplied arrays replace those arrays atomically.
+Invalid settings leave the prior settings intact. Model/role changes apply to the
+next occupant, not the current worker. Removing slots safely retires their current
+occupants. Editing the owner's condition invalidates old votes and notifies peers;
+membership changes invalidate an unfinished ballot. Unanimous yes pauses/drains
+for that condition, not controller-defined product completion.
+
+### Worker board scope and BF2 adoption
+
+The launcher supplies `FACTORY_FLOOR`, `FACTORY_DB`, `FACTORY_SESSION`,
+`FACTORY_SENDER`, `FACTORY_ROOT` and compatible `BF2_BOARD_*` aliases. Workers use
+plain `board post`, `read`, `status`, `vote NUMBER yes|no` and `done`; they cannot
+change their floor/identity. First plain read preserves the existing startup cursor
+and retained-owner-input boundary. Outside workers use `board --floor ID read`
+or `board --floor ID post 'text'` (owner input), or `factory message --floor ID`.
+Outside history does not consume a worker's input. `done`, `pause` and `vote`
+require a registered launched worker. Floor ballots come from the owner; legacy
+BF2 `pause KEY reason` behavior remains unchanged in legacy mode.
+
+```sh
+# One-time operation only when separately authorized; never a live trial fixture:
+"$FACTORY" adopt --floor bf2 --run-dir /absolute/stopped-drained/BF2-run \
+  --settings /tmp/bf2-floor-settings.json
+```
+
+Adoption is runtime-owned and requires a compatible stopped/drained BF2 run with
+its old controller exited. It registers the original database through the standard
+floor discovery path, preserving history, identities and session directory rather
+than rebuilding an empty run. It does not launch or credit old workers as fresh
+completions. Identical adoption retries must preserve that exact source/settings;
+conflicting source/settings are rejected. Keep the legacy `bin/bf2-swarm` controls
+for unadopted runs; do not use them to resume an adopted floor. This implementation
+assignment does not authorize Jack's live BF2 migration or any service restart.
+
+Checks after merging the runtime dependency:
+
+```sh
+node --test extensions/dark-factory/floors/cli*.test.ts extensions/bf2-swarm/board.test.ts
+# Isolated consumer worktree only: point tests at the sibling's real runtime.
+FACTORY_TEST_RUNTIME_DIR=/absolute/runtime-checkout \
+  node --test extensions/dark-factory/floors/cli*.test.ts
+```
+
+Integration tests use real SQLite/runtime operations with generic copied fixtures;
+only controller transport is injected, so they make no real worker/model/browser
+qualification claim. No live database, source project or services are exercised.
+
 ## Sequential dark factory
 
 Runs fresh agents through the canonical tmux subagent transport. The repository owns generic scheduling, locks, route guards, report delivery and continuation. SiftText owns project instructions and completion conditions; no project contract Markdown is shipped or read from this repository.
