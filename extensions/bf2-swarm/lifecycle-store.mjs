@@ -43,8 +43,11 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       });
     },
     ready() {
-      const changed = db.prepare("UPDATE swarm_workers SET state='active' WHERE session=? AND state='launching'").run(config.session).changes;
-      if (!changed && worker().state !== 'active') throw new Error('worker is not launchable');
+      transaction(() => {
+        const changed = db.prepare("UPDATE swarm_workers SET state='active' WHERE session=? AND state='launching'").run(config.session).changes;
+        if (changed) system(`${config.sender} joined.`);
+        else if (worker().state !== 'active') throw new Error('worker is not launchable');
+      });
     },
     done(text) {
       return transaction(() => {
