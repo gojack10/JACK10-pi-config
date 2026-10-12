@@ -86,7 +86,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       if (!db.prepare('PRAGMA table_info(board_posts)').all().some(c => c.name === 'role')) throw new Error('legacy board format; start a fresh run');
       transaction(() => {
         db.exec(`CREATE TABLE swarm_run (id INTEGER PRIMARY KEY CHECK(id=1), status TEXT NOT NULL, request INTEGER, config TEXT NOT NULL, controller INTEGER, tmux_parent TEXT,
-            reconvene INTEGER NOT NULL DEFAULT 0, wake_from INTEGER, room_pid INTEGER, room_port INTEGER, room_token TEXT NOT NULL);
+            reconvene INTEGER NOT NULL DEFAULT 0, room_pid INTEGER, room_port INTEGER, room_token TEXT NOT NULL);
           CREATE TABLE swarm_workers (session TEXT PRIMARY KEY, sender TEXT NOT NULL UNIQUE, pane TEXT NOT NULL,
             state TEXT NOT NULL, handoff INTEGER, cleaned INTEGER NOT NULL DEFAULT 0, tmux_session TEXT);
           CREATE UNIQUE INDEX swarm_live_panes ON swarm_workers(pane) WHERE cleaned=0;
@@ -208,7 +208,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         if (answer === 'no') closeVote(vote, 'rejected', 'One no, work continues');
         else if (vote.electorate.every(v => v.answer === 'yes')) {
           closeVote(vote, 'agreed', floor() ? 'Unanimous yes, waiting for JACK' : 'Three yes, waiting for JACK');
-          db.prepare("UPDATE swarm_run SET status='waiting', request=?, reconvene=0, wake_from=NULL").run(number);
+          db.prepare("UPDATE swarm_run SET status='waiting', request=?, reconvene=0").run(number);
           for (const peer of run.workers.filter(w => !w.cleaned)) retirementInput(peer.session);
         }
         return getVote(db.prepare('SELECT * FROM swarm_votes WHERE number=?').get(number));
@@ -228,10 +228,8 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         if (action === 'message') {
           number = insertPost(text, 'owner', 'JACK', 'owner');
           if (run.status !== 'running') {
-            db.prepare('UPDATE swarm_run SET wake_from=COALESCE(wake_from,?)').run(number);
             const settings = floor();
-            // Pending floors retain owner input without starting or bypassing
-            // missing launch settings. It is delivered after a configured start.
+            // Pending floors retain chat history without bypassing missing launch settings.
             if (!settings || !missingFloorLaunchSettings(settings).length) queuedStart();
           }
         } else if (action === 'start') queuedStart();

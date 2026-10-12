@@ -105,26 +105,21 @@ export function openBoard(config) {
   };
   const jobs = jobStore(db, transaction, config, insertPost);
   const retainedJobs = () => jobs.terminalNumbers();
-  const wakingBatch = (after, until, wakeFrom) => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE ((role='owner' AND number>=?) OR number IN (${retainedJobs().join(',') || 'NULL'})) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(wakeFrom ?? Number.MAX_SAFE_INTEGER, after, until, BATCH_LIMIT), { wakeUntil: until, wakeFrom });
+  const terminalBatch = (after, until) => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT), { wakeUntil: until });
   const retirementInput = () => config.floor && db.prepare('SELECT * FROM floor_retirement_input WHERE session=? AND override_reason IS NULL').get(config.session);
-  const ownerBatch = after => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE role='owner' AND number>? ORDER BY number LIMIT ?`).all(after, BATCH_LIMIT), { retirementOwner: true });
   return {
     close: () => db.close(),
     post: text => insertPost(text),
     lifecycle: lifecycleStore(db, transaction, config, insertPost),
     jobs,
-    ownerInputAllowed(text) {
-      const row = retirementInput();
-      if (!row?.pending) return false;
-      return JSON.parse(row.pending).text === text;
-    },
+    ownerInputAllowed() { return false; },
     history({ limit = HISTORY_LIMIT, before = Number.MAX_SAFE_INTEGER } = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('limit must be 1-100');
       if (!Number.isSafeInteger(before) || before < 1) throw new Error('before must be a positive post number');
       return transaction(() => ({
         posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number < ? ORDER BY number DESC LIMIT ?`).all(before, limit).reverse(),
         wake: before === Number.MAX_SAFE_INTEGER && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get() ?
-          db.prepare(`SELECT ${columns} FROM board_posts WHERE ((role='owner' AND number >= (SELECT wake_from FROM swarm_run)) OR number IN (${retainedJobs().join(',') || 'NULL'})) AND number < ? ORDER BY number`).all(before) : [],
+          db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number < ? ORDER BY number`).all(before) : [],
         highwater: db.prepare('SELECT COALESCE(MAX(number), 0) AS n FROM board_posts').get().n,
         startup: state().cursor === null,
       }));
@@ -140,16 +135,14 @@ export function openBoard(config) {
           posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number > ? ORDER BY number LIMIT 100`).all(after) };
       });
     },
-    finishStartup(highwater, wakeFrom) {
-      // Stdout acceptance is not model observation: waking owner input also goes
-      // through bounded genuine USER batches, unaffected by Bash output truncation.
+    finishStartup(highwater) {
+      // Retained independent-job terminal notices survive stdout truncation.
       transaction(() => {
         const changed = db.prepare('UPDATE board_sessions SET cursor=? WHERE session=? AND cursor IS NULL').run(highwater, config.session).changes;
         if (changed && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get()) {
-          const from = wakeFrom === undefined ? db.prepare('SELECT wake_from FROM swarm_run').get().wake_from : wakeFrom;
           const terminals = retainedJobs();
-          if (from !== null || terminals.length) {
-            const batch = wakingBatch(Math.min(from ?? Infinity, ...terminals) - 1, highwater, from);
+          if (terminals.length) {
+            const batch = terminalBatch(Math.min(...terminals) - 1, highwater);
             if (batch) db.prepare('UPDATE board_sessions SET pending=? WHERE session=?').run(JSON.stringify(batch), config.session);
           }
         }
@@ -157,13 +150,7 @@ export function openBoard(config) {
     },
     pending() {
       return transaction(() => {
-        const retirement = retirementInput();
-        if (retirement) {
-          if (retirement.pending) return JSON.parse(retirement.pending);
-          const batch = ownerBatch(retirement.cursor);
-          if (batch) db.prepare('UPDATE floor_retirement_input SET pending=? WHERE session=?').run(JSON.stringify(batch), config.session);
-          return batch;
-        }
+        if (retirementInput()) return null; // Preserve ordinary backlog until a context override.
         const current = state();
         if (current.cursor === null) return null; // Wait for the agent's first `board read`.
         if (current.pending) return JSON.parse(current.pending);
@@ -177,17 +164,12 @@ export function openBoard(config) {
     },
     confirmPersisted(key) {
       return transaction(() => {
-        const retirement = retirementInput();
-        if (retirement?.pending && JSON.parse(retirement.pending).key === key) {
-          db.prepare('UPDATE floor_retirement_input SET cursor=?,pending=NULL WHERE session=?').run(JSON.parse(retirement.pending).through, config.session);
-          return;
-        }
         const current = state();
         if (!current.pending) return;
         const pending = JSON.parse(current.pending);
         if (pending.key !== key) throw new Error('pending batch changed');
         if (pending.wakeUntil !== undefined) {
-          const next = wakingBatch(pending.through, pending.wakeUntil, pending.wakeFrom);
+          const next = terminalBatch(pending.through, pending.wakeUntil);
           db.prepare('UPDATE board_sessions SET pending=? WHERE session=?').run(next ? JSON.stringify(next) : null, config.session);
         } else db.prepare('UPDATE board_sessions SET cursor=?, pending=NULL WHERE session=?').run(pending.through, config.session);
       });
