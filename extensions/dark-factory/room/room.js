@@ -60,9 +60,13 @@ $('#notification-toggle').addEventListener('click', async () => {
   } else current.prefs.desktop = !current.prefs.desktop;
   save(localStorage, scoped('alerts', current.id), current.prefs); alerts();
 });
-function handshake() {
-  if (audio?.state !== 'running') return;
+async function handshake() {
+  // Never create audio outside a gesture. An unlocked context may be suspended
+  // by the browser when the tab/window loses focus; resume it for new arrivals.
+  if (!audio) return;
   try {
+    if (audio.state !== 'running') await audio.resume();
+    if (audio.state !== 'running') return;
     const start = audio.currentTime + .015;
     for (const [offset, duration, from, to, level] of [[0, .09, 620, 620, .06], [.13, .14, 930, 950, .055]]) {
       const at = start + offset, tone = audio.createOscillator(), volume = audio.createGain();
@@ -265,6 +269,8 @@ document.addEventListener('change', e => {
     if (route) e.target.closest('fieldset').querySelector('[name=thinking]').value = route.thinking;
   }
 });
+document.addEventListener('pointerdown', () => { void unlockAudio(); });
+document.addEventListener('keydown', () => { void unlockAudio(); });
 document.addEventListener('click', e => {
   void unlockAudio();
   const floor = e.target.closest('[data-floor]'); if (floor) selectFloor(floor.dataset.floor);
