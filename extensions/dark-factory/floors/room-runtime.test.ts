@@ -13,7 +13,7 @@ test('real runtime consumer seam: discovery, SQLite-isolated owner input/config/
   const runtime = await import(moduleURL.href), dir = mkdtempSync(join(tmpdir(), 'factory-room-runtime-')), root = join(dir, 'floors'), cwd = join(dir, 'repo');
   mkdirSync(cwd); mkdirSync(join(cwd, '.git'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const settings = name => ({ name, cwd, roots: ['11111111-1111-4111-8111-111111111111'], instructions: '22222222-2222-4222-8222-222222222222', voteCondition: `${name} owner condition`, bootstrap: 'Fixture only', warningText: 'Fixture only', wrapupText: 'Fixture only',
+  const settings = name => ({ name, cwd, roots: ['11111111-1111-4111-8111-111111111111'], instructions: '22222222-2222-4222-8222-222222222222', voteCondition: '33333333-3333-4333-8333-333333333333', bootstrap: 'Fixture only', warningText: 'Fixture only', wrapupText: 'Fixture only',
     slots: [{ id: 'sol', provider: 'openai-codex-test', model: 'gpt-6.1-sol', thinking: 'high', role: 'fixture', contextWarning: 80 },
       { id: 'oss', provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh', role: 'fixture', contextWarning: 75 }] });
   runtime.createFloor(settings('alpha'), { root, id: 'alpha' }); runtime.createFloor(settings('beta'), { root, id: 'beta' });
@@ -33,9 +33,10 @@ test('real runtime consumer seam: discovery, SQLite-isolated owner input/config/
   assert.equal((await post('alpha', 'configuration', { slots })).status, 200);
   assert.equal((await read('alpha')).settings.slots[0].role, 'edited fixture');
   assert.equal((await read('beta')).settings.slots[0].role, 'fixture');
-  assert.equal((await post('alpha', 'condition', { condition: 'Revised owner condition' })).status, 200);
-  assert.equal((await read('alpha')).settings.voteCondition, 'Revised owner condition');
-  assert.equal((await read('beta')).settings.voteCondition, 'beta owner condition');
+  assert.equal((await post('alpha', 'condition', { condition: 'Revised owner condition' })).status, 400);
+  assert.equal((await post('alpha', 'condition', { condition: '44444444-4444-4444-8444-444444444444' })).status, 200);
+  assert.equal((await read('alpha')).settings.voteCondition, '44444444-4444-4444-8444-444444444444');
+  assert.equal((await read('beta')).settings.voteCondition, '33333333-3333-4333-8333-333333333333');
   assert.equal((await post('alpha', 'configuration', { slots: slots.map(s => ({ ...s, model: 'arbitrary-model' })) })).status, 400);
   assert.equal((await read('alpha')).settings.slots[0].model, 'gpt-6.1-sol');
   assert.equal((await post('alpha', 'message', { key: 'fixture-input', text: 'Alpha only fixture input' })).status, 200);
