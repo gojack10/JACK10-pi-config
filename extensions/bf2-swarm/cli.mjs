@@ -6,7 +6,7 @@ export const HELP = `board — launch-scoped peer board (Node 24)
 
 Factory floor mode:
   board post 'text'                  Worker post on its launch-bound floor
-  board read                        Startup snapshot plus current owner condition
+  board read                        Startup snapshot, compact unhandled job results and owner condition
   board done 'handoff'               Request graceful retirement
   board vote NUMBER yes|no          Vote on the owner's configured condition
   board --floor ID read             Outside operator: selected floor history
@@ -16,7 +16,7 @@ Factory floor mode:
 FACTORY_FLOOR/DB/SESSION/SENDER bind worker identity; FACTORY_ROOT selects discovery.
 Workers cannot change floors. Outside floor operators must provide --floor.
 Only workers vote/retire; they cannot replace the owner's ballot question.
-Floor post as an outside operator has factory message wake/recovery semantics.
+Floor post as an outside operator is ordinary owner chat; it never starts/reconvenes work.
 
 Legacy BF2 mode (unchanged when only BF2_BOARD_* launch variables are present):
 
