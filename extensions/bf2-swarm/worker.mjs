@@ -95,7 +95,7 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     const bucket = Math.floor(percent / 10) * 10;
     if (state.floor && typeof percent === 'number' && Number.isFinite(percent) && percent < threshold &&
       bucket >= 10 && bucket <= 90 && bucket > budgetBucket && board.lifecycle.acceptsInput()) {
-      const receipt = await pi.sendUserMessage(`Context budget: ${bucket}% used. Goal: [[Friday Dogfood Trial|f0000000-0000-4000-8000-6a7cbfc400ef]] under SiftText Product. Pace: [[Factory Control Lifecycle|f0000000-0000-4000-8000-bc79858abbc4]]. Check: advancing the goal? bottleneck?`, {
+      const receipt = await pi.sendUserMessage(`Context budget: ${bucket}% used. Follow this floor's current goal and latest owner priorities, using its instruction entry and work owners. Check: advancing the goal? bottleneck?`, {
         deliverAs: 'steer', expandPromptTemplates: false,
         admissionKey: `factory-context-budget:${config.session}:${bucket}`,
         admissionGuard: () => !!live(ctx) && board.lifecycle.acceptsInput(),
