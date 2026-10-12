@@ -4,7 +4,7 @@
  * Connects to app.sifttext.com/mcp and registers selected ideation tools.
  *
  * Strategy: tool schemas are cached to tool-cache.json. Cache is valid for 24h.
- * On cache hit: tools load instantly (<50ms). On cache miss/expiry: ~2s connect.
+ * Cached tools register without a startup network/auth probe. Refresh failure keeps the last schemas.
  * No background refresh — cache invalidation is time-based only.
  *
  * Auth: SIFTTEXT_API_KEY env var, or ~/.pi/agent/.sifttext-key (read, never written)
@@ -194,20 +194,25 @@ async function registerTools(pi: ExtensionAPI, tools: CachedTool[], token: strin
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
-	const token = await getWorkingToken(process.env.SIFTTEXT_API_KEY);
+	// Register schemas independently of endpoint availability; calls still authenticate server-side.
+	const token = siftTextKey();
 	if (!token) {
-		console.warn("[sifttext-mcp] no working SiftText key (bad key or unreachable endpoint) — skipping SiftText tools");
+		console.warn("[sifttext-mcp] no SiftText key configured — skipping SiftText tools");
 		return;
 	}
 
 	// 1. Try cache — instant path (<50ms), re-fetch if older than 24h
 	let tools: CachedTool[] | null = null;
+	let cachedTools: CachedTool[] | null = null;
 	try {
 		if (fs.existsSync(CACHE_FILE)) {
 			const stat = fs.statSync(CACHE_FILE);
 			const stale = Date.now() - stat.mtimeMs > CACHE_TTL_MS;
-			tools = JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8"));
-			if (stale) tools = null; // Force re-fetch
+			const parsed = JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8"));
+			if (Array.isArray(parsed) && parsed.every(t => t && typeof t.name === "string" && t.inputSchema && typeof t.inputSchema === "object")) {
+				cachedTools = parsed;
+				if (!stale) tools = cachedTools;
+			}
 		}
 	} catch {
 		// Cache corrupted — will re-fetch
@@ -221,13 +226,18 @@ export default async function (pi: ExtensionAPI) {
 			if (retryToken && retryToken !== token) tools = await fetchToolSchemas(retryToken);
 		}
 		if (!tools || tools.length === 0) {
-			console.warn("[sifttext-mcp] Could not fetch tool schemas — skipping");
-			return;
+			if (!cachedTools?.length) {
+				console.warn("[sifttext-mcp] Could not fetch tool schemas and no cached schemas are available — skipping");
+				return;
+			}
+			console.warn("[sifttext-mcp] Schema refresh unavailable — using cached tool schemas");
+			tools = cachedTools;
+		} else {
+			// Save successful refreshes only; a failed refresh must not discard the last schemas.
+			try {
+				fs.writeFileSync(CACHE_FILE, JSON.stringify(tools, null, "\t"), "utf-8");
+			} catch {}
 		}
-		// Save cache for next time
-		try {
-			fs.writeFileSync(CACHE_FILE, JSON.stringify(tools, null, "\t"), "utf-8");
-		} catch {}
 	}
 
 	// 3. Register tools from cache (instant — TypeBox import only)
