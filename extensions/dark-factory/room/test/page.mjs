@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { esc, avatar, textMarkup, messageMarkup } from '../markup.mjs';
 
-export function page({ multi = false, snapshots = {}, shared = new Map(), saved = new Map(), permission = 'granted' } = {}) {
+export function page({ multi = false, snapshots = {}, shared = new Map(), saved = new Map(), permission = 'granted', fonts } = {}) {
   const elements = new Map(), requests = [], notices = [], played = [], contexts = [], timers = [];
   let permissionRequests = 0, rejectAudio = false, rejectSynthesis = false;
   const element = selector => {
@@ -28,7 +28,7 @@ export function page({ multi = false, snapshots = {}, shared = new Map(), saved 
     close() { this.closed = true; }
   }
   saved.set('bf2-room', JSON.stringify({ run: multi ? 'floors' : 'legacy', token: 'synthetic', multi }));
-  const scope = { document: { querySelector: element, events: {}, visibilityState: 'visible', hasFocus: () => true, addEventListener(name, fn) { this.events[name] = fn; } }, location: { hash: '' }, sessionStorage: store(saved), localStorage: store(shared), AudioContext, Notification,
+  const scope = { document: { querySelector: element, fonts, events: {}, visibilityState: 'visible', hasFocus: () => true, addEventListener(name, fn) { this.events[name] = fn; } }, location: { hash: '' }, sessionStorage: store(saved), localStorage: store(shared), AudioContext, Notification,
     esc, avatar, textMarkup, messageMarkup, crypto: { randomUUID: () => 'fixture-key' }, window: { focus() {} }, setInterval: (fn, ms) => timers.push([fn, ms]),
     fetch: async (path, options) => {
       requests.push([path, options]);
