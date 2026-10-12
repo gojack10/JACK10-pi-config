@@ -36,7 +36,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     const run = status(), peers = run.workers.filter(w => !w.cleaned);
     if (run.status !== 'running' || peers.length !== settings.slots.length || peers.some(w => w.state !== 'active' || w.retire_requested) ||
       settings.slots.some(s => !peers.some(w => w.slot === s.id))) return;
-    const number = system(`Owner ballot: ${settings.voteCondition}`);
+    const number = system(`Owner ballot condition node: ${settings.voteCondition}`);
     db.prepare("INSERT INTO swarm_votes VALUES (?,?,?,?,?,'open')").run(number, 'controller', `round-${number}`, settings.voteCondition,
       JSON.stringify(peers.map(w => ({ session: w.session, sender: w.sender, answer: null }))));
     return openVote();
@@ -127,7 +127,6 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const changed = db.prepare("UPDATE swarm_workers SET state='active' WHERE session=? AND state='launching'").run(config.session).changes;
         if (changed) system(`${config.sender} joined`);
         else if (worker().state !== 'active') throw new Error('worker is not launchable');
-        ownerBallot();
       });
     },
     done(text) {
@@ -330,8 +329,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
           db.prepare('UPDATE swarm_workers SET retire_requested=? WHERE session=?').run('slot removed', w.session);
           retirementInput(w.session);
         }
-        if (old.voteCondition !== settings.voteCondition) system(`Owner changed ballot condition: ${settings.voteCondition}. Old votes invalidated.`);
-        ownerBallot();
+        if (old.voteCondition !== settings.voteCondition) system(`Owner changed ballot condition node: ${settings.voteCondition}. Old votes invalidated.`);
         return floor();
       });
     },
