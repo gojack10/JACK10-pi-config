@@ -88,7 +88,10 @@ test('two floors isolate owner posts, settings, lifecycle commands and OSS selec
   for (const id of ['alpha', 'beta']) await f.run('create', '--floor', id, '--settings', f.input({ ...f.settings, name: id }));
   await f.run('message', '--floor', 'alpha', 'from alpha', '--key', 'alpha-message');
   await f.run('message', '--floor', 'alpha', 'from alpha', '--key', 'alpha-message');
-  assert.equal((await f.run('status', '--floor', 'alpha')).result.posts.filter(p => p.text === 'from alpha').length, 1);
+  const alpha = (await f.run('status', '--floor', 'alpha')).result;
+  assert.equal(alpha.posts.filter(p => p.text === 'from alpha').length, 1);
+  assert.equal(alpha.status, 'stopped', 'chat saves without Start on a fully configured floor');
+  assert.equal(alpha.pending, false);
   assert.equal((await f.run('status', '--floor', 'beta')).result.posts.length, 0);
   await f.run('start', '--floor', 'beta', '--key', 'beta-start');
   await f.run('stop', '--floor', 'alpha', '--key', 'alpha-stop');
@@ -101,7 +104,7 @@ test('two floors isolate owner posts, settings, lifecycle commands and OSS selec
   assert.equal((await f.run('oss', '--floor', 'beta')).result.selected, 'beta');
   assert.equal((await f.run('oss')).result.selected, 'beta');
   assert.equal((await f.run('oss', '--none')).result.selected, null);
-  assert.deepEqual(f.calls, ['alpha', 'alpha', 'beta']); // Controller transport only; no worker/model launched.
+  assert.deepEqual(f.calls, ['beta']); // Only explicit Start recovers a stopped controller; no worker/model launched.
 });
 
 test('real worker board binding, history startup boundary, outside scope and cross-floor refusal', async t => {
@@ -156,6 +159,7 @@ test('start rejects absent launch text; saved command recovery failure is truthf
   assert.equal((await f.run('status', '--floor', 'alpha')).result.status, 'stopped');
   const floor = runtime.openFloor('alpha', { root: f.root });
   try { floor.configure({ bootstrap: f.settings.bootstrap }); } finally { floor.close(); }
+  await f.run('start', '--floor', 'alpha', '--key', 'explicit-start');
   let printed = '';
   await assert.rejects(main(['message', '--floor', 'alpha', 'saved', '--key', 'retry'], f.env,
     { write(text, cb) { printed += text; cb(); } }, { ...f.api, ensureFloorController() { throw new Error('fixture recovery failure'); } }), /was saved; controller recovery failed/);
