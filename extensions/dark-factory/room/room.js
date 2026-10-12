@@ -120,6 +120,7 @@ function render() {
   if (!state) { if (current) current.signature = undefined; $('#transcript').innerHTML = ''; $('#members').innerHTML = ''; $('#request').hidden = true; $('#status').textContent = 'connecting'; controls(); alerts(); return; }
   const known = new Set([...(state.known ?? []), 'JACK']), log = $('#transcript');
   const near = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
+  const firstRender = current.signature === undefined;
   const signature = JSON.stringify(state.known ?? []), top = log.scrollTop, height = log.scrollHeight;
   if (current.signature !== signature) {
     log.innerHTML = current.posts.map(p => messageMarkup(p, known)).join('');
@@ -139,6 +140,11 @@ function render() {
   }
   current.signature = signature;
   current.renderedFirst = current.posts[0]?.number ?? 0; current.renderedAfter = current.after;
+  if (firstRender) {
+    const tail = log.scrollTop;
+    // Font loading can reflow the tail after the initial layout. Don't override a user scroll.
+    void document.fonts?.ready.then(() => { if (active() === current && log.scrollTop === tail) log.scrollTop = log.scrollHeight; });
+  }
   $('#floor-name').textContent = multi ? current.name : '';
   $('#members').innerHTML = [...(state.members ?? []), 'JACK'].map(id => {
     const worker = multi ? state.workers?.find(w => w.sender === id && !w.cleaned) : undefined;
