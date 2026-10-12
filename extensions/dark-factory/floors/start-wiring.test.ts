@@ -17,7 +17,7 @@ function fixture(t, { parent = null, missing = false, dead = '0', owner = '$10',
   writeFileSync(join(agent, 'settings.json'), JSON.stringify({ steeringMode: 'all', followUpMode: 'all' }));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const uuid = '11111111-1111-4111-8111-111111111111';
-  runtime.createFloor({ name: 'Fixture floor', cwd, roots: [uuid], instructions: uuid, voteCondition: 'Fixture condition',
+  runtime.createFloor({ name: 'Fixture floor', cwd, roots: [uuid], instructions: uuid, voteCondition: uuid,
     bootstrap: 'Offline fixture', warningText: 'Fixture warning', wrapupText: 'Fixture wrapup',
     slots: ['a','b'].map(id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high' })) }, { root, id: 'core' });
   const database = join(root, 'core', 'floor.sqlite'), db = new DatabaseSync(database);
