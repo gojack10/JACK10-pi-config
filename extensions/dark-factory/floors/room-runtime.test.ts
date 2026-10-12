@@ -43,7 +43,10 @@ test('real runtime consumer seam: discovery, SQLite-isolated owner input/config/
   assert.equal((await post('alpha', 'message', { key: 'fixture-input', text: 'Alpha only fixture input' })).status, 200);
   assert.equal((await read('alpha')).posts.filter(p => p.role === 'owner').length, 1);
   assert.equal((await read('beta')).posts.filter(p => p.role === 'owner').length, 0);
-  assert.ok(recoveries > 0, 'command requests native recovery only through injected fake');
+  assert.equal(recoveries, 0, 'ordinary stopped chat cannot recover/start a controller');
+  assert.equal((await read('alpha')).status, 'stopped');
+  assert.equal((await post('alpha', 'start', { key: 'explicit-start' })).status, 200);
+  assert.ok(recoveries > 0, 'explicit Start requests native recovery only through injected fake');
   const floor = runtime.openFloor('alpha', { root });
   try {
     const current = floor.settings().slots[0];
