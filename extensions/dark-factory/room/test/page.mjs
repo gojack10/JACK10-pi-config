@@ -7,7 +7,7 @@ export function page({ multi = false, snapshots = {}, shared = new Map(), saved 
   let permissionRequests = 0, rejectAudio = false, rejectSynthesis = false;
   const element = selector => {
     if (!elements.has(selector)) elements.set(selector, { value: '', hidden: false, events: {}, attrs: {}, dataset: {}, children: [], scrollHeight: 0, clientHeight: 0, scrollTop: 0,
-      addEventListener(name, fn) { this.events[name] = fn; }, setAttribute(name, value) { this.attrs[name] = value; }, focus() {}, insertAdjacentHTML(_where, html) { this.innerHTML += html; } });
+      addEventListener(name, fn) { this.events[name] = fn; }, setAttribute(name, value) { this.attrs[name] = value; }, focus() {}, insertAdjacentHTML(where, html) { this.innerHTML = where === 'afterbegin' ? html + this.innerHTML : this.innerHTML + html; } });
     return elements.get(selector);
   };
   const store = values => ({ getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) });
@@ -34,11 +34,12 @@ export function page({ multi = false, snapshots = {}, shared = new Map(), saved 
       requests.push([path, options]);
       if (path === '/api/floors') return { ok: true, json: async () => ({ floors: Object.keys(snapshots).map(id => ({ id, name: id })),
         routes: [{ provider: 'openai-codex-test', model: 'gpt-6.1-sol', thinking: 'high' }, { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }], oss: { status: 'draining' } }) };
-      const id = multi ? path.split('/')[3] : 'legacy', after = Number(new URL(path, 'http://fixture.test').searchParams.get('after'));
-      return { ok: true, json: async () => options.method === 'POST' ? { saved: true } : { ...snapshots[id], posts: snapshots[id].posts.filter(p => p.number > after) } };
+      const id = multi ? path.split('/')[3] : 'legacy', query = new URL(path, 'http://fixture.test').searchParams;
+      const posts = query.has('before') ? snapshots[id].posts.filter(p => p.number < Number(query.get('before'))).slice(-100) : snapshots[id].posts.filter(p => p.number > Number(query.get('after'))).slice(0, 100);
+      return { ok: true, json: async () => options.method === 'POST' ? { saved: true } : { ...snapshots[id], posts } };
     } };
   const source = readFileSync(new URL('../room.js', import.meta.url), 'utf8').replace(/^import[^\n]+\n/, '');
-  runInNewContext(source + '\nglobalThis.check = {poll,selectFloor,notify,openSettings,room,active,alerts,unlockAudio,selected:()=>selected};', scope);
+  runInNewContext(source + '\nglobalThis.check = {poll,loadOlder,selectFloor,notify,openSettings,room,active,alerts,unlockAudio,selected:()=>selected};', scope);
   return { ...scope.check, document: scope.document, element, requests, notices, played, contexts, timers, saved, shared, Notification, permissionRequests: () => permissionRequests,
     click: selector => element(selector).events.click(), failAudio: () => { rejectAudio = true; }, failSynthesis: () => { rejectSynthesis = true; } };
 }
