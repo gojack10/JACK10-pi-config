@@ -18,7 +18,7 @@ export function fixtureRuntime() {
       return { board: { history({ before, limit }) { return { posts: s.posts.filter(p => p.number < before).slice(-limit), highwater: s.posts.at(-1)?.number ?? 0 }; } },
         snapshot(after) { return { ...s, posts: s.posts.filter(p => p.number > after) }; },
         configure(patch) { calls.push([id, patch]); if (patch.slots) s.slots = patch.slots; if (patch.voteCondition) s.floor.voteCondition = patch.voteCondition; },
-        command(key, action, text) { if (!keys.has(`${id}:${key}`)) { keys.add(`${id}:${key}`); if (action === 'message') { s.posts.push({ number: s.posts.length + 1, sender: 'JACK', role: 'owner', text }); s.status = 'running'; } else s.status = action === 'start' ? 'running' : 'stopping'; } },
+        command(key, action, text) { if (!keys.has(`${id}:${key}`)) { keys.add(`${id}:${key}`); if (action === 'message') { s.posts.push({ number: s.posts.length + 1, sender: 'JACK', role: 'owner', text }); } else s.status = action === 'start' ? 'running' : 'stopping'; } },
         close() { closed++; } };
     } };
   return { runtime, states, calls, closed: () => closed, recoveries: () => recoveries, ensureController: () => { recoveries++; } };
@@ -42,6 +42,7 @@ test('multi-floor gateway isolates state, discovers without restart, sanitizes i
   const read = id => fetch(`${base}/${id}/state`, { headers: auth }).then(r => r.json());
   const a = await read('alpha'), b = await read('beta');
   assert.equal(a.posts.length, 1); assert.equal(a.posts[0].text, 'alpha input'); assert.equal(b.posts[0].text, 'beta input');
+  assert.equal(a.status, 'stopped'); assert.equal(b.status, 'stopped');
   assert.equal(a.settings.slots[0].contextWarningPercent, 80); assert.equal(a.workers[0].model, 'old');
   assert.ok(!JSON.stringify(a).includes('/private')); assert.ok(!JSON.stringify(a).includes('secret')); assert.ok(!JSON.stringify(a).includes('private prompt'));
   const slots = a.settings.slots.map(s => ({ ...s, contextWarningPercent: 70 }));
@@ -58,7 +59,7 @@ test('multi-floor gateway isolates state, discovers without restart, sanitizes i
   for (const query of ['after=-1','after=NaN','after=9007199254740992','after=0&after=1','before=0','before=-1','before=9007199254740992','before=1&after=0','before=1&before=2','db=private']) assert.equal((await fetch(`${base}/alpha/state?${query}`, { headers: auth })).status, 400);
   for (const path of ['/api/other/state','/api/floors/alpha/vote','/floor.sqlite','/runtime.mjs']) assert.equal((await fetch(room.origin + path, { headers: auth })).status, 404);
   assert.equal((await fetch(room.origin + '/')).status, 200); assert.equal((await fetch(room.origin + '/room.js')).status, 200);
-  assert.ok(h.closed() > 0); assert.equal(h.recoveries(), 3);
+  assert.ok(h.closed() > 0); assert.equal(h.recoveries(), 0, 'stopped chat never recovers a controller');
 });
 
 test('room history GET reads the newest bounded page and pages backwards without recovery', async t => {
@@ -75,6 +76,7 @@ test('room history GET reads the newest bounded page and pages backwards without
 
 test('failed recovery reports saved input and same-key retry stays idempotent', async t => {
   const h = fixtureRuntime(); let broken = true;
+  h.states.get('alpha').status = 'running';
   const room = await serveFloors({ ...h, ensureController() { if (broken) throw Error('private prerequisite/path'); } });
   t.after(() => new Promise(resolve => room.server.close(resolve)));
   const send = () => fetch(`${room.origin}/api/floors/alpha/message`, { method: 'POST', headers: { Authorization: `Bearer ${room.token}`, Origin: room.origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'retry', text: 'persist fixture input' }) });
