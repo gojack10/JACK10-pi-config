@@ -129,6 +129,10 @@ start a model or controller. For separately authorized machine work:
   --command-file /durable/command.sh --owner "$WORK_NODE_UUID"
 /absolute/agent-checkout/bin/factory-job list --floor project-a
 /absolute/agent-checkout/bin/factory-job status --floor project-a --key "$KEY"
+/absolute/agent-checkout/bin/factory-job pending --floor project-a
+# After inspecting and recording/acting on the result, including a failure:
+/absolute/agent-checkout/bin/factory-job handled --floor project-a --key "$KEY" \
+  --reason 'Recorded outcome and next action in the owning node'
 # Outside operator only, and only with explicit cancellation authority for this job:
 /absolute/agent-checkout/bin/factory-job cancel --floor project-a --key "$KEY"
 ```
@@ -152,8 +156,14 @@ START produces a retained abnormal/uncertain event, not an inferred process exit
 and never relaunches automatically.
 Publication retries and receipt reconciliation deduplicate the terminal event.
 Results/events remain in SQLite/artifacts while stopped or without peers. Fresh
-peers' startup history and bounded USER batches include retained terminal events,
-even beyond latest-30 history; this is not an ACK, assignment or acceptance system.
+peers receive compact unhandled completion notices even beyond latest-30 history,
+not every historical receipt. `factory-job pending` lists those results; `status`
+and explicit board history retain the complete evidence. After inspecting and
+recording/acting on a result, use `factory-job handled --key UUID --reason 'evidence/action pointer'`.
+The first handling record is shared and idempotent across replacements; delivery
+never marks a result handled. Handling a failure means its outcome was addressed,
+not that it passed. Migration leaves every old result unhandled unless actual
+handling can be verified. No age expiry, automatic success credit or scheduling lock.
 Completion never starts workers. Worker retirement, cleanup and floor Stop never
 signal independent jobs. Explicit cancellation addresses the runner's identity-bound
 control endpoint, verifies process-group drain and preserves output; absent or

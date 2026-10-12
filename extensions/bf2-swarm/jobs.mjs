@@ -31,7 +31,10 @@ const validReceipt = (id, receipt) => !!receipt && receipt.id === id && ['exited
 
 export function jobStore(db, transaction, config, insertPost) {
   const exists = () => !!db.prepare("SELECT name FROM sqlite_master WHERE name='factory_jobs'").get();
-  const list = () => exists() ? db.prepare('SELECT * FROM factory_jobs ORDER BY rowid').all().map(row => ({ ...row, manifest: JSON.parse(row.manifest), terminal: row.terminal && JSON.parse(row.terminal) })) : [];
+  if (exists()) transaction(() => {
+    if (!db.prepare('PRAGMA table_info(factory_jobs)').all().some(c => c.name === 'handled')) db.exec('ALTER TABLE factory_jobs ADD COLUMN handled TEXT');
+  });
+  const list = () => exists() ? db.prepare('SELECT * FROM factory_jobs ORDER BY rowid').all().map(row => ({ ...row, manifest: JSON.parse(row.manifest), terminal: row.terminal && JSON.parse(row.terminal), handled: row.handled ? JSON.parse(row.handled) : null })) : [];
   const terminal = (id, receipt) => transaction(() => {
     const row = list().find(j => j.id === id);
     if (!row) throw new Error('unknown independent job');
@@ -43,6 +46,23 @@ export function jobStore(db, transaction, config, insertPost) {
   });
   return {
     list, terminal,
+    pending: () => list().filter(j => j.terminal_number !== null && !j.handled),
+    handle(id, reason) {
+      if (typeof reason !== 'string' || !reason.trim() || reason.includes('\0') || Buffer.byteLength(reason) > 4096) throw new Error('handling requires a nonempty evidence/action pointer, at most 4096 bytes without NUL');
+      return transaction(() => {
+        if (config.session !== 'controller') {
+          const worker = db.prepare('SELECT state FROM swarm_workers WHERE session=?').get(config.session);
+          if (!worker || !['active','retiring'].includes(worker.state)) throw new Error('job handling requires an active/retiring peer or outside operator');
+        }
+        const row = list().find(j => j.id === id);
+        if (!row) throw new Error('unknown independent job');
+        if (row.terminal_number === null) throw new Error('job has no terminal result to handle');
+        if (row.handled) return row.handled;
+        const handled = { at: new Date().toISOString(), session: config.session, sender: config.sender, reason };
+        db.prepare('UPDATE factory_jobs SET handled=? WHERE id=? AND handled IS NULL').run(JSON.stringify(handled), id);
+        return handled;
+      });
+    },
     register(manifest, launch) {
       return transaction(() => {
         if (config.session !== 'controller') {
@@ -50,7 +70,7 @@ export function jobStore(db, transaction, config, insertPost) {
           if (!row || row.state !== 'active' || row.retire_requested) throw new Error('independent launch requires a working active peer');
         }
         if (db.prepare('SELECT status FROM swarm_run').get()?.status !== 'running') throw new Error('independent launch requires a running floor');
-        db.exec(`CREATE TABLE IF NOT EXISTS factory_jobs (id TEXT PRIMARY KEY, manifest TEXT NOT NULL, terminal TEXT, terminal_number INTEGER UNIQUE);`);
+        db.exec(`CREATE TABLE IF NOT EXISTS factory_jobs (id TEXT PRIMARY KEY, manifest TEXT NOT NULL, terminal TEXT, terminal_number INTEGER UNIQUE, handled TEXT);`);
         const prior = list().find(j => j.id === manifest.id);
         if (prior) {
           if (JSON.stringify(prior.manifest) !== JSON.stringify(manifest)) throw new Error('job key already used with different input');
@@ -90,7 +110,7 @@ export function jobStore(db, transaction, config, insertPost) {
       }
       return list();
     },
-    terminalNumbers: () => list().filter(j => j.terminal_number !== null).map(j => j.terminal_number),
+    terminalNumbers: (includeHandled = false) => list().filter(j => j.terminal_number !== null && (includeHandled || !j.handled)).map(j => j.terminal_number),
   };
 }
 

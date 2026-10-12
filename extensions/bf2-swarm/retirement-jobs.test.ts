@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { main as jobCli } from '../dark-factory/floors/job-cli.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createFloor, openFloor } from '../dark-factory/floors/runtime.mjs';
 import { openBoard } from './board.mjs';
@@ -203,6 +205,51 @@ test('native independent command survives launcher exit, final done and worker c
   assert.ok(history.wake.some(p => p.text.startsWith(`Independent job ${id}:`)), 'durable terminal event is retained beyond latest-30 history');
   next.finishStartup(history.highwater); assert.match(next.pending().text, new RegExp(`Independent job ${id}:`));
   assert.doesNotMatch(next.pending().text, /Unrelated retained owner input/);
+});
+
+test('global handling shrinks compact startup replay without losing failures, history or receipts', async t => {
+  const h = fixture(t), ids = [randomUUID(), randomUUID()];
+  for (const id of ids) {
+    h.board.jobs.register({ id, dir: h.dir, owner: node }, () => {});
+    assert.throws(() => h.board.jobs.handle(id, 'not done'), /no terminal result/);
+    h.board.jobs.terminal(id, { id, state: 'exited', code: id === ids[0] ? 7 : 0, signal: null, drained: true });
+  }
+  assert.throws(() => h.board.jobs.handle(ids[0], ' '), /nonempty/);
+  const initial = h.board.history();
+  assert.equal(initial.wake.length, 2);
+  assert.ok(initial.wake.every(p => !p.text.includes('Artifacts:') && !p.text.includes('receipt:')));
+  assert.ok(initial.wake.some(p => p.text.includes('exit 7')));
+  assert.ok(!initial.posts.some(p => p.text.startsWith('Independent job ')), 'plain startup does not repeat full receipts');
+  h.board.finishStartup(initial.highwater);
+  const delivered = h.board.pending(); h.board.confirmPersisted(delivered.key);
+  assert.equal(h.board.jobs.pending().length, 2, 'delivery is not handling');
+  const before = h.board.jobs.list().map(j => ({ id: j.id, receipt: j.terminal, post: j.terminal_number }));
+  const handled = await jobCli(['handled', '--key', ids[0], '--reason', 'Fixture failure inspected; repair recorded in owning node'], h.env);
+  assert.equal(handled.session, h.session);
+  assert.deepEqual(h.floor.board.jobs.handle(ids[0], 'duplicate handling'), handled, 'first handling wins across sessions');
+  assert.equal(h.board.jobs.pending().length, 1);
+  const session = randomUUID();
+  h.floor.board.lifecycle.addWorker(session, 'bbbbbbbb', '%2', undefined, { slot: 'b', launchConfig: { ...h.floor.board.lifecycle.status().config, ...h.floor.settings().slots[1] } });
+  const next = openBoard({ ...h.floor.config, session, sender: 'bbbbbbbb' }); t.after(() => next.close()); next.lifecycle.ready();
+  const snapshot = next.history();
+  assert.equal(snapshot.wake.length, 1); assert.ok(snapshot.wake[0].text.includes(ids[1]));
+  next.finishStartup(snapshot.highwater);
+  assert.ok(!next.pending().text.includes(ids[0]), 'handled failure is not replayed to replacements');
+  assert.ok(next.pending().text.includes('factory-job handled'));
+  assert.equal(next.history({ limit: 100 }).posts.filter(p => p.text.startsWith('Independent job ')).length, 2, 'full history is retained');
+  assert.deepEqual(next.jobs.list().map(j => ({ id: j.id, receipt: j.terminal, post: j.terminal_number })), before);
+  assert.equal((await jobCli(['pending'], h.env)).length, 1);
+});
+
+test('legacy job tables migrate without marking historical results handled', t => {
+  const h = fixture(t), id = randomUUID(), db = new DatabaseSync(h.floor.database);
+  db.exec('CREATE TABLE factory_jobs (id TEXT PRIMARY KEY, manifest TEXT NOT NULL, terminal TEXT, terminal_number INTEGER UNIQUE)');
+  db.prepare('INSERT INTO factory_jobs VALUES (?,?,?,?)').run(id, JSON.stringify({ id, dir: h.dir }), JSON.stringify({ id, state: 'exited', code: 1, signal: null, drained: true }), 999);
+  db.close();
+  const migrated = openBoard(h.config); t.after(() => migrated.close());
+  assert.equal(migrated.jobs.list()[0].handled, null);
+  assert.equal(migrated.jobs.pending().length, 1);
+  assert.equal(migrated.jobs.list()[0].terminal.code, 1);
 });
 
 test('explicit cancellation is separately identified, drains the native group, retains output and deduplicates its event', async t => {
