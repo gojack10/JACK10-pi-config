@@ -105,7 +105,18 @@ export function openBoard(config) {
   };
   const jobs = jobStore(db, transaction, config, insertPost);
   const retainedJobs = () => jobs.terminalNumbers();
-  const terminalBatch = (after, until) => batchFor(db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT), { wakeUntil: until });
+  const compactTerminals = posts => {
+    const pending = new Map(jobs.pending().map(j => [j.terminal_number, j]));
+    return posts.map(post => {
+      const job = pending.get(post.number);
+      return job ? { ...post, text: `Independent job ${job.id}: ${job.terminal.state}; exit ${job.terminal.code ?? 'unknown'}; drain ${job.terminal.drained ? 'verified' : 'uncertain'}; owner ${job.manifest.owner ?? 'unspecified'}.` } : post;
+    });
+  };
+  const terminalBatch = (after, until) => {
+    const posts = db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT);
+    const batch = batchFor(compactTerminals(posts), { wakeUntil: until });
+    return batch && { ...batch, text: `${batch.text}\nUnhandled results only. Inspect: factory-job status --key UUID. After recording/acting on the result: factory-job handled --key UUID --reason 'evidence/action pointer'. Delivery is not handling or acceptance.` };
+  };
   const retirementInput = () => config.floor && db.prepare('SELECT * FROM floor_retirement_input WHERE session=? AND override_reason IS NULL').get(config.session);
   return {
     close: () => db.close(),
@@ -113,16 +124,21 @@ export function openBoard(config) {
     lifecycle: lifecycleStore(db, transaction, config, insertPost),
     jobs,
     ownerInputAllowed() { return false; },
-    history({ limit = HISTORY_LIMIT, before = Number.MAX_SAFE_INTEGER } = {}) {
+    history(options = {}) {
+      const { limit = HISTORY_LIMIT, before = Number.MAX_SAFE_INTEGER } = options;
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('limit must be 1-100');
       if (!Number.isSafeInteger(before) || before < 1) throw new Error('before must be a positive post number');
-      return transaction(() => ({
-        posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number < ? ORDER BY number DESC LIMIT ?`).all(before, limit).reverse(),
-        wake: before === Number.MAX_SAFE_INTEGER && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get() ?
-          db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number < ? ORDER BY number`).all(before) : [],
-        highwater: db.prepare('SELECT COALESCE(MAX(number), 0) AS n FROM board_posts').get().n,
-        startup: state().cursor === null,
-      }));
+      return transaction(() => {
+        const startup = state().cursor === null;
+        const terminalPosts = config.floor && startup && Object.keys(options).length === 0 ? jobs.terminalNumbers(true) : [];
+        return {
+          posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number < ? ${terminalPosts.length ? `AND number NOT IN (${terminalPosts.join(',')})` : ''} ORDER BY number DESC LIMIT ?`).all(before, limit).reverse(),
+          wake: before === Number.MAX_SAFE_INTEGER && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get() ?
+            compactTerminals(db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number < ? ORDER BY number`).all(before)) : [],
+          highwater: db.prepare('SELECT COALESCE(MAX(number), 0) AS n FROM board_posts').get().n,
+          startup,
+        };
+      });
     },
     roomSnapshot(after = 0) {
       if (!Number.isSafeInteger(after) || after < 0) throw new Error('after must be a nonnegative post number');
@@ -136,7 +152,7 @@ export function openBoard(config) {
       });
     },
     finishStartup(highwater) {
-      // Retained independent-job terminal notices survive stdout truncation.
+      // Only unhandled results survive startup truncation; delivery never marks them handled.
       transaction(() => {
         const changed = db.prepare('UPDATE board_sessions SET cursor=? WHERE session=? AND cursor IS NULL').run(highwater, config.session).changes;
         if (changed && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get()) {
