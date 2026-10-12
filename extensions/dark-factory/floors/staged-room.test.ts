@@ -44,13 +44,14 @@ test('pending SQLite floor: API and CLI Start are atomic, chat cannot bypass, fi
   assert.equal(floor.snapshot().status, 'stopped'); assert.equal(floor.snapshot().pending, false);
   assert.equal(floor.snapshot().workers.length, 0); assert.equal(recoveries, 0);
   assert.equal((await post('condition', { condition: null })).status, 200);
-  assert.equal((await post('condition', { condition: 'Fixture condition' })).status, 200);
+  assert.equal((await post('condition', { condition: 'Fixture condition' })).status, 400);
+  assert.equal((await post('condition', { condition: '33333333-3333-4333-8333-333333333333' })).status, 200);
   floor.configure({ instructions: '22222222-2222-4222-8222-222222222222', bootstrap: 'Fixture boot', warningText: 'Fixture warning', wrapupText: 'Fixture drain' });
   assert.deepEqual((await read()).settings.missingLaunchSettings, []);
   assert.equal((await post('start', { key: 'retry' })).status, 200);
   assert.equal(floor.snapshot().status, 'running'); assert.equal(recoveries, 1);
   assert.equal((await post('condition', { condition: null })).status, 400);
-  assert.equal(floor.settings().voteCondition, 'Fixture condition');
+  assert.equal(floor.settings().voteCondition, '33333333-3333-4333-8333-333333333333');
   assert.equal((await post('stop', { key: 'stop' })).status, 200);
   assert.equal(floor.snapshot().status, 'stopped');
 });

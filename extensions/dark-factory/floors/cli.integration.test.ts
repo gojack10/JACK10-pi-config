@@ -25,7 +25,7 @@ function fixture(t) {
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ steeringMode: 'all', followUpMode: 'all' }));
   const root = join(dir, 'floors');
   const settings = { name: 'Fixture', cwd: repo, roots: ['11111111-1111-4111-8111-111111111111'],
-    instructions: '22222222-2222-4222-8222-222222222222', voteCondition: 'Fixture owner condition',
+    instructions: '22222222-2222-4222-8222-222222222222', voteCondition: '33333333-3333-4333-8333-333333333333',
     slots: ['peer-a', 'peer-b'].map(id => ({ id, provider: 'openai-codex', model: 'gpt-6.1-sol', thinking: 'high', role: 'Fixture role', contextWarning: 77 })),
     bootstrap: 'Fixture bootstrap only', warningText: 'Fixture warning only', wrapupText: 'Fixture wrapup only' };
   const path = join(dir, 'input.json');
@@ -58,7 +58,7 @@ test('real create-stopped/discovery/config/route validation use one runtime SQLi
   assert.equal((await f.run('config', '--floor', 'alpha')).result.voteCondition, f.settings.voteCondition);
   assert.equal((await f.run('config', '--floor', 'alpha', '--settings', f.input({ name: 'Changed' }))).result.name, 'Changed');
   for (const patch of [{ slots: f.settings.slots.slice(0, 1) }, { slots: Array(11).fill(f.settings.slots[0]) },
-    { cwd: 'relative' }, { instructions: 'not a UUID' }, { voteCondition: '' }, { unknown: true },
+    { cwd: 'relative' }, { instructions: 'not a UUID' }, { voteCondition: '' }, { voteCondition: 'Fixture owner condition' }, { voteCondition: 1 }, { voteCondition: [] }, { unknown: true },
     ...[{ model: 'unapproved' }, { provider: 'other' }, { thinking: 'low' }, { contextWarning: 0 }, { contextWarning: 101 }]
       .map(change => ({ slots: f.settings.slots.map(slot => ({ ...slot, ...change })) }))]) {
     await assert.rejects(f.run('config', '--floor', 'alpha', '--settings', f.input(patch)));
@@ -94,7 +94,7 @@ test('two floors isolate owner posts, settings, lifecycle commands and OSS selec
   await f.run('stop', '--floor', 'alpha', '--key', 'alpha-stop');
   assert.equal((await f.run('status', '--floor', 'alpha')).result.status, 'stopped');
   assert.equal((await f.run('status', '--floor', 'beta')).result.status, 'running');
-  await f.run('config', '--floor', 'alpha', '--settings', f.input({ voteCondition: 'Changed alpha condition' }));
+  await f.run('config', '--floor', 'alpha', '--settings', f.input({ voteCondition: '44444444-4444-4444-8444-444444444444' }));
   assert.equal((await f.run('config', '--floor', 'beta')).result.voteCondition, f.settings.voteCondition);
   await assert.rejects(f.run('oss', '--floor', 'beta'), /OSS slot/);
   await f.run('config', '--floor', 'beta', '--settings', f.input({ slots: [f.settings.slots[0], { ...f.settings.slots[1], provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }] }));
@@ -134,9 +134,15 @@ test('real worker board binding, history startup boundary, outside scope and cro
   const envB = { ...env, FACTORY_SESSION: 'session-b', FACTORY_SENDER: 'bbbbbbbb' };
   const workerB = boardApi.openBoard(boardApi.configuration(envB));
   t.after(() => workerB.close()); workerB.lifecycle.ready();
+  assert.equal(floor.snapshot().vote, undefined, 'joining all peers opens no ballot');
+  worker.lifecycle.ready(); workerB.lifecycle.ready();
+  assert.equal(floor.snapshot().vote, undefined, 'repeated readiness opens no ballot');
   await assert.rejects(boardMain(['pause', 'wrong-condition', 'peer invented question'], env, capture, f.api), /only the owner/);
+  await boardMain(['pause', 'fixture-round', f.settings.voteCondition], env, capture, f.api);
   const number = String(floor.snapshot().vote.number);
   await boardMain(['vote', number, 'yes'], env, capture, f.api);
+  assert.equal(floor.snapshot().vote.electorate.filter(v => v.answer === 'yes').length, 1);
+  assert.equal(floor.snapshot().status, 'running');
   await boardMain(['vote', number, 'yes'], envB, capture, f.api);
   assert.equal(floor.snapshot().status, 'waiting');
   await boardMain(['done', 'fixture progress stays on tree and messages'], env, capture, f.api);
