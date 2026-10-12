@@ -8,6 +8,8 @@ import { launchJob, cancelJob } from '../../bf2-swarm/jobs.mjs';
 export const HELP = `factory-job — independent machine jobs (no model/controller launch)
   factory-job launch [--floor ID] --key UUID --command-file FILE [--cwd PATH] [--owner NODE_UUID]
   factory-job list [--floor ID]
+  factory-job pending [--floor ID]       Unhandled completions only
+  factory-job handled [--floor ID] --key UUID --reason 'recorded evidence/action pointer'
   factory-job status [--floor ID] --key UUID
   factory-job cancel --floor ID --key UUID
   factory-job override-context --floor ID --session UUID --reason 'explicit human scope'
@@ -16,6 +18,8 @@ Workers use their launch-assigned floor. Cancellation and context overrides requ
 Keep the UUID key before launching; retrying it never starts a second process.
 Command, cwd, source revision, origin, control, log and receipts stay in the returned job directory.
 Status/Stop/worker retirement do not cancel jobs. A terminal event is not project acceptance.
+Mark handled only after inspecting and recording/acting on the result, including failures.
+Handling is shared across replacements; it retains receipts and does not assert success.
 Cancellation fails closed if runner identity/control or actual process-group drain cannot be established.
 Commands which detach descendants outside their process group need their own verified control/drain contract.
 Context override applies only to this occupant; it does not resume a stopped floor or undo final done.
@@ -27,11 +31,12 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   } });
   if (values.help) { console.log(HELP); return; }
   const [command] = positionals;
-  const allowed = { launch: ['key','command-file','cwd','owner'], list: [], status: ['key'], cancel: ['key'], 'override-context': ['session','reason'] };
+  const allowed = { launch: ['key','command-file','cwd','owner'], list: [], pending: [], handled: ['key','reason'], status: ['key'], cancel: ['key'], 'override-context': ['session','reason'] };
   if (positionals.length !== 1 || !Object.hasOwn(allowed, command)) throw new Error('use factory-job -h');
   for (const key of Object.keys(values)) if (!['floor','floors-dir',...allowed[command]].includes(key)) throw new Error(`--${key} is not valid for ${command}`);
-  if (['launch','status','cancel'].includes(command) && !values.key) throw new Error(`${command} requires --key UUID`);
+  if (['launch','status','cancel','handled'].includes(command) && !values.key) throw new Error(`${command} requires --key UUID`);
   if (command === 'launch' && !values['command-file']) throw new Error('launch requires --command-file FILE');
+  if (command === 'handled' && !values.reason) throw new Error('handled requires --reason evidence/action pointer');
   const scope = floorScope(values.floor, env);
   if (['cancel','override-context'].includes(command) && (scope.worker || env.BF2_BOARD_SESSION !== undefined)) throw new Error('explicit job cancellation/context override requires an outside authorized operator');
   const floor = openFloor(scope.floor, values['floors-dir'] ?? env.FACTORY_ROOT ? { root: values['floors-dir'] ?? env.FACTORY_ROOT } : {});
@@ -45,6 +50,8 @@ export async function main(args = process.argv.slice(2), env = process.env) {
     let result;
     if (command === 'launch') result = launchJob(board, config, { id: values.key, command: readFileSync(values['command-file'], 'utf8'), cwd: values.cwd ?? floor.settings().cwd, owner: values.owner ?? null });
     else if (command === 'override-context') result = floor.board.lifecycle.overrideContextStop(values.session, values.reason);
+    else if (command === 'handled') result = board.jobs.handle(values.key, values.reason);
+    else if (command === 'pending') result = board.jobs.pending().map(j => ({ id: j.id, owner: j.manifest.owner, state: j.terminal.state, code: j.terminal.code, drained: j.terminal.drained }));
     else {
       const jobs = board.jobs.observe();
       result = command === 'list' ? jobs : jobs.find(j => j.id === values.key);
