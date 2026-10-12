@@ -56,10 +56,16 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
       if (!match) return send(404, { error: 'unknown operation' });
       const [, id, action] = match;
       if (request.method === 'GET' && action === 'state') {
-        if ([...url.searchParams.keys()].some(k => k !== 'after') || url.searchParams.getAll('after').length > 1 ||
-            !/^\d+$/.test(url.searchParams.get('after') ?? '0') || !Number.isSafeInteger(Number(url.searchParams.get('after') ?? 0))) return send(400, { error: 'invalid cursor' });
+        const before = url.searchParams.has('before'), key = before ? 'before' : 'after';
+        const cursor = Number(url.searchParams.get(key) ?? 0);
+        if ([...url.searchParams.keys()].some(k => k !== key) || url.searchParams.getAll(key).length > 1 ||
+            !/^\d+$/.test(url.searchParams.get(key) ?? '0') || !Number.isSafeInteger(cursor) || (before && cursor < 1)) return send(400, { error: 'invalid cursor' });
         floor = runtime.openFloor(id, { root });
-        return send(200, publicSnapshot(floor.snapshot(Number(url.searchParams.get('after') ?? 0))));
+        if (before) {
+          const history = floor.board.history({ before: cursor, limit: 100 });
+          return send(200, { ...publicSnapshot(floor.snapshot(history.highwater)), posts: history.posts });
+        }
+        return send(200, publicSnapshot(floor.snapshot(cursor)));
       }
       if (request.method !== 'POST' || !Object.hasOwn(operations, action) || url.search) return send(404, { error: 'unknown operation' });
       if (request.headers.origin !== origin || request.headers['content-type'] !== 'application/json') return send(403, { error: 'same-origin JSON required' });

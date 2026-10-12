@@ -30,8 +30,15 @@ export async function serveRoom(board, config, { port = 0, controller = () => en
         if (!sameToken(request.headers.authorization, `Bearer ${token}`)) return send(403, { error: 'room capability required' });
         const action = url.pathname.slice(prefix.length);
         if (request.method === 'GET' && action === 'state') {
-          if ([...url.searchParams.keys()].some(k => k !== 'after') || !/^\d+$/.test(url.searchParams.get('after') ?? '0')) return send(400, { error: 'invalid cursor' });
-          return send(200, board.roomSnapshot(Number(url.searchParams.get('after') ?? 0)));
+          const before = url.searchParams.has('before'), key = before ? 'before' : 'after';
+          const cursor = Number(url.searchParams.get(key) ?? 0);
+          if ([...url.searchParams.keys()].some(k => k !== key) || url.searchParams.getAll(key).length > 1 ||
+              !/^\d+$/.test(url.searchParams.get(key) ?? '0') || !Number.isSafeInteger(cursor) || (before && cursor < 1)) return send(400, { error: 'invalid cursor' });
+          if (before) {
+            const history = board.history({ before: cursor, limit: 100 });
+            return send(200, { ...board.roomSnapshot(history.highwater), posts: history.posts });
+          }
+          return send(200, board.roomSnapshot(cursor));
         }
         if (request.method !== 'POST' || !['message','start','stop','close'].includes(action)) return send(404, { error: 'unknown operation' });
         if (request.headers.origin !== origin || request.headers['content-type'] !== 'application/json') return send(403, { error: 'JSON from local room origin required' });

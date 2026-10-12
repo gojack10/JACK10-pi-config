@@ -14,6 +14,7 @@ test('canonical assets and old callers share one source; old HTTP URLs still ser
   assert.equal(legacyMarkup, messageMarkup);
   const board = { lifecycle: { status: () => ({ room_token: 'a'.repeat(64) }),
     ownerCommand: () => { throw Error('static checks must never mutate'); } },
+    history: () => ({ posts: [{ number: 1, text: 'tail fixture' }], highwater: 1 }),
     roomSnapshot: () => ({ posts: [], members: [] }) };
   const room = await serveRoom(board, { run: 'fixture-assets' }, { controller: () => { throw Error('no recovery'); } });
   t.after(() => new Promise<void>(r => room.server.close(() => r())));
@@ -36,6 +37,8 @@ test('canonical assets and old callers share one source; old HTTP URLs still ser
   assert.match(html, /<script type="module" src="room\.js"><\/script>/);
   assert.match(readFileSync(canonical('room.js'), 'utf8'), /^import .* from '\.\/markup\.mjs';/);
   assert.equal((await fetch(room.origin + '/api/fixture-assets/state')).status, 403);
+  const tail = await fetch(room.origin + `/api/fixture-assets/state?before=${Number.MAX_SAFE_INTEGER}`, { headers: { Authorization: `Bearer ${room.token}` } });
+  assert.equal(tail.status, 200); assert.equal((await tail.json()).posts[0].text, 'tail fixture');
   assert.equal((await fetch(room.origin + '/api/other/state', { headers: { Authorization: `Bearer ${room.token}` } })).status, 404);
 });
 
@@ -69,7 +72,7 @@ test('unmodified canonical and compatible room modules load, render real metadat
     await import(source.href + `?fixture=${i}`); // Real module loading, including its relative markup import.
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(requests.length, 1);
-    assert.equal(requests[0][0], '/api/fixture-modules/state?after=0');
+    assert.equal(requests[0][0], '/api/fixture-modules/state?before=9007199254740991');
     assert.equal(requests[0][1].method, 'GET');
     assert.equal(requests[0][1].headers.Authorization, 'Bearer synthetic-capability');
     assert.deepEqual(timers, [1000]);
