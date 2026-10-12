@@ -96,6 +96,36 @@ test('two floors: isolated owner messages, peer identities, durable pending USER
   }
 });
 
+test('floor chat persists without starting, reversing Stop or changing an explicit queued Start', t => {
+  const h = fixture(t), floor = h.create('one');
+  const saved = floor.command('chat-stopped', 'message', 'Fixture chat before Start');
+  assert.deepEqual(floor.command('chat-stopped', 'message', 'Fixture chat before Start'), saved);
+  assert.equal(floor.board.lifecycle.status().reconvene, 0);
+  tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().status, 'stopped');
+  assert.equal(floor.snapshot().workers.length, 0);
+  assert.ok(floor.snapshot().posts.some(p => p.number === saved.number && p.text === 'Fixture chat before Start'));
+
+  const workers = h.boot(floor);
+  floor.command('stop', 'stop');
+  floor.command('chat-draining', 'message', 'Fixture chat during Stop');
+  assert.equal(floor.snapshot().status, 'stopping');
+  assert.equal(floor.board.lifecycle.status().reconvene, 0);
+  for (const w of workers) h.panes.get(w.pane).live = false;
+  tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().status, 'stopped');
+  assert.equal(floor.snapshot().workers.length, workers.length, 'chat cannot schedule replacements');
+
+  const next = h.boot(floor);
+  floor.command('stop-next', 'stop');
+  floor.command('explicit-start', 'start');
+  floor.command('chat-queued', 'message', 'Fixture chat with explicit Start pending');
+  assert.equal(floor.board.lifecycle.status().reconvene, 1, 'chat preserves an explicit queued Start');
+  for (const w of next) h.panes.get(w.pane).live = false;
+  tickFloor(floor, h.execute);
+  assert.equal(floor.snapshot().status, 'running');
+});
+
 test('2–10 next-occupant slots, invalid patches atomic, model/role edits do not mutate current workers; removal safely drains', t => {
   const h = fixture(t), floor = h.create('one'), workers = h.boot(floor);
   for (const slots of [[sol('a')], Array.from({ length: 11 }, (_, i) => sol(String(i))), [sol('a'), sol('a')], [sol('a'), { ...sol('b'), model: 'unapproved' }], [sol('a'), { ...sol('b'), thinking: 'low' }]]) assert.throws(() => floor.configure({ slots }));
@@ -262,6 +292,8 @@ test('ordinary additive BF2 adoption preserves original history, IDs and actual 
   assert.equal(floor.board.lifecycle.status().config.sessionDir, join(runDir, 'sessions'));
   floor.command('new', 'message', 'New owner history');
   const old = openBoard(config); try { assert.ok(old.history({ limit: 100 }).posts.some(p => p.text === 'New owner history')); } finally { old.close(); }
+  assert.equal(floor.snapshot().status, 'stopped', 'adopted floor chat does not reconvene');
+  floor.command('explicit-restart', 'start');
   assert.throws(() => adoptFloor(runDir, h.settings, { root: h.root, id: 'again' }), /stopped/);
 });
 

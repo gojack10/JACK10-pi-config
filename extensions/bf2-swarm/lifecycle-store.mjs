@@ -226,11 +226,8 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         let number = null;
         if (action === 'message') {
           number = insertPost(text, 'owner', 'JACK', 'owner');
-          if (run.status !== 'running') {
-            const settings = floor();
-            // Pending floors retain chat history without bypassing missing launch settings.
-            if (!settings || !missingFloorLaunchSettings(settings).length) queuedStart();
-          }
+          // Floor chat never starts/reconvenes work. Legacy BF2 retains its wake behavior.
+          if (run.status !== 'running' && !floor()) queuedStart();
         } else if (action === 'start') queuedStart();
         else stop();
         db.prepare('INSERT INTO swarm_commands VALUES (?,?,?,?)').run(key, action, text, number);
