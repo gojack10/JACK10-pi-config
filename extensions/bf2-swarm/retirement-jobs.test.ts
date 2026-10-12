@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { createFloor, openFloor } from '../dark-factory/floors/runtime.mjs';
 import { openBoard } from './board.mjs';
-import { installWorker } from './worker.mjs';
+import { installWorker, budgetType } from './worker.mjs';
 import { receiver } from './receiver.mjs';
 import { launchJob, cancelJob } from './jobs.mjs';
 
@@ -16,14 +16,14 @@ const eventually = async check => {
   for (let i = 0; i < 200; i++) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 25)); }
   assert.fail('isolated job did not produce expected evidence');
 };
-function fixture(t) {
+function fixture(t, contextWarning = 70) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'factory-retirement-'))), cwd = join(dir, 'repo'), root = join(dir, 'floors');
   mkdirSync(cwd);
   for (const args of [['init'],['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-m','Fixture']]) {
     const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr);
   }
   writeFileSync(join(cwd, 'draft.txt'), 'unfinished draft\n');
-  const slots = ['a','b'].map(id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 70 }));
+  const slots = ['a','b'].map(id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high', contextWarning }));
   createFloor({ name: 'Fixture', cwd, roots: [node], instructions: node, voteCondition: node, slots,
     bootstrap: 'Fixture bootstrap', warningText: `Context stop: {percent}% on floor {floor}. Read node ${node} now.`, wrapupText: `Retirement requested: {reason}; {status}; {floor}. Read node ${node} now.` }, { id: 'fixture', root });
   const floor = openFloor('fixture', { root }); floor.command('start', 'start');
@@ -41,25 +41,25 @@ function fixture(t) {
   return { dir, cwd, root, floor, board, config, env, session };
 }
 function fake(t, h, drained = () => true) {
-  const handlers = new Map(), entries = [], sent = []; let percent = 0, shuts = 0;
+  const handlers = new Map(), entries = [], sent = [], deliveries = []; let percent = 0, shuts = 0;
   const file = join(h.dir, 'session.jsonl'); writeFileSync(file, '{}\n');
   const ctx = { sessionManager: { getSessionId: () => h.session, getSessionFile: () => file, getEntries: () => entries, getBranch: () => entries }, getContextUsage: () => ({ percent }), shutdown: () => shuts++ };
   const pi = { on: (event, fn) => handlers.set(event, fn), getSettings: () => ({ steeringMode: 'all', followUpMode: 'all' }), appendEntry: (type, data) => entries.push({ type: 'custom', customType: type, data }),
     async sendUserMessage(text, options) {
       if (!options.admissionGuard()) return { status: 'rejected' };
       const handled = handlers.get('input')({ source: 'extension', text }, ctx);
-      sent.push(text); return { status: 'admitted', delivery: handled ? 'custom' : 'steer' };
+      sent.push(text); deliveries.push({ options, handled }); return { status: 'admitted', delivery: handled ? 'custom' : 'steer' };
     } };
   const api = installWorker(pi, h.env, drained);
   t.after(() => handlers.get('session_shutdown')({}, ctx));
-  return { handlers, ctx, pi, sent, api, usage: n => percent = n, shuts: () => shuts };
+  return { handlers, ctx, pi, sent, deliveries, entries, api, usage: n => percent = n, shuts: () => shuts };
 }
 
 test('threshold transitions durably before next tool; locator expands; native capture/drain/final tools survive', async t => {
   const h = fixture(t); let drained = false; const f = fake(t, h, () => drained);
   await f.handlers.get('session_start')({}, f.ctx);
   for (const n of [NaN, undefined, 69.9]) { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); }
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context budget: 60% used\./);
   f.usage(70);
   const blocked = await f.handlers.get('tool_call')({ toolName: 'subagent_launch' }, f.ctx);
   assert.ok(blocked.block); assert.match(blocked.reason, /Context stop: 70% on floor fixture/);
@@ -71,7 +71,8 @@ test('threshold transitions durably before next tool; locator expands; native ca
   assert.ok((await f.handlers.get('tool_call')({ toolName: 'bash_bg' }, f.ctx)).block);
   assert.throws(() => launchJob(h.board, h.config, { id: randomUUID(), command: 'true', cwd: h.cwd }), /working active peer/);
   assert.throws(() => h.board.lifecycle.pause('pause', node), /retirement/);
-  await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.sent.length, 1);
+  await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.sent.length, 2);
+  assert.equal(f.sent[1], `Context stop: 70% on floor fixture. Read node ${node} now.`);
   assert.deepEqual(f.handlers.get('input')({ source: 'extension', text: 'ordinary peer message' }, f.ctx), { action: 'handled' });
   assert.equal(h.board.lifecycle.acceptsInput(), false, 'ordinary input cannot clear the durable transition');
   assert.equal(f.handlers.get('input')({ source: 'interactive', text: 'Human scoped instruction' }, f.ctx), undefined);
@@ -84,6 +85,63 @@ test('threshold transitions durably before next tool; locator expands; native ca
   f.handlers.get('agent_settled')({}, f.ctx); assert.equal(f.shuts(), 1);
   assert.equal(h.floor.snapshot().workers[0].state, 'retired'); assert.equal(h.floor.snapshot().workers[0].cleaned, 0, 'safe settlement is not real Pi exit/cleanup');
   assert.equal(readFileSync(join(h.cwd, 'draft.txt'), 'utf8'), 'unfinished draft\n');
+});
+
+test('budget steers fire once per 10% bucket with node pointers; threshold retirement stays unchanged', async t => {
+  const h = fixture(t, 100), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+  const observe = async n => { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); };
+  for (const n of [undefined, null, NaN, Infinity, -10, '20', 0, 9.9]) await observe(n);
+  assert.equal(f.sent.length, 0);
+  for (let bucket = 10; bucket <= 90; bucket += 10) {
+    await observe(bucket); await observe(bucket + 0.1); await observe(bucket + 9.9);
+    assert.equal(f.sent.length, bucket / 10);
+    assert.equal(f.sent.at(-1), `Context budget: ${bucket}% used. Goal: [[Friday Dogfood Trial|dcb5f56a-79f0-4c9b-85e9-4e63a0e3bd8c]] under SiftText Product. Pace: [[Factory Control Lifecycle|3b763231-7c7f-4a7f-9161-e6f90d6e6929]]. Check: advancing the goal? bottleneck?`);
+    const { options, handled } = f.deliveries.at(-1);
+    assert.equal(options.deliverAs, 'steer'); assert.equal(options.expandPromptTemplates, false);
+    assert.equal(options.admissionKey, `factory-context-budget:${h.session}:${bucket}`);
+    assert.equal(handled, undefined, 'actual USER input must not be swallowed');
+    assert.equal(h.board.lifecycle.status().workers[0].retire_requested, null);
+  }
+  assert.deepEqual(f.entries, Array.from({ length: 9 }, (_, i) => ({ type: 'custom', customType: budgetType, data: { bucket: (i + 1) * 10 } })));
+  assert.equal(h.board.lifecycle.status().workers[0].context_percent, 99.9);
+  f.handlers.get('session_shutdown')({}, f.ctx); await f.handlers.get('session_start')({}, f.ctx);
+  await observe(99.9); await observe(10); await observe(90);
+  assert.equal(f.sent.length, 9, 'restart and context decreases must not replay old buckets');
+  await observe(100); await observe(101);
+  assert.equal(f.sent.length, 10);
+  assert.equal(f.sent.at(-1), `Context stop: 100% on floor fixture. Read node ${node} now.`);
+  assert.equal(h.board.lifecycle.status().workers[0].retire_requested, 'context threshold');
+  assert.equal(h.board.lifecycle.acceptsInput(), false);
+});
+
+test('budget steer skips crossed buckets, retries rejected admission and ignores unrelated/retiring sessions', async t => {
+  const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+  const observe = async n => { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); };
+  const send = f.pi.sendUserMessage; let reject = true;
+  f.pi.sendUserMessage = (...args) => reject ? Promise.resolve({ status: 'rejected' }) : send(...args);
+  await observe(21); assert.equal(f.sent.length, 0); assert.equal(f.entries.length, 0);
+  reject = false; await observe(29); await observe(29.9); await observe(11);
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context budget: 20%/);
+  await observe(69.9); assert.equal(f.sent.length, 2); assert.match(f.sent[1], /^Context budget: 60%/);
+  const id = f.ctx.sessionManager.getSessionId;
+  f.ctx.sessionManager.getSessionId = () => randomUUID(); await observe(90);
+  assert.equal(f.sent.length, 2); f.ctx.sessionManager.getSessionId = id;
+  h.floor.board.lifecycle.requestRetirement(h.session, 'Fixture retirement'); await observe(90);
+  assert.equal(f.sent.length, 3); assert.match(f.sent.at(-1), /^Retirement requested:/);
+  await observe(90); assert.equal(f.sent.length, 3);
+  f.api.done('Fixture done', f.ctx); await observe(90); assert.equal(f.sent.length, 3);
+});
+
+test('budget admission guard suppresses a concurrent owner stop without consuming the bucket', async t => {
+  const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+  const send = f.pi.sendUserMessage;
+  f.pi.sendUserMessage = (...args) => { h.floor.command('stop', 'stop'); return send(...args); };
+  f.usage(10); await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.sent.length, 0); assert.equal(f.entries.length, 0);
+  f.pi.sendUserMessage = send;
+  f.usage(60); await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Retirement requested: stopping/);
+  assert.equal(f.entries.length, 0, 'stopped floors emit retirement, not budget ticks');
 });
 
 test('rejected routing retries without losing the durable context stop', async t => {

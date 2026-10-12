@@ -197,13 +197,14 @@ test('required launch-text gate, per-occupant context-stop threshold and known J
   const pi = { on: (name, fn) => handlers.set(name, fn), getSettings: () => ({ steeringMode: 'all', followUpMode: 'all' }),
     appendEntry: (customType, data) => entries.push({ type: 'custom', customType, data }),
     async sendUserMessage(text, options) { assert.ok(options.admissionGuard()); sent.push(text); return { status: 'admitted', delivery: 'steer' }; } };
-  const ctx = { sessionManager: { getSessionId: () => w.session, getSessionFile: () => path, getEntries: () => entries }, getContextUsage: () => ({ percent }), shutdown: () => shutdown++ };
+  const ctx = { sessionManager: { getSessionId: () => w.session, getSessionFile: () => path, getEntries: () => entries, getBranch: () => entries }, getContextUsage: () => ({ percent }), shutdown: () => shutdown++ };
   const env = { FACTORY_FLOOR: floor.id, FACTORY_DB: floor.database, FACTORY_SESSION: w.session, FACTORY_SENDER: w.sender };
   installWorker(pi, env); t.after(() => handlers.get('session_shutdown')({}, ctx));
   await handlers.get('session_start')({}, ctx);
   for (const value of [undefined, NaN, 59]) { percent = value; await handlers.get('turn_end')({}, ctx); }
   percent = 60; await handlers.get('turn_end')({}, ctx); await handlers.get('turn_end')({}, ctx);
-  assert.deepEqual(sent, ['Fixture warning 60']); assert.equal(shutdown, 0);
+  assert.match(sent[0], /^Context budget: 50% used\./);
+  assert.deepEqual(sent.slice(1), ['Fixture warning 60']); assert.equal(shutdown, 0);
   assert.equal(floor.snapshot().workers[0].retire_requested, 'context threshold');
   assert.equal(floor.snapshot().workers[0].session_file, path); assert.equal(floor.snapshot().workers[0].context_percent, 60);
   handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'Fixture retryable error' } }, ctx);
