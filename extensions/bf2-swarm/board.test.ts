@@ -36,7 +36,10 @@ test('real executable post/read across separate processes; compound bash invocat
 test('help and invalid opt-in do not create SQLite; identity/run conflicts refuse', t => {
   const { env } = fixture(t);
   for (const flag of ['-h', '--help']) {
-    assert.equal(cli({ ...env, BF2_BOARD_DB: '' }, flag).status, 0);
+    const help = cli({ ...env, BF2_BOARD_DB: '' }, flag);
+    assert.equal(help.status, 0);
+    assert.doesNotMatch(help.stdout, /board status/);
+    for (const command of ['read', 'post', 'vote', 'done']) assert.match(help.stdout, new RegExp(`board ${command}\\b`));
     assert.equal(existsSync(env.BF2_BOARD_DB), false);
   }
   assert.equal(cli({ ...env, BF2_BOARD_SENDER: '' }, 'read').status, 1);
@@ -46,6 +49,48 @@ test('help and invalid opt-in do not create SQLite; identity/run conflicts refus
     assert.equal(cli({ ...env, ...overrides }, 'post', 'bad').status, 1);
   }
   assert.doesNotMatch(cli(env, 'read').stdout, /bad/);
+});
+
+test('status is rejected before opening a database in legacy, floor-worker and outside scopes', t => {
+  const { env } = fixture(t);
+  const scopes = [env,
+    { ...env, FACTORY_FLOOR: 'fixture', FACTORY_DB: env.BF2_BOARD_DB, FACTORY_SESSION: 'session-a', FACTORY_SENDER: 'aaaaaaaa' },
+    { ...env, FACTORY_ROOT: join(env.BF2_BOARD_DB, 'unused') }];
+  for (const [i, scoped] of scopes.entries()) {
+    const result = cli(scoped, ...(i === 2 ? ['--floor', 'fixture'] : []), 'status');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /expected post, read, done, pause or vote; use board -h/);
+    assert.equal(result.stdout, '');
+    assert.equal(existsSync(env.BF2_BOARD_DB), false);
+  }
+});
+
+test('read/post/vote/done dispatch remains available in legacy and floor-worker scopes', async () => {
+  for (const env of [{}, { FACTORY_FLOOR: 'fixture', FACTORY_DB: '/unused', FACTORY_SESSION: 'session-a', FACTORY_SENDER: 'aaaaaaaa' }]) {
+    const calls = [];
+    const api = { configuration: () => ({ run: 'fixture', sender: 'aaaaaaaa' }), openBoard: () => ({
+      post: text => { calls.push(['post', text]); return 1; },
+      history: options => { calls.push(['read', options]); return { posts: [], wake: [], startup: true, highwater: 1 }; },
+      finishStartup: (...args) => calls.push(['startup', ...args]),
+      lifecycle: {
+        status: () => ({ floor: { voteCondition: 'fixture condition' } }),
+        vote: (...args) => { calls.push(['vote', ...args]); return { number: 2, result: 'recorded' }; },
+        done: text => { calls.push(['done', text]); return 3; },
+      },
+      close: () => calls.push(['close']),
+    }) };
+    let text = '';
+    const output = { write(chunk, callback) { text += chunk; callback(); } };
+    for (const args of [['post', 'hello'], ['read'], ['vote', '2', 'yes'], ['vote', '2', 'no'], ['done', 'handoff']]) {
+      await main(args, env, output, api);
+    }
+    assert.deepEqual(calls, [['post', 'hello'], ['close'], ['read', {}], ['startup', 1, null], ['close'],
+      ['vote', 2, 'yes'], ['close'], ['vote', 2, 'no'], ['close'], ['done', 'handoff'], ['close']]);
+    assert.match(text, /Board run fixture/);
+    assert.match(text, /#1 aaaaaaaa/);
+    assert.match(text, /pause #2 recorded/);
+    assert.match(text, /#3 aaaaaaaa retirement requested/);
+  }
 });
 
 test('bounded chronological history; older reads do not initialize/advance delivery', t => {

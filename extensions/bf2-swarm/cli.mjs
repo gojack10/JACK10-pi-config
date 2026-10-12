@@ -7,7 +7,6 @@ export const HELP = `board — launch-scoped peer board (Node 24)
 Factory floor mode:
   board post 'text'                  Worker post on its launch-bound floor
   board read                        Startup snapshot plus current owner condition
-  board status                      Current owner condition, ballot and workers
   board done 'handoff'               Request graceful retirement
   board vote NUMBER yes|no          Vote on the owner's configured condition
   board --floor ID read             Outside operator: selected floor history
@@ -68,10 +67,10 @@ export async function main(args = process.argv.slice(2), env = process.env, outp
   const print = text => new Promise((resolve, reject) => output.write(text + '\n', error => error ? reject(error) : resolve()));
   if (values.help) { await print(HELP); return; }
   const [command, ...rest] = positionals;
-  if (!['post', 'read', 'status', 'done', 'pause', 'vote'].includes(command)) throw new Error('expected post, read, status, done, pause or vote; use board -h');
+  if (!['post', 'read', 'done', 'pause', 'vote'].includes(command)) throw new Error('expected post, read, done, pause or vote; use board -h');
   if (command !== 'read' && (values.limit !== undefined || values.before !== undefined)) throw new Error('history options require read');
   if (['post', 'done'].includes(command) && rest.length !== 1) throw new Error(`usage: board ${command} 'text'`);
-  if (['read', 'status'].includes(command) && rest.length) throw new Error(`usage: board ${command} [--floor ID]`);
+  if (command === 'read' && rest.length) throw new Error('usage: board read [--floor ID]');
   if (command === 'pause' && rest.length !== 2) throw new Error("usage: board pause KEY 'reason'");
   if (command === 'vote' && (rest.length !== 2 || !['yes','no'].includes(rest[1]))) throw new Error('usage: board vote NUMBER yes|no');
   const integer = value => {
@@ -87,11 +86,10 @@ export async function main(args = process.argv.slice(2), env = process.env, outp
   if (scope && !scope.worker) {
     const root = values['floors-dir'] ?? env.FACTORY_ROOT;
     if (command === 'post') return factoryMain(['message', '--floor', scope.floor, ...(root ? ['--floors-dir', root] : []), rest[0]], env, output, api);
-    if (!['read', 'status'].includes(command)) throw new Error('done, pause and vote require a launch-bound worker; use factory for owner controls');
+    if (command !== 'read') throw new Error('done, pause and vote require a launch-bound worker; use factory for owner controls');
     api ??= await import('../dark-factory/floors/runtime.mjs');
     const floor = api.openFloor(scope.floor, root === undefined ? {} : { root });
     try {
-      if (command === 'status') { await print(JSON.stringify(floor.snapshot(), null, 2)); return; }
       const snapshot = floor.board.history(options);
       await print(`Floor ${floor.id}; owner condition: ${JSON.stringify(floor.settings().voteCondition)}\n${formatPosts(floor.config.run, snapshot.posts)}`);
       return;
@@ -101,7 +99,6 @@ export async function main(args = process.argv.slice(2), env = process.env, outp
   const config = (api?.configuration ?? boardConfiguration)(env);
   const board = (api?.openBoard ?? openLegacyBoard)(config);
   try {
-    if (command === 'status') { await print(JSON.stringify(board.lifecycle.status(), null, 2)); return; }
     if (command === 'post' || command === 'done') {
       const number = command === 'done' ? board.lifecycle.done(rest[0]) : board.post(rest[0]);
       await print(`#${number} ${config.sender}${command === 'done' ? ' retirement requested (safe settlement pending)' : ''}`); return;
