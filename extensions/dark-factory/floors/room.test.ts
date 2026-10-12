@@ -15,7 +15,8 @@ export function fixtureRuntime() {
     selectOssFloor: id => { if (!states.has(id)) throw Error('unknown'); selectedFloor = id; },
     openFloor(id) {
       const s = states.get(id); if (!s) throw Error('unknown');
-      return { snapshot(after) { return { ...s, posts: s.posts.filter(p => p.number > after) }; },
+      return { board: { history({ before, limit }) { return { posts: s.posts.filter(p => p.number < before).slice(-limit), highwater: s.posts.at(-1)?.number ?? 0 }; } },
+        snapshot(after) { return { ...s, posts: s.posts.filter(p => p.number > after) }; },
         configure(patch) { calls.push([id, patch]); if (patch.slots) s.slots = patch.slots; if (patch.voteCondition) s.floor.voteCondition = patch.voteCondition; },
         command(key, action, text) { if (!keys.has(`${id}:${key}`)) { keys.add(`${id}:${key}`); if (action === 'message') { s.posts.push({ number: s.posts.length + 1, sender: 'JACK', role: 'owner', text }); s.status = 'running'; } else s.status = action === 'start' ? 'running' : 'stopping'; } },
         close() { closed++; } };
@@ -54,10 +55,22 @@ test('multi-floor gateway isolates state, discovers without restart, sanitizes i
   assert.equal((await post('alpha', 'message', { key: 'bad', text: 'x', sender: 'peer' })).status, 400);
   assert.equal((await post('alpha', 'message', { key: 'bad', text: 'x' }, { Origin: 'https://evil.test' })).status, 403);
   assert.equal((await post('alpha', 'message', { key: 'bad', text: 'x'.repeat(300000) })).status, 413);
-  for (const query of ['after=-1','after=NaN','after=9007199254740992','after=0&after=1','db=private']) assert.equal((await fetch(`${base}/alpha/state?${query}`, { headers: auth })).status, 400);
+  for (const query of ['after=-1','after=NaN','after=9007199254740992','after=0&after=1','before=0','before=-1','before=9007199254740992','before=1&after=0','before=1&before=2','db=private']) assert.equal((await fetch(`${base}/alpha/state?${query}`, { headers: auth })).status, 400);
   for (const path of ['/api/other/state','/api/floors/alpha/vote','/floor.sqlite','/runtime.mjs']) assert.equal((await fetch(room.origin + path, { headers: auth })).status, 404);
   assert.equal((await fetch(room.origin + '/')).status, 200); assert.equal((await fetch(room.origin + '/room.js')).status, 200);
   assert.ok(h.closed() > 0); assert.equal(h.recoveries(), 3);
+});
+
+test('room history GET reads the newest bounded page and pages backwards without recovery', async t => {
+  const h = fixtureRuntime(), room = await serveFloors(h);
+  t.after(() => new Promise(r => room.server.close(r)));
+  h.states.get('alpha').posts = Array.from({ length: 350 }, (_, i) => ({ number: i + 1, sender: 'peer', role: 'peer', text: `entry ${i + 1}` }));
+  const read = query => fetch(`${room.origin}/api/floors/alpha/state?${query}`, { headers: { Authorization: `Bearer ${room.token}` } }).then(r => r.json());
+  const tail = await read(`before=${Number.MAX_SAFE_INTEGER}`), older = await read(`before=${tail.posts[0].number}`);
+  assert.equal(tail.posts.length, 100); assert.equal(tail.posts[0].number, 251); assert.equal(tail.posts.at(-1).number, 350);
+  assert.equal(older.posts[0].number, 151); assert.equal(older.posts.at(-1).number, 250);
+  assert.equal(tail.status, 'stopped'); assert.equal(h.recoveries(), 0); assert.equal(h.calls.length, 0);
+  assert.equal((await read('after=350')).posts.length, 0);
 });
 
 test('failed recovery reports saved input and same-key retry stays idempotent', async t => {

@@ -19,7 +19,7 @@ const storage = (store, key, fallback = null) => { try { return JSON.parse(store
 const save = (store, key, value) => { try { store.setItem(key, JSON.stringify(value)); } catch { /* Storage-disabled browsers still work for this page. */ } };
 const scoped = (kind, id) => `${multi ? 'factory' : 'bf2'}-${kind}:${id}`;
 function room(id, name = id) {
-  if (!rooms.has(id)) rooms.set(id, { id, name, posts: [], after: 0, loaded: false, prefs: storage(localStorage, scoped('alerts', id), { sound: true, desktop: true }) });
+  if (!rooms.has(id)) rooms.set(id, { id, name, posts: [], after: 0, loaded: false, hasOlder: false, loadingOlder: false, prefs: storage(localStorage, scoped('alerts', id), { sound: true, desktop: true }) });
   const value = rooms.get(id); value.name = name; return value;
 }
 const active = () => rooms.get(selected);
@@ -102,8 +102,6 @@ function notify(current, next) {
       }
     }
   }
-  // All initial history pages stay silent, including a newly discovered floor.
-  current.loaded ||= next.length < 100;
 }
 function controls() {
   const missing = state?.settings?.missingLaunchSettings ?? [];
@@ -119,17 +117,28 @@ function controls() {
 }
 function render() {
   const current = active(); state = current?.state;
-  if (!state) { $('#transcript').innerHTML = ''; $('#members').innerHTML = ''; $('#request').hidden = true; $('#status').textContent = 'connecting'; controls(); alerts(); return; }
+  if (!state) { if (current) current.signature = undefined; $('#transcript').innerHTML = ''; $('#members').innerHTML = ''; $('#request').hidden = true; $('#status').textContent = 'connecting'; controls(); alerts(); return; }
   const known = new Set([...(state.known ?? []), 'JACK']), log = $('#transcript');
   const near = log.scrollHeight - log.clientHeight - log.scrollTop < 60;
-  const signature = JSON.stringify([current.after, state.known]);
-  // ponytail: rebuild loaded scrollback; append/index if long runs make this slow.
+  const signature = JSON.stringify(state.known ?? []), top = log.scrollTop, height = log.scrollHeight;
   if (current.signature !== signature) {
-    const top = log.scrollTop; log.innerHTML = current.posts.map(p => messageMarkup(p, known)).join('');
-    log.scrollTop = near ? log.scrollHeight : top;
-    if (current.signature && !near) $('#new-messages').hidden = false;
-    current.signature = signature;
+    log.innerHTML = current.posts.map(p => messageMarkup(p, known)).join('');
+    log.scrollTop = current.signature !== undefined && current.posts[0]?.number < current.renderedFirst ? top + log.scrollHeight - height : current.signature === undefined || near ? log.scrollHeight : top;
+  } else {
+    const older = current.posts.filter(p => p.number < current.renderedFirst);
+    const newer = current.posts.filter(p => p.number > current.renderedAfter);
+    if (older.length) {
+      log.insertAdjacentHTML('afterbegin', older.map(p => messageMarkup(p, known)).join(''));
+      log.scrollTop = top + log.scrollHeight - height;
+    }
+    if (newer.length) {
+      log.insertAdjacentHTML('beforeend', newer.map(p => messageMarkup(p, known)).join(''));
+      if (near && !older.length) log.scrollTop = log.scrollHeight;
+      else $('#new-messages').hidden = false;
+    }
   }
+  current.signature = signature;
+  current.renderedFirst = current.posts[0]?.number ?? 0; current.renderedAfter = current.after;
   $('#floor-name').textContent = multi ? current.name : '';
   $('#members').innerHTML = [...(state.members ?? []), 'JACK'].map(id => {
     const worker = multi ? state.workers?.find(w => w.sender === id && !w.cleaned) : undefined;
@@ -173,8 +182,11 @@ async function poll() {
     } else room(run);
     await Promise.all([...rooms.values()].map(async current => {
       try {
-        const next = await api(`state?after=${current.after}`, undefined, current.id);
+        const initial = !current.loaded;
+        const next = await api(`state?${initial ? `before=${Number.MAX_SAFE_INTEGER}` : `after=${current.after}`}`, undefined, current.id);
         notify(current, next.posts); current.posts.push(...next.posts);
+        if (initial) current.hasOlder = next.posts.length === 100;
+        current.loaded = true;
         current.after = current.posts.at(-1)?.number ?? 0; current.state = next; current.error = undefined;
       } catch (error) { current.error = error.message; current.state = undefined; }
     }));
@@ -190,6 +202,18 @@ async function poll() {
     if (active()?.error) $('#status').textContent = active().error;
   } catch (error) { $('#status').textContent = error.message; state = undefined; controls(); }
   finally { polling = false; }
+}
+async function loadOlder() {
+  const current = active();
+  if (!current?.loaded || !current.hasOlder || current.loadingOlder) return;
+  current.loadingOlder = true;
+  try {
+    const next = await api(`state?before=${current.posts[0].number}`, undefined, current.id);
+    current.posts.unshift(...next.posts);
+    current.hasOlder = next.posts.length === 100;
+    if (active() === current) render();
+  } catch (error) { if (active() === current) $('#status').textContent = error.message; }
+  finally { current.loadingOlder = false; }
 }
 async function mutate(action, body, id = selected) {
   if (busy) return false;
@@ -280,7 +304,11 @@ document.addEventListener('click', e => {
   if (mention) { $('#message').value += ($('#message').value ? ' ' : '') + '@' + mention.dataset.mention + ' '; persistDraft(); $('#message').focus(); controls(); }
 });
 $('#new-messages').addEventListener('click', () => { $('#transcript').scrollTop = $('#transcript').scrollHeight; $('#new-messages').hidden = true; });
-$('#transcript').addEventListener('scroll', () => { const log = $('#transcript'); if (log.scrollHeight - log.clientHeight - log.scrollTop < 30) $('#new-messages').hidden = true; });
+$('#transcript').addEventListener('scroll', () => {
+  const log = $('#transcript');
+  if (log.scrollHeight - log.clientHeight - log.scrollTop < 30) $('#new-messages').hidden = true;
+  if (log.scrollTop < 80) void loadOlder();
+});
 if (!multi && run) { room(run); $('#message').value = storage(sessionStorage, scoped('draft', run), null) ?? storage(sessionStorage, scoped('pending', run), {})?.text ?? ''; }
 alerts(); controls();
 if (!run || !token) $('#status').textContent = 'Reopen with the factory room command';
