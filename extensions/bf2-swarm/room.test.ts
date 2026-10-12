@@ -147,10 +147,14 @@ test('real owner metadata is identical in history and pushed USER; peer prose ca
   assert.equal(messageMarkup(posts.at(-2),new Set()).includes('class="name jack"'),false);
 });
 
-test('waking input older than latest 30 reaches first fresh-worker startup and survives reopen', t => {
+test('prior owner chat stays history, not fresh-worker input, even with a legacy wake watermark', t => {
   const h = fixture(t);
   h.board.lifecycle.stop();
   const number = h.board.lifecycle.ownerCommand('wake-old','message','Original waking question').number;
+  const db = new DatabaseSync(h.config.database);
+  if (!db.prepare('PRAGMA table_info(swarm_run)').all().some(c=>c.name==='wake_from')) db.exec('ALTER TABLE swarm_run ADD COLUMN wake_from INTEGER');
+  db.prepare('UPDATE swarm_run SET wake_from=?').run(number);
+  db.close();
   for (let i=0;i<45;i++) h.peers[0].post(`Drain coordination ${i}`);
   for (const p of ['%1','%2','%3']) h.dead.add(p);
   tick(h.board,h.config,h.execute);
@@ -159,26 +163,40 @@ test('waking input older than latest 30 reaches first fresh-worker startup and s
   assert.ok(peer.history().posts.every(p => p.number !== number));
   const env = { ...process.env,BF2_BOARD_DB:h.config.database,BF2_BOARD_RUN:h.config.run,BF2_BOARD_SESSION:fresh.session,BF2_BOARD_SENDER:fresh.sender };
   const read = spawnSync(resolve('bin/board'),['read'],{env,encoding:'utf8'});
-  assert.equal(read.status,0,read.stderr); assert.match(read.stdout,/JACK \[FACTORY OWNER\].*Original waking question/);
+  assert.equal(read.status,0,read.stderr); assert.doesNotMatch(read.stdout,/Original waking question/);
   assert.equal(peer.history().startup,false);
-  assert.match(peer.pending().text,/JACK \[FACTORY OWNER\].*Original waking question/,'waking source also becomes genuine USER input, not just truncatable stdout');
+  assert.deepEqual(peer.history().wake,[]);
+  assert.equal(peer.pending(),null);
+  h.board.lifecycle.ownerCommand('live-owner','message','New question after joining');
+  const batch = peer.pending();
+  assert.match(batch.text,/JACK \[FACTORY OWNER\].*New question after joining/);
+  assert.doesNotMatch(batch.text,/Original waking question/);
+  peer.confirmPersisted(batch.key);
+  assert.equal(peer.pending(),null);
   const reopened = openBoard(h.config); t.after(() => reopened.close());
   assert.equal(reopened.history({limit:100}).posts.find(p => p.number===number).text,'Original waking question');
 });
 
-test('large waking owner backlog is replayed in bounded USER batches without skipping newer input', t => {
-  const h = fixture(t); h.board.lifecycle.stop(); const numbers = [];
-  for (let i=0;i<6;i++) numbers.push(h.board.lifecycle.ownerCommand(`wake-${i}`,'message',`${i}:`+'x'.repeat(16000)).number);
+test('large prior owner backlog is not replayed; live owner posts remain bounded and ordered', t => {
+  const h = fixture(t); h.board.lifecycle.stop();
+  for (let i=0;i<6;i++) h.board.lifecycle.ownerCommand(`wake-${i}`,'message',`Prior ${i}:`+'x'.repeat(16000));
   for (const pane of ['%1','%2','%3']) h.dead.add(pane);
   tick(h.board,h.config,h.execute);
   const worker = h.board.lifecycle.status().workers.find(w=>!w.cleaned);
   const peer = openBoard({...h.config,session:worker.session,sender:worker.sender}); t.after(()=>peer.close()); peer.lifecycle.ready();
-  const snapshot = peer.history(); peer.finishStartup(snapshot.highwater,snapshot.wake[0].number);
+  const snapshot = peer.history();
+  assert.equal(snapshot.posts.filter(p=>p.role==='owner').length,6, 'plain read still shows chat history');
+  assert.deepEqual(snapshot.wake,[]);
+  peer.finishStartup(snapshot.highwater);
+  assert.equal(peer.pending(),null);
+  const numbers = [];
+  for (let i=0;i<6;i++) numbers.push(h.board.lifecycle.ownerCommand(`live-${i}`,'message',`Live ${i}:`+'x'.repeat(16000)).number);
   numbers.push(h.board.lifecycle.ownerCommand('later-owner','message','New input after startup').number);
   const observed = [];
   while (peer.pending()) {
     const batch = peer.pending();
     assert.ok(Buffer.byteLength(batch.text)<65536);
+    assert.doesNotMatch(batch.text,/Prior /);
     observed.push(...[...batch.text.matchAll(/^#(\d+) JACK \[FACTORY OWNER\]/gm)].map(m=>Number(m[1])));
     peer.confirmPersisted(batch.key); // Unit test simulates the receiver's persistence confirmation.
   }
