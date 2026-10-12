@@ -96,16 +96,17 @@ test('rejected routing retries without losing the durable context stop', async t
   assert.equal(f.sent.length, 1); assert.match(f.sent[0], /Read node/);
 });
 
-test('retirement preserves ordinary backlog while runtime-attributed owner input can wake idle worker; scoped override cannot undo Stop/done', async t => {
+test('retirement preserves ordinary backlog without owner replay; context override cannot undo Stop/done', async t => {
   const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
   h.board.finishStartup(h.board.history().highwater);
   h.floor.command('before', 'message', 'Old human input'); const ordinary = h.board.pending();
   f.usage(70); await f.handlers.get('turn_end')({}, f.ctx);
   const r = receiver(f.pi, h.config, f.ctx); t.after(() => r.close());
+  const sent = f.sent.length;
   h.floor.command('override', 'message', 'New explicit human question'); await r.pump();
-  assert.match(f.sent.at(-1), /New explicit human question/); assert.doesNotMatch(f.sent.at(-1), /Old human input/);
-  const owner = h.board.pending(); assert.ok(owner.retirementOwner);
-  assert.equal(f.handlers.get('input')({ source: 'extension', text: owner.text }, f.ctx), undefined);
+  assert.equal(f.sent.length, sent, 'retiring workers have no separate owner-input replay queue');
+  assert.equal(h.board.pending(), null);
+  assert.equal(h.board.ownerInputAllowed(ordinary.text), false);
   h.floor.board.lifecycle.overrideContextStop(h.session, 'Human authorized safe continuation of this occupant');
   assert.equal(h.board.lifecycle.acceptsInput(), true); assert.deepEqual(h.board.pending(), ordinary);
   await f.handlers.get('turn_end')({}, f.ctx); assert.equal(h.board.lifecycle.acceptsInput(), true, 'override survives another high usage observation');
@@ -140,8 +141,10 @@ test('native independent command survives launcher exit, final done and worker c
   const session = randomUUID(); h.floor.board.lifecycle.addWorker(session, 'bbbbbbbb', '%2', undefined, { slot: 'b', launchConfig: { ...h.floor.board.lifecycle.status().config, ...h.floor.settings().slots[1] } });
   const next = openBoard({ ...h.floor.config, session, sender: 'bbbbbbbb' }); t.after(() => next.close()); next.lifecycle.ready();
   const history = next.history(); assert.ok(!history.posts.some(p => p.text.startsWith(`Independent job ${id}:`)));
+  assert.ok(history.wake.every(p => p.role === 'system'), 'only terminal job notices bypass the startup history limit');
   assert.ok(history.wake.some(p => p.text.startsWith(`Independent job ${id}:`)), 'durable terminal event is retained beyond latest-30 history');
   next.finishStartup(history.highwater); assert.match(next.pending().text, new RegExp(`Independent job ${id}:`));
+  assert.doesNotMatch(next.pending().text, /Unrelated retained owner input/);
 });
 
 test('explicit cancellation is separately identified, drains the native group, retains output and deduplicates its event', async t => {
