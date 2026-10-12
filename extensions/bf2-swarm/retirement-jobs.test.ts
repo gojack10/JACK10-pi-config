@@ -24,7 +24,7 @@ function fixture(t) {
   }
   writeFileSync(join(cwd, 'draft.txt'), 'unfinished draft\n');
   const slots = ['a','b'].map(id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 70 }));
-  createFloor({ name: 'Fixture', cwd, roots: [node], instructions: node, voteCondition: 'Fixture condition', slots,
+  createFloor({ name: 'Fixture', cwd, roots: [node], instructions: node, voteCondition: node, slots,
     bootstrap: 'Fixture bootstrap', warningText: `Context stop: {percent}% on floor {floor}. Read node ${node} now.`, wrapupText: `Retirement requested: {reason}; {status}; {floor}. Read node ${node} now.` }, { id: 'fixture', root });
   const floor = openFloor('fixture', { root }); floor.command('start', 'start');
   const session = randomUUID(), sender = 'aaaaaaaa';
@@ -70,7 +70,7 @@ test('threshold transitions durably before next tool; locator expands; native ca
   }
   assert.ok((await f.handlers.get('tool_call')({ toolName: 'bash_bg' }, f.ctx)).block);
   assert.throws(() => launchJob(h.board, h.config, { id: randomUUID(), command: 'true', cwd: h.cwd }), /working active peer/);
-  assert.throws(() => h.board.lifecycle.pause('pause', 'Fixture condition'), /retirement/);
+  assert.throws(() => h.board.lifecycle.pause('pause', node), /retirement/);
   await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.sent.length, 1);
   assert.deepEqual(f.handlers.get('input')({ source: 'extension', text: 'ordinary peer message' }, f.ctx), { action: 'handled' });
   assert.equal(h.board.lifecycle.acceptsInput(), false, 'ordinary input cannot clear the durable transition');

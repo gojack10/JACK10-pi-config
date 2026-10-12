@@ -18,7 +18,7 @@ function fixture(t) {
   mkdirSync(cwd); mkdirSync(join(cwd, '.git')); mkdirSync(agent);
   writeFileSync(join(agent, 'settings.shared.json'), JSON.stringify({ steeringMode: 'all', followUpMode: 'all' }));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const settings = { name: 'Fixture floor', cwd, roots: [node], instructions: node, voteCondition: 'Fixture condition', slots: [sol('a'), sol('b')],
+  const settings = { name: 'Fixture floor', cwd, roots: [node], instructions: node, voteCondition: node, slots: [sol('a'), sol('b')],
     bootstrap: 'Offline fixture bootstrap', warningText: 'Fixture warning {percent}', wrapupText: 'Fixture drain {reason} {status}' };
   const create = (id, patch = {}) => {
     createFloor({ ...settings, ...patch }, { root, id });
@@ -70,14 +70,22 @@ test('two floors: isolated owner messages, peer identities, durable pending USER
   assert.throws(() => configuration({ FACTORY_FLOOR: 'one', FACTORY_DB: one.database, FACTORY_SESSION: a[0].session, FACTORY_SENDER: a[0].sender, BF2_BOARD_DB: two.database }), /conflicting/);
   const env = { FACTORY_FLOOR: 'one', FACTORY_DB: one.database, FACTORY_SESSION: a[0].session, FACTORY_SENDER: a[0].sender };
   assert.equal(configuration(env).database, one.database);
-  const ballot = one.snapshot().vote;
-  assert.equal(ballot.reason, h.settings.voteCondition); assert.equal(ballot.electorate.length, 2);
+  assert.equal(one.snapshot().vote, undefined, 'readiness opens no ballot');
+  const beforeReady = one.snapshot();
+  p.lifecycle.ready(); q.lifecycle.ready();
+  assert.deepEqual(one.snapshot(), beforeReady, 'repeated readiness is silent');
   assert.throws(() => p.lifecycle.pause('arbitrary', 'Peer-redefined question'), /only the owner/);
-  p.lifecycle.vote(ballot.number, 'yes');
-  one.configure({ voteCondition: 'New fixture condition' });
+  const ballot = p.lifecycle.pause('first', one.settings().voteCondition);
+  assert.equal(ballot.reason, h.settings.voteCondition); assert.equal(ballot.electorate.length, 2);
+  assert.ok(ballot.electorate.every(v => v.answer === null), 'requesting a round is not a vote');
+  const tally = p.lifecycle.vote(ballot.number, 'yes');
+  assert.equal(tally.result, 'open'); assert.equal(tally.electorate.filter(v => v.answer === 'yes').length, 1);
+  one.configure({ voteCondition: '22222222-2222-4222-8222-222222222222' });
+  assert.equal(one.snapshot().vote, undefined, 'configuration cancels but opens no ballot');
   assert.throws(() => h.peer(one, a[1]).lifecycle.vote(ballot.number, 'yes'), /cancelled/);
-  const fresh = one.snapshot().vote; assert.notEqual(fresh.number, ballot.number);
-  p.lifecycle.vote(fresh.number, 'yes'); h.peer(one, a[1]).lifecycle.vote(fresh.number, 'yes');
+  const fresh = p.lifecycle.pause('revised', one.settings().voteCondition); assert.notEqual(fresh.number, ballot.number);
+  p.lifecycle.vote(fresh.number, 'yes');
+  assert.equal(h.peer(one, a[1]).lifecycle.vote(fresh.number, 'yes').result, 'agreed');
   assert.equal(one.snapshot().status, 'waiting'); assert.equal(two.snapshot().status, 'running');
   const launches = h.calls.filter(c => c[0] === 'new-session'); tickFloor(one, h.execute);
   assert.equal(h.calls.filter(c => c[0] === 'new-session').length, launches.length);
@@ -91,7 +99,7 @@ test('two floors: isolated owner messages, peer identities, durable pending USER
 test('2–10 next-occupant slots, invalid patches atomic, model/role edits do not mutate current workers; removal safely drains', t => {
   const h = fixture(t), floor = h.create('one'), workers = h.boot(floor);
   for (const slots of [[sol('a')], Array.from({ length: 11 }, (_, i) => sol(String(i))), [sol('a'), sol('a')], [sol('a'), { ...sol('b'), model: 'unapproved' }], [sol('a'), { ...sol('b'), thinking: 'low' }]]) assert.throws(() => floor.configure({ slots }));
-  for (const patch of [null, [], { roots: [[node]] }, { instructions: [node] }, { bootstrap: ' ' }, { warningText: '' }, { slots: [sol('a'), { ...sol('b'), provider: ['openai-codex-fixture'] }] }]) assert.throws(() => floor.configure(patch));
+  for (const patch of [null, [], { roots: [[node]] }, { instructions: [node] }, ...['', 'Fixture condition', [node], 1, {}].map(voteCondition => ({ voteCondition })), { bootstrap: ' ' }, { warningText: '' }, { slots: [sol('a'), { ...sol('b'), provider: ['openai-codex-fixture'] }] }]) assert.throws(() => floor.configure(patch));
   assert.equal(floor.settings().slots.length, 2);
   const slots = Array.from({ length: 10 }, (_, i) => sol(i === 0 ? 'a' : i === 1 ? 'b' : `s${i}`));
   slots[0] = { ...slots[0], model: 'gpt-6-luna', role: 'Fixture specialization', contextWarning: 60 };
@@ -130,19 +138,32 @@ test('unavailable independent-job evidence cannot block real worker cleanup or i
 });
 
 test('unfinished ballots invalidate on slot and actual membership change; no is not controller judgment', t => {
-  const h = fixture(t), floor = h.create('one'), workers = h.boot(floor), first = floor.snapshot().vote;
-  h.peer(floor, workers[0]).lifecycle.vote(first.number, 'yes');
+  const h = fixture(t), floor = h.create('one'), workers = h.boot(floor), p = h.peer(floor, workers[0]);
+  assert.equal(floor.snapshot().vote, undefined);
+  const first = p.lifecycle.pause('first', floor.settings().voteCondition);
+  p.lifecycle.vote(first.number, 'yes');
   floor.configure({ slots: [...floor.settings().slots, sol('c')] });
   assert.equal(floor.snapshot().vote, undefined);
   tickFloor(floor, h.execute); const third = floor.snapshot().workers.at(-1); h.peer(floor, third).lifecycle.ready();
-  const round = floor.snapshot().vote;
+  assert.equal(floor.snapshot().vote, undefined, 'new slot readiness opens no ballot');
+  assert.throws(() => h.peer(floor, third).lifecycle.vote(first.number, 'yes'), /fixed electorate/);
+  assert.throws(() => h.peer(floor, workers[1]).lifecycle.vote(first.number, 'yes'), /cancelled/);
+  const round = p.lifecycle.pause('expanded', floor.settings().voteCondition);
   assert.equal(round.electorate.length, 3); assert.ok(round.electorate.every(v => v.answer === null));
   h.peer(floor, workers[0]).lifecycle.vote(round.number, 'yes');
   h.panes.get(third.pane).live = false; tickFloor(floor, h.execute); assert.equal(floor.snapshot().vote, undefined);
   const next = floor.snapshot().workers.at(-1); h.peer(floor, next).lifecycle.ready();
-  const current = floor.snapshot().vote; assert.notEqual(current.number, round.number);
+  assert.equal(floor.snapshot().vote, undefined, 'replacement readiness opens no ballot');
+  h.peer(floor, next).lifecycle.ready();
+  assert.equal(floor.snapshot().vote, undefined, 'repeated replacement readiness opens no ballot');
+  assert.throws(() => h.peer(floor, workers[1]).lifecycle.vote(round.number, 'yes'), /cancelled/);
+  const current = p.lifecycle.pause('replacement', floor.settings().voteCondition); assert.notEqual(current.number, round.number);
   assert.ok(current.electorate.every(v => v.answer === null)); assert.ok(!current.electorate.some(v => v.session === third.session));
-  h.peer(floor, workers[0]).lifecycle.vote(current.number, 'no'); assert.equal(floor.snapshot().status, 'running');
+  assert.equal(p.lifecycle.vote(current.number, 'no').result, 'rejected');
+  assert.equal(floor.snapshot().status, 'running'); assert.equal(floor.snapshot().vote, undefined);
+  assert.throws(() => h.peer(floor, workers[1]).lifecycle.vote(current.number, 'yes'), /rejected/);
+  floor.configure({ name: 'Renamed fixture' });
+  assert.equal(floor.snapshot().vote, undefined, 'configuration after rejection opens no ballot');
   const again = h.peer(floor, workers[0]).lifecycle.pause('retry', floor.settings().voteCondition);
   assert.equal(again.reason, h.settings.voteCondition); assert.ok(again.electorate.every(v => v.answer === null));
 });
