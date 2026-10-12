@@ -84,7 +84,9 @@ Creation is **stopped**. New production bootstrap/warning/wrapup/role instructio
 must be shown exactly to Jack and approved before installation. Null launch text
 and pending instruction/vote settings permit stopped creation/adoption/configuration
 but block Start before saving any start command, changing state or spawning.
-Chat on a pending stopped floor is saved without starting; it cannot bypass the gate.
+Chat never starts or reconvenes a floor, including a fully configured stopped or
+draining floor. It is saved without changing lifecycle state; only explicit Start
+queues a reconvene. Running peers still receive owner chat normally.
 The website lists missing launch fields; configure the vote there and other launch
 inputs with `factory config`. Live, queued or draining floors cannot clear these
 prerequisites, preserving graceful stop. The CLI does not load a packaged
