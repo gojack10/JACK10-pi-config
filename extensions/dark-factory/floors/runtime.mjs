@@ -45,7 +45,8 @@ export function validateSettings(input) {
   if (!statSync(cwd).isDirectory() || !existsSync(join(cwd, '.git'))) throw new Error('cwd must be an existing Git checkout');
   if (!Array.isArray(input.roots) || !input.roots.length || input.roots.length > 100 || input.roots.some(r => typeof r !== 'string' || !uuid.test(r))) throw new Error('roots must contain tree starting node UUIDs');
   if (input.instructions != null && (typeof input.instructions !== 'string' || !uuid.test(input.instructions))) throw new Error('instructions must be a tree node UUID or null while stopped');
-  const voteCondition = input.voteCondition == null ? null : text(input.voteCondition, 'voteCondition');
+  if (input.voteCondition != null && (typeof input.voteCondition !== 'string' || !uuid.test(input.voteCondition))) throw new Error('voteCondition must be a tree node UUID or null while stopped');
+  const voteCondition = input.voteCondition ?? null;
   if (!Array.isArray(input.slots) || input.slots.length < 2 || input.slots.length > 10) throw new Error('floor requires 2-10 slots');
   const slots = input.slots.map(s => {
     if (!s || Object.keys(s).some(k => !['id','provider','model','thinking','role','contextWarning'].includes(k))) throw new Error('unknown slot setting');
