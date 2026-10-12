@@ -43,6 +43,7 @@ def capture(name):
 try:
     wait(1)
     check('document.querySelectorAll(".message").length === 100 && document.querySelector("#transcript").firstElementChild.textContent.includes("Fictional message 251") && document.querySelector("#transcript").lastElementChild.textContent.includes("Fictional message 350")')
+    check('document.querySelector("#transcript").scrollHeight - document.querySelector("#transcript").clientHeight - document.querySelector("#transcript").scrollTop < 2')
     for width,height in [(320,568),(390,844),(700,900),(701,900),(1440,900),(390,400),(844,390)]:
         cdp('Emulation.setDeviceMetricsOverride', session_id=sid, width=width, height=height, deviceScaleFactor=1, mobile=True)
         wait(.2)

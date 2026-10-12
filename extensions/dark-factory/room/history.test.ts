@@ -2,6 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { page, snapshot, flushed } from './test/page.mjs';
 
+test('initial tail follows delayed font layout unless the reader has scrolled', async () => {
+  let resolve;
+  const fonts = { ready: new Promise(done => { resolve = done; }) };
+  const s = snapshot(); s.posts = [{ number: 1, sender: 'aaaaaaaa', role: 'peer', text: 'latest', created: '2026-01-01T00:00:00Z' }];
+  const a = page({ snapshots: { legacy: s }, fonts }), b = page({ snapshots: { legacy: s }, fonts }); await flushed();
+  a.element('#transcript').scrollHeight = 2400;
+  b.element('#transcript').scrollHeight = 2400; b.element('#transcript').scrollTop = 40;
+  resolve(); await flushed();
+  assert.equal(a.element('#transcript').scrollTop, 2400);
+  assert.equal(b.element('#transcript').scrollTop, 40);
+});
+
 test('initial render is the newest page; older pages stay silent and new arrivals append', async () => {
   const s = snapshot();
   s.posts = Array.from({ length: 350 }, (_, i) => ({ number: i + 1, sender: 'aaaaaaaa', role: 'peer', text: `Entry ${i + 1} end`, created: '2026-01-01T00:00:00Z' }));
