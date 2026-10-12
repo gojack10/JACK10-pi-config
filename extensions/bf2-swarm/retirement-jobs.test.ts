@@ -87,7 +87,7 @@ test('threshold transitions durably before next tool; locator expands; native ca
   assert.equal(readFileSync(join(h.cwd, 'draft.txt'), 'utf8'), 'unfinished draft\n');
 });
 
-test('budget steers fire once per 10% bucket with node pointers; threshold retirement stays unchanged', async t => {
+test('budget steers reference the current floor goal without project IDs; threshold retirement stays unchanged', async t => {
   const h = fixture(t, 100), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
   const observe = async n => { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); };
   for (const n of [undefined, null, NaN, Infinity, -10, '20', 0, 9.9]) await observe(n);
@@ -95,7 +95,7 @@ test('budget steers fire once per 10% bucket with node pointers; threshold retir
   for (let bucket = 10; bucket <= 90; bucket += 10) {
     await observe(bucket); await observe(bucket + 0.1); await observe(bucket + 9.9);
     assert.equal(f.sent.length, bucket / 10);
-    assert.equal(f.sent.at(-1), `Context budget: ${bucket}% used. Goal: [[Friday Dogfood Trial|dcb5f56a-79f0-4c9b-85e9-4e63a0e3bd8c]] under SiftText Product. Pace: [[Factory Control Lifecycle|3b763231-7c7f-4a7f-9161-e6f90d6e6929]]. Check: advancing the goal? bottleneck?`);
+    assert.equal(f.sent.at(-1), `Context budget: ${bucket}% used. Follow this floor's current goal and latest owner priorities, using its instruction entry and work owners. Check: advancing the goal? bottleneck?`);
     const { options, handled } = f.deliveries.at(-1);
     assert.equal(options.deliverAs, 'steer'); assert.equal(options.expandPromptTemplates, false);
     assert.equal(options.admissionKey, `factory-context-budget:${h.session}:${bucket}`);
