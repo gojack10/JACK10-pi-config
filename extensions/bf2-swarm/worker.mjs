@@ -2,6 +2,7 @@ import { configuration, openBoard } from './board.mjs';
 
 export const WARNING = 'Context is at least 80%. Preserve useful progress on the tree and consider a handoff/retirement at a sensible boundary. This is one warning, not a forced stop; tools remain available.';
 export const warningType = 'bf2-swarm-warning';
+export const budgetType = 'factory-context-budget';
 export const wrapup = (run, state) => `BF2 swarm ${run}: ${state.status}. Finish safely, record ${state.status}/inspection state on experiment node ${state.config.instructions} using its instructions, then board done with a handoff. No replacements while ${state.status}; waiting is not BF2 success.`;
 
 const expand = (text, values) => text.replace(/\{(percent|status|instructions|floor|reason)\}/g, (match, key) => String(values[key] ?? match));
@@ -28,7 +29,7 @@ export function handoffTool(worker, parameters) {
 export function installWorker(pi, env = process.env, drained = () => true) {
   if (env.BF2_SWARM_WORKER !== '1' && !env.FACTORY_SESSION) return;
   const config = configuration(env);
-  let board, timer, warned = false, pausedNotice, notifying = false, refused = false;
+  let board, timer, warned = false, budgetBucket = 0, pausedNotice, notifying = false, refused = false;
   const close = () => { clearInterval(timer); timer = undefined; board?.close(); board = undefined; };
   const live = ctx => board && ctx.sessionManager.getSessionId() === config.session;
   const notifyPause = async ctx => {
@@ -64,6 +65,8 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     board.lifecycle.ready();
     refused = false;
     warned = ctx.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === warningType);
+    if (config.floor) budgetBucket = ctx.sessionManager.getBranch().reduce((bucket, e) =>
+      e.type === 'custom' && e.customType === budgetType ? Math.max(bucket, e.data.bucket) : bucket, 0);
     timer = setInterval(() => { void notifyPause(ctx).catch(e => console.error(`BF2 swarm: ${e.message}`)); }, 1000);
     timer.unref();
   });
@@ -89,6 +92,19 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     await notifyPause(ctx);
     const state = board.lifecycle.status(), row = state.workers.find(w => w.session === config.session);
     const threshold = row?.launch_config?.contextWarning ?? 80;
+    const bucket = Math.floor(percent / 10) * 10;
+    if (state.floor && typeof percent === 'number' && Number.isFinite(percent) && percent < threshold &&
+      bucket >= 10 && bucket <= 90 && bucket > budgetBucket && board.lifecycle.acceptsInput()) {
+      const receipt = await pi.sendUserMessage(`Context budget: ${bucket}% used. Goal: [[Friday Dogfood Trial|dcb5f56a-79f0-4c9b-85e9-4e63a0e3bd8c]] under SiftText Product. Pace: [[Factory Control Lifecycle|3b763231-7c7f-4a7f-9161-e6f90d6e6929]]. Check: advancing the goal? bottleneck?`, {
+        deliverAs: 'steer', expandPromptTemplates: false,
+        admissionKey: `factory-context-budget:${config.session}:${bucket}`,
+        admissionGuard: () => !!live(ctx) && board.lifecycle.acceptsInput(),
+      });
+      if (receipt.status === 'admitted') {
+        budgetBucket = bucket;
+        pi.appendEntry(budgetType, { bucket });
+      }
+    }
     if (!state.floor && !warned && typeof percent === 'number' && Number.isFinite(percent) && percent >= threshold && board.lifecycle.acceptsInput()) {
       warned = true;
       pi.appendEntry(warningType, { warned: true });
