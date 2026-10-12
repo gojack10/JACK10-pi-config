@@ -28,7 +28,7 @@ export function page({ multi = false, snapshots = {}, shared = new Map(), saved 
     close() { this.closed = true; }
   }
   saved.set('bf2-room', JSON.stringify({ run: multi ? 'floors' : 'legacy', token: 'synthetic', multi }));
-  const scope = { document: { querySelector: element, addEventListener() {} }, location: { hash: '' }, sessionStorage: store(saved), localStorage: store(shared), AudioContext, Notification,
+  const scope = { document: { querySelector: element, events: {}, visibilityState: 'visible', hasFocus: () => true, addEventListener(name, fn) { this.events[name] = fn; } }, location: { hash: '' }, sessionStorage: store(saved), localStorage: store(shared), AudioContext, Notification,
     esc, avatar, textMarkup, messageMarkup, crypto: { randomUUID: () => 'fixture-key' }, window: { focus() {} }, setInterval: (fn, ms) => timers.push([fn, ms]),
     fetch: async (path, options) => {
       requests.push([path, options]);
@@ -39,7 +39,7 @@ export function page({ multi = false, snapshots = {}, shared = new Map(), saved 
     } };
   const source = readFileSync(new URL('../room.js', import.meta.url), 'utf8').replace(/^import[^\n]+\n/, '');
   runInNewContext(source + '\nglobalThis.check = {poll,selectFloor,notify,openSettings,room,active,alerts,unlockAudio,selected:()=>selected};', scope);
-  return { ...scope.check, element, requests, notices, played, contexts, timers, saved, shared, Notification, permissionRequests: () => permissionRequests,
+  return { ...scope.check, document: scope.document, element, requests, notices, played, contexts, timers, saved, shared, Notification, permissionRequests: () => permissionRequests,
     click: selector => element(selector).events.click(), failAudio: () => { rejectAudio = true; }, failSynthesis: () => { rejectSynthesis = true; } };
 }
 export const snapshot = (name = 'fixture') => ({ status: 'running', posts: [], members: ['aaaaaaaa'], known: ['aaaaaaaa'], workers: [],

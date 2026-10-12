@@ -41,6 +41,21 @@ test('all initial pages silent; cross-floor @JACK notifications focus destinatio
   await a.poll(); assert.equal(a.notices.length, 2, 'mute scoped to beta');
 });
 
+test('background peer arrivals resume gesture-unlocked audio without focus or visibility gates', async () => {
+  const p = page({ snapshots: { legacy: snapshot() } }); await flushed();
+  p.document.visibilityState = 'hidden'; p.document.hasFocus = () => false;
+  p.notify(p.active(), [{ role: 'peer', text: 'not unlocked', number: 1 }]);
+  assert.equal(p.contexts.length, 0, 'background arrivals cannot create a context');
+  p.document.events.keydown(); await flushed();
+  assert.equal(p.contexts[0].state, 'running', 'first keyboard gesture unlocks audio');
+  p.contexts[0].state = 'suspended';
+  p.notify(p.active(), [{ role: 'peer', text: 'background arrival', number: 2 }]); await flushed();
+  assert.equal(p.contexts[0].state, 'running'); assert.equal(p.played.length, 2);
+  p.contexts[0].state = 'suspended'; p.failAudio();
+  p.notify(p.active(), [{ role: 'peer', text: 'resume refused', number: 3 }]); await flushed();
+  assert.equal(p.played.length, 2, 'autoplay refusal is contained, not falsely reported as sound');
+});
+
 test('blocked permission never requests silently or produces fake desktop alerts', async () => {
   const p = page({ snapshots: { legacy: snapshot() }, permission: 'denied' }); await flushed();
   p.notify(p.active(), [{ role: 'peer', sender: 'peer', text: '@JACK', number: 1 }]);
