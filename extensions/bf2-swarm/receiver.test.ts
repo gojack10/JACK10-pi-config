@@ -6,6 +6,7 @@ const fixtureRoot = join(homedir(), '.local/state/bf2-room-tests');
 mkdirSync(fixtureRoot, { recursive: true });
 import { join } from 'node:path';
 import { configuration, openBoard, BATCH_LIMIT } from './board.mjs';
+import { main as boardMain } from './cli.mjs';
 import { receiver, installReceiver } from './receiver.mjs';
 import boardExtension from '../../optional-extensions/bf2-board.ts';
 
@@ -93,9 +94,11 @@ test('startup waits for plain read boundary; history overlaps do not eat pending
   const h = fixture(t); h.peer.post('startup history');
   const r = h.start(); await r.pump();
   assert.equal(h.calls.length, 0);
-  const snapshot = h.board.history();
-  h.peer.post('after snapshot');
-  h.board.finishStartup(snapshot.highwater);
+  await boardMain(['read'], h.env, { write(text, callback) {
+    assert.match(text, /startup history/);
+    h.peer.post('after snapshot');
+    callback();
+  } });
   await r.pump();
   assert.doesNotMatch(h.calls[0].message.content[0].text, /startup history/);
   assert.match(h.calls[0].message.content[0].text, /after snapshot/);
