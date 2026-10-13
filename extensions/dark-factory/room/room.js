@@ -261,8 +261,6 @@ function slotControls() {
   $('#add-slot').disabled = fields.length >= 10;
   for (const field of fields) field.querySelector('[data-remove-slot]').disabled = fields.length <= 2;
 }
-const pathfinderTextFields = [['entry','Factory entry node UUID'], ['agent','Agent role node UUID'], ['goal','Goal node UUID'], ['continuation','Continuation node UUID (optional)'],
-  ['bootstrap','Approved launch text'], ['question','Review question'], ['codeRoots','Assigned code directories (one absolute path per line)'], ['resources','Authorized resources'], ['resultDestination','Result destination']];
 function pathfinderControls() {
   const enabled = $('#pathfinder-enabled').checked;
   $('#pathfinder-fields').hidden = !enabled; $('#pathfinder-fields').disabled = !enabled;
@@ -274,7 +272,7 @@ function openSettings() {
   $('#slot-fields').innerHTML = state.settings.slots.map(slotMarkup).join('');
   const p = state.settings.pathfinder ?? pathfinderDefaults;
   $('#pathfinder-enabled').checked = !!state.settings.pathfinder;
-  $('#pathfinder-fields').innerHTML = `${routeMarkup(p)}<label>Context warning %<input name="contextWarning" type="number" min="0.01" max="100" step="any" value="${esc(p.contextWarning)}" required></label>${pathfinderTextFields.map(([key, label]) => `<label>${label}<textarea name="${key}" maxlength="${key === 'codeRoots' ? 65536 : 16384}" ${key === 'continuation' ? '' : 'required'}>${esc(key === 'codeRoots' ? (p[key] ?? []).join('\n') : p[key] ?? '')}</textarea></label>`).join('')}<p>Access: read/write assigned project tree, board and code.</p>`;
+  $('#pathfinder-fields').innerHTML = `${routeMarkup(p)}<label>Context warning %<input name="contextWarning" type="number" min="0.01" max="100" step="any" value="${esc(p.contextWarning)}" required></label><label>Continuation node UUID (optional)<input name="continuation" value="${esc(p.continuation ?? '')}"></label><p>Uses the floor’s goal, project entry, checkout and permissions. Ask review questions with @PATHFINDER on the board.</p>`;
   const current = state.workers?.find(w => w.slotId === '@PATHFINDER' && !w.cleaned);
   $('#pathfinder-current').textContent = current ? `Current: @PATHFINDER · ${current.provider}/${current.model} · ${current.thinking} · ${current.phase} · context ${current.contextPercent ?? 'unknown'}%` : 'Current: unoccupied';
   pathfinderControls();
@@ -308,9 +306,7 @@ $('#pathfinder-settings').addEventListener('submit', async e => {
     const field = $('#pathfinder-fields'), value = name => field.querySelector(`[name=${name}]`).value;
     const route = routes.find(r => routeValue(r) === value('route'));
     pathfinder = { provider: route.provider, model: route.model, thinking: value('thinking'), contextWarning: Number(value('contextWarning')),
-      ...Object.fromEntries(pathfinderTextFields.map(([key]) => [key, value(key)])),
-      continuation: value('continuation').trim() || null, codeRoots: value('codeRoots').split('\n').map(s => s.trim()).filter(Boolean),
-      grant: { tree: 'read-write', board: 'read-write', code: 'read-write' } };
+      continuation: value('continuation').trim() || null };
   }
   if (await mutate('configuration', { pathfinder }) && panelFloor === selected) openSettings();
 });

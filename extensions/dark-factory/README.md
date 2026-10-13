@@ -103,8 +103,8 @@ for that condition, not controller-defined product completion.
 
 `pathfinder` is an optional settings object; omitted/null leaves it disabled.
 It runs one separately scheduled `@PATHFINDER` session outside the 2–10 peer
-slots and ballot electorate. In room settings, enable Pathfinder, fill its
-assignment and save. The form edits its route and assignment; disabling and
+slots and ballot electorate. In room settings, enable Pathfinder and save.
+The form edits its route and optional continuation; disabling and
 saving gracefully retires its occupant. The same settings remain available
 through `factory config`. Both paths save to SQLite `floor_settings`; timer and
 delivery state stay in `floor_pathfinder`. Saving settings never starts a stopped floor.
@@ -114,28 +114,27 @@ Optional `provider`, `model`, `thinking` fields override those defaults using th
 supported routes. `contextWarning` defaults to 80. Like peers, Pathfinder has no
 runtime cost cap.
 
-Required assignment fields:
+`pathfinder: {}` enables these defaults. `continuation` may hold an existing
+review-owner UUID or null. Runtime generates the Pathfinder loading message,
+including Factory Pathfinder Entry and Pathfinder Agent. It includes the exact
+common floor bootstrap used by workers, with Pathfinder's substantive role
+superseding peer identity and self-selected worker assignment. Goal resolution
+uses that same project entry; floor `cwd`, `roots` and `instructions` supply the
+project context. Send custom review questions to `@PATHFINDER` on the board.
 
-- `bootstrap`: exact approved launch text that routes the agent through the common
-  reads, Factory Pathfinder Entry and Pathfinder Agent. Runtime appends assignment
-  JSON; it does not interpolate node IDs into this text.
-- `entry`, `agent`, `goal`: actual factory-entry, reusable-role and goal node UUIDs.
-- `question`: owner-supplied review question; `continuation`: existing review-owner
-  UUID or null. Project entry and tree roots come from the floor's existing
-  `instructions` and `roots` fields.
-- `codeRoots`: 1–100 existing absolute assigned directories.
-- `grant`: exactly `{"tree":"read-write","board":"read-write","code":"read-write"}`.
-- `resources`, `resultDestination`: explicit owner-authorized resources/limits and
-  where results belong, as bounded text.
+Project instructions and actual model settings govern permissions, resources and
+additional repositories. Discovering a path grants no new write authority.
+Findings return through the factory board and existing work owners. The common
+role nodes own mutation boundaries, Commit approval, Canopy and the Deslopifier.
+Existing same-user tools provide cooperative access, without an OS sandbox.
+Resolve unavailable tool access before deployment.
 
-Incomplete assignments and invalid route overrides are rejected atomically.
-Setting it to null requests graceful retirement of its occupant. Assignment/route
-edits affect the next occupant. All fields and lifecycle text are retained in the
-launch snapshot.
-The common role nodes own mutation boundaries, Commit approval, Canopy and the
-Deslopifier. The assignment supplies cooperative access constraints, using the
-existing same-user tools; these are not an OS sandbox or automatic tree-write
-approval. Resolve unavailable tool access before deployment.
+Invalid route overrides or continuation UUIDs are rejected atomically. Setting
+Pathfinder to null requests graceful retirement. Route/continuation edits affect
+the next occupant. Existing launch snapshots remain retained. Older stored
+Pathfinder setup fields are accepted for compatibility, omitted from generated
+missions, and discarded on the next settings save. They cannot override the
+floor's common bootstrap, goal resolution or project context.
 
 While running and absent, the durable timer launches a pass after 30 minutes.
 An authenticated owner/peer post with a standalone uppercase `@PATHFINDER` mention

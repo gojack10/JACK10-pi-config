@@ -8,7 +8,7 @@ import { createFloor, openFloor, selectOssFloor, ossStatus, validateSettings } f
 import { tickFloor } from './supervisor.mjs';
 import { openBoard, configuration } from '../../bf2-swarm/board.mjs';
 import { installWorker } from '../../bf2-swarm/worker.mjs';
-import { ABSENCE_MS, PATHFINDER_SLOT } from '../../bf2-swarm/pathfinder.mjs';
+import { ABSENCE_MS, PATHFINDER_SLOT, PATHFINDER_ENTRY, PATHFINDER_AGENT, pathfinderMission } from '../../bf2-swarm/pathfinder.mjs';
 import { publicSnapshot, serveFloors } from './room.mjs';
 import { textMarkup } from '../room/markup.mjs';
 
@@ -20,9 +20,7 @@ function fixture(t, pathfinderRoute = route) {
   mkdirSync(cwd); mkdirSync(join(cwd, '.git')); mkdirSync(agent);
   writeFileSync(join(agent, 'settings.json'), JSON.stringify({ steeringMode: 'all', followUpMode: 'all' }));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const pathfinder = { ...pathfinderRoute, bootstrap: 'Fixture: read configured common, factory entry and Pathfinder agent nodes.',
-    entry: node, agent: node, goal: node, question: 'Fixture goal review', continuation: node, codeRoots: [cwd],
-    resources: 'Fixture authorized resource limit', resultDestination: 'Fixture board and owning nodes', grant: { tree: 'read-write', board: 'read-write', code: 'read-write' } };
+  const pathfinder = { ...pathfinderRoute, continuation: node };
   createFloor({ name: 'Fixture floor', cwd, roots: [node], instructions: node, voteCondition: node,
     slots: ['a','b'].map(id => ({ ...route, id })), pathfinder,
     bootstrap: 'Fixture peer entry', warningText: 'Fixture threshold {percent}', wrapupText: 'Fixture retirement {reason}' }, { id: 'one', root });
@@ -88,11 +86,13 @@ test('30-minute absence, one non-worker session, inspectable assignment, settlem
   h.advance(1); h.tick(); const w = h.current(), b = h.ready(w);
   assert.ok(w); assert.equal(h.peers().length, 2); assert.equal(h.state().pathfinder.absent_since, null);
   const mission = readFileSync(join(h.root, 'one', `${w.session}.boot.txt`), 'utf8');
-  assert.ok(mission.startsWith(h.pathfinder.bootstrap));
+  assert.equal(mission, pathfinderMission(h.state().config));
+  assert.ok(mission.includes('Common floor launch instructions:\nFixture peer entry\n'));
+  assert.match(mission, /current goal resolved through that same project entry/);
+  assert.match(mission, /discovering another path grants no write authority/);
   const assignment = JSON.parse(mission.split('Factory Pathfinder assignment:\n')[1]);
-  assert.equal(assignment.identity, '@PATHFINDER'); assert.equal(assignment.goal, node);
-  assert.deepEqual(assignment.grant, h.pathfinder.grant); assert.deepEqual(assignment.codeRoots, h.pathfinder.codeRoots);
-  assert.equal(assignment.entry, node); assert.equal(assignment.agent, node); assert.equal(assignment.question, h.pathfinder.question);
+  assert.deepEqual(assignment, { identity: '@PATHFINDER', floor: 'one', cwd: h.floor.settings().cwd, roots: [node],
+    instructions: node, entry: PATHFINDER_ENTRY, agent: PATHFINDER_AGENT, continuation: node });
   h.startup(b); b.post('@PATHFINDER fixture self-reference');
   h.advance(5 * ABSENCE_MS); h.tick(); assert.equal(h.current().session, w.session);
   h.retire(w, b); h.tick(); assert.equal(h.state().pathfinder.absent_since, null, 'settlement leaves a live pane occupied');
@@ -180,17 +180,37 @@ test('stopped requests stay chat; explicit Start, context retirement, error and 
   h.tick(); assert.equal(h.state().status, 'stopped'); assert.equal(h.current(), undefined);
 });
 
-test('Pathfinder configuration is explicit and atomic, changed route/grant applies to next occupant', t => {
+test('Pathfinder configuration is reduced and atomic, changed route/continuation applies to next occupant', t => {
   const h = fixture(t);
-  for (const patch of [{ grant: { tree: 'read-only', board: 'read-write', code: 'read-write' } }, { goal: '' }, { entry: '' }, { agent: '' },
-    { bootstrap: null }, { goal: [node] }, { continuation: [node] }, { resources: '' }, { codeRoots: ['relative'] }, { resultDestination: '' }, { provider: '' }, { provider: null }, { model: 'unapproved' }, { model: null }, { thinking: 'low' }, { thinking: null }, { extra: true }]) {
+  for (const patch of [{ continuation: [node] }, { continuation: '' }, { provider: '' }, { provider: null }, { model: 'unapproved' }, { model: null }, { thinking: 'low' }, { thinking: null }, { extra: true }]) {
     const before = h.floor.settings(); assert.throws(() => h.floor.configure({ pathfinder: { ...h.pathfinder, ...patch } })); assert.deepEqual(h.floor.settings(), before);
   }
   h.start(); floorMessage(h, 'wake', '@PATHFINDER fixture review'); h.tick(); const w = h.current(), b = h.ready(w); h.startup(b);
-  h.floor.configure({ pathfinder: { ...h.pathfinder, model: 'gpt-6-luna', question: 'Fixture next review' } });
+  h.floor.configure({ pathfinder: { ...h.pathfinder, model: 'gpt-6-luna', continuation: null } });
   assert.equal(h.current().launch_config.model, 'gpt-6.1-sol');
   h.retire(w, b); h.panes.get(w.pane).live = false; h.tick(); h.advance(ABSENCE_MS); h.tick();
-  assert.equal(h.current().launch_config.model, 'gpt-6-luna'); assert.equal(h.current().launch_config.question, 'Fixture next review');
+  assert.equal(h.current().launch_config.model, 'gpt-6-luna'); assert.equal(h.current().launch_config.continuation, null);
+});
+
+test('empty Pathfinder setup enables defaults; legacy stored setup cannot override common project context', t => {
+  const h = fixture(t);
+  h.floor.configure({ pathfinder: {} });
+  assert.deepEqual(h.floor.settings().pathfinder, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80, continuation: null });
+  const legacy = { ...h.pathfinder, bootstrap: 'Obsolete specialist bootstrap', entry: node, agent: node,
+    goal: '22222222-2222-4222-8222-222222222222', question: 'Obsolete specialist question', codeRoots: ['/no-longer-present'],
+    grant: { tree: 'read-write', board: 'read-write', code: 'read-write' }, resources: 'Obsolete resources', resultDestination: 'Obsolete destination' };
+  const db = new DatabaseSync(h.floor.database), settings = { ...h.floor.settings(), pathfinder: legacy };
+  db.prepare('UPDATE floor_settings SET settings=?').run(JSON.stringify(settings));
+  db.prepare('UPDATE swarm_run SET config=?').run(JSON.stringify({ ...h.state().config, pathfinder: legacy })); db.close();
+  const reopened = openFloor('one', { root: h.root }); reopened.close();
+  h.start(); floorMessage(h, 'legacy', '@PATHFINDER use the current project goal'); h.tick();
+  const w = h.current(), mission = readFileSync(join(h.root, 'one', `${w.session}.boot.txt`), 'utf8');
+  assert.ok(mission.includes('Common floor launch instructions:\nFixture peer entry\n'));
+  assert.doesNotMatch(mission, /Obsolete|22222222-2222-4222-8222-222222222222|no-longer-present|"goal"|"grant"|"codeRoots"/);
+  assert.equal(JSON.parse(mission.split('Factory Pathfinder assignment:\n')[1]).continuation, node);
+  h.floor.configure({ slots: h.floor.settings().slots });
+  assert.deepEqual(h.floor.settings().pathfinder, { ...route, continuation: node });
+  assert.equal(h.current().session, w.session);
 });
 
 test('pre-release launch failures retain requests and ownership-ambiguous launch never duplicates', t => {
@@ -216,22 +236,24 @@ test('room configuration uses SQLite for Pathfinder defaults, atomic edits and g
   const discovery = await fetch(`${room.origin}/api/floors`, { headers: auth }).then(r => r.json());
   assert.deepEqual(discovery.pathfinderDefaults, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80 });
   assert.equal((await read()).settings.pathfinder, null);
+  assert.equal((await post({ pathfinder: {} })).status, 200);
+  assert.deepEqual((await read()).settings.pathfinder, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80, continuation: null });
   assert.equal((await post({ pathfinder: h.pathfinder })).status, 200);
   const configured = await read();
   assert.equal(configured.status, 'stopped'); assert.equal(recoveries, 0);
   assert.equal(configured.settings.pathfinder.provider, 'openai-codex-personal');
-  assert.deepEqual(configured.settings.pathfinder.codeRoots, h.pathfinder.codeRoots);
+  assert.equal(configured.settings.pathfinder.continuation, node);
   const reopened = openFloor('one', { root: h.root });
   assert.deepEqual(reopened.settings().pathfinder, configured.settings.pathfinder); reopened.close();
   const prior = h.floor.settings();
-  for (const body of [{}, { pathfinder: {} }, { pathfinder: false }, { pathfinder: { ...h.pathfinder, grant: {} } },
+  for (const body of [{}, { pathfinder: false }, { pathfinder: { ...h.pathfinder, continuation: 'invalid' } },
     { pathfinder: { ...h.pathfinder, model: 'unapproved' } }, { pathfinder: null, slots: [] }, { pathfinder: null, command: '/bin/sh' }]) {
     assert.equal((await post(body)).status, 400); assert.deepEqual(h.floor.settings(), prior);
   }
   h.start(); floorMessage(h, 'room-wake', '@PATHFINDER fixture'); h.tick(); h.ready(h.current());
   const occupant = h.current();
   const peers = h.peers().map(w => w.session);
-  assert.equal((await post({ pathfinder: { ...h.pathfinder, provider: 'openai-codex-fixture', model: 'gpt-6-luna', question: 'Edited fixture' } })).status, 200);
+  assert.equal((await post({ pathfinder: { ...h.pathfinder, provider: 'openai-codex-fixture', model: 'gpt-6-luna', continuation: null } })).status, 200);
   assert.equal(h.current().launch_config.model, 'gpt-6.1-sol');
   assert.equal((await read()).settings.pathfinder.model, 'gpt-6-luna');
   assert.deepEqual(h.peers().map(w => w.session), peers);
