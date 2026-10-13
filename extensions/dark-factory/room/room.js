@@ -148,7 +148,7 @@ function render() {
   $('#floor-name').textContent = multi ? current.name : '';
   $('#members').innerHTML = [...(state.members ?? []), 'JACK'].map(id => {
     const worker = multi ? state.workers?.find(w => w.sender === id && !w.cleaned) : undefined;
-    const role = id === 'JACK' ? 'factory owner' : worker ? `current: ${worker.model ?? 'unknown'} · ${worker.phase ?? 'unknown'}${state.settings.slots.some(s => s.id === worker.slotId) ? '' : ' · removed slot, draining'}` : 'swarm agent';
+    const role = id === 'JACK' ? 'factory owner' : worker ? `current: ${worker.model ?? 'unknown'} · ${worker.phase ?? 'unknown'}${worker.slotId === '@PATHFINDER' ? ' · Pathfinder' : state.settings.slots.some(s => s.id === worker.slotId) ? '' : ' · removed slot, draining'}` : 'swarm agent';
     return `<div class="member">${avatar(id === 'JACK')}<div><div class="name ${id === 'JACK' ? 'jack' : ''}">${esc(id)}</div><div class="role">${esc(role)}</div></div></div>`;
   }).join('');
   const vote = state.vote, condition = state.settings?.voteCondition;
