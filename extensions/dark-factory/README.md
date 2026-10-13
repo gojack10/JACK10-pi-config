@@ -99,6 +99,65 @@ occupants. Editing the owner's condition invalidates old votes and notifies peer
 membership changes invalidate an unfinished ballot. Unanimous yes pauses/drains
 for that condition, not controller-defined product completion.
 
+### Pathfinder
+
+`pathfinder` is an optional settings object; omitted/null leaves it disabled.
+It runs one separately scheduled `@PATHFINDER` session outside the 2–10 peer
+slots and ballot electorate. Configure it through the operator settings import.
+The room displays its authenticated address and occupant; adding or removing
+Pathfinder currently uses `factory config`.
+
+Enabled Pathfinder defaults to `openai-codex-personal` / `gpt-6.1-sol` / `high`.
+Optional `provider`, `model`, `thinking` fields override those defaults using the
+supported routes. `contextWarning` defaults to 80. Like peers, Pathfinder has no
+runtime cost cap.
+
+Required assignment fields:
+
+- `bootstrap`: exact approved launch text that routes the agent through the common
+  reads, Factory Pathfinder Entry and Pathfinder Agent. Runtime appends assignment
+  JSON; it does not interpolate node IDs into this text.
+- `entry`, `agent`, `goal`: actual factory-entry, reusable-role and goal node UUIDs.
+- `question`: owner-supplied review question; `continuation`: existing review-owner
+  UUID or null. Project entry and tree roots come from the floor's existing
+  `instructions` and `roots` fields.
+- `codeRoots`: 1–100 existing absolute assigned directories.
+- `grant`: exactly `{"tree":"read-write","board":"read-write","code":"read-write"}`.
+- `resources`, `resultDestination`: explicit owner-authorized resources/limits and
+  where results belong, as bounded text.
+
+Incomplete assignments and invalid route overrides are rejected atomically.
+Setting it to null requests graceful retirement of its occupant. Assignment/route
+edits affect the next occupant. All fields and lifecycle text are retained in the
+launch snapshot.
+The common role nodes own mutation boundaries, Commit approval, Canopy and the
+Deslopifier. The assignment supplies cooperative access constraints, using the
+existing same-user tools; these are not an OS sandbox or automatic tree-write
+approval. Resolve unavailable tool access before deployment.
+
+While running and absent, the durable timer launches a pass after 30 minutes.
+An authenticated owner/peer post with a standalone uppercase `@PATHFINDER` mention
+wakes it on the next controller tick (normally within two seconds). Code literals,
+path tokens, system posts and Pathfinder's own posts do not trigger a launch.
+Requests stay ordinary board input. Old undelivered requests survive latest-30
+startup truncation. Active requests go to the one existing session through the
+normal durable USER-input receiver. Retiring sessions retain undelivered requests
+for a successor; their presence still prevents another launch.
+
+Ordinary `board done` / `messaged_outcome`, context retirement, errors and Stop use
+the existing session lifecycle. A clean settlement alone cannot release a live
+pane. Only verified native cleanup starts the next absence interval. Investigation
+results have no special scheduling trigger. Stopped/waiting/draining floors retain
+requests and require explicit Start; queued requests can wake Pathfinder after
+that Start. Independent jobs keep their current completion/control path.
+
+SQLite adds `floor_pathfinder` for the absence timestamp and delivered-request
+watermark. Recovery retains it; an older registered floor initializes the timer
+when first observed with Pathfinder configured. Deploy matching controller,
+board/CLI and room-reader source together: older dedicated-DB readers reject the
+new table. Source tests use disposable floors and transport fixtures. Live rollout,
+settings installation and real model qualification require separate authorization.
+
 ### Context retirement and independent jobs
 
 Floor workers persist a context-stop request at the configured threshold before
