@@ -31,10 +31,12 @@ OSS-floor selection calls the runtime's drain-before-reassignment operation;
 configure a local Qwen slot on the destination first. Selection does not start
 a stopped floor.
 
-Settings accepts only slot route/thinking/role/context settings and the owner
-condition. No browser-selected DB, source directory, executable, launch prompt
-or sender identity is accepted. Discovery/snapshots omit DB paths, bootstrap
-instructions and credentials. Runtime validation remains authoritative.
+Settings edits slot route/thinking/role/context settings, the owner condition,
+and the optional Pathfinder route and assignment, including approved launch text
+and assigned code directories. Both configuration paths use runtime validation and
+SQLite; saving does not start a stopped floor. No browser-selected DB, runtime
+source root, executable or sender identity is accepted. Discovery/snapshots omit
+DB paths, peer bootstrap instructions and credentials.
 
 ## Notifications
 

@@ -1,14 +1,16 @@
 // Disposable fixture only. Run with browser-harness installed; no workers/models.
 import { execFile } from 'node:child_process';
+import { PATHFINDER_DEFAULTS } from '../../floors/runtime.mjs';
 import { serveFloors } from '../../floors/room.mjs';
 const settings = id => ({ name: id, instructions: id === 'beta' ? null : '11111111-1111-4111-8111-111111111111', bootstrap: 'Fixture boot', warningText: 'Fixture warning', wrapupText: 'Fixture drain', voteCondition: `${id} dogfood`, slots: [1,2].map(n => ({ id: `slot-${n}`, provider: 'fixture', model: 'sol', thinking: 'high', role: '', contextWarning: 80 })) });
 const floors = new Map(['alpha','beta'].map(id => [id, { floor: settings(id), status: 'stopped', draining: false, posts: [], known: ['aaaaaaaa'], members: ['aaaaaaaa'], workers: [{ sender: 'aaaaaaaa', slot: 'slot-1', launch_config: { provider: 'fixture', model: 'old', thinking: 'high', role: 'current', contextWarning: 80 }, state: 'active' }] }]));
 let selectedFloor = 'alpha';
-const runtime = { ROUTES: [{ provider: 'fixture', model: 'sol', thinking: 'high' }, { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }],
+const runtime = { PATHFINDER_DEFAULTS, ROUTES: [{ provider: 'fixture', model: 'sol', thinking: 'high' }, { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }],
   listFloors: () => [...floors].map(([id,s]) => ({ id, name: id, status: s.status })), ossStatus: () => ({ selected: selectedFloor, floor: 'alpha', session: 'fixture-session' }),
   selectOssFloor: id => { selectedFloor = id; }, openFloor(id) {
     const s = floors.get(id); if (!s) throw Error('unknown floor');
-    return { snapshot(after) { return { ...s, slots: s.floor.slots, posts: s.posts.filter(p => p.number > after) }; },
+    return { board: { history({ before, limit }) { return { posts: s.posts.filter(p => p.number < before).slice(-limit), highwater: s.posts.at(-1)?.number ?? 0 }; } },
+      snapshot(after) { return { ...s, slots: s.floor.slots, posts: s.posts.filter(p => p.number > after) }; },
       configure(patch) { Object.assign(s.floor, patch); }, command(key, action, text) { if (action === 'message') s.posts.push({ number: s.posts.length + 1, role: 'owner', sender: 'JACK', text, created: new Date().toISOString() }); else s.status = action === 'start' ? 'running' : 'stopping'; }, close() {} };
   } };
 const room = await serveFloors({ runtime, ensureController() {} });

@@ -103,9 +103,11 @@ for that condition, not controller-defined product completion.
 
 `pathfinder` is an optional settings object; omitted/null leaves it disabled.
 It runs one separately scheduled `@PATHFINDER` session outside the 2–10 peer
-slots and ballot electorate. Configure it through the operator settings import.
-The room displays its authenticated address and occupant; adding or removing
-Pathfinder currently uses `factory config`.
+slots and ballot electorate. In room settings, enable Pathfinder, fill its
+assignment and save. The form edits its route and assignment; disabling and
+saving gracefully retires its occupant. The same settings remain available
+through `factory config`. Both paths save to SQLite `floor_settings`; timer and
+delivery state stay in `floor_pathfinder`. Saving settings never starts a stopped floor.
 
 Enabled Pathfinder defaults to `openai-codex-personal` / `gpt-6.1-sol` / `high`.
 Optional `provider`, `model`, `thinking` fields override those defaults using the

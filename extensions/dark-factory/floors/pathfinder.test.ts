@@ -204,6 +204,43 @@ test('pre-release launch failures retain requests and ownership-ambiguous launch
   assert.throws(() => h.tick(), /stable tmux IDs/); assert.equal(h.current().session, held.session);
 });
 
+test('room configuration uses SQLite for Pathfinder defaults, atomic edits and graceful removal without Start', async t => {
+  const h = fixture(t, {});
+  h.floor.configure({ pathfinder: null });
+  let recoveries = 0;
+  const room = await serveFloors({ root: h.root, ensureController() { recoveries++; } });
+  t.after(() => new Promise<void>(resolve => room.server.close(() => resolve())));
+  const auth = { Authorization: `Bearer ${room.token}` };
+  const read = () => fetch(`${room.origin}/api/floors/one/state`, { headers: auth }).then(r => r.json());
+  const post = body => fetch(`${room.origin}/api/floors/one/configuration`, { method: 'POST', headers: { ...auth, Origin: room.origin, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const discovery = await fetch(`${room.origin}/api/floors`, { headers: auth }).then(r => r.json());
+  assert.deepEqual(discovery.pathfinderDefaults, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80 });
+  assert.equal((await read()).settings.pathfinder, null);
+  assert.equal((await post({ pathfinder: h.pathfinder })).status, 200);
+  const configured = await read();
+  assert.equal(configured.status, 'stopped'); assert.equal(recoveries, 0);
+  assert.equal(configured.settings.pathfinder.provider, 'openai-codex-personal');
+  assert.deepEqual(configured.settings.pathfinder.codeRoots, h.pathfinder.codeRoots);
+  const reopened = openFloor('one', { root: h.root });
+  assert.deepEqual(reopened.settings().pathfinder, configured.settings.pathfinder); reopened.close();
+  const prior = h.floor.settings();
+  for (const body of [{}, { pathfinder: {} }, { pathfinder: false }, { pathfinder: { ...h.pathfinder, grant: {} } },
+    { pathfinder: { ...h.pathfinder, model: 'unapproved' } }, { pathfinder: null, slots: [] }, { pathfinder: null, command: '/bin/sh' }]) {
+    assert.equal((await post(body)).status, 400); assert.deepEqual(h.floor.settings(), prior);
+  }
+  h.start(); floorMessage(h, 'room-wake', '@PATHFINDER fixture'); h.tick(); h.ready(h.current());
+  const occupant = h.current();
+  const peers = h.peers().map(w => w.session);
+  assert.equal((await post({ pathfinder: { ...h.pathfinder, provider: 'openai-codex-fixture', model: 'gpt-6-luna', question: 'Edited fixture' } })).status, 200);
+  assert.equal(h.current().launch_config.model, 'gpt-6.1-sol');
+  assert.equal((await read()).settings.pathfinder.model, 'gpt-6-luna');
+  assert.deepEqual(h.peers().map(w => w.session), peers);
+  assert.equal((await post({ pathfinder: null })).status, 200);
+  assert.equal((await read()).settings.pathfinder, null);
+  assert.equal(h.current().session, occupant.session); assert.equal(h.current().retire_requested, 'slot removed');
+  assert.ok(h.peers().every(w => !w.retire_requested));
+});
+
 test('an explicitly configured local Pathfinder uses the same global OSS lease and cleanup barrier', t => {
   const h = fixture(t);
   const local = { ...h.pathfinder, provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' };

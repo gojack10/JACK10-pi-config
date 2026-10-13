@@ -16,6 +16,7 @@ export const ROUTES = Object.freeze([
   { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' },
   { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6-luna', thinking: 'high' },
 ]);
+export const PATHFINDER_DEFAULTS = Object.freeze({ provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80 });
 export const isOss = slot => slot?.provider === 'local' && slot.model === 'qwen3.8-flash-next';
 const code = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
@@ -63,7 +64,7 @@ export function validateSettings(input) {
   if (input.pathfinder != null) {
     const p = input.pathfinder;
     if (typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(k => !['provider','model','thinking','contextWarning','bootstrap','entry','agent','goal','question','continuation','codeRoots','resources','grant','resultDestination'].includes(k))) throw new Error('unknown Pathfinder setting');
-    const { provider = 'openai-codex-personal', model = 'gpt-6.1-sol', thinking = 'high', contextWarning } = p;
+    const { provider = PATHFINDER_DEFAULTS.provider, model = PATHFINDER_DEFAULTS.model, thinking = PATHFINDER_DEFAULTS.thinking, contextWarning = PATHFINDER_DEFAULTS.contextWarning } = p;
     const configuredRoute = validateSlot({ id: 'pathfinder', provider, model, thinking, contextWarning });
     for (const key of ['entry','agent','goal']) if (typeof p[key] !== 'string' || !uuid.test(p[key])) throw new Error(`Pathfinder ${key} must be a node UUID`);
     if (p.continuation != null && (typeof p.continuation !== 'string' || !uuid.test(p.continuation))) throw new Error('Pathfinder continuation must be a node UUID or null');
