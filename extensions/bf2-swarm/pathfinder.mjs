@@ -35,10 +35,20 @@ export function pathfinderStore(db, config) {
   };
 }
 
+export const PATHFINDER_ENTRY = '1aec93e4-a313-4948-828c-610c535e18a5';
+export const PATHFINDER_AGENT = '1f887f9a-2e1e-4c10-9969-db3f81237ce0';
 export function pathfinderMission(settings) {
-  const { bootstrap, provider, model, thinking, contextWarning, ...assignment } = settings.pathfinder;
-  return `${bootstrap}\n\nFactory Pathfinder assignment:\n${JSON.stringify({
+  return `You are @PATHFINDER, the floor's Pathfinder. Complete the common launch instructions' required reads below, then read Factory Pathfinder Entry ${PATHFINDER_ENTRY} and Pathfinder Agent ${PATHFINDER_AGENT} before choosing work. Pathfinder replaces the common entry's peer identity and self-selected worker assignment; its project reads, board and lifecycle mechanics still apply.
+Use the floor's current goal resolved through that same project entry. Directed @PATHFINDER board requests supply review questions; the continuation locator preserves unfinished review state.
+Use the floor checkout and project instructions to find relevant code. Preserve existing project permissions and write boundaries; discovering another path grants no write authority. Model settings and project instructions govern resources. Return findings through the factory board and existing work owners. Stop dependent work and report missing required reads or authority. Follow the common Stop, settlement and recovery instructions.
+
+Common floor launch instructions:
+${settings.bootstrap}
+
+Factory Pathfinder assignment:
+${JSON.stringify({
     identity: '@PATHFINDER', floor: settings.floorId, cwd: settings.cwd, roots: settings.roots,
-    instructions: settings.instructions, ...assignment,
+    instructions: settings.instructions, entry: PATHFINDER_ENTRY, agent: PATHFINDER_AGENT,
+    continuation: settings.pathfinder.continuation ?? null,
   }, null, 2)}\n`;
 }

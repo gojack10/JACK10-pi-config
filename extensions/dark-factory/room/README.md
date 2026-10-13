@@ -32,8 +32,9 @@ configure a local Qwen slot on the destination first. Selection does not start
 a stopped floor.
 
 Settings edits slot route/thinking/role/context settings, the owner condition,
-and the optional Pathfinder route and assignment, including approved launch text
-and assigned code directories. Both configuration paths use runtime validation and
+and the optional Pathfinder route and continuation. Pathfinder inherits the
+floor's goal, project entry, checkout and permissions; review questions go to
+`@PATHFINDER` on the board. Both configuration paths use runtime validation and
 SQLite; saving does not start a stopped floor. No browser-selected DB, runtime
 source root, executable or sender identity is accepted. Discovery/snapshots omit
 DB paths, peer bootstrap instructions and credentials.
