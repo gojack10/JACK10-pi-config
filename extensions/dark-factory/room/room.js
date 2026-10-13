@@ -14,7 +14,7 @@ if (fragmentRun && fragmentToken) {
 const { run, token, multi = false } = JSON.parse(sessionStorage.getItem('bf2-room') ?? '{}');
 const rooms = new Map();
 let selected = multi ? sessionStorage.getItem('factory-selected') : run;
-let state, busy = false, polling = false, routes = [], oss, audio, panelFloor, selectedLoaded = false, queuedFloor;
+let state, busy = false, polling = false, routes = [], pathfinderDefaults, oss, audio, panelFloor, selectedLoaded = false, queuedFloor;
 const storage = (store, key, fallback = null) => { try { return JSON.parse(store.getItem(key)) ?? fallback; } catch { return fallback; } };
 const save = (store, key, value) => { try { store.setItem(key, JSON.stringify(value)); } catch { /* Storage-disabled browsers still work for this page. */ } };
 const scoped = (kind, id) => `${multi ? 'factory' : 'bf2'}-${kind}:${id}`;
@@ -179,7 +179,7 @@ async function poll() {
   polling = true;
   try {
     if (multi) {
-      const discovery = await api('floors'); routes = discovery.routes; oss = discovery.oss;
+      const discovery = await api('floors'); routes = discovery.routes; pathfinderDefaults = discovery.pathfinderDefaults; oss = discovery.oss;
       const ids = new Set(discovery.floors.map(f => f.id));
       for (const f of discovery.floors) room(f.id, f.name);
       for (const id of rooms.keys()) if (!ids.has(id)) rooms.delete(id);
@@ -199,7 +199,7 @@ async function poll() {
     if (multi) {
       // Preserve already-validated operator provider aliases from configured slots.
       // Canonical runtime route templates may use a generic Codex provider.
-      for (const current of rooms.values()) for (const slot of current.state?.settings.slots ?? []) {
+      for (const current of rooms.values()) for (const slot of [...(current.state?.settings.slots ?? []), current.state?.settings.pathfinder].filter(Boolean)) {
         if (!routes.some(r => routeValue(r) === routeValue(slot))) routes.push({ provider: slot.provider, model: slot.model, thinking: slot.thinking });
       }
     }
@@ -225,7 +225,7 @@ async function mutate(action, body, id = selected) {
   if (busy) return false;
   busy = true; controls();
   try { await api(action, body, id); await poll(); return true; }
-  catch (error) { $('#status').textContent = error.message; if (!$('#settings-panel').hidden) $('#settings-error').textContent = error.message; return false; }
+  catch (error) { $('#status').textContent = error.message; if (!$('#settings-panel').hidden) $(action === 'configuration' && Object.hasOwn(body, 'pathfinder') ? '#pathfinder-error' : '#settings-error').textContent = error.message; return false; }
   finally { busy = false; controls(); if (queuedFloor) { const id = queuedFloor; queuedFloor = undefined; selectFloor(id); } }
 }
 $('#factory-control').addEventListener('click', () => {
@@ -249,23 +249,38 @@ $('#composer').addEventListener('submit', async e => {
   }
 });
 const routeValue = route => `${route.provider}/${route.model}`;
+function routeMarkup(slot) {
+  return `<label>Next model<select name="route">${routes.map(r => `<option value="${esc(routeValue(r))}" ${routeValue(r) === routeValue(slot) ? 'selected' : ''}>${esc(routeValue(r))}</option>`).join('')}</select></label><label>Next thinking<select name="thinking">${[...new Set(routes.map(r => r.thinking))].map(t => `<option ${t === slot.thinking ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
+}
 function slotMarkup(slot, index) {
   const current = state.workers?.filter(w => w.slotId === slot.id && !w.cleaned) ?? [];
-  return `<fieldset data-slot="${esc(slot.id)}"><legend>Slot ${index + 1}</legend><p class="muted">Current: ${current.length ? current.map(w => `${esc(w.sender)} · ${esc(w.provider)}/${esc(w.model)} · ${esc(w.thinking)} · ${esc(w.role || 'peer')} · warning ${esc(w.contextWarningPercent ?? 'unknown')}% · ${esc(w.phase ?? '')}`).join('<br>') : 'unoccupied'}</p><label>Next model<select name="route">${routes.map(r => `<option value="${esc(routeValue(r))}" ${routeValue(r) === routeValue(slot) ? 'selected' : ''}>${esc(routeValue(r))}</option>`).join('')}</select></label><label>Next thinking<select name="thinking">${[...new Set(routes.map(r => r.thinking))].map(t => `<option ${t === slot.thinking ? 'selected' : ''}>${t}</option>`).join('')}</select></label><label>Next role<textarea name="role" maxlength="16384">${esc(slot.role ?? '')}</textarea></label><label>Context warning % (advisory)<input name="contextWarningPercent" type="number" min="0.01" max="100" step="any" value="${esc(slot.contextWarningPercent)}" required></label><p class="muted">Context usage: ${current.map(w => w.contextPercent == null ? 'unknown' : `${esc(w.contextPercent)}%`).join(', ') || 'unknown'}</p><button type="button" data-remove-slot>Remove slot (drain)</button></fieldset>`;
+  return `<fieldset data-slot="${esc(slot.id)}"><legend>Slot ${index + 1}</legend><p class="muted">Current: ${current.length ? current.map(w => `${esc(w.sender)} · ${esc(w.provider)}/${esc(w.model)} · ${esc(w.thinking)} · ${esc(w.role || 'peer')} · warning ${esc(w.contextWarningPercent ?? 'unknown')}% · ${esc(w.phase ?? '')}`).join('<br>') : 'unoccupied'}</p>${routeMarkup(slot)}<label>Next role<textarea name="role" maxlength="16384">${esc(slot.role ?? '')}</textarea></label><label>Context warning % (advisory)<input name="contextWarningPercent" type="number" min="0.01" max="100" step="any" value="${esc(slot.contextWarningPercent)}" required></label><p class="muted">Context usage: ${current.map(w => w.contextPercent == null ? 'unknown' : `${esc(w.contextPercent)}%`).join(', ') || 'unknown'}</p><button type="button" data-remove-slot>Remove slot (drain)</button></fieldset>`;
 }
 function slotControls() {
   const fields = [...$('#slot-fields').children];
   $('#add-slot').disabled = fields.length >= 10;
   for (const field of fields) field.querySelector('[data-remove-slot]').disabled = fields.length <= 2;
 }
+const pathfinderTextFields = [['entry','Factory entry node UUID'], ['agent','Agent role node UUID'], ['goal','Goal node UUID'], ['continuation','Continuation node UUID (optional)'],
+  ['bootstrap','Approved launch text'], ['question','Review question'], ['codeRoots','Assigned code directories (one absolute path per line)'], ['resources','Authorized resources'], ['resultDestination','Result destination']];
+function pathfinderControls() {
+  const enabled = $('#pathfinder-enabled').checked;
+  $('#pathfinder-fields').hidden = !enabled; $('#pathfinder-fields').disabled = !enabled;
+}
 function openSettings() {
   if (!state?.settings) return;
   panelFloor = selected;
   $('#settings-panel').hidden = false;
   $('#slot-fields').innerHTML = state.settings.slots.map(slotMarkup).join('');
+  const p = state.settings.pathfinder ?? pathfinderDefaults;
+  $('#pathfinder-enabled').checked = !!state.settings.pathfinder;
+  $('#pathfinder-fields').innerHTML = `${routeMarkup(p)}<label>Context warning %<input name="contextWarning" type="number" min="0.01" max="100" step="any" value="${esc(p.contextWarning)}" required></label>${pathfinderTextFields.map(([key, label]) => `<label>${label}<textarea name="${key}" maxlength="${key === 'codeRoots' ? 65536 : 16384}" ${key === 'continuation' ? '' : 'required'}>${esc(key === 'codeRoots' ? (p[key] ?? []).join('\n') : p[key] ?? '')}</textarea></label>`).join('')}<p>Access: read/write assigned project tree, board and code.</p>`;
+  const current = state.workers?.find(w => w.slotId === '@PATHFINDER' && !w.cleaned);
+  $('#pathfinder-current').textContent = current ? `Current: @PATHFINDER · ${current.provider}/${current.model} · ${current.thinking} · ${current.phase} · context ${current.contextPercent ?? 'unknown'}%` : 'Current: unoccupied';
+  pathfinderControls();
   $('#vote-condition').value = state.settings.voteCondition ?? '';
   $('#oss-status').textContent = oss ? `OSS floor: ${oss.selectedFloor ?? oss.floorId ?? 'none'} · ${oss.status ?? (oss.draining ? 'draining' : oss.moving ? 'moving, waiting for drain' : 'status unknown')}` : 'OSS status unavailable';
-  $('#settings-error').textContent = ''; slotControls();
+  $('#settings-error').textContent = ''; $('#pathfinder-error').textContent = ''; slotControls();
 }
 $('#settings-toggle').addEventListener('click', openSettings);
 $('#settings-close').addEventListener('click', () => { $('#settings-panel').hidden = true; panelFloor = undefined; });
@@ -284,6 +299,20 @@ $('#slot-settings').addEventListener('submit', async e => {
   });
   if (slots.length < 2 || slots.length > 10) { $('#settings-error').textContent = 'Configure 2–10 slots'; return; }
   if (await mutate('configuration', { slots }) && panelFloor === selected) openSettings();
+});
+$('#pathfinder-enabled').addEventListener('change', pathfinderControls);
+$('#pathfinder-settings').addEventListener('submit', async e => {
+  e.preventDefault(); if (panelFloor !== selected) return;
+  let pathfinder = null;
+  if ($('#pathfinder-enabled').checked) {
+    const field = $('#pathfinder-fields'), value = name => field.querySelector(`[name=${name}]`).value;
+    const route = routes.find(r => routeValue(r) === value('route'));
+    pathfinder = { provider: route.provider, model: route.model, thinking: value('thinking'), contextWarning: Number(value('contextWarning')),
+      ...Object.fromEntries(pathfinderTextFields.map(([key]) => [key, value(key)])),
+      continuation: value('continuation').trim() || null, codeRoots: value('codeRoots').split('\n').map(s => s.trim()).filter(Boolean),
+      grant: { tree: 'read-write', board: 'read-write', code: 'read-write' } };
+  }
+  if (await mutate('configuration', { pathfinder }) && panelFloor === selected) openSettings();
 });
 $('#condition-settings').addEventListener('submit', async e => {
   e.preventDefault(); if (panelFloor !== selected) return;
