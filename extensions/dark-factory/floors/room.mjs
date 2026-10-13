@@ -16,13 +16,14 @@ const slot = s => ({ ...fields(s, ['id','provider','model','thinking','role']), 
 export function publicSnapshot(snapshot) {
   return { ...fields(snapshot, ['status','draining','pending','known','members','posts','vote']),
     settings: { name: snapshot.floor.name, voteCondition: snapshot.floor.voteCondition, slots: snapshot.slots.map(slot),
+      pathfinder: snapshot.floor.pathfinder ?? null,
       missingLaunchSettings: missingFloorLaunchSettings(snapshot.floor) },
     workers: snapshot.workers.map(w => ({ ...fields(w, ['cleaned']), sender: pathfinderAddress(w), slotId: w.slot,
       ...fields(w.launch_config, ['provider','model','thinking','role']), contextWarningPercent: w.launch_config?.contextWarning,
       phase: w.retire_requested ? 'retirement requested' : w.state, contextPercent: w.context_percent ?? null })) };
 }
 const validObject = (body, keys) => body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).every(k => keys.includes(k));
-const operations = { message: ['key','text'], start: ['key'], stop: ['key'], configuration: ['slots'], condition: ['condition'], oss: [] };
+const operations = { message: ['key','text'], start: ['key'], stop: ['key'], configuration: ['slots','pathfinder'], condition: ['condition'], oss: [] };
 
 // Runtime is the only discovery/store/lifecycle owner. Imports are deferred so this
 // adapter can be checked with a fake runtime without starting a worker or database.
@@ -51,7 +52,8 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
       if (!equal(request.headers.authorization, `Bearer ${token}`)) return send(403, { error: 'room capability required' });
       if (request.method === 'GET' && url.pathname === '/api/floors' && !url.search) {
         return send(200, { floors: runtime.listFloors({ root }).map(f => fields(f, ['id','name','status'])),
-          routes: runtime.ROUTES.map(r => fields(r, ['provider','model','thinking'])), oss: publicOss(runtime.ossStatus({ root })) });
+          routes: runtime.ROUTES.map(r => fields(r, ['provider','model','thinking'])), pathfinderDefaults: runtime.PATHFINDER_DEFAULTS,
+          oss: publicOss(runtime.ossStatus({ root })) });
       }
       const match = /^\/api\/floors\/([a-zA-Z0-9_-]+)\/([a-z]+)$/.exec(url.pathname);
       if (!match) return send(404, { error: 'unknown operation' });
@@ -77,8 +79,8 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
         chunks.push(chunk);
       }
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      if (!validObject(body, operations[action]) || operations[action].some(k => body[k] === undefined)) return send(400, { error: 'unexpected input' });
-      if (action === 'configuration' && (!Array.isArray(body.slots) || body.slots.length < 2 || body.slots.length > 10 ||
+      if (!validObject(body, operations[action]) || (action === 'configuration' ? !Object.keys(body).length : operations[action].some(k => body[k] === undefined))) return send(400, { error: 'unexpected input' });
+      if (action === 'configuration' && Object.hasOwn(body, 'slots') && (!Array.isArray(body.slots) || body.slots.length < 2 || body.slots.length > 10 ||
           body.slots.some(s => !validObject(s, ['id','provider','model','thinking','role','contextWarningPercent'])))) return send(400, { error: 'invalid slots' });
       if (action === 'oss') {
         // Selection names a discovered floor, never a path/executable. Runtime owns
@@ -87,7 +89,9 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
         return send(200, { oss: publicOss(runtime.ossStatus({ root })) });
       }
       floor = runtime.openFloor(id, { root });
-      if (action === 'configuration') floor.configure({ slots: body.slots.map(s => ({ ...fields(s, ['id','provider','model','thinking','role']), contextWarning: s.contextWarningPercent })) });
+      if (action === 'configuration') floor.configure({
+        ...(Object.hasOwn(body, 'slots') ? { slots: body.slots.map(s => ({ ...fields(s, ['id','provider','model','thinking','role']), contextWarning: s.contextWarningPercent })) } : {}),
+        ...(Object.hasOwn(body, 'pathfinder') ? { pathfinder: body.pathfinder } : {}) });
       else if (action === 'condition') floor.configure({ voteCondition: body.condition });
       else {
         floor.command(body.key, action, action === 'message' ? body.text : null);
@@ -99,6 +103,7 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
     } catch (error) {
       const message = error.message?.startsWith('floor start requires launch settings:') ? error.message :
         error.message?.includes('approved provider/model/thinking') ? 'Choose an approved model and thinking route' :
+        error.message?.startsWith('Pathfinder ') || error.message === 'unknown Pathfinder setting' || error.message?.startsWith('at most one OSS occupant') ? error.message :
         error.message?.includes('needs an OSS slot') ? 'Configure one local Qwen slot on this floor first' : 'Operation refused; check floor settings and availability';
       if (!response.headersSent) send(400, { error: message }); else response.end();
     }

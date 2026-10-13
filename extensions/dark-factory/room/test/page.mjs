@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { PATHFINDER_DEFAULTS } from '../../floors/runtime.mjs';
 import { esc, avatar, textMarkup, messageMarkup } from '../markup.mjs';
 
 export function page({ multi = false, snapshots = {}, shared = new Map(), saved = new Map(), permission = 'granted', fonts } = {}) {
@@ -33,7 +34,8 @@ export function page({ multi = false, snapshots = {}, shared = new Map(), saved 
     fetch: async (path, options) => {
       requests.push([path, options]);
       if (path === '/api/floors') return { ok: true, json: async () => ({ floors: Object.keys(snapshots).map(id => ({ id, name: id })),
-        routes: [{ provider: 'openai-codex-test', model: 'gpt-6.1-sol', thinking: 'high' }, { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }], oss: { status: 'draining' } }) };
+        pathfinderDefaults: PATHFINDER_DEFAULTS,
+        routes: [PATHFINDER_DEFAULTS, { provider: 'openai-codex-test', model: 'gpt-6.1-sol', thinking: 'high' }, { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' }], oss: { status: 'draining' } }) };
       const id = multi ? path.split('/')[3] : 'legacy', query = new URL(path, 'http://fixture.test').searchParams;
       const posts = query.has('before') ? snapshots[id].posts.filter(p => p.number < Number(query.get('before'))).slice(-100) : snapshots[id].posts.filter(p => p.number > Number(query.get('after'))).slice(0, 100);
       return { ok: true, json: async () => options.method === 'POST' ? { saved: true } : { ...snapshots[id], posts } };

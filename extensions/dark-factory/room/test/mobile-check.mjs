@@ -2,6 +2,7 @@
 // Requires browser-harness. Fictional in-memory runtime; never launches a controller/model.
 import { execFile } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { PATHFINDER_DEFAULTS } from '../../floors/runtime.mjs';
 import { serveFloors } from '../../floors/room.mjs';
 
 const slots = Array.from({ length: 6 }, (_, i) => ({ id: `slot-${i}`, provider: 'fixture', model: 'fictional-model', thinking: 'high', role: 'fixture peer', contextWarning: 80 }));
@@ -11,6 +12,7 @@ const posts = Array.from({ length: 350 }, (_, i) => ({ number: i + 1, role: 'pee
 const commands = [];
 const floor = { name: 'Fictional workshop', instructions: '11111111-1111-4111-8111-111111111111', bootstrap: 'Fixture', warningText: 'Fixture', wrapupText: 'Fixture', voteCondition: condition, slots };
 const runtime = {
+  PATHFINDER_DEFAULTS,
   ROUTES: [{ provider: 'fixture', model: 'fictional-model', thinking: 'high' }],
   listFloors: () => [{ id: 'fixture', name: floor.name, status: 'running' }, { id: 'other', name: 'Other fictional floor', status: 'running' }],
   ossStatus: () => ({}),

@@ -34,6 +34,39 @@ test('validated operator provider aliases stay selectable even when route templa
   assert.match(p.element('#slot-fields').innerHTML, /value="openai-codex-fixture\/gpt-6\.1-sol" selected/);
 });
 
+test('Pathfinder form defaults, optional removal, assignment payload and configured aliases remain floor scoped', async () => {
+  const s = snapshot(), p = page({ multi: true, snapshots: { alpha: s, beta: snapshot('beta') } });
+  await flushed(); p.openSettings();
+  assert.equal(p.element('#pathfinder-enabled').checked, false);
+  assert.equal(p.element('#pathfinder-fields').disabled, true);
+  assert.match(p.element('#pathfinder-fields').innerHTML, /value="openai-codex-personal\/gpt-6\.1-sol" selected/);
+  assert.match(p.element('#pathfinder-fields').innerHTML, /Approved launch text/);
+  p.element('#pathfinder-enabled').checked = true; p.element('#pathfinder-enabled').events.change();
+  assert.equal(p.element('#pathfinder-fields').hidden, false); assert.equal(p.element('#pathfinder-fields').disabled, false);
+  const values = { route: 'openai-codex-personal/gpt-6.1-sol', thinking: 'high', contextWarning: '80',
+    entry: 'entry', agent: 'agent', goal: 'goal', bootstrap: 'Fixture approved text', question: 'Fixture question',
+    continuation: '', codeRoots: '/fixture/a\n\n/fixture/b\n', resources: 'Fixture resources', resultDestination: 'Fixture destination' };
+  p.element('#pathfinder-fields').querySelector = selector => ({ value: values[selector.slice(6, -1)] });
+  await p.element('#pathfinder-settings').events.submit({ preventDefault() {} });
+  const configured = JSON.parse(p.requests.find(([path]) => path.endsWith('/configuration'))[1].body);
+  assert.deepEqual(Object.keys(configured), ['pathfinder']);
+  assert.equal(configured.pathfinder.provider, 'openai-codex-personal');
+  assert.equal(configured.pathfinder.continuation, null); assert.deepEqual(configured.pathfinder.codeRoots, ['/fixture/a', '/fixture/b']);
+  assert.deepEqual(configured.pathfinder.grant, { tree: 'read-write', board: 'read-write', code: 'read-write' });
+  s.settings.pathfinder = { ...configured.pathfinder, provider: 'openai-codex-fixture' };
+  s.workers = [{ slotId: '@PATHFINDER', provider: 'openai-codex-test', model: 'gpt-6-luna', thinking: 'high', phase: 'active', contextPercent: 12 }];
+  await p.poll(); p.openSettings();
+  assert.match(p.element('#pathfinder-fields').innerHTML, /value="openai-codex-fixture\/gpt-6\.1-sol" selected/);
+  assert.match(p.element('#pathfinder-current').textContent, /gpt-6-luna/);
+  p.element('#pathfinder-enabled').checked = false;
+  await p.element('#pathfinder-settings').events.submit({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(p.requests.filter(([path]) => path.endsWith('/configuration')).at(-1)[1].body), { pathfinder: null });
+  p.selectFloor('beta'); p.openSettings(); assert.equal(p.element('#pathfinder-enabled').checked, false);
+  p.selectFloor('alpha');
+  await p.element('#pathfinder-settings').events.submit({ preventDefault() {} });
+  assert.equal(p.requests.filter(([path]) => path.endsWith('/configuration')).length, 2, 'switching floors closes stale form');
+});
+
 test('settings expose current versus next config, advisory unknown usage, owner condition and safe OSS move', async () => {
   const snapshots = { alpha: snapshot() }, p = page({ multi: true, snapshots });
   snapshots.alpha.workers = [{ sender: 'aaaaaaaa', slotId: '1', provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh', role: 'current role', phase: 'draining' }];
