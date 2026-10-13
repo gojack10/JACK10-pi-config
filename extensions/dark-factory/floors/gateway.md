@@ -14,7 +14,7 @@ Environment inputs:
 - `FACTORY_GATEWAY_PORT`: loopback port, default 64375; 0 selects a disposable port.
 - `FACTORY_READER_CODE`: absolute source/pin root for reader runtime exports.
   Unset means this checkout. Its board reader must accept the additive floor
-  schema (`factory_jobs`, `floor_retirement_input`); the tracked reader does.
+  schema (`factory_jobs`, `floor_retirement_input`, `floor_pathfinder`); the tracked reader does.
 - `FACTORY_CONTROLLER_CODE`: absolute approved source/pin root for the selected
   floor's `openFloor` and native `ensureFloorController`. Unset means this checkout.
 - `FACTORY_CONTROLLER_FLOOR`: selected floor ID, default `core`.

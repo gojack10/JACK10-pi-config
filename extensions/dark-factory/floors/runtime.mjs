@@ -35,9 +35,18 @@ const text = (value, label, optional = false) => {
   if (typeof value !== 'string' || (!optional && !value.trim()) || value.includes('\0') || Buffer.byteLength(value) > 16384) throw new Error(`${label} must be bounded text without NUL`);
   return value;
 };
+function validateSlot(s) {
+  if (!s || Object.keys(s).some(k => !['id','provider','model','thinking','role','contextWarning'].includes(k))) throw new Error('unknown slot setting');
+  const id = validId(s.id);
+  if (typeof s.provider !== 'string' || !ROUTES.some(r => (r.providerPattern ? new RegExp(r.providerPattern).test(s.provider) : r.provider === s.provider) && r.model === s.model && r.thinking === s.thinking)) throw new Error('slot requires an explicitly approved provider/model/thinking route');
+  const contextWarning = s.contextWarning ?? 80;
+  if (typeof contextWarning !== 'number' || !Number.isFinite(contextWarning) || contextWarning <= 0 || contextWarning > 100) throw new Error('contextWarning must be >0 and <=100 percent');
+  if (s.role !== undefined && typeof s.role !== 'string') throw new Error('role must be text');
+  return { id, provider: s.provider, model: s.model, thinking: s.thinking, role: text(s.role ?? '', 'role', true), contextWarning };
+}
 export function validateSettings(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('floor settings must be an object');
-  const keys = ['name','cwd','roots','instructions','voteCondition','slots','bootstrap','warningText','wrapupText'];
+  const keys = ['name','cwd','roots','instructions','voteCondition','slots','bootstrap','warningText','wrapupText','pathfinder'];
   if (Object.keys(input).some(k => !keys.includes(k))) throw new Error('unknown floor setting');
   const name = text(input.name, 'name');
   if (!isAbsolute(input.cwd ?? '') || /[\0\n\r]/.test(input.cwd)) throw new Error('cwd must be an absolute checkout path');
@@ -48,17 +57,26 @@ export function validateSettings(input) {
   if (input.voteCondition != null && (typeof input.voteCondition !== 'string' || !uuid.test(input.voteCondition))) throw new Error('voteCondition must be a tree node UUID or null while stopped');
   const voteCondition = input.voteCondition ?? null;
   if (!Array.isArray(input.slots) || input.slots.length < 2 || input.slots.length > 10) throw new Error('floor requires 2-10 slots');
-  const slots = input.slots.map(s => {
-    if (!s || Object.keys(s).some(k => !['id','provider','model','thinking','role','contextWarning'].includes(k))) throw new Error('unknown slot setting');
-    const id = validId(s.id);
-    if (typeof s.provider !== 'string' || !ROUTES.some(r => (r.providerPattern ? new RegExp(r.providerPattern).test(s.provider) : r.provider === s.provider) && r.model === s.model && r.thinking === s.thinking)) throw new Error('slot requires an explicitly approved provider/model/thinking route');
-    const contextWarning = s.contextWarning ?? 80;
-    if (typeof contextWarning !== 'number' || !Number.isFinite(contextWarning) || contextWarning <= 0 || contextWarning > 100) throw new Error('contextWarning must be >0 and <=100 percent');
-    if (s.role !== undefined && typeof s.role !== 'string') throw new Error('role must be text');
-    return { id, provider: s.provider, model: s.model, thinking: s.thinking, role: text(s.role ?? '', 'role', true), contextWarning };
-  });
+  const slots = input.slots.map(validateSlot);
   if (new Set(slots.map(s => s.id)).size !== slots.length || slots.filter(isOss).length > 1) throw new Error('slot IDs must be unique; at most one OSS slot per floor');
-  return { name, cwd, roots: [...new Set(input.roots)], instructions: input.instructions ?? null, voteCondition, slots,
+  let pathfinder = null;
+  if (input.pathfinder != null) {
+    const p = input.pathfinder;
+    if (typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(k => !['provider','model','thinking','contextWarning','bootstrap','entry','agent','goal','question','continuation','codeRoots','resources','grant','resultDestination'].includes(k))) throw new Error('unknown Pathfinder setting');
+    const { provider = 'openai-codex-personal', model = 'gpt-6.1-sol', thinking = 'high', contextWarning } = p;
+    const configuredRoute = validateSlot({ id: 'pathfinder', provider, model, thinking, contextWarning });
+    for (const key of ['entry','agent','goal']) if (typeof p[key] !== 'string' || !uuid.test(p[key])) throw new Error(`Pathfinder ${key} must be a node UUID`);
+    if (p.continuation != null && (typeof p.continuation !== 'string' || !uuid.test(p.continuation))) throw new Error('Pathfinder continuation must be a node UUID or null');
+    if (!Array.isArray(p.codeRoots) || !p.codeRoots.length || p.codeRoots.length > 100 || p.codeRoots.some(r => typeof r !== 'string' || !isAbsolute(r) || /[\0\n\r]/.test(r))) throw new Error('Pathfinder codeRoots must be absolute assigned paths');
+    const codeRoots = [...new Set(p.codeRoots.map(r => realpathSync(r)))];
+    if (codeRoots.some(r => !statSync(r).isDirectory())) throw new Error('Pathfinder codeRoots must be directories');
+    if (!p.grant || Object.keys(p.grant).sort().join(',') !== 'board,code,tree' || Object.values(p.grant).some(v => v !== 'read-write')) throw new Error('Pathfinder requires explicit read-write tree, board and code grant');
+    pathfinder = { ...Object.fromEntries(['provider','model','thinking','contextWarning'].map(k => [k, configuredRoute[k]])),
+      ...Object.fromEntries(['bootstrap','question','resources','resultDestination'].map(k => [k, text(p[k], `Pathfinder ${k}`)])),
+      entry: p.entry, agent: p.agent, goal: p.goal, continuation: p.continuation ?? null, codeRoots, grant: { ...p.grant } };
+  }
+  if (slots.filter(isOss).length + Number(isOss(pathfinder)) > 1) throw new Error('at most one OSS occupant per floor, including Pathfinder');
+  return { name, cwd, roots: [...new Set(input.roots)], instructions: input.instructions ?? null, voteCondition, slots, pathfinder,
     ...Object.fromEntries(['bootstrap','warningText','wrapupText'].map(key => [key, input[key] == null ? null : text(input[key], key)])) };
 }
 const launchSettings = (settings, root, id, runDir, agentDir) => ({ ...settings, floorId: id, floorRoot: root, root: settings.roots[0],
@@ -116,7 +134,7 @@ export function openFloor(id, { root = DEFAULT_ROOT } = {}) {
     },
     snapshot(after = 0) {
       const state = board.lifecycle.status();
-      return { ...board.roomSnapshot(after), floor: { id, ...state.floor }, workers: state.workers, slots: state.floor.slots, jobs: board.jobs.list() };
+      return { ...board.roomSnapshot(after), floor: { id, ...state.floor }, workers: state.workers, slots: state.floor.slots, pathfinder: state.pathfinder, jobs: board.jobs.list() };
     },
     command: (key, action, value = null) => board.lifecycle.ownerCommand(key, action, value),
     close: () => board.close() };
@@ -146,7 +164,7 @@ export function adoptFloor(runDir, input, { root = DEFAULT_ROOT, id } = {}) {
   if (existsSync(join(dir, 'floor.sqlite'))) {
     const prior = openFloor(id, { root });
     try {
-      if (realpathSync(prior.database) !== realpathSync(join(runDir, 'board.sqlite')) || JSON.stringify(prior.settings()) !== JSON.stringify(settings)) throw new Error('floor already adopted with different source or settings');
+      if (realpathSync(prior.database) !== realpathSync(join(runDir, 'board.sqlite')) || JSON.stringify(validateSettings(prior.settings())) !== JSON.stringify(settings)) throw new Error('floor already adopted with different source or settings');
       return { id, database: prior.database, name: settings.name, status: prior.snapshot().status };
     } finally { prior.close(); }
   }
@@ -181,7 +199,7 @@ export const ossStatus = ({ root = DEFAULT_ROOT } = {}) => withOss(root, db => (
 export function selectOssFloor(id, { root = DEFAULT_ROOT } = {}) {
   if (id !== null) {
     const floor = openFloor(id, { root });
-    try { if (!floor.settings().slots.some(isOss)) throw new Error('selected floor needs an OSS slot'); }
+    try { if (!floor.settings().slots.some(isOss) && !isOss(floor.settings().pathfinder)) throw new Error('selected floor needs an OSS slot'); }
     finally { floor.close(); }
   }
   const state = withOss(root, db => { db.prepare('UPDATE oss SET selected=?').run(id); return { ...db.prepare('SELECT selected,floor,session FROM oss').get() }; });

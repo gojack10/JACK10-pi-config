@@ -1,5 +1,6 @@
 // Cooperative run state, not authentication against agents rewriting local files.
 import { randomBytes } from 'node:crypto';
+import { pathfinderStore, PATHFINDER_SLOT } from './pathfinder.mjs';
 
 export const missingFloorLaunchSettings = settings => ['instructions','voteCondition','bootstrap','warningText','wrapupText'].filter(key => !settings?.[key]);
 const requireFloorLaunchSettings = settings => {
@@ -8,6 +9,7 @@ const requireFloorLaunchSettings = settings => {
 };
 
 export function lifecycleStore(db, transaction, config, insertPost) {
+  const pathfinder = pathfinderStore(db, config);
   const exists = () => !!db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get();
   const floor = () => db.prepare("SELECT name FROM sqlite_master WHERE name='floor_settings'").get() ?
     JSON.parse(db.prepare('SELECT settings FROM floor_settings').get().settings) : null;
@@ -16,7 +18,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   const status = () => {
     if (!exists()) throw new Error('this board has no experimental lifecycle');
     const run = db.prepare('SELECT * FROM swarm_run').get();
-    return { ...run, config: JSON.parse(run.config), floor: floor(), vote: openVote(), workers: db.prepare('SELECT * FROM swarm_workers ORDER BY rowid').all().map(w => ({ ...w, ...(w.launch_config ? { launch_config: JSON.parse(w.launch_config) } : {}) })) };
+    return { ...run, config: JSON.parse(run.config), floor: floor(), pathfinder: pathfinder.state(), vote: openVote(), workers: db.prepare('SELECT * FROM swarm_workers ORDER BY rowid').all().map(w => ({ ...w, ...(w.launch_config ? { launch_config: JSON.parse(w.launch_config) } : {}) })) };
   };
   const worker = () => {
     status();
@@ -33,7 +35,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
   const ownerBallot = () => {
     const settings = floor();
     if (!settings?.voteCondition || openVote()) return openVote();
-    const run = status(), peers = run.workers.filter(w => !w.cleaned);
+    const run = status(), peers = run.workers.filter(w => !w.cleaned && w.slot !== PATHFINDER_SLOT);
     if (run.status !== 'running' || peers.length !== settings.slots.length || peers.some(w => w.state !== 'active' || w.retire_requested) ||
       settings.slots.some(s => !peers.some(w => w.slot === s.id))) return;
     const number = system(`Owner ballot condition node: ${settings.voteCondition}`);
@@ -62,6 +64,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     if (vote) closeVote(vote, 'cancelled', 'JACK stopped the factory');
     const next = run.workers.some(w => !w.cleaned) ? 'stopping' : 'stopped';
     db.prepare('UPDATE swarm_run SET status=?, request=NULL, reconvene=0').run(next);
+    pathfinder.reset(false);
     for (const peer of run.workers.filter(w => !w.cleaned)) retirementInput(peer.session);
     if (run.status !== next || run.reconvene) system('JACK requested a stop, agents finish safely with no replacements');
   };
@@ -70,6 +73,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
     if (run.status === 'running' || run.workers.some(w => !w.cleaned)) return;
     if (run.reconvene) {
       db.prepare("UPDATE swarm_run SET status='running', request=NULL, reconvene=0").run();
+      pathfinder.reset(true);
       system('JACK reconvened the factory with fresh capacity');
     } else if (run.status === 'stopping') {
       db.prepare("UPDATE swarm_run SET status='stopped'").run();
@@ -101,12 +105,14 @@ export function lifecycleStore(db, transaction, config, insertPost) {
       return transaction(() => {
         if (status().status !== 'running') return false;
         const settings = floor();
-        if (db.prepare('SELECT COUNT(*) AS n FROM swarm_workers WHERE cleaned=0').get().n >= (settings?.slots.length ?? 3)) return false;
-        const slot = settings?.slots.find(s => s.id === allocation.slot);
+        const specialist = allocation.slot === PATHFINDER_SLOT;
+        if (specialist ? !pathfinder.due(status()) : db.prepare(`SELECT COUNT(*) AS n FROM swarm_workers WHERE cleaned=0 ${settings ? "AND slot != '@PATHFINDER'" : ''}`).get().n >= (settings?.slots.length ?? 3)) return false;
+        const slot = specialist ? settings?.pathfinder : settings?.slots.find(s => s.id === allocation.slot);
         if (settings && (!slot || db.prepare('SELECT session FROM swarm_workers WHERE slot=? AND cleaned=0').get(allocation.slot) ||
-          Object.keys(slot).some(k => slot[k] !== allocation.launchConfig?.[k]))) return false;
+          Object.keys(slot).some(k => JSON.stringify(slot[k]) !== JSON.stringify(allocation.launchConfig?.[k])))) return false;
         const vote = openVote();
-        if (vote) closeVote(vote, 'cancelled', 'Electorate changed, work continues');
+        if (vote && !specialist) closeVote(vote, 'cancelled', 'Electorate changed, work continues');
+        if (specialist) pathfinder.present();
         db.prepare('INSERT INTO board_sessions(session,sender) VALUES (?,?)').run(session, sender);
         if (settings) db.prepare("INSERT INTO swarm_workers(session,sender,pane,state,slot,launch_config) VALUES (?,?,?,'launching',?,?)").run(session, sender, pane, allocation.slot, JSON.stringify(allocation.launchConfig));
         else db.prepare("INSERT INTO swarm_workers(session,sender,pane,state) VALUES (?,?,?,'launching')").run(session, sender, pane);
@@ -115,6 +121,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
           try { launch(receipt => db.prepare('UPDATE swarm_workers SET pane=?, tmux_session=? WHERE session=?').run(receipt.pane, receipt.session, session)); }
           catch (error) {
             db.prepare("UPDATE swarm_workers SET state='launch-failed', cleaned=? WHERE session=?").run(error.ownedChild ? 0 : 1, session);
+            if (specialist && !error.ownedChild) pathfinder.reset(true);
             system(settings ? `${sender} launch failed: ${String(error.message).slice(0, 1000)}. Session ID: ${session}; JSONL not registered (Pi startup not established). Replacement waits for actual cleanup.` :
               `${sender} launch failed: ${String(error.message).slice(0, 1000)}. Retrying after ordinary delay.`);
           }
@@ -147,7 +154,8 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const changed = db.prepare('UPDATE swarm_workers SET cleaned=1 WHERE session=? AND cleaned=0').run(session).changes;
         if (changed) {
           cancelDeparture(session);
-          const row = db.prepare('SELECT sender,state FROM swarm_workers WHERE session=?').get(session);
+          const row = db.prepare('SELECT * FROM swarm_workers WHERE session=?').get(session);
+          if (row.slot === PATHFINDER_SLOT) pathfinder.reset(status().status === 'running');
           system(`${row.sender} left${row.state === 'retired' ? ' after saving progress' : ''}`);
         }
       });
@@ -163,7 +171,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         keyCheck(key);
         const run = status();
         if (run.floor) {
-          worker();
+          if (worker().slot === PATHFINDER_SLOT) throw new Error('Pathfinder is outside peer ballot membership');
           if (!this.acceptsInput()) throw new Error('ballots are unavailable during retirement');
           if (reason !== run.floor.voteCondition) throw new Error('only the owner may configure the floor ballot condition');
           const vote = ownerBallot();
@@ -208,6 +216,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         else if (vote.electorate.every(v => v.answer === 'yes')) {
           closeVote(vote, 'agreed', floor() ? 'Unanimous yes, waiting for JACK' : 'Three yes, waiting for JACK');
           db.prepare("UPDATE swarm_run SET status='waiting', request=?, reconvene=0").run(number);
+          pathfinder.reset(false);
           for (const peer of run.workers.filter(w => !w.cleaned)) retirementInput(peer.session);
         }
         return getVote(db.prepare('SELECT * FROM swarm_votes WHERE number=?').get(number));
@@ -320,7 +329,9 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         if (vote && (old.voteCondition !== settings.voteCondition || JSON.stringify(old.slots.map(s => s.id).sort()) !== JSON.stringify(settings.slots.map(s => s.id).sort()))) closeVote(vote, 'cancelled', 'Owner condition or configured membership changed; old votes invalidated');
         db.prepare('UPDATE floor_settings SET settings=?').run(JSON.stringify(settings));
         db.prepare('UPDATE swarm_run SET config=?').run(JSON.stringify(launchSettings));
-        for (const w of status().workers.filter(w => !w.cleaned && !settings.slots.some(s => s.id === w.slot))) {
+        if (!old.pathfinder && settings.pathfinder) pathfinder.reset(run.status === 'running');
+        if (!settings.pathfinder) pathfinder.reset(false);
+        for (const w of status().workers.filter(w => !w.cleaned && (w.slot === PATHFINDER_SLOT ? !settings.pathfinder : !settings.slots.some(s => s.id === w.slot)))) {
           db.prepare('UPDATE swarm_workers SET retire_requested=? WHERE session=?').run('slot removed', w.session);
           retirementInput(w.session);
         }

@@ -6,7 +6,7 @@ export function textMarkup(text, known) {
     let result = '', last = 0;
     // Conservative boundaries reject UUID components, longer hashes, filenames,
     // paths and URL tokens. Registration, not regex alone, establishes a person.
-    for (const m of part.matchAll(/(^|[^A-Za-z0-9_@/\\.\-])@?(JACK|[a-f0-9]{8})(?![A-Za-z0-9_@/\\.\-])/g)) {
+    for (const m of part.matchAll(/(^|[^A-Za-z0-9_@/\\.\-])@?(JACK|PATHFINDER|[a-f0-9]{8})(?![A-Za-z0-9_@/\\.\-])/g)) {
       const start = m.index + m[1].length, end = m.index + m[0].length;
       const token = part.slice(0, start).match(/\S*$/)[0] + part.slice(start).match(/^\S*/)[0];
       result += esc(part.slice(last, start));

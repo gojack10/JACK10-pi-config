@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { lifecycleStore } from './lifecycle-store.mjs';
 import { jobStore } from './jobs.mjs';
+import { pathfinderStore, pathfinderAddress, PATHFINDER_SLOT } from './pathfinder.mjs';
 
 export const HISTORY_LIMIT = 30;
 export const BATCH_LIMIT = 100;
@@ -41,7 +42,7 @@ export function openBoard(config) {
     db.exec('PRAGMA busy_timeout=5000');
     // Dedicated databases only: never silently retrofit an unrelated SQLite file.
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings', 'factory_jobs', 'floor_retirement_input'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
+    if (tables.some(t => !['board_run', 'board_sessions', 'board_posts', 'swarm_run', 'swarm_workers', 'swarm_votes', 'swarm_commands', 'floor_settings', 'factory_jobs', 'floor_retirement_input', 'floor_pathfinder'].includes(t.name))) throw new Error('not a dedicated BF2 board database');
     if (config.floor && (!tables.some(t => t.name === 'floor_settings') || db.prepare('SELECT id FROM floor_settings').get()?.id !== config.floor)) throw new Error('database belongs to another floor');
     if (tables.some(t => t.name === 'board_run') && db.prepare('SELECT run FROM board_run').get()?.run !== config.run) throw new Error('database belongs to another run');
     if (tables.some(t => t.name === 'swarm_run') && !db.prepare('PRAGMA table_info(swarm_run)').all().some(c => c.name === 'room_token')) throw new Error('legacy swarm format; use its original code for history and start a fresh room run');
@@ -67,7 +68,9 @@ export function openBoard(config) {
           number INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
           session TEXT NOT NULL, sender TEXT NOT NULL, created TEXT NOT NULL, text TEXT NOT NULL,
           role TEXT NOT NULL DEFAULT 'peer' CHECK(role IN ('peer','owner','system')));`);
-      if (config.floor) db.exec(`CREATE TABLE IF NOT EXISTS floor_retirement_input (session TEXT PRIMARY KEY, cursor INTEGER NOT NULL, pending TEXT, override_reason TEXT);`);
+      if (config.floor) db.exec(`CREATE TABLE IF NOT EXISTS floor_retirement_input (session TEXT PRIMARY KEY, cursor INTEGER NOT NULL, pending TEXT, override_reason TEXT);
+        CREATE TABLE IF NOT EXISTS floor_pathfinder (id INTEGER PRIMARY KEY CHECK(id=1), absent_since REAL, delivered INTEGER NOT NULL DEFAULT 0);
+        INSERT OR IGNORE INTO floor_pathfinder(id) VALUES (1);`);
       db.prepare('INSERT OR IGNORE INTO board_run VALUES (1, ?)').run(config.run);
       if (db.prepare('SELECT run FROM board_run').get().run !== config.run) throw new Error('database belongs to another run');
       const identity = db.prepare('SELECT sender FROM board_sessions WHERE session=?').get(config.session);
@@ -79,7 +82,7 @@ export function openBoard(config) {
   } catch (error) { db.close(); throw error; }
 
   const hasRoles = db.prepare('PRAGMA table_info(board_posts)').all().some(c => c.name === 'role');
-  const columns = `number, sender, created, text, ${hasRoles ? 'role' : "'peer' AS role"}`;
+  const columns = `number, ${config.floor ? `CASE WHEN session IN (SELECT session FROM swarm_workers WHERE slot='${PATHFINDER_SLOT}') THEN 'PATHFINDER' ELSE sender END AS sender` : 'sender'}, created, text, ${hasRoles ? 'role' : "'peer' AS role"}`;
   const state = () => db.prepare('SELECT cursor, pending FROM board_sessions WHERE session=?').get(config.session);
   const insertPost = (text, session = config.session, sender = config.sender, role = 'peer') => {
     if (typeof text !== 'string' || !text.trim() || text.includes('\0') || Buffer.byteLength(text) > MAX_TEXT_BYTES) throw new Error(`post requires nonempty text without NUL, at most ${MAX_TEXT_BYTES} UTF-8 bytes`);
@@ -104,7 +107,8 @@ export function openBoard(config) {
     return { key, through: posts.at(-1).number, text: `BF2 board batch ${key}\n${formatPosts(config.run, posts)}`, ...extra };
   };
   const jobs = jobStore(db, transaction, config, insertPost);
-  const retainedJobs = () => jobs.terminalNumbers();
+  const pathfinder = pathfinderStore(db, config);
+  const retainedInputs = () => [...jobs.terminalNumbers(), ...(config.floor && db.prepare('SELECT slot FROM swarm_workers WHERE session=?').get(config.session)?.slot === PATHFINDER_SLOT ? pathfinder.requests() : [])];
   const compactTerminals = posts => {
     const pending = new Map(jobs.pending().map(j => [j.terminal_number, j]));
     return posts.map(post => {
@@ -113,9 +117,9 @@ export function openBoard(config) {
     });
   };
   const terminalBatch = (after, until) => {
-    const posts = db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT);
+    const posts = db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedInputs().join(',') || 'NULL'}) AND number > ? AND number <= ? ORDER BY number LIMIT ?`).all(after, until, BATCH_LIMIT);
     const batch = batchFor(compactTerminals(posts), { wakeUntil: until });
-    return batch && { ...batch, text: `${batch.text}\nUnhandled results only. Inspect: factory-job status --key UUID. After recording/acting on the result: factory-job handled --key UUID --reason 'evidence/action pointer'. Delivery is not handling or acceptance.` };
+    return batch && { ...batch, text: batch.text + (posts.some(p => jobs.terminalNumbers().includes(p.number)) ? `\nUnhandled results only. Inspect: factory-job status --key UUID. After recording/acting on the result: factory-job handled --key UUID --reason 'evidence/action pointer'. Delivery is not handling or acceptance.` : '') };
   };
   const retirementInput = () => config.floor && db.prepare('SELECT * FROM floor_retirement_input WHERE session=? AND override_reason IS NULL').get(config.session);
   return {
@@ -134,7 +138,7 @@ export function openBoard(config) {
         return {
           posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number < ? ${terminalPosts.length ? `AND number NOT IN (${terminalPosts.join(',')})` : ''} ORDER BY number DESC LIMIT ?`).all(before, limit).reverse(),
           wake: before === Number.MAX_SAFE_INTEGER && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get() ?
-            compactTerminals(db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedJobs().join(',') || 'NULL'}) AND number < ? ORDER BY number`).all(before)) : [],
+            compactTerminals(db.prepare(`SELECT ${columns} FROM board_posts WHERE number IN (${retainedInputs().join(',') || 'NULL'}) AND number < ? ORDER BY number`).all(before)) : [],
           highwater: db.prepare('SELECT COALESCE(MAX(number), 0) AS n FROM board_posts').get().n,
           startup,
         };
@@ -146,8 +150,8 @@ export function openBoard(config) {
         const run = this.lifecycle.status();
         return { run: config.run, status: run.status, pending: !!run.reconvene,
           draining: run.workers.some(w => !w.cleaned) && run.status !== 'running',
-          members: run.workers.filter(w => !w.cleaned && ['active','retiring','retired'].includes(w.state)).map(w => w.sender),
-          known: run.workers.map(w => w.sender), vote: run.vote,
+          members: run.workers.filter(w => !w.cleaned && ['active','retiring','retired'].includes(w.state)).map(pathfinderAddress),
+          known: [...new Set([...run.workers.map(pathfinderAddress), ...(run.floor?.pathfinder ? ['PATHFINDER'] : [])])], vote: run.vote,
           posts: db.prepare(`SELECT ${columns} FROM board_posts WHERE number > ? ORDER BY number LIMIT 100`).all(after) };
       });
     },
@@ -155,8 +159,9 @@ export function openBoard(config) {
       // Only unhandled results survive startup truncation; delivery never marks them handled.
       transaction(() => {
         const changed = db.prepare('UPDATE board_sessions SET cursor=? WHERE session=? AND cursor IS NULL').run(highwater, config.session).changes;
+        if (changed) pathfinder.delivered(highwater);
         if (changed && db.prepare("SELECT name FROM sqlite_master WHERE name='swarm_run'").get()) {
-          const terminals = retainedJobs();
+          const terminals = retainedInputs();
           if (terminals.length) {
             const batch = terminalBatch(Math.min(...terminals) - 1, highwater);
             if (batch) db.prepare('UPDATE board_sessions SET pending=? WHERE session=?').run(JSON.stringify(batch), config.session);
@@ -184,6 +189,7 @@ export function openBoard(config) {
         if (!current.pending) return;
         const pending = JSON.parse(current.pending);
         if (pending.key !== key) throw new Error('pending batch changed');
+        pathfinder.delivered(pending.through);
         if (pending.wakeUntil !== undefined) {
           const next = terminalBatch(pending.through, pending.wakeUntil);
           db.prepare('UPDATE board_sessions SET pending=? WHERE session=?').run(next ? JSON.stringify(next) : null, config.session);

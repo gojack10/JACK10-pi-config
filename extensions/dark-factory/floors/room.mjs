@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { missingFloorLaunchSettings } from '../../bf2-swarm/lifecycle-store.mjs';
+import { pathfinderAddress } from '../../bf2-swarm/pathfinder.mjs';
 
 const assets = new URL('../room/', import.meta.url);
 const files = { '/': ['index.html', 'text/html; charset=utf-8'], '/room.js': ['room.js', 'text/javascript'],
@@ -16,7 +17,7 @@ export function publicSnapshot(snapshot) {
   return { ...fields(snapshot, ['status','draining','pending','known','members','posts','vote']),
     settings: { name: snapshot.floor.name, voteCondition: snapshot.floor.voteCondition, slots: snapshot.slots.map(slot),
       missingLaunchSettings: missingFloorLaunchSettings(snapshot.floor) },
-    workers: snapshot.workers.map(w => ({ ...fields(w, ['sender','cleaned']), slotId: w.slot,
+    workers: snapshot.workers.map(w => ({ ...fields(w, ['cleaned']), sender: pathfinderAddress(w), slotId: w.slot,
       ...fields(w.launch_config, ['provider','model','thinking','role']), contextWarningPercent: w.launch_config?.contextWarning,
       phase: w.retire_requested ? 'retirement requested' : w.state, contextPercent: w.context_percent ?? null })) };
 }

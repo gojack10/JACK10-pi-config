@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { openBoard } from './board.mjs';
+import { PATHFINDER_SLOT, pathfinderMission } from './pathfinder.mjs';
 
 const code = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '../..'));
 export const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`;
@@ -124,14 +125,16 @@ export function tick(board, config, execute = tmux, env = process.env, hooks = {
   if (checked(execute, ['show-options', '-qv', '-t', parent, '@bf2_swarm_run']) !== config.run) throw new Error('parent ownership tag changed; refusing launch');
   const occupied = state.workers.filter(w => !w.cleaned).length;
   const vacancies = state.floor ? state.floor.slots.filter(s => !state.workers.some(w => !w.cleaned && w.slot === s.id)) : Array.from({ length: 3 - occupied }, () => null);
+  if (state.floor?.pathfinder) vacancies.push({ id: PATHFINDER_SLOT, ...state.floor.pathfinder });
   for (const slot of vacancies) {
     // SQLite uniqueness checks make collisions a rejected allocation, never reuse.
     const session = randomUUID(), sender = randomBytes(4).toString('hex');
     const pane = `bf2-${config.run}-${sender}`;
     const settings = slot ? { ...state.config, ...slot } : state.config;
+    const specialist = slot?.id === PATHFINDER_SLOT;
     const mission = join(settings.runDir ?? dirname(config.database), `${session}.boot.txt`);
     const allocate = () => board.lifecycle.addWorker(session, sender, pane, register => {
-      writeFileSync(mission, slot ? `${settings.bootstrap}${settings.role ? `\n${settings.role}\n` : ''}` : bootMission(settings), { flag: 'wx', mode: 0o600 });
+      writeFileSync(mission, specialist ? pathfinderMission(settings) : slot ? `${settings.bootstrap}${settings.role ? `\n${settings.role}\n` : ''}` : bootMission(settings), { flag: 'wx', mode: 0o600 });
       const barrier = `bf2-boot-${session}`;
       const receipt = checked(execute, ['new-session', '-d', '-P', '-F', '#{session_id} #{pane_id}', '-s', pane, '-n', 'peer', '-c', settings.cwd,
         `tmux wait-for ${quote(barrier)} && ${workerCommand(settings, { ...config, session, sender }, pane, mission, env)}`]);
