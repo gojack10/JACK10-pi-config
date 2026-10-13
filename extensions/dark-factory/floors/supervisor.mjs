@@ -4,7 +4,7 @@ import { ensureController, tick, tmux, settingsFor } from '../../bf2-swarm/contr
 import { openFloor, isOss, ossStatus, claimOss, releaseOss, validateSettings, missingFloorLaunchSettings } from './runtime.mjs';
 
 export function validateFloorLaunch(settings) {
-  validateSettings(Object.fromEntries(['name','cwd','roots','instructions','voteCondition','slots','bootstrap','warningText','wrapupText'].map(k => [k, settings[k]])));
+  validateSettings(Object.fromEntries(['name','cwd','roots','instructions','voteCondition','slots','bootstrap','warningText','wrapupText','pathfinder'].map(k => [k, settings[k]])));
   const missing = missingFloorLaunchSettings(settings);
   if (missing.length) throw new Error(`floor start requires launch settings: ${missing.join(', ')}`);
   realpathSync(settings.agentDir);
