@@ -40,19 +40,18 @@ test('Pathfinder form defaults, optional removal, assignment payload and configu
   assert.equal(p.element('#pathfinder-enabled').checked, false);
   assert.equal(p.element('#pathfinder-fields').disabled, true);
   assert.match(p.element('#pathfinder-fields').innerHTML, /value="openai-codex-personal\/gpt-6\.1-sol" selected/);
-  assert.match(p.element('#pathfinder-fields').innerHTML, /Approved launch text/);
+  assert.doesNotMatch(p.element('#pathfinder-fields').innerHTML, /name="(?:bootstrap|question|codeRoots|resources|resultDestination|goal|entry|agent)"/);
+  assert.match(p.element('#pathfinder-fields').innerHTML, /Uses the floor’s goal/);
   p.element('#pathfinder-enabled').checked = true; p.element('#pathfinder-enabled').events.change();
   assert.equal(p.element('#pathfinder-fields').hidden, false); assert.equal(p.element('#pathfinder-fields').disabled, false);
   const values = { route: 'openai-codex-personal/gpt-6.1-sol', thinking: 'high', contextWarning: '80',
-    entry: 'entry', agent: 'agent', goal: 'goal', bootstrap: 'Fixture approved text', question: 'Fixture question',
-    continuation: '', codeRoots: '/fixture/a\n\n/fixture/b\n', resources: 'Fixture resources', resultDestination: 'Fixture destination' };
+    continuation: '' };
   p.element('#pathfinder-fields').querySelector = selector => ({ value: values[selector.slice(6, -1)] });
   await p.element('#pathfinder-settings').events.submit({ preventDefault() {} });
   const configured = JSON.parse(p.requests.find(([path]) => path.endsWith('/configuration'))[1].body);
   assert.deepEqual(Object.keys(configured), ['pathfinder']);
   assert.equal(configured.pathfinder.provider, 'openai-codex-personal');
-  assert.equal(configured.pathfinder.continuation, null); assert.deepEqual(configured.pathfinder.codeRoots, ['/fixture/a', '/fixture/b']);
-  assert.deepEqual(configured.pathfinder.grant, { tree: 'read-write', board: 'read-write', code: 'read-write' });
+  assert.deepEqual(configured.pathfinder, { provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80, continuation: null });
   s.settings.pathfinder = { ...configured.pathfinder, provider: 'openai-codex-fixture' };
   s.workers = [{ slotId: '@PATHFINDER', provider: 'openai-codex-test', model: 'gpt-6-luna', thinking: 'high', phase: 'active', contextPercent: 12 }];
   await p.poll(); p.openSettings();

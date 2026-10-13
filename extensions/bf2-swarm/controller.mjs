@@ -134,7 +134,7 @@ export function tick(board, config, execute = tmux, env = process.env, hooks = {
     const specialist = slot?.id === PATHFINDER_SLOT;
     const mission = join(settings.runDir ?? dirname(config.database), `${session}.boot.txt`);
     const allocate = () => board.lifecycle.addWorker(session, sender, pane, register => {
-      writeFileSync(mission, specialist ? pathfinderMission(settings) : slot ? `${settings.bootstrap}${settings.role ? `\n${settings.role}\n` : ''}` : bootMission(settings), { flag: 'wx', mode: 0o600 });
+      writeFileSync(mission, specialist ? pathfinderMission(state.config) : slot ? `${settings.bootstrap}${settings.role ? `\n${settings.role}\n` : ''}` : bootMission(settings), { flag: 'wx', mode: 0o600 });
       const barrier = `bf2-boot-${session}`;
       const receipt = checked(execute, ['new-session', '-d', '-P', '-F', '#{session_id} #{pane_id}', '-s', pane, '-n', 'peer', '-c', settings.cwd,
         `tmux wait-for ${quote(barrier)} && ${workerCommand(settings, { ...config, session, sender }, pane, mission, env)}`]);

@@ -66,15 +66,10 @@ export function validateSettings(input) {
     if (typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(k => !['provider','model','thinking','contextWarning','bootstrap','entry','agent','goal','question','continuation','codeRoots','resources','grant','resultDestination'].includes(k))) throw new Error('unknown Pathfinder setting');
     const { provider = PATHFINDER_DEFAULTS.provider, model = PATHFINDER_DEFAULTS.model, thinking = PATHFINDER_DEFAULTS.thinking, contextWarning = PATHFINDER_DEFAULTS.contextWarning } = p;
     const configuredRoute = validateSlot({ id: 'pathfinder', provider, model, thinking, contextWarning });
-    for (const key of ['entry','agent','goal']) if (typeof p[key] !== 'string' || !uuid.test(p[key])) throw new Error(`Pathfinder ${key} must be a node UUID`);
     if (p.continuation != null && (typeof p.continuation !== 'string' || !uuid.test(p.continuation))) throw new Error('Pathfinder continuation must be a node UUID or null');
-    if (!Array.isArray(p.codeRoots) || !p.codeRoots.length || p.codeRoots.length > 100 || p.codeRoots.some(r => typeof r !== 'string' || !isAbsolute(r) || /[\0\n\r]/.test(r))) throw new Error('Pathfinder codeRoots must be absolute assigned paths');
-    const codeRoots = [...new Set(p.codeRoots.map(r => realpathSync(r)))];
-    if (codeRoots.some(r => !statSync(r).isDirectory())) throw new Error('Pathfinder codeRoots must be directories');
-    if (!p.grant || Object.keys(p.grant).sort().join(',') !== 'board,code,tree' || Object.values(p.grant).some(v => v !== 'read-write')) throw new Error('Pathfinder requires explicit read-write tree, board and code grant');
+    // Accept retired fields from stored configurations; saves discard the duplicate setup.
     pathfinder = { ...Object.fromEntries(['provider','model','thinking','contextWarning'].map(k => [k, configuredRoute[k]])),
-      ...Object.fromEntries(['bootstrap','question','resources','resultDestination'].map(k => [k, text(p[k], `Pathfinder ${k}`)])),
-      entry: p.entry, agent: p.agent, goal: p.goal, continuation: p.continuation ?? null, codeRoots, grant: { ...p.grant } };
+      continuation: p.continuation ?? null };
   }
   if (slots.filter(isOss).length + Number(isOss(pathfinder)) > 1) throw new Error('at most one OSS occupant per floor, including Pathfinder');
   return { name, cwd, roots: [...new Set(input.roots)], instructions: input.instructions ?? null, voteCondition, slots, pathfinder,
