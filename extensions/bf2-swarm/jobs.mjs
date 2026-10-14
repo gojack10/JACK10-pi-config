@@ -69,7 +69,12 @@ export function jobStore(db, transaction, config, insertPost) {
           const row = db.prepare('SELECT state,retire_requested FROM swarm_workers WHERE session=?').get(config.session);
           if (!row || row.state !== 'active' || row.retire_requested) throw new Error('independent launch requires a working active peer');
         }
-        if (db.prepare('SELECT status FROM swarm_run').get()?.status !== 'running') throw new Error('independent launch requires a running floor');
+        const status = db.prepare('SELECT status FROM swarm_run').get()?.status;
+        if (manifest.stoppedOperation !== undefined) {
+          if (config.session !== 'controller' || manifest.origin !== config.session) throw new Error('stopped operation requires an outside authorized operator');
+          if (typeof manifest.stoppedOperation !== 'string' || !manifest.stoppedOperation.trim() || manifest.stoppedOperation.includes('\0') || Buffer.byteLength(manifest.stoppedOperation) > 4096 || !manifest.owner) throw new Error('stopped operation requires an owner and bounded explicit authorization reason');
+          if (status !== 'stopped' || db.prepare('SELECT 1 FROM swarm_workers WHERE cleaned=0 LIMIT 1').get()) throw new Error('stopped operation requires a stopped, drained floor');
+        } else if (status !== 'running') throw new Error('independent launch requires a running floor');
         db.exec(`CREATE TABLE IF NOT EXISTS factory_jobs (id TEXT PRIMARY KEY, manifest TEXT NOT NULL, terminal TEXT, terminal_number INTEGER UNIQUE, handled TEXT);`);
         const prior = list().find(j => j.id === manifest.id);
         if (prior) {
@@ -114,7 +119,7 @@ export function jobStore(db, transaction, config, insertPost) {
   };
 }
 
-export function launchJob(board, config, { id, command, cwd, owner = null }) {
+export function launchJob(board, config, { id, command, cwd, owner = null, stoppedOperation }) {
   if (typeof id !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id)) throw new Error('job key must be a fresh UUID, retained for uncertain retries');
   if (typeof command !== 'string' || !command.trim() || command.includes('\0') || Buffer.byteLength(command) > 65536) throw new Error('job command must be nonempty bounded text without NUL');
   if (owner !== null && (typeof owner !== 'string' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(owner))) throw new Error('job owner must be a node UUID');
@@ -125,11 +130,12 @@ export function launchJob(board, config, { id, command, cwd, owner = null }) {
   if (revision.error || revision.status !== 0) throw new Error('job cwd needs an existing Git revision; dirty drafts remain in place');
   const dir = join(state.config.runDir, 'jobs', id);
   const manifest = { id, command, cwd, revision: revision.stdout.trim(), owner, dir, database: config.database, run: config.run, floor: state.config.floorId,
-    origin: config.session, log: join(dir, 'output.log'), receipt: join(dir, 'terminal.json') };
+    origin: config.session, log: join(dir, 'output.log'), receipt: join(dir, 'terminal.json'),
+    ...(stoppedOperation !== undefined ? { stoppedOperation } : {}) };
   // Stable retries read the original manifest instead of allocating another process.
   const previous = board.jobs.list().find(j => j.id === id);
   if (previous) {
-    if (previous.manifest.command !== command || previous.manifest.cwd !== cwd || previous.manifest.owner !== owner || previous.manifest.origin !== config.session) throw new Error('job key already used with different input');
+    if (previous.manifest.command !== command || previous.manifest.cwd !== cwd || previous.manifest.owner !== owner || previous.manifest.origin !== config.session || previous.manifest.stoppedOperation !== stoppedOperation) throw new Error('job key already used with different input');
     return previous;
   }
   let child;

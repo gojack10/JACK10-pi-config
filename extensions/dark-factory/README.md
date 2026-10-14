@@ -197,6 +197,15 @@ start a model or controller. For separately authorized machine work:
 /absolute/agent-checkout/bin/factory-job cancel --floor project-a --key "$KEY"
 ```
 
+For separately human-authorized machine work while a floor remains stopped, an
+outside operator can add `--stopped-operation 'explicit authorization reason'`
+and `--owner NODE_UUID` to launch. This requires a stopped floor with every worker
+cleaned; stopping/draining floors and inherited worker identities (even empty
+values) are refused. The reason is retained in the immutable job manifest and
+must match on retries. This never starts/reconvenes workers or changes owner Stop.
+Ordinary launches still require a running floor; cancellation uses the unchanged
+identity-bound control/drain contract.
+
 Workers omit `--floor` and keep their launch binding. Launch defaults to the floor's
 Git cwd and records its actual HEAD; dirty drafts are not reset or snapshotted.
 The retained job directory contains the immutable command/cwd/revision/origin/owner
