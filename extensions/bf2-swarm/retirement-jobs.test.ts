@@ -252,6 +252,40 @@ test('legacy job tables migrate without marking historical results handled', t =
   assert.equal(migrated.jobs.list()[0].terminal.code, 1);
 });
 
+test('explicit outside stopped operation preserves Stop, worker refusal, authorization and immutable job custody', async t => {
+  const h = fixture(t), reason = 'Human approved this disposable stopped-floor cancellation fixture';
+  const input = { id: randomUUID(), command: 'printf "ready\\n"; sleep 20', cwd: h.cwd, owner: node, stoppedOperation: reason };
+  assert.throws(() => launchJob(h.board, h.config, input), /outside authorized operator/);
+  assert.throws(() => launchJob(h.floor.board, h.floor.config, input), /stopped, drained floor/);
+  const command = join(h.dir, 'stopped-command.sh'); writeFileSync(command, input.command);
+  const args = ['launch','--floor','fixture','--key',input.id,'--command-file',command,'--cwd',h.cwd,'--owner',node,'--stopped-operation',reason];
+  for (const name of ['FACTORY_FLOOR','FACTORY_DB','FACTORY_SESSION','FACTORY_SENDER','BF2_BOARD_SESSION','BF2_BOARD_SENDER','BF2_SWARM_WORKER']) {
+    await assert.rejects(jobCli(args, { FACTORY_ROOT: h.root, [name]: '' }), /outside authorized operator/);
+  }
+  h.floor.command('stop', 'stop');
+  assert.throws(() => launchJob(h.floor.board, h.floor.config, input), /stopped, drained floor/);
+  h.board.lifecycle.done('Fixture drained'); h.board.lifecycle.settled(); h.floor.board.lifecycle.cleaned(h.session); h.floor.board.lifecycle.advanceDrain();
+  assert.equal(h.floor.snapshot().status, 'stopped');
+  assert.throws(() => launchJob(h.floor.board, h.floor.config, { ...input, stoppedOperation: undefined }), /running floor/);
+  for (const bad of [{ stoppedOperation: '' }, { stoppedOperation: 'x'.repeat(4097) }, { owner: null }]) {
+    assert.throws(() => launchJob(h.floor.board, h.floor.config, { ...input, ...bad }), /owner and bounded explicit authorization/);
+  }
+  assert.equal(h.floor.board.jobs.list().length, 0);
+  const launch = spawnSync(resolve('bin/factory-job'), args, { env: { ...process.env, FACTORY_ROOT: h.root }, encoding: 'utf8' });
+  assert.equal(launch.status, 0, launch.stderr);
+  const row = h.floor.board.jobs.list()[0]; assert.equal(row.manifest.stoppedOperation, reason); assert.equal(row.manifest.owner, node);
+  assert.equal(row.manifest.origin, h.floor.config.session);
+  await eventually(() => existsSync(row.manifest.log) && readFileSync(row.manifest.log, 'utf8').includes('ready'));
+  assert.equal(launchJob(h.floor.board, h.floor.config, input).id, input.id);
+  assert.throws(() => launchJob(h.floor.board, h.floor.config, { ...input, stoppedOperation: 'other grant' }), /different input/);
+  const cancel = spawnSync(resolve('bin/factory-job'), ['cancel','--floor','fixture','--key',input.id], { env: { ...process.env, FACTORY_ROOT: h.root }, encoding: 'utf8' });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  const terminal = JSON.parse(cancel.stdout); assert.equal(terminal.state, 'cancelled'); assert.equal(terminal.drained, true);
+  assert.equal(h.floor.board.jobs.list().length, 1);
+  assert.equal(h.floor.snapshot().status, 'stopped'); assert.equal(h.floor.snapshot().workers.filter(w => !w.cleaned).length, 0);
+  assert.equal(readFileSync(join(h.cwd, 'draft.txt'), 'utf8'), 'unfinished draft\n');
+});
+
 test('explicit cancellation is separately identified, drains the native group, retains output and deduplicates its event', async t => {
   const h = fixture(t), row = launchJob(h.board, h.config, { id: randomUUID(), command: 'printf "draft output\\n"; sleep 20', cwd: h.cwd });
   await eventually(() => existsSync(join(row.manifest.dir, 'process.json')) && existsSync(row.manifest.log));
