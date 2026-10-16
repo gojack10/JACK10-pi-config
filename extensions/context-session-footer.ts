@@ -19,12 +19,6 @@ import {
 } from "./context-session-footer/session-usage.ts";
 import { formatFooterDuration } from "./context-session-footer/duration.ts";
 import { renderQuotaLines } from "./context-session-footer/quota.ts";
-import {
-	appendTrafficBesideCache,
-	registerTrafficCommand,
-	TrafficMeter,
-	trafficRow,
-} from "./context-session-footer/traffic.ts";
 
 const fitToWidth = (s: string, width: number): string => {
 	if (width <= 0) return "";
@@ -288,7 +282,6 @@ function getTemperature(): number | null {
 
 export default function (pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
-	registerTrafficCommand(pi, { changed: () => requestRender?.() });
 	let cacheTimers: CacheStatusRow[] = [];
 	let quotaState: CodexUsageState | undefined;
 	pi.events.on("cache-status:update", (data) => {
@@ -305,9 +298,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI) return;
-		const traffic = new TrafficMeter(() => requestRender?.());
-		traffic.start();
-
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const rerender = () => tui.requestRender();
 			requestRender = rerender;
@@ -318,7 +308,6 @@ export default function (pi: ExtensionAPI) {
 				dispose() {
 					clearInterval(timer);
 					unsubscribe();
-					traffic.stop();
 					if (requestRender === rerender) requestRender = undefined;
 				},
 				invalidate() {},
@@ -388,25 +377,7 @@ export default function (pi: ExtensionAPI) {
 						dim,
 					);
 					flushFooterLine(lineState, width);
-					const cacheStart = lineState.lines.length;
 					appendCacheTable(lineState, cacheTimers, width, theme);
-					const cacheEnd = lineState.lines.length;
-					appendTrafficBesideCache(
-						lineState.lines,
-						cacheStart,
-						cacheEnd,
-						width,
-						trafficRow(
-							traffic.snapshot(),
-							false,
-							formatCacheTimerValue,
-							Date.now(),
-							traffic.currentIdentity(),
-							traffic.degraded(),
-						),
-						visibleWidth,
-						(text) => theme.fg("dim", text),
-					);
 					flushFooterLine(lineState, width);
 					appendQuotaLines(lineState, quota, width, theme);
 					flushFooterLine(lineState, width);
