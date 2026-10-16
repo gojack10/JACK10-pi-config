@@ -319,8 +319,22 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(resident["id"])
         self.assertEqual(p.MLX_LAST_REQUEST_AT, 0.0)
 
+    async def test_unmanaged_glm_chat_is_refused_before_forwarding(self):
+        p = self.p
+        request = type("Request", (), {
+            "read": AsyncMock(return_value=json.dumps({"model": p.GLM_FLASH_MODEL_ID}).encode()),
+            "headers": {},
+        })()
+        with patch.object(p, "RESERVATION_TRIAL", False):
+            with self.assertRaises(p.web.HTTPServiceUnavailable) as error:
+                await p.handle_chat(request)
+        self.assertIn("glm_native_model_unqualified", error.exception.text)
+        self.assertEqual(self.events, [])
+        self.assertEqual(p.ACTIVE_REQUESTS, 0)
+
     async def test_handler_keeps_reservation_until_backend_response(self):
         p = self.p
+        self.loaded = p.QWEN_NEXT_MODEL_ID
         entered, release = asyncio.Event(), asyncio.Event()
 
         class Response:
@@ -346,14 +360,14 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
                 return Response()
 
         request = type("Request", (), {
-            "read": AsyncMock(return_value=json.dumps({"model": p.GLM_FLASH_MODEL_ID}).encode()),
+            "read": AsyncMock(return_value=json.dumps({"model": p.QWEN_NEXT_MODEL_ID}).encode()),
             "headers": {},
             "transport": type("Transport", (), {"is_closing": lambda _: False})(),
         })()
         with patch.object(p, "ClientSession", Session):
             response = asyncio.create_task(p.handle_chat(request))
-            await entered.wait()
-            switch = asyncio.create_task(p.begin_request("ds4", p.QWEN_NEXT_MODEL_ID))
+            await asyncio.wait_for(entered.wait(), 2)
+            switch = asyncio.create_task(p.begin_request("ds4", p.DS41_MODEL_ID))
             await asyncio.sleep(0)
             self.assertFalse(switch.done())
             self.assertEqual(self.events, [])
@@ -361,7 +375,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             await response
             await switch
             await p.finish_request("ds4")
-        self.assertEqual(self.events, ["stop", "desired:qwen", "start"])
+        self.assertEqual(self.events, ["stop", "desired:ds41", "start"])
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
