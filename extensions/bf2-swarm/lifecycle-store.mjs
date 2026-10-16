@@ -2,6 +2,7 @@
 import { randomBytes } from 'node:crypto';
 import { pathfinderStore, PATHFINDER_SLOT } from './pathfinder.mjs';
 
+export const CODEX_QUOTA_RETIREMENT = 'Codex Personal quota exhausted';
 export const missingFloorLaunchSettings = settings => ['instructions','voteCondition','bootstrap','warningText','wrapupText'].filter(key => !settings?.[key]);
 const requireFloorLaunchSettings = settings => {
   const missing = missingFloorLaunchSettings(settings);
@@ -251,7 +252,8 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         const state = launchError ? (floor() && row.state !== 'launching' ? 'exited-with-error' : 'launch-failed') : row.handoff === null ? 'exited' : 'exited-with-handoff';
         db.prepare('UPDATE swarm_workers SET state=? WHERE session=?').run(state, session);
         if (floor()) {
-          system(`${row.sender} ${launchError ? `${row.state === 'launching' ? 'launch failed' : 'failed'}: ${String(launchError).slice(0, 1000)}` : `exited (${state})`}. Session: ${row.session_file ?? 'JSONL not registered; Pi may not have started'}; session ID: ${row.session}. Replacement ${status().status === 'running' ? 'pending after actual cleanup' : 'disabled while floor is not running'}.`);
+          const run = status(), configured = row.slot === PATHFINDER_SLOT ? !!run.floor.pathfinder : run.floor.slots.some(s => s.id === row.slot);
+          system(`${row.sender} ${launchError ? `${row.state === 'launching' ? 'launch failed' : 'failed'}: ${String(launchError).slice(0, 1000)}` : `exited (${state})`}. Session: ${row.session_file ?? 'JSONL not registered; Pi may not have started'}; session ID: ${row.session}. Replacement ${!configured ? 'disabled: slot removed' : run.status === 'running' ? 'pending after actual cleanup' : 'disabled while floor is not running'}.`);
           return;
         }
         system(launchError ? `${row.sender} launch failed: ${launchError}. Retrying after ordinary delay.` :
@@ -317,7 +319,7 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         return db.prepare("UPDATE swarm_workers SET retire_requested=CASE WHEN retire_requested='context threshold' THEN ? ELSE COALESCE(retire_requested,?) END WHERE session=? AND cleaned=0").run(reason, reason, session).changes > 0;
       });
     },
-    configureFloor(settings, launchSettings) {
+    configureFloor(settings, launchSettings, retirementReason = 'slot removed') {
       controller();
       return transaction(() => {
         if (!floor()) throw new Error('not a floor');
@@ -331,10 +333,12 @@ export function lifecycleStore(db, transaction, config, insertPost) {
         db.prepare('UPDATE swarm_run SET config=?').run(JSON.stringify(launchSettings));
         if (!old.pathfinder && settings.pathfinder) pathfinder.reset(run.status === 'running');
         if (!settings.pathfinder) pathfinder.reset(false);
-        for (const w of status().workers.filter(w => !w.cleaned && (w.slot === PATHFINDER_SLOT ? !settings.pathfinder : !settings.slots.some(s => s.id === w.slot)))) {
-          db.prepare('UPDATE swarm_workers SET retire_requested=? WHERE session=?').run('slot removed', w.session);
+        for (const w of status().workers.filter(w => !w.cleaned && (w.slot === PATHFINDER_SLOT ? old.pathfinder && !settings.pathfinder :
+          old.slots.some(s => s.id === w.slot) && !settings.slots.some(s => s.id === w.slot)))) {
+          db.prepare('UPDATE swarm_workers SET retire_requested=? WHERE session=?').run(retirementReason, w.session);
           retirementInput(w.session);
         }
+        if (retirementReason === CODEX_QUOTA_RETIREMENT) system(`${retirementReason}: removed exhausted Codex slots/Pathfinder. No automatic respawn, including after quota reset; re-add in settings to resume. Session transcripts and independent jobs retained.`);
         if (old.voteCondition !== settings.voteCondition) system(`Owner changed ballot condition node: ${settings.voteCondition}. Old votes invalidated.`);
         return floor();
       });

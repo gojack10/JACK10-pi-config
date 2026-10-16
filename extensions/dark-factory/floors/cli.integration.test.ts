@@ -57,7 +57,7 @@ test('real create-stopped/discovery/config/route validation use one runtime SQLi
   assert.equal((await f.run('status', '--floor', 'alpha')).result.status, 'stopped');
   assert.equal((await f.run('config', '--floor', 'alpha')).result.voteCondition, f.settings.voteCondition);
   assert.equal((await f.run('config', '--floor', 'alpha', '--settings', f.input({ name: 'Changed' }))).result.name, 'Changed');
-  for (const patch of [{ slots: f.settings.slots.slice(0, 1) }, { slots: Array(11).fill(f.settings.slots[0]) },
+  for (const patch of [{ slots: null }, { slots: Array(11).fill(f.settings.slots[0]) },
     { cwd: 'relative' }, { instructions: 'not a UUID' }, { voteCondition: '' }, { voteCondition: 'Fixture owner condition' }, { voteCondition: 1 }, { voteCondition: [] }, { unknown: true },
     ...[{ model: 'unapproved' }, { provider: 'other' }, { thinking: 'low' }, { contextWarning: 0 }, { contextWarning: 101 }]
       .map(change => ({ slots: f.settings.slots.map(slot => ({ ...slot, ...change })) }))]) {

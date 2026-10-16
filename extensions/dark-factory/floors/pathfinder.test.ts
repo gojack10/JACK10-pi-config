@@ -247,7 +247,7 @@ test('room configuration uses SQLite for Pathfinder defaults, atomic edits and g
   assert.deepEqual(reopened.settings().pathfinder, configured.settings.pathfinder); reopened.close();
   const prior = h.floor.settings();
   for (const body of [{}, { pathfinder: false }, { pathfinder: { ...h.pathfinder, continuation: 'invalid' } },
-    { pathfinder: { ...h.pathfinder, model: 'unapproved' } }, { pathfinder: null, slots: [] }, { pathfinder: null, command: '/bin/sh' }]) {
+    { pathfinder: { ...h.pathfinder, model: 'unapproved' } }, { pathfinder: null, slots: null }, { pathfinder: null, command: '/bin/sh' }]) {
     assert.equal((await post(body)).status, 400); assert.deepEqual(h.floor.settings(), prior);
   }
   h.start(); floorMessage(h, 'room-wake', '@PATHFINDER fixture'); h.tick(); h.ready(h.current());

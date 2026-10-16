@@ -2,6 +2,25 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ensureController, tick, tmux, settingsFor } from '../../bf2-swarm/controller.mjs';
 import { openFloor, isOss, ossStatus, claimOss, releaseOss, validateSettings, missingFloorLaunchSettings } from './runtime.mjs';
+import { join } from 'node:path';
+import { evaluateCodexRouteFromFiles, isCodexQuotaExhausted } from '../../codex-personal/router.ts';
+import { CODEX_QUOTA_RETIREMENT } from '../../bf2-swarm/lifecycle-store.mjs';
+
+function retireExhaustedCodex(floor) {
+  const state = floor.board.lifecycle.status();
+  if (state.status !== 'running') return;
+  const codex = slot => /^openai-codex(?:-[a-z0-9-]+)?$/.test(slot?.provider ?? '');
+  const routes = [...state.floor.slots, state.floor.pathfinder].filter(codex);
+  const exhausted = new Set([...new Set(routes.map(s => s.model))]
+    .filter(model => isCodexQuotaExhausted(evaluateCodexRouteFromFiles({ model,
+      registryPath: join(state.config.agentDir, 'codex-accounts.json'),
+      feedPath: join(state.config.agentDir, 'codex-usage-state.json'),
+      observabilityPath: join(state.config.agentDir, 'codex-usage-observability.jsonl') }))));
+  if (!exhausted.size) return;
+  const remove = slot => codex(slot) && exhausted.has(slot.model);
+  floor.configure({ slots: state.floor.slots.filter(s => !remove(s)),
+    ...(remove(state.floor.pathfinder) ? { pathfinder: null } : {}) }, CODEX_QUOTA_RETIREMENT);
+}
 
 export function validateFloorLaunch(settings) {
   validateSettings(Object.fromEntries(['name','cwd','roots','instructions','voteCondition','slots','bootstrap','warningText','wrapupText','pathfinder'].map(k => [k, settings[k]])));
@@ -18,6 +37,8 @@ export function ensureFloorController(floor, execute = tmux, env = process.env) 
   return ensureController(floor.board, floor.config, execute, env);
 }
 export function tickFloor(floor, execute = tmux, env = process.env) {
+  // Use the same SQL-backed slot removal as the room, before admitting replacements.
+  retireExhaustedCodex(floor);
   // Independent-job observation cannot hold worker cleanup/replacement hostage.
   try { floor.board.jobs.observe(); }
   catch (error) { console.error(`Factory job observation unavailable: ${error.message}; receipts/effects remain uncertain`); }
