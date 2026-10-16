@@ -22,5 +22,6 @@
   "httpIdleTimeoutMs": 0,
   "showCacheMissNotices": true,
   "collapseChangelog": true,
-  "tuiMode": "fullscreen"
+  "tuiMode": "fullscreen",
+  "editorPaddingX": 1
 }
