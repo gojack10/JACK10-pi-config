@@ -9,6 +9,8 @@ import { createFloor, openFloor, listFloors, adoptFloor, selectOssFloor, ossStat
 import { tickFloor } from './supervisor.mjs';
 import { openBoard, configuration } from '../../bf2-swarm/board.mjs';
 import { installWorker } from '../../bf2-swarm/worker.mjs';
+import { normalizeObservation } from '../../codex-quota-extension/store.ts';
+import { CODEX_QUOTA_RETIREMENT } from '../../bf2-swarm/lifecycle-store.mjs';
 
 const node = '11111111-1111-4111-8111-111111111111';
 const sol = id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high', role: '', contextWarning: 80 });
@@ -126,9 +128,9 @@ test('floor chat persists without starting, reversing Stop or changing an explic
   assert.equal(floor.snapshot().status, 'running');
 });
 
-test('2–10 next-occupant slots, invalid patches atomic, model/role edits do not mutate current workers; removal safely drains', t => {
+test('0–10 next-occupant slots, invalid patches atomic, model/role edits do not mutate current workers; removal safely drains', t => {
   const h = fixture(t), floor = h.create('one'), workers = h.boot(floor);
-  for (const slots of [[sol('a')], Array.from({ length: 11 }, (_, i) => sol(String(i))), [sol('a'), sol('a')], [sol('a'), { ...sol('b'), model: 'unapproved' }], [sol('a'), { ...sol('b'), thinking: 'low' }]]) assert.throws(() => floor.configure({ slots }));
+  for (const slots of [null, Array.from({ length: 11 }, (_, i) => sol(String(i))), [sol('a'), sol('a')], [sol('a'), { ...sol('b'), model: 'unapproved' }], [sol('a'), { ...sol('b'), thinking: 'low' }]]) assert.throws(() => floor.configure({ slots }));
   for (const patch of [null, [], { roots: [[node]] }, { instructions: [node] }, ...['', 'Fixture condition', [node], 1, {}].map(voteCondition => ({ voteCondition })), { bootstrap: ' ' }, { warningText: '' }, { slots: [sol('a'), { ...sol('b'), provider: ['openai-codex-fixture'] }] }]) assert.throws(() => floor.configure(patch));
   assert.equal(floor.settings().slots.length, 2);
   const slots = Array.from({ length: 10 }, (_, i) => sol(i === 0 ? 'a' : i === 1 ? 'b' : `s${i}`));
@@ -146,6 +148,9 @@ test('2–10 next-occupant slots, invalid patches atomic, model/role edits do no
   floor.configure({ slots: slots.slice(0, 2) });
   const removed = floor.snapshot().workers.filter(w => !w.cleaned && w.slot !== 'a' && w.slot !== 'b');
   assert.ok(removed.every(w => w.retire_requested === 'slot removed'));
+  floor.configure({ name: 'Renamed during drain' }, CODEX_QUOTA_RETIREMENT);
+  assert.ok(floor.snapshot().workers.filter(w => removed.some(old => old.session === w.session)).every(w => w.retire_requested === 'slot removed'),
+    'later quota removal cannot retag an already removed non-Codex worker');
   tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.filter(w => !w.cleaned).length, 10);
   for (const w of removed) h.panes.get(w.pane).live = false;
   tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.filter(w => !w.cleaned).length, 2);
@@ -153,6 +158,74 @@ test('2–10 next-occupant slots, invalid patches atomic, model/role edits do no
   assert.equal(floor.snapshot().status, 'stopping');
   for (const w of floor.snapshot().workers.filter(w => !w.cleaned)) h.panes.get(w.pane).live = false;
   tickFloor(floor, h.execute); assert.equal(floor.snapshot().status, 'stopped');
+});
+
+test('exhausted Personal pool removes Codex slots and Pathfinder durably; other routes, ballots and native drain work', async t => {
+  const h = fixture(t), router = { ...sol('r'), provider: 'openrouter', model: 'xiaomi/mimo-v2.6-pro' };
+  const floor = h.create('one', { slots: [{ ...sol('a'), provider: 'openai-codex-personal' }, { ...sol('b'), model: 'gpt-6-luna' }, router, oss('q')], pathfinder: {} });
+  const agent = floor.board.lifecycle.status().config.agentDir, now = Date.now(), seconds = now / 1000;
+  const accounts = ['first','second'].map(key => ({ accountKey: key, providerId: `openai-codex-${key}`, credentialRef: `openai-codex-${key}`,
+    label: key, policyClass: 'perishable', supportedModels: ['gpt-6.1-sol','gpt-6-luna'] }));
+  writeFileSync(join(agent, 'codex-accounts.json'), JSON.stringify({ schemaVersion: 1, umbrellaProviderId: 'openai-codex-personal', accounts }));
+  const samples = accounts.map((a, i) => normalizeObservation(a, 200, {
+    'x-codex-plan-type': 'plus', 'x-codex-primary-window-minutes': '300', 'x-codex-primary-used-percent': i ? '99' : '100',
+    'x-codex-primary-reset-at': String(seconds + 7200), 'x-codex-secondary-window-minutes': '10080',
+    'x-codex-secondary-used-percent': '20', 'x-codex-secondary-reset-at': String(seconds + 86400) }, undefined, now));
+  const save = () => writeFileSync(join(agent, 'codex-usage-state.json'), JSON.stringify({ schemaVersion: 2, generation: 1, generatedAt: now, accounts: samples }));
+  save(); selectOssFloor('one', { root: h.root }); const workers = h.boot(floor), lease = ossStatus({ root: h.root });
+  floor.command('wake-pathfinder', 'message', '@PATHFINDER fixture pass'); tickFloor(floor, h.execute);
+  const specialist = floor.snapshot().workers.find(w => w.slot === '@PATHFINDER');
+  assert.ok(specialist); h.peer(floor, specialist).lifecycle.ready(); workers.push(specialist);
+  const p = h.peer(floor, workers[0]), ballot = p.lifecycle.pause('round', floor.settings().voteCondition);
+  p.lifecycle.vote(ballot.number, 'yes');
+  tickFloor(floor, h.execute); assert.equal(floor.settings().slots.length, 4, 'one account with usage keeps the whole pool usable');
+  samples[1].status429 = true; samples[1].notBefore = seconds + 60; save();
+  tickFloor(floor, h.execute); assert.equal(floor.settings().slots.length, 4, 'transient cooldown does not remove slots');
+  samples[1].windows[1].pctUsed = 100; save();
+  tickFloor(floor, h.execute);
+  assert.deepEqual(floor.settings().slots.map(s => s.id), ['r','q']); assert.equal(floor.settings().pathfinder, null);
+  assert.equal(floor.snapshot().vote, undefined); assert.equal(floor.snapshot().status, 'running');
+  assert.ok(floor.snapshot().workers.filter(w => ['a','b','@PATHFINDER'].includes(w.slot)).every(w => w.retire_requested === CODEX_QUOTA_RETIREMENT));
+  assert.ok(floor.snapshot().workers.filter(w => ['r','q'].includes(w.slot)).every(w => !w.retire_requested));
+  assert.deepEqual(ossStatus({ root: h.root }), lease); assert.ok(!h.calls.some(c => c[0] === 'kill-pane'));
+
+  const w = specialist, handlers = new Map(), path = join(agent, 'retained.jsonl'); let drained = false, shutdown = 0;
+  writeFileSync(path, JSON.stringify({ type: 'session', id: w.session }) + '\n');
+  const pi = { on: (name, fn) => handlers.set(name, fn), getSettings: () => ({ steeringMode: 'all', followUpMode: 'all' }),
+    sendUserMessage: () => assert.fail('exhausted workers cannot generate a wrapup') };
+  const ctx = { sessionManager: { getSessionId: () => w.session, getSessionFile: () => path, getEntries: () => [], getBranch: () => [] },
+    isIdle: () => true, shutdown: () => shutdown++ };
+  installWorker(pi, { FACTORY_FLOOR: floor.id, FACTORY_DB: floor.database, FACTORY_SESSION: w.session, FACTORY_SENDER: w.sender }, () => drained);
+  t.after(() => handlers.get('session_shutdown')({}, ctx)); await handlers.get('session_start')({}, ctx);
+  handlers.get('agent_settled')({}, ctx); assert.equal(shutdown, 0, 'tracked background work must drain');
+  drained = true; handlers.get('agent_settled')({ interruption: { kind: 'context' } }, ctx); assert.equal(shutdown, 0);
+  handlers.get('agent_settled')({}, ctx); assert.equal(shutdown, 1);
+  assert.equal(floor.snapshot().workers.find(row => row.session === w.session).handoff, null, 'no fabricated successful handoff');
+  assert.equal(readFileSync(path, 'utf8'), JSON.stringify({ type: 'session', id: w.session }) + '\n');
+  tickFloor(floor, h.execute); assert.equal(floor.snapshot().workers.filter(w => !w.cleaned).length, 5, 'live panes still own their seats');
+  for (const w of workers.filter(w => ['a','b','@PATHFINDER'].includes(w.slot))) h.panes.get(w.pane).live = false;
+  tickFloor(floor, h.execute); assert.deepEqual(floor.snapshot().workers.filter(w => !w.cleaned).map(w => w.slot), ['r','q']);
+  samples.forEach(a => { a.status429 = false; a.notBefore = null; a.windows.forEach(w => { w.pctUsed = 0; }); }); save();
+  const reopened = openFloor('one', { root: h.root });
+  try { tickFloor(reopened, h.execute); assert.deepEqual(reopened.settings().slots.map(s => s.id), ['r','q']); }
+  finally { reopened.close(); }
+  assert.equal(h.calls.filter(c => c[0] === 'new-session').length, 5, 'quota reset/recovery cannot respawn removed slots');
+  assert.equal(floor.snapshot().posts.filter(p => p.text.startsWith(`${CODEX_QUOTA_RETIREMENT}: removed`)).length, 1);
+});
+
+test('all-Codex floors can shrink to zero before launch without a replacement loop', t => {
+  const h = fixture(t), floor = h.create('one');
+  const agent = floor.board.lifecycle.status().config.agentDir, now = Date.now();
+  const account = { accountKey: 'fixture', providerId: 'openai-codex-fixture', credentialRef: 'openai-codex-fixture',
+    label: 'Fixture', policyClass: 'perishable', supportedModels: ['gpt-6.1-sol'] };
+  writeFileSync(join(agent, 'codex-accounts.json'), JSON.stringify({ schemaVersion: 1, umbrellaProviderId: 'openai-codex-personal', accounts: [account] }));
+  const telemetry = normalizeObservation(account, 200, { 'x-codex-plan-type': 'pro', 'x-codex-secondary-window-minutes': '10080',
+    'x-codex-secondary-used-percent': '100', 'x-codex-secondary-reset-at': String(now / 1000 + 86400) }, undefined, now);
+  writeFileSync(join(agent, 'codex-usage-state.json'), JSON.stringify({ schemaVersion: 2, generation: 1, generatedAt: now, accounts: [telemetry] }));
+  floor.command('start', 'start'); tickFloor(floor, h.execute); tickFloor(floor, h.execute);
+  assert.equal(floor.settings().slots.length, 0); assert.equal(floor.snapshot().workers.length, 0);
+  assert.equal(h.calls.filter(c => c[0] === 'new-session').length, 0);
+  assert.equal(floor.snapshot().posts.filter(p => p.text.startsWith(`${CODEX_QUOTA_RETIREMENT}: removed`)).length, 1);
 });
 
 test('unavailable independent-job evidence cannot block real worker cleanup or imply job cancellation', t => {

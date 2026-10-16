@@ -48,7 +48,7 @@ h1,h2,h3,p{margin:0}h1{font-size:15px;font-weight:500;color:var(--fg0)}h2{font-s
     <section class="conversation" aria-label="Conversation">
       <section id="settings-panel" class="settings-panel" aria-label="Floor settings" hidden>
         <button id="settings-close" type="button">close settings</button>
-        <p>Configuration applies to the next occupant. Removed slots drain safely. Configure 2–10 slots.</p>
+        <p>Configuration applies to the next occupant. Removed slots drain safely. Configure 0–10 slots.</p>
         <form id="slot-settings"><h2>Worker slots</h2><div id="slot-fields"></div><button id="add-slot" type="button">add slot</button> <button type="submit">save next configuration</button><p id="settings-error" class="error" role="status"></p></form>
         <form id="pathfinder-settings"><h2>Pathfinder</h2><p>Optional @PATHFINDER: directed requests or 30-minute absence reviews. No cost cap. Changes apply to the next occupant; disabling drains the current session.</p><label><input id="pathfinder-enabled" type="checkbox"> Enable Pathfinder</label><div id="pathfinder-current" class="muted"></div><fieldset id="pathfinder-fields" hidden disabled></fieldset><button type="submit">save Pathfinder</button><p id="pathfinder-error" class="error" role="status"></p></form>
         <form id="condition-settings"><h2>Owner vote condition</h2><p>Editing clears old votes and informs workers. Unanimous yes pauses and drains.</p><label for="vote-condition">Condition</label><textarea id="vote-condition" maxlength="16384"></textarea><button type="submit">save condition</button></form>
