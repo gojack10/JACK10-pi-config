@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
+import { FOREGROUND_TIMEOUT_SECONDS } from '../bash-timeout/policy.ts';
 
 // Use Pi's real loader so package aliases and TypeBox resolve as they do at startup.
 const { loadExtensions } = await import(pathToFileURL(join(homedir(),
@@ -303,6 +304,7 @@ test('spawn failure is terminal but waits for its overlapping peer', { timeout: 
   await delay(150); assert.equal(h.messages.length, 0);
   await a.release(); await until(() => h.messages.length === 1);
   assert.match(h.messages[0].text, /failed|ENOENT/);
+  assert.doesNotMatch(h.messages[0].text, new RegExp(`job_${failed.details.job_id} finished below`));
   assert.ok(h.messages[0].text.includes(`job_${failed.details.job_id}`));
 });
 
@@ -330,6 +332,43 @@ test('can kill a job whose shell exited while descendants still hold stdout', { 
   assert.match(result.content[0].text, /SIGTERM/);
   await until(() => h.messages.length === 1);
   assert.match(h.messages[0].text, /killed/);
+  assert.doesNotMatch(h.messages[0].text, /Use bash instead of bash_bg/);
+});
+
+test('timing guidance uses each bash_bg job duration, not batch duration', async t => {
+  const h = await harness(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const limitMs = FOREGROUND_TIMEOUT_SECONDS * 1000;
+  const slow = await h.gated('slow-suite');
+  now += limitMs;
+  const fast = await h.gated('fast-suite');
+  await fast.release();
+  await until(async () => !(await h.call('bash_tail', { job_id: fast.details.job_id })).details.alive);
+  now += limitMs;
+  await slow.release();
+  await until(() => h.messages.length === 1);
+  assert.match(h.messages[0].text, new RegExp(`job_${fast.details.job_id} finished below bash's ${FOREGROUND_TIMEOUT_SECONDS}-second limit`));
+  assert.doesNotMatch(h.messages[0].text, new RegExp(`job_${slow.details.job_id} finished below`));
+  assert.match(h.messages[0].text, /Use bash instead of bash_bg for this command or suite next time/);
+});
+
+test('timing guidance excludes the limit and longer runs, but includes nonzero exits', async t => {
+  const h = await harness(t, true);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const limitMs = FOREGROUND_TIMEOUT_SECONDS * 1000;
+  for (const [elapsed, advice] of [[limitMs - 1, true], [limitMs, false], [limitMs + 1, false]] as const) {
+    await h.call('bash_bg', { command: 'exit 7' });
+    now += elapsed;
+    await until(() => h.messages.length > 0);
+    const message = h.messages.pop()!.text;
+    assert.match(message, /exit 7/);
+    assert.equal(message.includes('Use bash instead of bash_bg'), advice);
+  }
+  await h.call('background_jobs_consumer', { action: 'start', command: 'true' });
+  await until(() => h.messages.length === 1);
+  assert.doesNotMatch(h.messages[0].text, /Use bash instead of bash_bg/);
 });
 
 test('tail respects real lines, byte bounds and UTF-8; preserves full log', { timeout: 10000 }, async t => {

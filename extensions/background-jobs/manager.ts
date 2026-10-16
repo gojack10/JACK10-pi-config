@@ -4,6 +4,7 @@ import { createWriteStream } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FOREGROUND_TIMEOUT_SECONDS } from "../bash-timeout/policy.ts";
 
 type UserMessageOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
 type SendUserMessage = (content: string, options?: UserMessageOptions) => void | PromiseLike<unknown>;
@@ -26,6 +27,8 @@ export interface BackgroundJobStartOptions {
   cwd: string;
   /** Identity/status used by extensions that supervise a structured child. */
   completionId?: string;
+  /** Include timing advice for commands launched through bash_bg, not child monitors. */
+  suggestForeground?: boolean;
 }
 
 export type BackgroundJobCompletionSource = "model" | "technical" | "protocol" | "transport";
@@ -130,6 +133,7 @@ export type BackgroundJobKillResult =
 
 interface BgJob extends BackgroundJobInfo {
   child: ChildProcess;
+  suggestForeground?: boolean;
   errorMessage?: string;
   completionId?: string;
   completion?: BackgroundJobCompletionOverride;
@@ -266,6 +270,7 @@ export class BackgroundJobManager {
       exitedAt: undefined,
       killed: false,
       completionId: options.completionId,
+      suggestForeground: options.suggestForeground,
       onStdout: hooks.onStdout,
     };
     this.jobs.set(id, job);
@@ -693,7 +698,7 @@ export class BackgroundJobManager {
     return {
       batchId,
       completions: retained,
-      text: `SYSTEM (background-jobs): All ${retained.length} background job(s) in this batch finished.\n${retained.map(completion => this.renderCompletion(completion)).join("\n")}`,
+      text: `SYSTEM (background-jobs): All ${retained.length} background job(s) in this batch finished.\n\n${retained.map(completion => this.renderCompletion(completion)).join("\n\n")}`,
     };
   }
 
@@ -721,11 +726,16 @@ export class BackgroundJobManager {
   }
 
   private renderCompletionSummary(job: BgJob): string {
-    const elapsed = Math.round(((job.exitedAt ?? Date.now()) - job.startedAt) / 1000);
+    const elapsedMs = (job.exitedAt ?? Date.now()) - job.startedAt;
+    const elapsed = Math.round(elapsedMs / 1000);
+    const guidance = job.suggestForeground && job.exitedAt !== undefined && !job.killed && !job.errorMessage
+      && job.exitCode != null && job.exitCode >= 0 && elapsedMs >= 0 && elapsedMs < FOREGROUND_TIMEOUT_SECONDS * 1000
+      ? `\n\njob_${job.id} finished below bash's ${FOREGROUND_TIMEOUT_SECONDS}-second limit. Use bash instead of bash_bg for this command or suite next time.`
+      : "";
     const status = job.exitCode === -1
       ? `failed${job.errorMessage ? ` (${job.errorMessage})` : ""}`
       : `exit ${job.exitCode}${job.killed ? " (killed)" : ""}`;
-    return `job_${job.id} (${job.label}): [${status}] (${elapsed}s). Log: ${job.logPath}`;
+    return `job_${job.id} (${job.label}): [${status}] (${elapsed}s). Log: ${job.logPath}${guidance}`;
   }
 
   private info(job: BgJob): BackgroundJobInfo {

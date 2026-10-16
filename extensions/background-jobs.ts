@@ -14,20 +14,20 @@ export default function backgroundJobs(pi: ExtensionAPI) {
     name: "bash_bg",
     label: "bash_bg",
     description:
-      "Spawn a background command. Returns {job_id, log_path}. Give it a short task label. All overlapping jobs form one batch: one automatic steering notification when ALL jobs finish, at the next tool-call boundary if busy, or waking the agent if idle. New overlapping jobs extend the wait. Do independent work or end your turn; NEVER poll or wait for completion. Inspect running jobs only if the user explicitly asks for progress/ETA. Read completed logs to consume results; use bash_kill to stop a job.",
+      "Start a labeled background command and return its job_id and log_path.\n\nOverlapping jobs form one batch, so each new overlapping job delays its single steering notification until it finishes. That notification resumes an idle agent or arrives at a busy agent's next tool-call boundary.\n\nWhile the batch runs, do independent work or end your turn without waiting or polling. Inspect running jobs only if the user explicitly asks for progress or an ETA, and read completed logs after the notification.",
     parameters: Type.Object({
       command: Type.String({ description: "Bash command (runs through `sh -c`)." }),
       label: Type.Optional(Type.String({ description: "Short task name, e.g. 'Run tests' or 'Queue probe', not shell code.", minLength: 1, maxLength: 80 })),
       cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to session cwd." })),
     }),
     async execute(_id, { command, cwd, label }, _signal, _onUpdate, ctx) {
-      const result = getBackgroundJobManager(pi, ctx).start({ command, cwd: cwd ?? ctx.cwd, label });
+      const result = getBackgroundJobManager(pi, ctx).start({ command, cwd: cwd ?? ctx.cwd, label, suggestForeground: true });
       const { job, runningJobs } = result;
       return {
         content: [
           {
             type: "text",
-            text: `Started job_${job.id} (${job.label}, pid ${job.pid ?? "?"}).\nLog: ${job.logPath}\nCommand: ${command}\n\n${runningJobs === 1 ? "1 job running; it will notify automatically when done." : `${runningJobs} jobs running; completed results are held until ALL finish, then sent in ONE steering notification.`} New overlapping jobs extend the wait.\nDo independent work if available; otherwise end your turn now. Do NOT poll with bash_tail, bash_jobs, bash, sleep, or wait just to check completion. Automatic notification will resume you. Only inspect running jobs if the user explicitly asks for progress/ETA; never repeatedly poll. Reading completed logs to consume results is allowed.`,
+            text: `Started job_${job.id} (${job.label}, pid ${job.pid ?? "?"}).\nLog: ${job.logPath}\nCommand: ${command}\n\n${runningJobs === 1 ? "1 job is running" : `${runningJobs} jobs are running`} in a batch that sends one steering notification when all jobs finish. New overlapping jobs join this batch and delay its notification until they finish.\n\nWhile the batch runs, do independent work or end your turn without waiting or polling through any tool or shell command. Inspect running jobs only if the user explicitly asks for progress or an ETA, and read completed logs after the notification.`,
           },
         ],
         details: { job_id: job.id, log_path: job.logPath, pid: job.pid, label: job.label, running_jobs: runningJobs },
@@ -39,7 +39,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
     name: "bash_tail",
     label: "bash_tail",
     description:
-      "Read the last N lines of a job's log, capped at 50 KiB. Use to consume completed results, or inspect running progress/ETA ONLY when the user explicitly asks. Never poll for completion: an automatic batch notification will resume you. Returns alive=true while output is still being collected.",
+      "Read a completed log after the batch notification, or inspect a running job when the user explicitly asks for progress or an ETA. Do not poll for completion.\n\nReturns the last N lines, up to 50 KiB, with alive=true while output is still being collected.",
     parameters: Type.Object({
       job_id: Type.Integer(),
       lines: Type.Optional(
@@ -90,7 +90,7 @@ export default function backgroundJobs(pi: ExtensionAPI) {
   pi.registerTool({
     name: "bash_jobs",
     label: "bash_jobs",
-    description: "List background jobs when the user explicitly asks for progress/ETA, or to find completed results. Never poll for completion; all overlapping jobs produce one automatic notification when done.",
+    description: "List jobs to find completed results or answer the user's request for progress or an ETA. Do not poll for completion. The batch notification arrives after all overlapping jobs finish.",
     parameters: Type.Object({}),
     async execute(_id, _args, _signal, _onUpdate, ctx) {
       const result = getBackgroundJobManager(pi, ctx).list();
