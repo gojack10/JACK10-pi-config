@@ -99,7 +99,8 @@ def clean_native(native, ticket=None):
 
 class FileEngine:
     """One qualified native process, one request, one private control directory."""
-    def __init__(self, kind, control, pid, log, binary=None, *, expected_sha=None):
+    def __init__(self, kind, control, pid, log, binary=None, *, expected_sha=None, terminal_only=False):
+        self.terminal_only = terminal_only
         self.kind, self.control, self.pid = kind, Path(control), int(pid)
         self.log = Path(log)
         self.binary = Path(binary) if binary else None
@@ -156,10 +157,16 @@ class FileEngine:
 
     def _binding(self, request_id):
         if self.kind == 'ds4':
-            rows = [self.fields(line) for line in self.lines() if line.startswith('FREEZE_BIND ')
+            # GLM's real worker record binds forwarding identity only. It does
+            # not certify a retained checkpoint or authorize pause/borrowing.
+            prefix = 'FREEZE_REQUEST ' if self.terminal_only else 'FREEZE_BIND '
+            rows = [self.fields(line) for line in self.lines() if line.startswith(prefix)
                     and self.fields(line).get('request') == request_id]
             if len(rows) != 1 or int(rows[0]['pid']) != self.pid:
                 return None
+            if self.terminal_only:
+                return dict(pid=self.pid, job=rows[0]['job'], session=rows[0]['session'],
+                            request=request_id, engine=self.incarnation, terminal_only=True)
             return dict(pid=self.pid, nonce=rows[0]['nonce'], session=rows[0]['session'],
                         request=request_id, engine=self.incarnation)
         rows = [json.loads(line) for line in self.lines() if line.strip()]
@@ -208,6 +215,8 @@ class FileEngine:
                 await asyncio.sleep(.2)
 
     async def pause(self, ticket):
+        if getattr(self, 'terminal_only', False):
+            raise RuntimeError('terminal-only engine cannot pause or borrow')
         if self.binding is None or self.hold is not None:
             raise RuntimeError('unbound or already held main')
         if self.kind == 'ds4':
@@ -272,6 +281,8 @@ class FileEngine:
         return False
 
     async def resume(self, run):
+        if getattr(self, 'terminal_only', False):
+            raise RuntimeError('terminal-only engine cannot resume retained state')
         ack = self.hold
         if ack is None or not self.alive():
             raise RuntimeError('lost native held identity')
@@ -303,6 +314,8 @@ class FileEngine:
         self.resume_run = run
 
     async def retire(self):
+        if getattr(self, 'terminal_only', False):
+            raise RuntimeError('terminal-only engine cannot retire retained state')
         ack = self.hold
         if ack is None or not self.alive():
             raise RuntimeError('no surviving held stack to retire')
@@ -928,8 +941,11 @@ async def handle_main(request, body, backend_name, model_id, checked,
        not port or backend != f'http://127.0.0.1:{port}/v1' or \
        os.getenv('LOCAL_PROXY_PRIVATE_LEASE') != '1':
         unavailable(request, 'native_reservation_adapter_unavailable')
-    models = {'qwen3.8-flash-next'} if MANAGED_ENGINE_PREPARER is None else \
-             {'qwen3.8-flash-next', 'deepseek-v4.1-flash'}
+    if MANAGED_ENGINE_PREPARER is None:
+        models = {'qwen3.8-flash-next'}
+    else:
+        from managed_switch import MODELS
+        models = MODELS  # staged candidates stay excluded until qualified
     if backend_name != 'ds4' or model_id not in models or \
        not isinstance(payload, dict) or payload.get('stream') is not True or \
        payload.get('temperature', 0) != 0 or not request_id or len(request_id) > 128 or \
@@ -963,9 +979,15 @@ async def handle_main(request, body, backend_name, model_id, checked,
                     headers = dict(Authorization=request.headers.get('Authorization') or
                                    'Bearer ' + (Path(__file__).parent / '.proxy-key').read_text().strip(),
                                    **{'X-Pi-Request-Id': request_id, 'Content-Type': 'application/json'})
+                    if model_id == 'glm-5.3-flash':
+                        for name in ('X-Pi-Origin', 'X-Pi-Live-Answer'):
+                            if value := request.headers.get(name):
+                                headers[name] = value
                     async with session.post(backend + '/chat/completions', data=body, headers=headers) as upstream:
                         if upstream.status != 200 or upstream.content_type != 'text/event-stream':
                             raise RuntimeError(f'unqualified upstream response {upstream.status}/{upstream.content_type}')
+                        if model_id == 'glm-5.3-flash' and not getattr(engine, 'terminal_only', False):
+                            raise RuntimeError('GLM requires terminal-only native adapter')
                         binding = await engine.bind(request_id)
                         if LIVE is not None:
                             raise RuntimeError('second managed owner')
@@ -974,16 +996,18 @@ async def handle_main(request, body, backend_name, model_id, checked,
                         base = secrets.randbits(40)
                         owner = (0, base, base + 1, base + 2)
                         journal = Path(control) / ('reservation-' + request_id + '.jsonl')
-                        borrower = KevHTTP(Path(control) / ('borrow-' + request_id))
+                        terminal_only = model_id == 'glm-5.3-flash'
+                        borrower = None if terminal_only else KevHTTP(Path(control) / ('borrow-' + request_id))
                         with journal.open('x') as evidence:
                             evidence.write(json.dumps(dict(owner=owner, request_id=request_id,
                                 pid=engine.pid, started=engine.started, incarnation=engine.incarnation,
                                 binding=binding)) + '\n')
                             evidence.flush()
                             os.fsync(evidence.fileno())
-                        reservation = Reservation(checked, engine, borrower, owner, journal, request_id,
-                                                  mark_blocked, abort_main=asyncio.current_task().cancel)
-                        holder['reservation'] = LIVE = reservation
+                        if not terminal_only:
+                            reservation = Reservation(checked, engine, borrower, owner, journal, request_id,
+                                                      mark_blocked, abort_main=asyncio.current_task().cancel)
+                            holder['reservation'] = LIVE = reservation
                         async for chunk in upstream.content.iter_any():
                             if not disconnected:
                                 await queue.put(chunk)
@@ -1010,12 +1034,12 @@ async def handle_main(request, body, backend_name, model_id, checked,
                     raise RuntimeError('retained main blocked: ' + reservation.blocked)
                 LIVE = None
                 await finish_request(backend_name, release_chat=disconnected)
-            elif disconnected:
-                # Cancelled before bind (possibly before HTTP headers). There is
-                # no checked owner/borrower yet, but native work may have started.
+            elif disconnected or model_id == 'glm-5.3-flash':
+                # Terminal-only GLM, or cancellation before bind/headers. There
+                # is no retained owner/borrower; EOF still cannot prove drain.
                 await engine.terminal()
                 await engine.release_terminal()
-                await finish_request(backend_name, release_chat=True)
+                await finish_request(backend_name, release_chat=disconnected)
         except Exception as exc:
             holder['error'] = repr(exc)
             if reservation:

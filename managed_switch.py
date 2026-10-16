@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -31,6 +32,19 @@ MODELS = {
          '--dir-steering-strength 1']),
 }
 
+
+# Preparation only: deliberately NOT in MODELS. Register only after an explicit
+# supervised native qualification of these exact bytes/settings, not a build.
+GLM_CANDIDATE = dict(mode='glm', binary=HOME/'ds4/runtimes/glm-1485eb283928/ds4-server', sha=None, terminal_only=True,
+    args=['GLM-5.3-Flash-Q2.gguf', '--metal', '--power 100', '--ctx 500000'],
+    argv=['--chdir', str(HOME/'ds4/runtimes/glm-1485eb283928'),
+          '-m', str(HOME/'dsv4/gguf/GLM-5.3-Flash-Q2.gguf'),
+          '--metal', '--power', '100', '--ctx', '500000', '--port', '8001'])
+
+
+# Exact-byte GLM terminal-only qualification: reports/live-qualification in
+# /Users/jack/research/glm-restore-20261012. No retained borrowing.
+MODELS['glm-5.3-flash'] = dict(GLM_CANDIDATE, sha='1485eb2839289b738f2fb90c6e99034a7ca7fc6e652cd881ec2266a617fcd986')
 
 def command(*args, check=True):
     return subprocess.run(args, check=check, capture_output=True, text=True).stdout.strip()
@@ -102,10 +116,17 @@ class ManagedSwitch:
         p=service_pid()
         if not p: raise RuntimeError('managed engine absent')
         argv=command('/bin/ps','-p',str(p),'-o','command=')
-        if not all(arg in argv for arg in config['args']):
+        if 'argv' in config:
+            # GLM's baseline is ordinary decode, RAM-only KV and 500K context.
+            # Exact tokens also reject duplicate/overriding flags and path substrings.
+            valid = shlex.split(argv) == [str(config['binary']), *config['argv']]
+        else:
+            valid = all(arg in argv for arg in config['args'])
+        if not valid:
             raise RuntimeError('unqualified model settings')
         e=rb.FileEngine('ds4',ctl('getenv','DS4_FREEZE_DIR'),p,HOME/'.dsv4/dsv4.log',
-                        config['binary'],expected_sha=config['sha'])
+                        config['binary'],expected_sha=config['sha'],
+                        terminal_only=config.get('terminal_only', False))
         e.core=ROOT/'coordinator/liveness-evidence-20260925/coordinator-cpu'
         return e
 
