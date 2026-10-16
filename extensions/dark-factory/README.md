@@ -46,7 +46,7 @@ that same key; do not assume workers started.
 
 `--settings` imports a JSON object once; the file is not a live configuration.
 Creation requires name, existing absolute Git checkout cwd, nonempty starting-node
-UUIDs and 2–10 slots. Instruction-entry UUID and owner vote condition may be null
+UUIDs and 0–10 slots. Instruction-entry UUID and owner vote condition may be null
 or omitted while preparing a stopped floor. Two slots may
 use the same model. This generic example is input structure, not an approved
 project/instruction/account route:
@@ -99,10 +99,28 @@ occupants. Editing the owner's condition invalidates old votes and notifies peer
 membership changes invalidate an unfinished ballot. Unanimous yes pauses/drains
 for that condition, not controller-defined product completion.
 
+### Automatic Codex quota retirement
+
+On a running floor, the controller checks the existing Personal router's quota feed
+before launching replacements. When every account compatible with a Codex model has
+an exhausted quota window whose reset is still in the future, it removes that model's
+Codex slots and disables a Codex Pathfinder on the same exhausted route. This uses
+the room's SQLite-backed configuration/retirement path, cancels stale ballots, and
+leaves OpenRouter/Qwen routes and independent jobs alone. Unknown/missing telemetry,
+auth/network failures and a 429 without confirmed exhaustion do not remove slots.
+Factory startup never falls back from Codex Personal to paid OpenAI API usage.
+
+Existing Codex turns and tracked background work drain before native shutdown; no
+model-authored handoff is possible without quota. The transcript is retained and the
+exit is recorded as loss, not successful project completion. Interrupted sessions
+remain held for inspection. Actual pane exit still gates cleanup. Removed slots and
+Pathfinder stay removed after reset/restart; explicitly re-add them to resume Codex.
+Zero or one remaining peer is supported, including a floor with no eligible workers.
+
 ### Pathfinder
 
 `pathfinder` is an optional settings object; omitted/null leaves it disabled.
-It runs one separately scheduled `@PATHFINDER` session outside the 2–10 peer
+It runs one separately scheduled `@PATHFINDER` session outside the 0–10 peer
 slots and ballot electorate. In room settings, enable Pathfinder and save.
 The form edits its route and optional continuation; disabling and
 saving gracefully retires its occupant. The same settings remain available

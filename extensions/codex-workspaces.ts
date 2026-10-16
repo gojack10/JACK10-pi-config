@@ -186,7 +186,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					evaluateCodexRouteFromFiles({ model: model.id, registryPath: REGISTRY_PATH, feedPath: FEED_PATH }),
 				context,
 				excludedAccountKeys: failedAccounts,
-				fallbackProviderId: sessionStarted ? undefined : "openai",
+				fallbackProviderId: sessionStarted || process.env.FACTORY_FLOOR ? undefined : "openai",
 			});
 			startupFallbackWarning = resolved.warning;
 			if (resolved.pin) {

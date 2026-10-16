@@ -80,7 +80,7 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
       }
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       if (!validObject(body, operations[action]) || (action === 'configuration' ? !Object.keys(body).length : operations[action].some(k => body[k] === undefined))) return send(400, { error: 'unexpected input' });
-      if (action === 'configuration' && Object.hasOwn(body, 'slots') && (!Array.isArray(body.slots) || body.slots.length < 2 || body.slots.length > 10 ||
+      if (action === 'configuration' && Object.hasOwn(body, 'slots') && (!Array.isArray(body.slots) || body.slots.length > 10 ||
           body.slots.some(s => !validObject(s, ['id','provider','model','thinking','role','contextWarningPercent'])))) return send(400, { error: 'invalid slots' });
       if (action === 'oss') {
         // Selection names a discovered floor, never a path/executable. Runtime owns

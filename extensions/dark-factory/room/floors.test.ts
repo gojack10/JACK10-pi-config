@@ -78,13 +78,18 @@ test('settings expose current versus next config, advisory unknown usage, owner 
   assert.equal(JSON.parse(p.requests.find(([path]) => path.endsWith('/condition'))[1].body).condition, 'Dogfood only');
   await p.click('#oss-select'); assert.deepEqual(JSON.parse(p.requests.find(([path]) => path.endsWith('/oss'))[1].body), {});
   const field = id => ({ dataset: { slot: id }, querySelector(selector) { return { value: ({ '[name=route]': 'openai-codex-test/gpt-6.1-sol', '[name=thinking]': 'high', '[name=role]': 'next role', '[name=contextWarningPercent]': '75' })[selector] }; } });
-  p.element('#slot-fields').children = [field('1')];
+  p.element('#slot-fields').children = Array.from({ length: 11 }, (_, i) => field(String(i)));
   await p.element('#slot-settings').events.submit({ preventDefault() {} });
-  assert.equal(p.element('#settings-error').textContent, 'Configure 2–10 slots');
+  assert.equal(p.element('#settings-error').textContent, 'Configure 0–10 slots');
   assert.equal(p.requests.some(([path]) => path.endsWith('/configuration')), false);
   p.element('#slot-fields').children = [field('1'), field('2')];
   await p.element('#slot-settings').events.submit({ preventDefault() {} });
   const configured = JSON.parse(p.requests.find(([path]) => path.endsWith('/configuration'))[1].body);
   assert.equal(configured.slots.length, 2); assert.equal(configured.slots[0].role, 'next role');
   assert.equal(configured.slots[0].contextWarningPercent, 75);
+  for (const count of [1, 0]) {
+    p.element('#slot-fields').children = Array.from({ length: count }, (_, i) => field(String(i)));
+    await p.element('#slot-settings').events.submit({ preventDefault() {} });
+    assert.equal(JSON.parse(p.requests.filter(([path]) => path.endsWith('/configuration')).at(-1)[1].body).slots.length, count);
+  }
 });
