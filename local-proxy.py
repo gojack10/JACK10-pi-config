@@ -24,6 +24,7 @@ from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
 import swap_policy
+from managed_switch import MODELS as MANAGED_MODELS
 from winnow_runtime import WinnowRuntime, MODEL_ID as WINNOW_MODEL_ID, UPSTREAM_ID as WINNOW_UPSTREAM_ID, PORT as WINNOW_PORT
 
 CHAT_TIMEOUT = ClientTimeout(total=None, sock_connect=10, sock_read=None)
@@ -80,7 +81,9 @@ MLX_START_TIMEOUT = 900
 MLX_IDLE_TIMEOUT = 30 * 60
 MLX_LAST_REQUEST_AT = 0.0
 DS41_MODEL_ID = "deepseek-v4.1-flash"
-DS4_MODEL_IDS = {QWEN_NEXT_MODEL_ID, DS41_MODEL_ID}
+# Only the reviewed native registry advertises switchable DS4 models. A staged
+# candidate (including GLM) is neither admission nor qualification evidence.
+DS4_MODEL_IDS = set(MANAGED_MODELS)
 DS4_SERVICE_LABEL = "com.dsv4.server"
 DS4_DESIRED_FILE = Path.home() / ".dsv4" / "desired-model"
 DS4_SWITCH_TIMEOUT = 600
@@ -1427,6 +1430,8 @@ async def begin_independent_kev(request):
             try:
                 manager.adopt()  # existing pinned Qwen/V4.1 only; never start/switch a model
                 engine = manager.engine
+                if getattr(engine, 'terminal_only', False):
+                    raise RuntimeError('terminal_only_main_cannot_borrow')
                 if hashlib.sha256(engine.core.read_bytes()).hexdigest() != COORDINATOR_SHA256:
                     raise RuntimeError('unqualified coordinator binary')
             except BaseException:
@@ -1548,7 +1553,8 @@ async def handle_models(request):
             continue
         for model in result:
             model_id = model.get("id")
-            if not model_id or model_id in seen or model_id in DS4_MODEL_IDS:
+            if not model_id or model_id in seen or model_id in DS4_MODEL_IDS or \
+               model_id == GLM_FLASH_MODEL_ID:
                 continue
             seen.add(model_id)
             merged.append(model)
@@ -1575,7 +1581,17 @@ async def handle_chat(request):
         is_stream = bool(payload.get("stream", False))
 
     backend_name = get_backend_name(model_id)
+    if model_id == GLM_FLASH_MODEL_ID and (
+        not RESERVATION_TRIAL or not DUAL_MODELS or model_id not in DS4_MODEL_IDS
+    ):
+        reservation_body.unavailable(request, 'glm_native_model_unqualified')
     if RESERVATION_TRIAL and backend_name in ('ds4', 'mlx'):
+        if model_id == GLM_FLASH_MODEL_ID:
+            # GLM deliberately skips the retained-owner coordinator, but its
+            # CPU native-eligibility authority still needs the same build pin.
+            if hashlib.sha256(COORDINATOR.read_bytes()).hexdigest() != COORDINATOR_SHA256:
+                reservation_body.unavailable(request, 'unqualified_coordinator_binary')
+            body = normalize_ds4_chat_body(backend_name, body)
         return await reservation_body.handle_main(request, body, backend_name, model_id,
             CheckedReservation, begin_request, finish_request, REQUEST_CONDITION,
             BACKENDS[backend_name]['v1'], mark_reservation_blocked)
@@ -1860,6 +1876,10 @@ async def handle_other(request):
         if not err and isinstance(payload, dict):
             model_id = payload.get("model", "")
     backend_name = get_backend_name(model_id)
+    if model_id == GLM_FLASH_MODEL_ID:
+        # GLM is prepared only for native terminal-only streaming chat. Never
+        # bypass its adapter through /completions, /responses or the catch-all.
+        reservation_body.unavailable(request, 'unsupported_native_reservation_path')
     started = forwarded = complete = False
 
     try:
