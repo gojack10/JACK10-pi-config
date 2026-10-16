@@ -38,6 +38,14 @@ export type RouteEvaluation = {
 	error?: string;
 };
 
+// Unknown capacity and transient rate limits are not proof of exhausted usage.
+export const isCodexQuotaExhausted = (evaluation: RouteEvaluation): boolean => {
+	const compatible = evaluation.accounts.filter(({ reasons }) => !reasons.includes("UNSUPPORTED MODEL"));
+	return evaluation.allBlocked && compatible.length > 0 && compatible.every(({ telemetry, reasons }) =>
+		!!telemetry && !reasons.includes("REGISTRY/FEED MISMATCH") &&
+		reasons.some((reason) => reason.startsWith("WINDOW EXHAUSTED ")));
+};
+
 const DEFAULT_REGISTRY_PATH = join(homedir(), ".pi", "agent", "codex-accounts.json");
 const DEFAULT_FEED_PATH = join(homedir(), ".pi", "agent", "codex-usage-state.json");
 const DEFAULT_OBSERVABILITY_PATH = join(homedir(), ".pi", "agent", "codex-usage-observability.jsonl");

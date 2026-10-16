@@ -259,7 +259,6 @@ function slotMarkup(slot, index) {
 function slotControls() {
   const fields = [...$('#slot-fields').children];
   $('#add-slot').disabled = fields.length >= 10;
-  for (const field of fields) field.querySelector('[data-remove-slot]').disabled = fields.length <= 2;
 }
 function pathfinderControls() {
   const enabled = $('#pathfinder-enabled').checked;
@@ -295,7 +294,7 @@ $('#slot-settings').addEventListener('submit', async e => {
     return { id: field.dataset.slot, provider: route.provider, model: route.model, thinking: field.querySelector('[name=thinking]').value,
       role: field.querySelector('[name=role]').value, contextWarningPercent: Number(field.querySelector('[name=contextWarningPercent]').value) };
   });
-  if (slots.length < 2 || slots.length > 10) { $('#settings-error').textContent = 'Configure 2–10 slots'; return; }
+  if (slots.length > 10) { $('#settings-error').textContent = 'Configure 0–10 slots'; return; }
   if (await mutate('configuration', { slots }) && panelFloor === selected) openSettings();
 });
 $('#pathfinder-enabled').addEventListener('change', pathfinderControls);
@@ -330,7 +329,7 @@ document.addEventListener('click', e => {
   void unlockAudio();
   const floor = e.target.closest('[data-floor]'); if (floor) selectFloor(floor.dataset.floor);
   const remove = e.target.closest('[data-remove-slot]');
-  if (remove && $('#slot-fields').children.length > 2) { remove.closest('fieldset').remove(); slotControls(); }
+  if (remove) { remove.closest('fieldset').remove(); slotControls(); }
   const mention = e.target.closest('[data-mention]');
   if (mention) { $('#message').value += ($('#message').value ? ' ' : '') + '@' + mention.dataset.mention + ' '; persistDraft(); $('#message').focus(); controls(); }
 });

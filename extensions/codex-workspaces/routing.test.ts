@@ -12,12 +12,16 @@ test("resumes and reroutes on each prompt, recovers priority after reset, and bo
 	const home = await mkdtemp(join(tmpdir(), "codex-routing-"));
 	const oldHome = process.env.HOME;
 	const oldMaintenance = process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
+	const oldFloor = process.env.FACTORY_FLOOR;
+	delete process.env.FACTORY_FLOOR;
 	process.env.HOME = home;
 	delete process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
 	t.after(async () => {
 		process.env.HOME = oldHome;
 		if (oldMaintenance === undefined) delete process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
 		else process.env.PI_CODEX_ACCOUNT_MAINTENANCE = oldMaintenance;
+		if (oldFloor === undefined) delete process.env.FACTORY_FLOOR;
+		else process.env.FACTORY_FLOOR = oldFloor;
 		await rm(home, { recursive: true, force: true });
 	});
 	const dir = join(home, ".pi/agent");
@@ -92,4 +96,17 @@ test("resumes and reroutes on each prompt, recovers priority after reset, and bo
 	await emit("session_start");
 	await emit("before_agent_start");
 	assert.equal(selections, before); // Explicit maintenance never auto-routes.
+
+	delete process.env.PI_CODEX_ACCOUNT_MAINTENANCE;
+	for (const sample of samples) for (const window of sample.windows) { window.pctUsed = 100; window.resetAt = now / 1000 + 7200; }
+	await save();
+	for (const factory of [false, true]) {
+		if (factory) process.env.FACTORY_FLOOR = 'fixture';
+		const fresh = await loadExtensions([fileURLToPath(new URL('../codex-workspaces.ts', import.meta.url))], home);
+		assert.deepEqual(fresh.errors, []);
+		const provider = fresh.runtime.pendingNativeProviderRegistrations.find((entry: any) => entry.provider.id === selector.id)!.provider;
+		const resolve = () => provider.resolveModel({ provider: selector.id, id }, { getModel: ctx.modelRegistry.find, hasAuth: async () => true });
+		if (factory) await assert.rejects(resolve(), /no Codex Personal account.*currently routable/);
+		else assert.equal((await resolve()).provider, 'openai', 'ordinary interactive startup keeps its existing fallback');
+	}
 });

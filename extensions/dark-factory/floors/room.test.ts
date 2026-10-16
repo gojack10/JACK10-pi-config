@@ -52,7 +52,7 @@ test('multi-floor gateway isolates state, discovers without restart, sanitizes i
   assert.equal((await read('alpha')).settings.voteCondition, 'Dogfood'); assert.equal((await read('beta')).settings.voteCondition, 'Owner condition');
   assert.equal((await post('beta', 'oss', {})).status, 200);
   assert.equal((await (await fetch(base, { headers: auth })).json()).oss.selectedFloor, 'beta');
-  for (const body of [{ slots: [] }, { slots: [...slots, { id: 'bad', executable: '/bin/sh' }] }, { slots, database: '/private' }]) assert.equal((await post('alpha', 'configuration', body)).status, 400);
+  for (const body of [{ slots: null }, { slots: Array(11).fill(slots[0]) }, { slots: [...slots, { id: 'bad', executable: '/bin/sh' }] }, { slots, database: '/private' }]) assert.equal((await post('alpha', 'configuration', body)).status, 400);
   assert.equal((await post('alpha', 'message', { key: 'bad', text: 'x', sender: 'peer' })).status, 400);
   assert.equal((await post('alpha', 'message', { key: 'bad', text: 'x' }, { Origin: 'https://evil.test' })).status, 403);
   assert.equal((await post('alpha', 'message', { key: 'bad', text: 'x'.repeat(300000) })).status, 413);

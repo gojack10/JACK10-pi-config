@@ -57,7 +57,7 @@ export function validateSettings(input) {
   if (input.instructions != null && (typeof input.instructions !== 'string' || !uuid.test(input.instructions))) throw new Error('instructions must be a tree node UUID or null while stopped');
   if (input.voteCondition != null && (typeof input.voteCondition !== 'string' || !uuid.test(input.voteCondition))) throw new Error('voteCondition must be a tree node UUID or null while stopped');
   const voteCondition = input.voteCondition ?? null;
-  if (!Array.isArray(input.slots) || input.slots.length < 2 || input.slots.length > 10) throw new Error('floor requires 2-10 slots');
+  if (!Array.isArray(input.slots) || input.slots.length > 10) throw new Error('floor requires 0-10 slots');
   const slots = input.slots.map(validateSlot);
   if (new Set(slots.map(s => s.id)).size !== slots.length || slots.filter(isOss).length > 1) throw new Error('slot IDs must be unique; at most one OSS slot per floor');
   let pathfinder = null;
@@ -122,11 +122,11 @@ export function openFloor(id, { root = DEFAULT_ROOT } = {}) {
   const config = { database, run, floor: id, session: 'controller', sender: '00000000' }, board = openBoard(config);
   return { id, database, config, board, root,
     settings: () => board.lifecycle.status().floor,
-    configure(patch) {
+    configure(patch, retirementReason) {
       if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('configuration patch must be an object');
       const settings = validateSettings({ ...this.settings(), ...patch });
       const current = board.lifecycle.status().config;
-      return board.lifecycle.configureFloor(settings, launchSettings(settings, root, id, metadata.run_dir, current.agentDir));
+      return board.lifecycle.configureFloor(settings, launchSettings(settings, root, id, metadata.run_dir, current.agentDir), retirementReason);
     },
     snapshot(after = 0) {
       const state = board.lifecycle.status();

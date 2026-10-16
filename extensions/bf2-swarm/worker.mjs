@@ -1,4 +1,5 @@
 import { configuration, openBoard } from './board.mjs';
+import { CODEX_QUOTA_RETIREMENT } from './lifecycle-store.mjs';
 
 export const WARNING = 'Context is at least 80%. Preserve useful progress on the tree and consider a handoff/retirement at a sensible boundary. This is one warning, not a forced stop; tools remain available.';
 export const warningType = 'bf2-swarm-warning';
@@ -29,14 +30,26 @@ export function handoffTool(worker, parameters) {
 export function installWorker(pi, env = process.env, drained = () => true) {
   if (env.BF2_SWARM_WORKER !== '1' && !env.FACTORY_SESSION) return;
   const config = configuration(env);
-  let board, timer, warned = false, budgetBucket = 0, pausedNotice, notifying = false, refused = false;
+  let board, timer, warned = false, budgetBucket = 0, pausedNotice, notifying = false, refused = false, settled = true;
   const close = () => { clearInterval(timer); timer = undefined; board?.close(); board = undefined; };
   const live = ctx => board && ctx.sessionManager.getSessionId() === config.session;
+  const exitExhausted = (row, ctx) => {
+    if (row?.retire_requested !== CODEX_QUOTA_RETIREMENT) return false;
+    // No quota remains for a model-authored handoff. Retain the transcript as loss,
+    // not a fabricated successful handoff; never cancel independent machine jobs.
+    board.lifecycle.lost(config.session, CODEX_QUOTA_RETIREMENT);
+    ctx.shutdown();
+    return true;
+  };
   const notifyPause = async ctx => {
     if (!live(ctx) || notifying) return;
     const state = board.lifecycle.status();
     const row = state.workers.find(w => w.session === config.session);
     const notice = `${state.status}:${row?.retire_requested ?? ''}`;
+    if (row?.retire_requested === CODEX_QUOTA_RETIREMENT) {
+      if (settled && ctx.isIdle() && drained(ctx)) exitExhausted(row, ctx);
+      return; // Do not enqueue an impossible model wrapup on every timer tick.
+    }
     if (!row || row.state !== 'active' || (state.status === 'running' && !row.retire_requested) || pausedNotice === notice) return;
     notifying = true;
     try {
@@ -131,9 +144,12 @@ export function installWorker(pi, env = process.env, drained = () => true) {
   pi.on('message_end', (event, ctx) => {
     if (live(ctx) && event.message?.role === 'assistant') board.lifecycle.recordError(event.message.stopReason === 'error' ? event.message.errorMessage ?? 'assistant ended with error; no further diagnosis available' : null);
   });
+  pi.on('agent_start', () => { settled = false; });
   pi.on('agent_settled', (event, ctx) => {
+    settled = !event.interruption;
     if (!event.interruption && live(ctx) && drained(ctx)) {
       const row = board.lifecycle.status().workers.find(w => w.session === config.session);
+      if (exitExhausted(row, ctx)) return;
       if (row?.last_error) { board.lifecycle.lost(config.session, row.last_error); ctx.shutdown(); return; }
     }
     // Native settlement has no outcome field; interrupted runs are not safe retirement.

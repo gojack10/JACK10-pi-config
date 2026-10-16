@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { CodexAccount, CodexAccountRegistry, CodexUsageState, RegistryAccount } from "../codex-quota-extension/store.ts";
-import { evaluateCodexRoute, evaluateCodexRouteFromFiles } from "./router.ts";
+import { evaluateCodexRoute, evaluateCodexRouteFromFiles, isCodexQuotaExhausted } from "./router.ts";
 
 const now = 2_000_000_000_000;
 const seconds = now / 1000;
@@ -68,6 +68,28 @@ test("all exhausted accounts report earliest recovery", () => {
 	assert.equal(result.allBlocked, true);
 	assert.match(result.error!, /WINDOW EXHAUSTED 300m/);
 	assert.match(result.error!, new RegExp(`Earliest recovery: ${new Date((seconds + 7200) * 1000).toISOString()}`));
+});
+
+test("factory retirement needs confirmed exhaustion on every compatible account, not just an unavailable route", () => {
+	const samples = accounts.map((account, i) => telemetry(account, i === 0 ? 100 : 20, i === 0 ? 20 : 100));
+	const check = (samples: CodexAccount[], routedModel = model, configured = registry) => isCodexQuotaExhausted(
+		evaluateCodexRoute({ registry: configured, feed: feed(...samples), model: routedModel, now }));
+	assert.equal(check(samples), true, "different exhausted windows still block every account");
+	assert.equal(check(samples.slice(1)), false, "missing account telemetry is not exhaustion");
+	assert.equal(check(samples, "gpt-9-missing"), false);
+	assert.equal(check(samples, model, { ...registry, accounts: [] }), false);
+	const limited = telemetry(accounts[0]!);
+	limited.status429 = true; limited.notBefore = seconds + 60;
+	assert.equal(check([limited, ...samples.slice(1)]), false, "429/cooldown alone is not exhausted usage");
+	limited.windows[0]!.pctUsed = 100;
+	assert.equal(check([limited, ...samples.slice(1)]), true);
+	limited.id = "openai-codex-wrong";
+	assert.equal(check([limited, ...samples.slice(1)]), false, "mismatched feed cannot delete capacity");
+	const reset = telemetry(accounts[0]!, 100, 100);
+	reset.windows.forEach(window => { window.resetAt = seconds - 1; });
+	assert.equal(check([reset, ...samples.slice(1)]), false, "elapsed resets permit verification");
+	const configured = { ...registry, accounts: accounts.map((account, i) => i === 0 ? { ...account, supportedModels: ["other"] } : account) };
+	assert.equal(check(samples.slice(1), model, configured), true, "unsupported accounts do not belong to this route");
 });
 
 test("split quota windows across accounts cannot form a route", () => {

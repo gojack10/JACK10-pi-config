@@ -22,7 +22,7 @@ hosted configuration.
 
 The browser discovers floors every second, polls every floor's messages, and
 keeps transcript/cursor/status, drafts and failed-send retry keys floor-scoped.
-Tabs appear without a server restart. Slots configure 2–10 next occupants;
+Tabs appear without a server restart. Slots configure 0–10 next occupants;
 current occupants, advisory warning threshold and unknown context usage are
 shown separately. Removing a slot requests runtime drain, not a browser kill.
 The owner condition is editable; its electorate and actual yes count are shown
