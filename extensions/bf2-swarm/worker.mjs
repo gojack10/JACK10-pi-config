@@ -76,13 +76,17 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     if (!config.floor || checkingGoal || Date.now() - goalCheckAt < GOAL_CHECK_MS || !allowed()) return;
     checkingGoal = true;
     try {
-      const receipt = await pi.sendUserMessage(`Five-minute reminder. ${goalCheck(board.lifecycle.status())}`, {
+      const percent = ctx.getContextUsage()?.percent;
+      const notice = `Context usage: ${typeof percent === 'number' && Number.isFinite(percent) ? `${percent}%` : 'unknown'}.`;
+      const reminder = `Five-minute reminder. ${goalCheck(board.lifecycle.status())}`;
+      const receipt = await pi.sendUserMessage(`${notice}\n\n${reminder}`, {
         deliverAs: 'steer', expandPromptTemplates: false,
         admissionKey: `factory-goal-check:${config.session}:${goalCheckAt}`, admissionGuard: allowed,
       });
       if (allowed() && receipt.status === 'admitted' && ['steer', 'turn'].includes(receipt.delivery)) {
         goalCheckAt = Date.now();
         pi.appendEntry(goalCheckType, { at: goalCheckAt });
+        board.post(`[Synthetic five-minute check-in] ${config.sender}\n${notice}\n\n${reminder}`);
       }
     } finally { checkingGoal = false; }
   };

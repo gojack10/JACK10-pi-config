@@ -32,8 +32,14 @@ export function receiver(pi, config, ctx) {
         if (!batch) return;
         // message_end extensions run BEFORE Pi appends the entry. Inspect on a
         // later tick/turn instead; do not equate an admission receipt with storage.
-        const matches = entry => entry.type === 'message' && entry.message.role === 'user' &&
-          textOf(entry.message.content) === batch.text;
+        const usage = ctx.getContextUsage?.()?.percent;
+        const contextNotice = `Context usage: ${typeof usage === 'number' && Number.isFinite(usage) ? `${usage}%` : 'unknown'}.`;
+        let deliveryText = `${contextNotice}\n\n${batch.text}`;
+        const matches = entry => {
+          const content = textOf(entry.message?.content);
+          return entry.type === 'message' && entry.message.role === 'user' &&
+            (content === batch.text || (content.startsWith('Context usage: ') && content.endsWith(batch.text)));
+        };
         const selected = ctx.sessionManager.getBranch().find(matches);
         // SessionManager appends in memory before its synchronous file write. A
         // branch entry alone could survive a failed write; require disk evidence.
@@ -50,9 +56,10 @@ export function receiver(pi, config, ctx) {
           admitted = undefined;
           batch = board.pending();
           if (!batch) return;
+          deliveryText = `${contextNotice}\n\n${batch.text}`;
         }
         if (admitted === batch.key) return;
-        const receipt = await pi.sendUserMessage(batch.text, {
+        const receipt = await pi.sendUserMessage(deliveryText, {
           deliverAs: 'steer', expandPromptTemplates: false,
           admissionKey: `bf2-board:${batch.key}`, admissionGuard: current,
         });
