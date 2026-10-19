@@ -1,0 +1,2 @@
+# Unified patches use a single space to mark empty context lines.
+/startlux-service/managed.patch whitespace=-blank-at-eol

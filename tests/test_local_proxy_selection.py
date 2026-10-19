@@ -26,7 +26,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.p = p = load_proxy()
         self.enterContext(patch.object(p.swap_policy, "SWAP", p.swap_policy.SwapPolicy()))
         self.enterContext(patch.object(p.swap_policy, "port_listening", return_value=False))
-        self.enterContext(patch.object(p.WINNOW, "probe", return_value=None))
+        self.enterContext(patch.object(p.STARTLUX, "probe", return_value=None))
         self.loaded = p.GLM_FLASH_MODEL_ID
         self.events = []
         self.fail_start = False
