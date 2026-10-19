@@ -150,7 +150,7 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     const bucket = Math.floor(percent / 10) * 10;
     if (state.floor && typeof percent === 'number' && Number.isFinite(percent) && percent < threshold &&
       bucket >= 10 && bucket <= 90 && bucket > budgetBucket && board.lifecycle.acceptsInput()) {
-      const receipt = await pi.sendUserMessage(`Context budget: ${bucket}% used. ${goalCheck(state)}`, {
+      const receipt = await pi.sendUserMessage(`Context usage: ${percent}%. Retirement threshold: ${threshold}%. This is a progress reminder, not a stop request. Continue working.\n\n${goalCheck(state)}`, {
         deliverAs: 'steer', expandPromptTemplates: false,
         admissionKey: `factory-context-budget:${config.session}:${bucket}`,
         admissionGuard: () => !!live(ctx) && board.lifecycle.acceptsInput(),

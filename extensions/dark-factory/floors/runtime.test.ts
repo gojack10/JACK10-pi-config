@@ -306,7 +306,7 @@ test('required launch-text gate, per-occupant context-stop threshold and known J
   await handlers.get('session_start')({}, ctx);
   for (const value of [undefined, NaN, 59]) { percent = value; await handlers.get('turn_end')({}, ctx); }
   percent = 60; await handlers.get('turn_end')({}, ctx); await handlers.get('turn_end')({}, ctx);
-  assert.match(sent[0], /^Context budget: 50% used\./);
+  assert.match(sent[0], /^Context usage: 59%\. Retirement threshold: 60%\. This is a progress reminder, not a stop request\. Continue working\./);
   assert.deepEqual(sent.slice(1), [`Fixture warning 60\n\n${goalCheck(floor.board.lifecycle.status())}`]); assert.equal(shutdown, 0);
   assert.equal(floor.snapshot().workers[0].retire_requested, 'context threshold');
   assert.equal(floor.snapshot().workers[0].session_file, path); assert.equal(floor.snapshot().workers[0].context_percent, 60);

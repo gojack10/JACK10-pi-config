@@ -64,7 +64,7 @@ test('threshold transitions durably before next tool; locator expands; native ca
   const h = fixture(t); let drained = false; const f = fake(t, h, () => drained);
   await f.handlers.get('session_start')({}, f.ctx);
   for (const n of [NaN, undefined, 69.9]) { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); }
-  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context budget: 60% used\./);
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context usage: 69\.9%\. Retirement threshold: 70%\. This is a progress reminder, not a stop request\. Continue working\./);
   f.usage(70);
   const blocked = await f.handlers.get('tool_call')({ toolName: 'subagent_launch' }, f.ctx);
   assert.ok(blocked.block); assert.match(blocked.reason, /Context stop: 70% on floor fixture/);
@@ -94,13 +94,16 @@ test('threshold transitions durably before next tool; locator expands; native ca
 
 test('budget steers reference the current floor goal without project IDs; threshold retirement stays unchanged', async t => {
   const h = fixture(t, 100), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+  h.floor.configure({ slots: h.floor.settings().slots.map(s => ({ ...s, contextWarning: 80 })) });
+  assert.equal(h.floor.settings().slots[0].contextWarning, 80);
+  assert.equal(h.board.lifecycle.status().workers[0].launch_config.contextWarning, 100, 'notices and enforcement use the SQLite occupant threshold, not next-occupant settings');
   const observe = async n => { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); };
   for (const n of [undefined, null, NaN, Infinity, -10, '20', 0, 9.9]) await observe(n);
   assert.equal(f.sent.length, 0);
   for (let bucket = 10; bucket <= 90; bucket += 10) {
     await observe(bucket); await observe(bucket + 0.1); await observe(bucket + 9.9);
     assert.equal(f.sent.length, bucket / 10);
-    assert.equal(f.sent.at(-1), `Context budget: ${bucket}% used. ${goalCheck(h.board.lifecycle.status())}`);
+    assert.equal(f.sent.at(-1), `Context usage: ${bucket}%. Retirement threshold: 100%. This is a progress reminder, not a stop request. Continue working.\n\n${goalCheck(h.board.lifecycle.status())}`);
     const { options, handled } = f.deliveries.at(-1);
     assert.equal(options.deliverAs, 'steer'); assert.equal(options.expandPromptTemplates, false);
     assert.equal(options.admissionKey, `factory-context-budget:${h.session}:${bucket}`);
@@ -126,8 +129,8 @@ test('budget steer skips crossed buckets, retries rejected admission and ignores
   f.pi.sendUserMessage = (...args) => reject ? Promise.resolve({ status: 'rejected' }) : send(...args);
   await observe(21); assert.equal(f.sent.length, 0); assert.ok(!f.entries.some(e => e.customType === budgetType));
   reject = false; await observe(29); await observe(29.9); await observe(11);
-  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context budget: 20%/);
-  await observe(69.9); assert.equal(f.sent.length, 2); assert.match(f.sent[1], /^Context budget: 60%/);
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context usage: 29%\. Retirement threshold: 70%\./);
+  await observe(69.9); assert.equal(f.sent.length, 2); assert.match(f.sent[1], /^Context usage: 69\.9%\. Retirement threshold: 70%\./);
   const id = f.ctx.sessionManager.getSessionId;
   f.ctx.sessionManager.getSessionId = () => randomUUID(); await observe(90);
   assert.equal(f.sent.length, 2); f.ctx.sessionManager.getSessionId = id;
@@ -172,7 +175,7 @@ for (const specialist of [false, true]) test(`five-minute USER reminders wake id
   assert.equal(f.deliveries[0].options.deliverAs, 'steer'); assert.equal(f.deliveries[0].options.expandPromptTemplates, false);
   f.handlers.get('agent_start')({}, f.ctx);
   f.usage(10); await f.handlers.get('turn_end')({}, f.ctx);
-  assert.equal(f.sent.at(-1), `Context budget: 10% used. ${text}`);
+  assert.equal(f.sent.at(-1), `Context usage: 10%. Retirement threshold: 70%. This is a progress reminder, not a stop request. Continue working.\n\n${text}`);
   await advance(GOAL_CHECK_MS); assert.equal(f.sent.length, 3, 'busy worker still receives the five-minute steer');
   assert.equal(f.sent.at(-1), `Context usage: 10%.\n\n${f.sent[0].split('\n\n')[1]}`);
   assert.notEqual(f.deliveries[0].options.admissionKey, f.deliveries.at(-1).options.admissionKey);
