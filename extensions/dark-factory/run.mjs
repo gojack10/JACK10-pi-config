@@ -9,9 +9,14 @@ import { suiteStatus } from './parallel.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const [command, argument] = process.argv.slice(2);
+const configFlag = process.argv.indexOf('--config');
+const prepared = ['start', 'smoke'].includes(command) && configFlag !== -1
+  ? JSON.parse(readFileSync(resolve(process.argv[configFlag + 1]), 'utf8')) : undefined;
+const selected = prepared?.project;
 const project = command === 'controller'
   ? JSON.parse(readFileSync(join(resolve(argument), 'config.json'), 'utf8')).project ?? taskSettings()
-  : taskSettings(!argument || argument === '--wait' ? 'bf2' : argument);
+  : selected ? taskSettings(selected.name, { [selected.name]: selected })
+    : taskSettings(!argument || argument.startsWith('--') ? 'task' : argument);
 const runs = taskRuns(join(home, 'factory-runs'), project.name);
 const lock = join(runs, 'LOCK');
 const quote = x => `'${x.replaceAll("'", "'\\''")}'`;
@@ -104,10 +109,9 @@ if (command === 'controller') {
     }
   }
 } else if (command === 'smoke' || command === 'start') {
-  const configFlag = process.argv.indexOf('--config');
-  const prepared = configFlag === -1 ? undefined : JSON.parse(readFileSync(resolve(process.argv[configFlag + 1]), 'utf8'));
-  if (prepared && prepared.project?.name !== project.name) throw Error('prepared config task mismatch');
-  const contract = prepared?.contract ?? readFileSync(join(here, `${project.name}-contract.md`), 'utf8');
+  if (prepared && argument && !argument.startsWith('--') && argument !== project.name) throw Error('prepared config task mismatch');
+  if (command === 'start' && !project.root) throw Error('Configure a SiftText instruction entry before starting project work');
+  const contract = ''; // Project instructions are read from SiftText, never repository contract files.
   mkdirSync(runs, { recursive: true });
   try { mkdirSync(lock); } catch { throw Error(`Factory ${project.name} locked. Inspect ${join(lock, 'run')}; never remove while its worker may still run.`); }
   const directory = prepared?.directory ? resolve(prepared.directory) : join(runs, new Date().toISOString().replaceAll(':', '-') + (command === 'smoke' ? '-smoke' : `-${project.name}`));
@@ -225,7 +229,7 @@ if (command === 'controller') {
     strategy: blockedResume ? 'operator retries resolved blocker from retained report' : contextResume ? 'fresh agent continues verified context checkpoint' : failed.status === 'stopped' ? 'continue after verified checkpoint' : reviewOrphan ? 'fresh planner reviews unverified orphan' : 'retry interrupted role',
     failure_evidence: failureDir }, null, 2));
 } else if (command === 'suite-status') {
-  const suitePath = join(home, 'factory-runs/sample/SUITE');
+  const suitePath = join(runs, 'SUITE');
   if (!existsSync(suitePath)) console.log(JSON.stringify({ status: 'no_parallel_suite' }));
   else console.log(JSON.stringify(suiteStatus(JSON.parse(readFileSync(readFileSync(suitePath, 'utf8').trim(), 'utf8'))), null, 2));
 } else if (command === 'status') {
@@ -254,6 +258,6 @@ if (command === 'controller') {
     } else console.log(`Stopped and released stale lock: ${directory}`);
   }
 } else {
-  console.log('Usage: node run.mjs <smoke|start|resume|status|suite-status|stop|recover> [task] [--wait] [--config file] (default: bf2)');
+  console.log('Usage: node run.mjs <smoke|start|resume|status|suite-status|stop|recover> [task] [--wait] [--config file] (default: task; project authority comes from SiftText)');
   process.exitCode = 2;
 }

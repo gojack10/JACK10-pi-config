@@ -70,6 +70,11 @@ commit-runs/
 # Dark-factory task lanes: per-run assignment prompts name private projects,
 # SiftText owners and model routes. Only the general engine stays tracked.
 extensions/dark-factory/*-contract.md
+/factory-projects.local.json
+/extensions/dark-factory/lean.mjs
+/extensions/dark-factory/lean.test.ts
+/extensions/dark-factory/size.mjs
+/extensions/dark-factory/size.test.ts
 
 # Private product/tree exports, account audits and disposable research runs.
 # Keep root anchoring so similarly named harness source/tests remain visible.

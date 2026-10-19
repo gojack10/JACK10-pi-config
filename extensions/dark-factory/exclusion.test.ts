@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { continuationAfterStop, runLoop, save, taskSettings, validateReport } from './core.mjs';
 
-const project = { ...taskSettings('sample-reader-0'), excludeUnreadable: true };
+const reader = { ...taskSettings('task', {}), name: 'reader', ready: 'reads_complete' };
+const project = { ...reader, excludeUnreadable: true };
 
 test('authorized access exclusions advance once, remain separate from reads and preserve coverage gaps', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'sample-exclude-'));
+  const d = mkdtempSync(join(tmpdir(), 'reader-exclude-'));
   try {
     const tasks = ['denied', 'readable'].map(tree_id => ({ tree_id, root_id: `root-${tree_id}` }));
     const seen = [];
@@ -22,7 +23,7 @@ test('authorized access exclusions advance once, remain separate from reads and 
           exclusion_reason: 'Root read returned Tree not accessible via AI' } : {}) });
       const text = JSON.stringify({ version: 1, role, disposition: excluded ? 'excluded' : 'worked',
         tree_id: task.tree_id, tree_packet: packet, evidence: [packet], updated_nodes: [], summary: 'honest coverage' });
-      if (excluded) assert.throws(() => validateReport(text, role, false, taskSettings('sample-reader-0')), /invalid disposition/);
+      if (excluded) assert.throws(() => validateReport(text, role, false, reader), /invalid disposition/);
       return { text, receipt: { job: task.tree_id } };
     } });
     assert.deepEqual(seen, ['denied', 'readable']);
@@ -36,7 +37,7 @@ test('authorized access exclusions advance once, remain separate from reads and 
 });
 
 test('a graceful stop after exclusion resumes the next tree without replaying the denied tree', async () => {
-  const d = mkdtempSync(join(tmpdir(), 'sample-exclude-stop-'));
+  const d = mkdtempSync(join(tmpdir(), 'reader-exclude-stop-'));
   try {
     const tasks = ['denied', 'next'].map(tree_id => ({ tree_id, root_id: `root-${tree_id}` }));
     const packet = join(d, 'packet.json');
@@ -68,7 +69,7 @@ test('a graceful stop after exclusion resumes the next tree without replaying th
 
 test('network failures and mismatched identities cannot become access exclusions', async () => {
   for (const fields of [{ exclusion_kind: 'network_timeout' }, { root_id: 'wrong-root' }]) {
-    const d = mkdtempSync(join(tmpdir(), 'sample-exclude-invalid-'));
+    const d = mkdtempSync(join(tmpdir(), 'reader-exclude-invalid-'));
     try {
       const task = { tree_id: 'denied', root_id: 'root' }, packet = join(d, 'packet.json');
       save(packet, { ...task, coverage_status: 'excluded', exclusion_kind: 'ai_read_denied', exclusion_reason: 'denied', ...fields });

@@ -73,8 +73,7 @@ test('provider errors get two same-attempt continuations; reload cannot reset th
       assert.equal(result.continue, true);
       assert.deepEqual(result.entries[0].data, { jobId: 'job', attemptId: 'attempt', retry });
       assert.match(result.entries[1].content, /Do not replay completed work or spent launches/);
-      assert.match(result.entries[1].content, /trust saved results and recover uncertain delivery only with a narrow marker lookup/);
-      assert.doesNotMatch(result.entries[1].content, /verify uncertain effects/);
+      assert.match(result.entries[1].content, /verify uncertain effects before acting/);
       h.entries.push(...result.entries);
       h.load();
     }
