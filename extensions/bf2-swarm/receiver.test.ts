@@ -37,7 +37,7 @@ function fixture(t) {
   let receipt = { status: 'admitted', delivery: 'steer' };
   const ctx = { sessionManager: {
     getSessionId: () => config.session, getSessionFile: () => file, getBranch: () => branch,
-  } };
+  }, getContextUsage: () => ({ percent: 37 }) };
   const pi = { async sendUserMessage(text, options) {
     calls.push({ message: { role: 'user', content: [{ type: 'text', text }] }, options });
     return receipt;
@@ -62,6 +62,7 @@ test('already-pending peers become one attributed USER input, steer; no self ech
   const call = h.calls[0];
   assert.equal(call.message.role, 'user');
   assert.match(call.message.content[0].text, /#1 bbbbbbbb .*"first".*\n#3 bbbbbbbb .*"second"/);
+  assert.match(call.message.content[0].text, /^Context usage: 37%\.\n\nBF2 board batch/);
   assert.doesNotMatch(call.message.content[0].text, /"own"/);
   assert.equal(call.options.deliverAs, 'steer');
   assert.equal(call.options.expandPromptTemplates, false);
@@ -153,7 +154,8 @@ test('native Pi resumes a torn tail and receiver reconciles later USER persisten
   h.startup(); h.peer.post('first');
   let r = h.start(); await r.pump();
   const first = h.board.pending();
-  assert.equal(h.ctx.sessionManager.getBranch().at(-1).message.content[0].text, first.text);
+  assert.ok(h.ctx.sessionManager.getBranch().at(-1).message.content[0].text.startsWith('Context usage: 37%.\n\n'));
+  assert.ok(h.ctx.sessionManager.getBranch().at(-1).message.content[0].text.endsWith(first.text));
   h.peer.post('second'); r.close();
   h.ctx.sessionManager = SessionManager.open(file);
   r = h.start(); await r.pump();
