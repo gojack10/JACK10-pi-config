@@ -26,10 +26,10 @@ MODELS = {
    args=['Qwen3.8-Flash-Next-Q4.gguf','--mtp','--ctx 750000']),
  'deepseek-v4.1-flash': dict(mode='ds41', binary=HOME/'ds4/ds4-server-v41-reservation',
    sha='a3897ee4f2a85f51a2b499ede9e4bbd13886ee0b5f9b1d52cd5ed04e5c7d512a',
-   args=['DeepSeek-V4.1-Flash-Q2.gguf','--metal','--ssd-streaming','--power 100',
+   args=['DeepSeek-V4.1-Flash-1017-Q2.gguf','--metal','--ssd-streaming','--power 100',
          '--ssd-streaming-cache-experts 64GB','--ctx 1000000',
-         '--dir-steering-file /Users/jack/.dsv4/adapters/dealignai-writer-proxy.ds41dir',
-         '--dir-steering-strength 1']),
+         '--dir-steering-file /Users/jack/.dsv4/adapters/msuiche-1017-residual.ds41dir',
+         '--dir-steering-strength 0.5']),
 }
 
 
