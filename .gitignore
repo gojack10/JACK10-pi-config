@@ -70,3 +70,22 @@ commit-runs/
 # Dark-factory task lanes: per-run assignment prompts name private projects,
 # SiftText owners and model routes. Only the general engine stays tracked.
 extensions/dark-factory/*-contract.md
+
+# Private product/tree exports, account audits and disposable research runs.
+# Keep root anchoring so similarly named harness source/tests remain visible.
+/artifacts/
+/decision-calibration-*/
+/decisions-spend-audit-*/
+/eval-call-policy-*/
+/local-decisions-research-*/
+/luna-only-*/
+# mkdtemp run directories end in six characters; not startlux-service/.
+/startlux-*-??????/
+
+# Local service installations and private research-policy executables.
+# Keep the serving adapters, provisioning source, patches and tests tracked.
+/startlux-service/.venv/
+/startlux-service/pin.json
+/startlux-service/model-pin.json
+/startlux-service/swap-cpu
+/startlux-service/swap-check
