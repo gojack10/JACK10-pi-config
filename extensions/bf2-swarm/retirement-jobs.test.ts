@@ -9,7 +9,7 @@ import { main as jobCli } from '../dark-factory/floors/job-cli.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createFloor, openFloor } from '../dark-factory/floors/runtime.mjs';
 import { openBoard } from './board.mjs';
-import { installWorker, budgetType } from './worker.mjs';
+import { installWorker, budgetType, goalCheck, goalCheckType, GOAL_CHECK_MS } from './worker.mjs';
 import { receiver } from './receiver.mjs';
 import { launchJob, cancelJob } from './jobs.mjs';
 
@@ -18,7 +18,7 @@ const eventually = async check => {
   for (let i = 0; i < 200; i++) { const value = check(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 25)); }
   assert.fail('isolated job did not produce expected evidence');
 };
-function fixture(t, contextWarning = 70) {
+function fixture(t, contextWarning = 70, specialist = false) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'factory-retirement-'))), cwd = join(dir, 'repo'), root = join(dir, 'floors');
   mkdirSync(cwd);
   for (const args of [['init'],['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-m','Fixture']]) {
@@ -26,11 +26,14 @@ function fixture(t, contextWarning = 70) {
   }
   writeFileSync(join(cwd, 'draft.txt'), 'unfinished draft\n');
   const slots = ['a','b'].map(id => ({ id, provider: 'openai-codex-fixture', model: 'gpt-6.1-sol', thinking: 'high', contextWarning }));
-  createFloor({ name: 'Fixture', cwd, roots: [node], instructions: node, voteCondition: node, slots,
+  const pathfinder = specialist ? { provider: slots[0].provider, model: slots[0].model, thinking: slots[0].thinking, contextWarning } : null;
+  createFloor({ name: 'Fixture', cwd, roots: [node], instructions: node, voteCondition: node, slots, pathfinder,
     bootstrap: 'Fixture bootstrap', warningText: `Context stop: {percent}% on floor {floor}. Read node ${node} now.`, wrapupText: `Retirement requested: {reason}; {status}; {floor}. Read node ${node} now.` }, { id: 'fixture', root });
   const floor = openFloor('fixture', { root }); floor.command('start', 'start');
   const session = randomUUID(), sender = 'aaaaaaaa';
-  floor.board.lifecycle.addWorker(session, sender, '%1', undefined, { slot: 'a', launchConfig: { ...floor.board.lifecycle.status().config, ...floor.settings().slots[0] } });
+  if (specialist) floor.command('review', 'message', '@PATHFINDER fixture review');
+  floor.board.lifecycle.addWorker(session, sender, '%1', undefined, { slot: specialist ? '@PATHFINDER' : 'a',
+    launchConfig: { ...floor.board.lifecycle.status().config, ...(specialist ? floor.settings().pathfinder : floor.settings().slots[0]) } });
   const config = { ...floor.config, session, sender }, board = openBoard(config); board.lifecycle.ready();
   const env = { FACTORY_FLOOR: floor.id, FACTORY_ROOT: root, FACTORY_DB: floor.database, FACTORY_SESSION: session, FACTORY_SENDER: sender };
   t.after(async () => {
@@ -74,7 +77,7 @@ test('threshold transitions durably before next tool; locator expands; native ca
   assert.throws(() => launchJob(h.board, h.config, { id: randomUUID(), command: 'true', cwd: h.cwd }), /working active peer/);
   assert.throws(() => h.board.lifecycle.pause('pause', node), /retirement/);
   await f.handlers.get('turn_end')({}, f.ctx); assert.equal(f.sent.length, 2);
-  assert.equal(f.sent[1], `Context stop: 70% on floor fixture. Read node ${node} now.`);
+  assert.equal(f.sent[1], `Context stop: 70% on floor fixture. Read node ${node} now.\n\n${goalCheck(h.board.lifecycle.status())}`);
   assert.deepEqual(f.handlers.get('input')({ source: 'extension', text: 'ordinary peer message' }, f.ctx), { action: 'handled' });
   assert.equal(h.board.lifecycle.acceptsInput(), false, 'ordinary input cannot clear the durable transition');
   assert.equal(f.handlers.get('input')({ source: 'interactive', text: 'Human scoped instruction' }, f.ctx), undefined);
@@ -97,21 +100,21 @@ test('budget steers reference the current floor goal without project IDs; thresh
   for (let bucket = 10; bucket <= 90; bucket += 10) {
     await observe(bucket); await observe(bucket + 0.1); await observe(bucket + 9.9);
     assert.equal(f.sent.length, bucket / 10);
-    assert.equal(f.sent.at(-1), `Context budget: ${bucket}% used. Follow this floor's current goal and latest owner priorities, using its instruction entry and work owners. Check: advancing the goal? bottleneck?`);
+    assert.equal(f.sent.at(-1), `Context budget: ${bucket}% used. ${goalCheck(h.board.lifecycle.status())}`);
     const { options, handled } = f.deliveries.at(-1);
     assert.equal(options.deliverAs, 'steer'); assert.equal(options.expandPromptTemplates, false);
     assert.equal(options.admissionKey, `factory-context-budget:${h.session}:${bucket}`);
     assert.equal(handled, undefined, 'actual USER input must not be swallowed');
     assert.equal(h.board.lifecycle.status().workers[0].retire_requested, null);
   }
-  assert.deepEqual(f.entries, Array.from({ length: 9 }, (_, i) => ({ type: 'custom', customType: budgetType, data: { bucket: (i + 1) * 10 } })));
+  assert.deepEqual(f.entries.filter(e => e.customType === budgetType), Array.from({ length: 9 }, (_, i) => ({ type: 'custom', customType: budgetType, data: { bucket: (i + 1) * 10 } })));
   assert.equal(h.board.lifecycle.status().workers[0].context_percent, 99.9);
   f.handlers.get('session_shutdown')({}, f.ctx); await f.handlers.get('session_start')({}, f.ctx);
   await observe(99.9); await observe(10); await observe(90);
   assert.equal(f.sent.length, 9, 'restart and context decreases must not replay old buckets');
   await observe(100); await observe(101);
   assert.equal(f.sent.length, 10);
-  assert.equal(f.sent.at(-1), `Context stop: 100% on floor fixture. Read node ${node} now.`);
+  assert.equal(f.sent.at(-1), `Context stop: 100% on floor fixture. Read node ${node} now.\n\n${goalCheck(h.board.lifecycle.status())}`);
   assert.equal(h.board.lifecycle.status().workers[0].retire_requested, 'context threshold');
   assert.equal(h.board.lifecycle.acceptsInput(), false);
 });
@@ -121,7 +124,7 @@ test('budget steer skips crossed buckets, retries rejected admission and ignores
   const observe = async n => { f.usage(n); await f.handlers.get('turn_end')({}, f.ctx); };
   const send = f.pi.sendUserMessage; let reject = true;
   f.pi.sendUserMessage = (...args) => reject ? Promise.resolve({ status: 'rejected' }) : send(...args);
-  await observe(21); assert.equal(f.sent.length, 0); assert.equal(f.entries.length, 0);
+  await observe(21); assert.equal(f.sent.length, 0); assert.ok(!f.entries.some(e => e.customType === budgetType));
   reject = false; await observe(29); await observe(29.9); await observe(11);
   assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Context budget: 20%/);
   await observe(69.9); assert.equal(f.sent.length, 2); assert.match(f.sent[1], /^Context budget: 60%/);
@@ -139,12 +142,103 @@ test('budget admission guard suppresses a concurrent owner stop without consumin
   const send = f.pi.sendUserMessage;
   f.pi.sendUserMessage = (...args) => { h.floor.command('stop', 'stop'); return send(...args); };
   f.usage(10); await f.handlers.get('turn_end')({}, f.ctx);
-  assert.equal(f.sent.length, 0); assert.equal(f.entries.length, 0);
+  assert.equal(f.sent.length, 0); assert.ok(!f.entries.some(e => e.customType === budgetType));
   f.pi.sendUserMessage = send;
   f.usage(60); await f.handlers.get('turn_end')({}, f.ctx);
   assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Retirement requested: stopping/);
-  assert.equal(f.entries.length, 0, 'stopped floors emit retirement, not budget ticks');
+  assert.ok(!f.entries.some(e => e.customType === budgetType), 'stopped floors emit retirement, not budget ticks');
 });
+
+const flushTimers = () => new Promise(resolve => setImmediate(resolve));
+for (const specialist of [false, true]) test(`five-minute USER reminders wake idle and steer busy ${specialist ? 'Pathfinder' : 'peer'} sessions; reload preserves cadence`, async t => {
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 1000 });
+  const h = fixture(t, 70, specialist), f = fake(t, h);
+  await f.handlers.get('session_start')({}, f.ctx);
+  const initialPosts = h.floor.snapshot().posts.length;
+  const advance = async ms => { t.mock.timers.tick(ms); await flushTimers(); };
+  await advance(120000);
+  f.handlers.get('session_shutdown')({}, f.ctx); await f.handlers.get('session_start')({}, f.ctx);
+  await advance(GOAL_CHECK_MS - 120000 - 1); assert.equal(f.sent.length, 0);
+  await advance(1); assert.equal(f.sent.length, 1, 'idle worker receives real USER input without board activity');
+  const text = goalCheck(h.board.lifecycle.status());
+  assert.equal(f.sent[0], `Five-minute reminder. ${text}`);
+  assert.match(text, /current goal node ID resolved through.*11111111/);
+  assert.equal(text.split('\n')[1], 'What do I now know? What have I observed? Is anything uncertain? Has any observation changed or contributed to your goal?');
+  assert.match(text, /eligible peers.*current ballot condition and vote accordingly\./);
+  assert.doesNotMatch(text, /Do not merely acknowledge|Pathfinder reports its assessment|Finishing a reply or assignment|prescribed reasoning method|Stop or context retirement takes precedence/);
+  assert.deepEqual(f.deliveries.map(d => d.handled), [undefined]);
+  assert.equal(f.deliveries[0].options.deliverAs, 'steer'); assert.equal(f.deliveries[0].options.expandPromptTemplates, false);
+  f.handlers.get('agent_start')({}, f.ctx);
+  f.usage(10); await f.handlers.get('turn_end')({}, f.ctx);
+  assert.equal(f.sent.at(-1), `Context budget: 10% used. ${text}`);
+  await advance(GOAL_CHECK_MS); assert.equal(f.sent.length, 3, 'busy worker still receives the five-minute steer');
+  assert.equal(f.sent.at(-1), f.sent[0]);
+  assert.notEqual(f.deliveries[0].options.admissionKey, f.deliveries.at(-1).options.admissionKey);
+  f.handlers.get('agent_settled')({}, f.ctx);
+  t.mock.timers.setTime(Date.now() + 4 * GOAL_CHECK_MS);
+  await advance(1000); assert.equal(f.sent.length, 4, 'missed intervals coalesce, no catch-up burst');
+  await advance(1000); assert.equal(f.sent.length, 4);
+  assert.equal(h.floor.snapshot().posts.length, initialPosts, 'private reminders cannot create board echo loops');
+  f.handlers.get('session_shutdown')({}, f.ctx);
+  await advance(GOAL_CHECK_MS); assert.equal(f.sent.length, 4, 'shutdown releases the timer');
+});
+
+test('five-minute admission retries rejection, does not count handled input, and serializes slow sends', async t => {
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 1000 });
+  const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+  const send = f.pi.sendUserMessage;
+  f.pi.sendUserMessage = async () => ({ status: 'rejected' });
+  t.mock.timers.tick(GOAL_CHECK_MS); await flushTimers();
+  assert.equal(f.entries.filter(e => e.customType === goalCheckType).length, 1);
+  f.pi.sendUserMessage = async () => ({ status: 'admitted', delivery: 'custom' });
+  t.mock.timers.tick(1000); await flushTimers();
+  assert.equal(f.entries.filter(e => e.customType === goalCheckType).length, 1);
+  let release, sends = 0;
+  f.pi.sendUserMessage = async (...args) => { sends++; await new Promise(resolve => { release = resolve; }); return send(...args); };
+  t.mock.timers.tick(1000); await flushTimers();
+  t.mock.timers.tick(10000); await flushTimers(); assert.equal(sends, 1);
+  release(); await flushTimers(); assert.equal(f.sent.length, 1);
+  assert.equal(f.entries.filter(e => e.customType === goalCheckType).length, 2);
+  t.mock.timers.tick(1000); await flushTimers(); assert.equal(sends, 1);
+});
+
+test('five-minute admission rechecks concurrent Stop and never consumes a rejected tick', async t => {
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 1000 });
+  const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+  const send = f.pi.sendUserMessage;
+  f.pi.sendUserMessage = (...args) => { h.floor.command('stop', 'stop'); return send(...args); };
+  t.mock.timers.tick(GOAL_CHECK_MS); await flushTimers();
+  assert.equal(f.sent.length, 0); assert.equal(f.entries.filter(e => e.customType === goalCheckType).length, 1);
+  t.mock.timers.tick(1000); await flushTimers();
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0], /^Retirement requested:/);
+});
+
+for (const boundary of ['context', 'slot removed', 'done', 'stop', 'waiting', 'human interruption', 'other session']) {
+  test(`five-minute reminder respects ${boundary}`, async t => {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 1000 });
+    const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
+    if (boundary === 'context') f.usage(70);
+    if (boundary === 'slot removed') h.floor.board.lifecycle.requestRetirement(h.session, boundary);
+    if (boundary === 'done') f.api.done('Fixture done', f.ctx);
+    if (boundary === 'stop') h.floor.command('stop', 'stop');
+    if (boundary === 'waiting') {
+      h.floor.configure({ slots: [h.floor.settings().slots[0]] });
+      const vote = h.board.lifecycle.pause('ready', node); h.board.lifecycle.vote(vote.number, 'yes');
+    }
+    if (boundary === 'human interruption') f.handlers.get('agent_settled')({ interruption: { kind: 'human' } }, f.ctx);
+    if (boundary === 'other session') f.ctx.sessionManager.getSessionId = () => 'other';
+    t.mock.timers.tick(GOAL_CHECK_MS); await flushTimers();
+    assert.ok(!f.sent.some(text => text.startsWith('Five-minute reminder.')));
+    if (boundary === 'context') {
+      assert.equal(h.board.lifecycle.status().workers[0].retire_requested, 'context threshold');
+      assert.equal(f.sent[0], `Context stop: 70% on floor fixture. Read node ${node} now.\n\n${goalCheck(h.board.lifecycle.status())}`);
+    }
+    if (boundary === 'human interruption') {
+      f.handlers.get('agent_start')({}, f.ctx);
+      t.mock.timers.tick(1000); await flushTimers(); assert.equal(f.sent.length, 1, 'explicit continuation permits reminders again');
+    }
+  });
+}
 
 test('rejected routing retries without losing the durable context stop', async t => {
   const h = fixture(t), f = fake(t, h); await f.handlers.get('session_start')({}, f.ctx);
