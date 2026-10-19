@@ -2,8 +2,8 @@
 
 `/Users/jack/research/bend/swap-policy/swap-cpu` (source + proof in that
 directory) is the only decision authority for reuse / stop-then-start swap /
-fail-closed refuse / idle release across DS4, mlx-lm and the planned
-decision-only Winnow. This module encodes host facts and decodes directives;
+fail-closed refuse / idle release across DS4, mlx-lm and the
+decision-only StartLux. This module encodes host facts and decodes directives;
 it keeps no second transition table. The host still owns the foreign
 observations named in SWAP_HOST_CONTRACT.md: native GPU quiescence, service
 exit, loaded-model identity, chat ownership and backend readiness.
@@ -17,20 +17,20 @@ import socket
 import subprocess
 from pathlib import Path
 
-POLICY_BINARY = Path('/Users/jack/research/bend/swap-policy/swap-cpu')
+POLICY_BINARY = Path(__file__).resolve().parent / 'startlux-service/swap-cpu'
 POLICY_SHA256 = '69b74155c37e9242640d8c35877379658b7176a5f8a8bbe0ab164acba1231320'
 MAX_NAT = 281474976410654
 
-# Host-side identity table. Winnow is declared here for the decision-only model
-# whose runtime artifacts have not been located; a request only reaches the
-# policy after the host has established qualification.
+# Slot 5 is a one-for-one replacement, NOT a second identity or alias. The
+# renamed source/proof/codec was rebuilt and checked; its wire bytes are unchanged.
+# New MLX host facts still require independent managed GPU qualification.
 MODEL_TAGS = {
     'qwen3.8-flash-next': 0,          # DS4 :8001
     'deepseek-v4.1-flash': 1,         # DS4 :8001
     'glm-5.3-flash': 2,               # DS4, separate checkout
     'qwen3.8-27b-uncensored': 3,      # mlx-lm :8000
     'gemma-4-31b-mlx': 4,             # mlx-lm :8000
-    'winnow-12b': 5,                  # decision-only, planned
+    'startlux-4b-instant': 5,          # decision-only, sticky
 }
 TAG_MODELS = {tag: model for model, tag in MODEL_TAGS.items()}
 

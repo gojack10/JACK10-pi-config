@@ -1,0 +1,8 @@
+[project]
+name = "managed-startlux"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = ["startlux-decide[mlx]"]
+
+[tool.uv.sources]
+startlux-decide = { path = "/Users/jack/.local/share/startlux/source-83fe6c7" }
