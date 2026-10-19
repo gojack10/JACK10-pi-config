@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { createFloor, openFloor, listFloors, adoptFloor, selectOssFloor, ossStatus, claimOss, releaseOss, ROUTES } from './runtime.mjs';
 import { tickFloor } from './supervisor.mjs';
 import { openBoard, configuration } from '../../bf2-swarm/board.mjs';
-import { installWorker } from '../../bf2-swarm/worker.mjs';
+import { installWorker, goalCheck } from '../../bf2-swarm/worker.mjs';
 import { normalizeObservation } from '../../codex-quota-extension/store.ts';
 import { CODEX_QUOTA_RETIREMENT } from '../../bf2-swarm/lifecycle-store.mjs';
 
@@ -192,7 +192,7 @@ test('exhausted Personal pool removes Codex slots and Pathfinder durably; other 
   const w = specialist, handlers = new Map(), path = join(agent, 'retained.jsonl'); let drained = false, shutdown = 0;
   writeFileSync(path, JSON.stringify({ type: 'session', id: w.session }) + '\n');
   const pi = { on: (name, fn) => handlers.set(name, fn), getSettings: () => ({ steeringMode: 'all', followUpMode: 'all' }),
-    sendUserMessage: () => assert.fail('exhausted workers cannot generate a wrapup') };
+    appendEntry() {}, sendUserMessage: () => assert.fail('exhausted workers cannot generate a wrapup') };
   const ctx = { sessionManager: { getSessionId: () => w.session, getSessionFile: () => path, getEntries: () => [], getBranch: () => [] },
     isIdle: () => true, shutdown: () => shutdown++ };
   installWorker(pi, { FACTORY_FLOOR: floor.id, FACTORY_DB: floor.database, FACTORY_SESSION: w.session, FACTORY_SENDER: w.sender }, () => drained);
@@ -307,7 +307,7 @@ test('required launch-text gate, per-occupant context-stop threshold and known J
   for (const value of [undefined, NaN, 59]) { percent = value; await handlers.get('turn_end')({}, ctx); }
   percent = 60; await handlers.get('turn_end')({}, ctx); await handlers.get('turn_end')({}, ctx);
   assert.match(sent[0], /^Context budget: 50% used\./);
-  assert.deepEqual(sent.slice(1), ['Fixture warning 60']); assert.equal(shutdown, 0);
+  assert.deepEqual(sent.slice(1), [`Fixture warning 60\n\n${goalCheck(floor.board.lifecycle.status())}`]); assert.equal(shutdown, 0);
   assert.equal(floor.snapshot().workers[0].retire_requested, 'context threshold');
   assert.equal(floor.snapshot().workers[0].session_file, path); assert.equal(floor.snapshot().workers[0].context_percent, 60);
   handlers.get('message_end')({ message: { role: 'assistant', stopReason: 'error', errorMessage: 'Fixture retryable error' } }, ctx);

@@ -177,15 +177,34 @@ board/CLI and room-reader source together: older dedicated-DB readers reject the
 new table. Source tests use disposable floors and transport fixtures. Live rollout,
 settings installation and real model qualification require separate authorization.
 
-### Context retirement and independent jobs
+### Goal reminders, context retirement and independent jobs
+
+Every running floor occupant, including Pathfinder, receives a private USER goal
+reminder every five minutes through the existing worker timer and native steer
+admission. It starts a turn when idle and steers when busy; no board post or peer
+reply is required. The same reassessment text accompanies 10%-context-budget
+notices and the configured context-stop signal: reconsider the current goal,
+evidence, uncertainty and next useful action instead of treating a finished piece
+as a finished goal. Agents choose their approach; runtime does not interpret goal
+nodes, assign work, certify completion or cast votes. Only eligible peers vote on
+the owner's current condition; Pathfinder communicates its assessment.
+
+The session journal retains the reminder clock across reloads. Missed intervals
+coalesce rather than replaying a burst; rejected admission is retried, and overlapping
+sends cannot duplicate a tick. Reminders do not revive stopped/waiting floors,
+retiring/done workers or explicitly interrupted turns, and shutdown clears the timer.
+Pathfinder's separate 30-minute absence launch policy is unchanged. New occupants
+load this source; existing processes must be explicitly reloaded or replaced to
+receive it. No controller restart or settings migration is required for new workers.
 
 Floor workers persist a context-stop request at the configured threshold before
-admitting another tool, and at `turn_end`. Lifecycle inputs render the occupant's
-launch-snapshot `warningText`/`wrapupText`; install the approved event/node-locator
-text from Factory Control Lifecycle, not a behavior copied into source. All five
-existing placeholders are available. Existing occupants retain their launch text;
-source changes and tree persistence alone do not install approved settings.
-Unadopted legacy BF2 retains its old advisory warning.
+admitting another tool, at `turn_end`, and on the worker timer. Lifecycle inputs
+render the occupant's launch-snapshot `warningText`/`wrapupText`; all five existing
+placeholders remain available. Context-stop input appends the shared reassessment
+with explicit handoff-only precedence: the threshold still ends substantive work
+and voting. Existing occupants retain their configured launch text; source changes
+and tree persistence alone do not install new settings. Unadopted legacy BF2 retains
+its old advisory warning and does not receive the five-minute reminders.
 
 Retirement prevents new machine-job launches, ballots and new orchestration tools.
 Native read/shell/edit/write, tree operations, tool discovery, background-result

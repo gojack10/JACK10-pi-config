@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createFloor, openFloor, selectOssFloor, ossStatus, validateSettings } from './runtime.mjs';
 import { tickFloor } from './supervisor.mjs';
 import { openBoard, configuration } from '../../bf2-swarm/board.mjs';
-import { installWorker } from '../../bf2-swarm/worker.mjs';
+import { installWorker, goalCheck } from '../../bf2-swarm/worker.mjs';
 import { ABSENCE_MS, PATHFINDER_SLOT, PATHFINDER_ENTRY, PATHFINDER_AGENT, pathfinderMission } from '../../bf2-swarm/pathfinder.mjs';
 import { publicSnapshot, serveFloors } from './room.mjs';
 import { textMarkup } from '../room/markup.mjs';
@@ -158,7 +158,7 @@ test('stopped requests stay chat; explicit Start, context retirement, error and 
   t.after(() => handlers.get('session_shutdown')({}, ctx));
   await handlers.get('session_start')({}, ctx); h.startup(h.board(w));
   await handlers.get('tool_call')({ toolName: 'read' }, ctx);
-  assert.equal(h.current().retire_requested, 'context threshold'); assert.deepEqual(sent, ['Fixture threshold 80']);
+  assert.equal(h.current().retire_requested, 'context threshold'); assert.deepEqual(sent, [`Fixture threshold 80\n\n${goalCheck(h.state())}`]);
   assert.ok(await handlers.get('tool_call')({ toolName: 'subagent_launch' }, ctx));
   assert.equal(await handlers.get('tool_call')({ toolName: 'write' }, ctx), undefined);
   worker.done('Fixture unfinished review owner retained', ctx);
