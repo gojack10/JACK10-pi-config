@@ -391,6 +391,8 @@ test('advertised routes use the approved selectors while explicit account routes
     ['openai-codex-personal', 'gpt-6.1-sol', 'high'],
     ['local', 'qwen3.8-flash-next', 'xhigh'],
     ['openai-codex-personal', 'gpt-6-luna', 'high'],
+    ['openai', 'gpt-6-luna', 'high'],
+    ['openai', 'gpt-6-luna', 'xhigh'],
   ]);
   const h = fixture(t);
   for (const [i, r] of ROUTES.entries()) {

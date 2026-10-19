@@ -52,7 +52,7 @@ export async function serveFloors({ root, token = randomBytes(32).toString('hex'
       if (!equal(request.headers.authorization, `Bearer ${token}`)) return send(403, { error: 'room capability required' });
       if (request.method === 'GET' && url.pathname === '/api/floors' && !url.search) {
         return send(200, { floors: runtime.listFloors({ root }).map(f => fields(f, ['id','name','status'])),
-          routes: runtime.ROUTES.map(r => fields(r, ['provider','model','thinking'])), pathfinderDefaults: runtime.PATHFINDER_DEFAULTS,
+          routes: runtime.ROUTES.map(r => fields(r, ['provider','model','thinking','label'])), pathfinderDefaults: runtime.PATHFINDER_DEFAULTS,
           oss: publicOss(runtime.ossStatus({ root })) });
       }
       const match = /^\/api\/floors\/([a-zA-Z0-9_-]+)\/([a-z]+)$/.exec(url.pathname);

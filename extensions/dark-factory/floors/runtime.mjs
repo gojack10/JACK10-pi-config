@@ -15,6 +15,8 @@ export const ROUTES = Object.freeze([
   { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6.1-sol', thinking: 'high' },
   { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' },
   { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6-luna', thinking: 'high' },
+  { provider: 'openai', model: 'gpt-6-luna', thinking: 'high', label: '[openai] (ZDR)' },
+  { provider: 'openai', model: 'gpt-6-luna', thinking: 'xhigh', label: '[openai] (ZDR)' },
 ]);
 export const PATHFINDER_DEFAULTS = Object.freeze({ provider: 'openai-codex-personal', model: 'gpt-6.1-sol', thinking: 'high', contextWarning: 80 });
 export const isOss = slot => slot?.provider === 'local' && slot.model === 'qwen3.8-flash-next';
