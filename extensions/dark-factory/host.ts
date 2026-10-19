@@ -6,7 +6,7 @@ import { BackgroundJobManager } from '../background-jobs/manager.ts';
 import { SubagentLauncher } from '../subagent-launch/manager.ts';
 import { isContinuation, readAttemptResult, taskSettings, runLoop, save, mission, validateReport } from './core.mjs';
 import { acquireSlot } from './slots.mjs';
-import { waitProfileInputs } from './parallel.mjs';
+import { waitAggregateInputs } from './parallel.mjs';
 import { closeIdleWatches } from './watch.mjs';
 
 export default function (pi: ExtensionAPI) {
@@ -29,7 +29,7 @@ export default function (pi: ExtensionAPI) {
       try {
         await runLoop({ directory, smoke: config.smoke, project, resume, assignments: config.assignments,
           runStep: async ({ step, role, reportPath, previous, task }) => {
-            if (config.readers && role === 'planner') await waitProfileInputs(directory, config.readers, config.video_dependency);
+            if (config.readers && role === 'planner') await waitAggregateInputs(directory, config.readers, config.prerequisite_dependency);
             const stopError = Object.assign(Error('stop requested'), { factoryStopped: true });
             if (existsSync(join(directory, 'STOP'))) throw stopError;
             const cancellation = new AbortController();
@@ -43,12 +43,12 @@ export default function (pi: ExtensionAPI) {
             } finally { stopWatch?.close(); }
             try {
             // A queued admission may outlive the packet snapshot; refresh before authoring.
-            if (config.readers && role === 'planner') await waitProfileInputs(directory, config.readers, config.video_dependency);
+            if (config.readers && role === 'planner') await waitAggregateInputs(directory, config.readers, config.prerequisite_dependency);
             if (existsSync(join(directory, 'STOP'))) throw stopError;
             const missionPath = join(directory, `${step}-${role}.md`);
             writeFileSync(missionPath, mission({ role, reportPath, previous, task, smoke: config.smoke, directory, contract: config.contract, project }));
             const extensionFiles: string[] = [];
-            if (config.smoke || project.name === 'bf2') {
+            {
               const policyFile = join(directory, `${step}-policy.ts`);
               const policy = { smoke: config.smoke, route: project.route, role, project, report: reportPath,
                 reads: [join(directory, 'fixture.txt'), ...(previous ? [previous] : [])] };
@@ -102,7 +102,7 @@ export default function (pi: ExtensionAPI) {
             if (config.readers && role === 'planner' && report.disposition === 'next') {
               const inputs = JSON.parse(readFileSync(join(directory, 'reader-inputs.json'), 'utf8'));
               if (inputs.pending.length && !inputs.pending.some(p => p.tree_id === report.task?.tree_id)) {
-                throw Error('profile assignment must identify one pending tree packet');
+                throw Error('aggregate assignment must identify one pending tree packet');
               }
             }
             if (result.outcome.payload.outcome !== final.status) throw Error('batch and durable outcome disagree');

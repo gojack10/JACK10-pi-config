@@ -1,8 +1,8 @@
-import { homedir } from 'node:os';
 import { appendFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import { readMonitorReceipt, sessionBranch } from '../task-outcomes/monitor-receipt.mjs';
+import { homedir } from 'node:os';
 
 export const ROUTE = { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' };
 const LOCAL_PROJECTS = join(homedir(), '.pi/agent/factory-projects.local.json');
@@ -21,13 +21,12 @@ export function taskSettings(name = 'task', projects = existsSync(LOCAL_PROJECTS
       (project.root !== undefined && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(project.root))) throw Error('Invalid factory project configuration');
   return { ...project, name };
 }
-export function taskRuns(base, name = 'bf2') {
-  taskSettings(name);
-  // Keep the live legacy BF2 controller's LOCK/LAST paths unchanged.
-  return name === 'bf2' ? base : join(base, name);
+export function taskRuns(base, name = 'task') {
+  if (!/^[a-z][a-z0-9-]*$/.test(name)) throw Error('Invalid factory task name');
+  return name === 'task' ? base : join(base, name);
 }
-export function factoryActivity(sessionNames, processCommands, directory, name = 'bf2') {
-  taskSettings(name);
+export function factoryActivity(sessionNames, processCommands, directory, name = 'task') {
+  if (!/^[a-z][a-z0-9-]*$/.test(name)) throw Error('Invalid factory task name');
   return {
     sessions: sessionNames.filter(session => new RegExp(`^${name}-(factory|planner|worker)-`).test(session)),
     controller: processCommands.some(command => command.includes('dark-factory/run.mjs controller') && command.includes(directory)),
@@ -47,17 +46,15 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   if (!Array.isArray(r.updated_nodes) || !r.updated_nodes.every(id => typeof id === 'string' && /^[a-f0-9-]{36}$/.test(id))) throw Error('invalid updated_nodes');
   if (smoke && r.updated_nodes.length) throw Error('smoke must not mutate tree');
   if (!smoke && !['blocked', 'continue'].includes(r.disposition)) {
-    if (project.name === 'bf2' && !project.lean && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
-    if (project.name !== 'bf2' && r.evidence.length === 0) throw Error('completed project work requires evidence');
+    if (project.requireTreeWrites && r.updated_nodes.length === 0) throw Error('completed project work requires verified tree writes');
+    if (r.evidence.length === 0) throw Error('completed project work requires evidence');
   }
   if (project.lean && !smoke && r.disposition === 'next' && Array.isArray(r.task?.acceptance) &&
       r.task.acceptance.every(item => typeof item === 'string')) r.task.acceptance = r.task.acceptance.join('\n');
-  if (project.lean && project.name === 'sample-aggregate' && r.disposition === 'next' && r.task &&
+  if (project.lean && r.disposition === 'next' && r.task &&
       !r.task.tree_id && typeof r.tree_id === 'string') r.task.tree_id = r.tree_id;
   if (r.disposition === 'next' && (!r.task || typeof r.task.instruction !== 'string' || !r.task.instruction.trim() || typeof r.task.acceptance !== 'string' || !r.task.acceptance.trim())) throw Error('next requires bounded task and acceptance');
-  if (r.disposition === 'ready_for_user_test' && (smoke || r.evidence.length < 2 || typeof r.launch_command !== 'string' || !r.launch_command.trim())) throw Error('ready requires launch command and launch/UI evidence');
-  if (['complete', 'profile_ready', 'video_ready'].includes(r.disposition) &&
-      (smoke || (!project.lean && (r.evidence.length < 2 || !r.updated_nodes.length)))) throw Error('ready requires coverage/profile evidence and verified profile node IDs');
+  if (r.disposition === project.ready && (smoke || r.evidence.length === 0)) throw Error('ready requires evidence from an authorized run');
   return r;
 }
 
@@ -105,7 +102,7 @@ export function continuationAfterStop(state, history) {
 export async function runLoop({ directory, smoke, runStep, project = taskSettings(), resume, assignments, maxSteps = smoke ? 2 : 10000 }) {
   const statePath = join(directory, 'state.json');
   if (existsSync(statePath) && !resume) throw Error('existing run: reconcile its retained attempt before restarting; no blind replay');
-  const nodeAssignments = project.name === 'sample-rewrite';
+  const nodeAssignments = project.assignmentKind === 'node';
   let previous = resume?.previous ?? null, task = resume?.task ?? null;
   let assignmentIndex = resume?.assignmentIndex ?? 0;
   let role = assignments ? 'worker' : resume?.role ?? ((resume?.step ?? 1) % 2 ? 'planner' : 'worker');
