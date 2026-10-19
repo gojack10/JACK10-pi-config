@@ -250,7 +250,7 @@ $('#composer').addEventListener('submit', async e => {
 });
 const routeValue = route => `${route.provider}/${route.model}`;
 function routeMarkup(slot) {
-  return `<label>Next model<select name="route">${routes.map(r => `<option value="${esc(routeValue(r))}" ${routeValue(r) === routeValue(slot) ? 'selected' : ''}>${esc(routeValue(r))}</option>`).join('')}</select></label><label>Next thinking<select name="thinking">${[...new Set(routes.map(r => r.thinking))].map(t => `<option ${t === slot.thinking ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
+  return `<label>Next model<select name="route">${routes.map(r => `<option value="${esc(routeValue(r))}" ${routeValue(r) === routeValue(slot) ? 'selected' : ''}>${esc(r.label ? `${routeValue(r)} ${r.label}` : routeValue(r))}</option>`).join('')}</select></label><label>Next thinking<select name="thinking">${[...new Set(routes.map(r => r.thinking))].map(t => `<option ${t === slot.thinking ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
 }
 function slotMarkup(slot, index) {
   const current = state.workers?.filter(w => w.slotId === slot.id && !w.cleaned) ?? [];
