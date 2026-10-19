@@ -25,7 +25,7 @@ from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
 import swap_policy
 from managed_switch import MODELS as MANAGED_MODELS
-from winnow_runtime import WinnowRuntime, MODEL_ID as WINNOW_MODEL_ID, UPSTREAM_ID as WINNOW_UPSTREAM_ID, PORT as WINNOW_PORT
+from startlux_runtime import StartLuxRuntime, MODEL_ID as STARTLUX_MODEL_ID, UPSTREAM_ID as STARTLUX_UPSTREAM_ID, PORT as STARTLUX_PORT, CONTEXT as STARTLUX_CONTEXT, WORK_TOKENS as STARTLUX_WORK_TOKENS
 
 CHAT_TIMEOUT = ClientTimeout(total=None, sock_connect=10, sock_read=None)
 DISCOVERY_TIMEOUT = ClientTimeout(total=5, sock_connect=2, sock_read=5)
@@ -140,7 +140,7 @@ ACTIVE_TICKET = None
 REQUEST_QUEUE = []
 CHAT_OWNER = None
 INDEPENDENT_SWITCH = None
-WINNOW = WinnowRuntime()
+STARTLUX = StartLuxRuntime()
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -808,7 +808,7 @@ async def mlx_idle_check_loop():
                     int((time.monotonic() - MLX_LAST_REQUEST_AT) * 1000),
                     MLX_IDLE_TIMEOUT * 1000, False)
                 if action != "unload":
-                    continue  # Keep: sticky Winnow, unknown identity or active owner
+                    continue  # Keep: sticky StartLux, unknown identity or active owner
                 await stop_mlx()
                 swap_policy.SWAP.release_done()
         except Exception as e:
@@ -938,7 +938,7 @@ async def ds4_idle_check_loop():
                     int((time.monotonic() - DS4_LAST_REQUEST_AT) * 1000),
                     DS4_IDLE_TIMEOUT * 1000, False)
                 if action != "unload":
-                    continue  # Keep: sticky Winnow, unknown identity or active owner
+                    continue  # Keep: sticky StartLux, unknown identity or active owner
                 await stop_dsv4()
                 swap_policy.SWAP.release_done()
                 DS4_LAST_REQUEST_AT = 0.0
@@ -1128,13 +1128,13 @@ async def refresh_swap_residency():
     Returns (resident_model_id_or_None, mlx_unproven).
     """
     try:
-        if await asyncio.to_thread(WINNOW.probe):
-            # The ordinary path has no native Winnow adapter. Never adopt
+        if await asyncio.to_thread(STARTLUX.probe):
+            # The ordinary path has no native StartLux adapter. Never adopt
             # it as empty and start a second engine after a proxy restart.
             swap_policy.SWAP.adopt_unknown()
             return None, True
     except Exception as exc:
-        log.warning(f"swap residency: Winnow identity unproven: {exc}")
+        log.warning(f"swap residency: StartLux identity unproven: {exc}")
         swap_policy.SWAP.adopt_unknown()
         return None, True
     try:
@@ -1341,10 +1341,10 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                     pass
             if client_disconnected(request):
                 raise ConnectionResetError("client disconnected while queued")
-            if managed and backend_name == 'winnow':
+            if managed and backend_name == 'startlux':
                 if INDEPENDENT_SWITCH is None:
-                    raise web.HTTPServiceUnavailable(text='Winnow managed switch unavailable')
-                engine = await INDEPENDENT_SWITCH.prepare_winnow()
+                    raise web.HTTPServiceUnavailable(text='StartLux managed switch unavailable')
+                engine = await INDEPENDENT_SWITCH.prepare_startlux()
             elif managed:
                 # Switch/verify/rebind while no main is admitted and the same
                 # condition still excludes every queued request and idle task.
@@ -1504,10 +1504,10 @@ async def prepare_non_ds4_backend(backend_name, model_id):
         # Policy-owned swap: any DS4 eviction is the policy's Stop directive.
         await ensure_mlx_model(model_id)
     else:
-        # External backends have no checked Winnow handoff. Refuse rather than
+        # External backends have no checked StartLux handoff. Refuse rather than
         # overlap an unmanaged request with its resident Metal process.
-        if await asyncio.to_thread(WINNOW.probe):
-            raise web.HTTPServiceUnavailable(text='Winnow resident; external backend handoff unqualified')
+        if await asyncio.to_thread(STARTLUX.probe):
+            raise web.HTTPServiceUnavailable(text='StartLux resident; external backend handoff unqualified')
         await unload_ds4_if_idle(backend_name)
         await stop_mlx()
 
@@ -1688,36 +1688,46 @@ async def handle_chat(request):
 
 
 async def handle_systemone(request):
-    """Decision-only Winnow entry; no chat route and no direct public GPU port."""
+    """Decision-only StartLux entry; no chat route or public GPU child port."""
     if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
         raise web.HTTPUnauthorized()
-    body = await request.content.read(1024 * 1024 + 1)
-    if len(body) > 1024 * 1024:
-        raise web.HTTPRequestEntityTooLarge(max_size=1024 * 1024, actual_size=len(body))
+    body = bytearray()
+    # Positive-length stream reads may return short chunks before EOF.
+    while chunk := await request.content.read(1024 * 1024 + 1 - len(body)):
+        body.extend(chunk)
+        if len(body) > 1024 * 1024:
+            raise web.HTTPRequestEntityTooLarge(max_size=1024 * 1024, actual_size=len(body))
     payload, err = parse_json_body(body)
-    if err or not isinstance(payload, dict) or payload.get('model') != WINNOW_MODEL_ID:
-        raise web.HTTPBadRequest(text='Explicit model winnow-12b required; Kev/jev aliases are retired')
+    if err:
+        raise web.HTTPBadRequest(text='Invalid JSON body')
+    if not isinstance(payload, dict):
+        raise web.HTTPBadRequest(text='Expected JSON object')
+    if payload.get('model') != STARTLUX_MODEL_ID:
+        raise web.HTTPBadRequest(text='Explicit model startlux-4b-instant required; legacy aliases retired')
     if not isinstance(payload.get('questions'), dict) or not payload['questions'] or \
        payload.get('state') is None:
-        raise web.HTTPBadRequest(text='Winnow requires state and named questions')
+        raise web.HTTPBadRequest(text='StartLux requires state and named questions')
     if INDEPENDENT_SWITCH is None:
-        raise web.HTTPServiceUnavailable(text='managed Winnow route unavailable')
-    payload['model'] = WINNOW_UPSTREAM_ID
+        raise web.HTTPServiceUnavailable(text='managed StartLux route unavailable')
+    try:
+        await STARTLUX.preflight(payload)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from None
+    except Exception:
+        raise web.HTTPServiceUnavailable(text='StartLux artifact/tokenizer preflight unavailable') from None
+    payload['model'] = STARTLUX_UPSTREAM_ID
     started = forwarded = complete = False
     try:
-        await begin_request('winnow', WINNOW_MODEL_ID, request, managed=True)
+        await begin_request('startlux', STARTLUX_MODEL_ID, request, managed=True)
         started = True
         async with ClientSession(timeout=CHAT_TIMEOUT) as session:
             forwarded = True
-            async with session.post(f'http://127.0.0.1:{WINNOW_PORT}/v1/systemone',
-                 json=payload, headers=AUTH_HEADERS) as upstream:
+            async with session.post(f'http://127.0.0.1:{STARTLUX_PORT}/v1/systemone',
+                 json=payload, headers=STARTLUX.child_headers) as upstream:
                 result = await upstream.read()  # Drain even if the caller disconnects.
                 if upstream.status == 200:
                     answer = json.loads(result)
-                    if not isinstance(answer, dict) or answer.get('model') != WINNOW_UPSTREAM_ID or \
-                       not isinstance(answer.get('answers'), dict) or \
-                       set(answer['answers']) != set(payload['questions']):
-                        raise RuntimeError('Winnow response identity/questions mismatch')
+                    STARTLUX.validate_response(payload, answer)
                     complete = True  # Error bodies and unverified answers are not native-stop proof.
                 return web.Response(status=upstream.status, body=result,
                                     content_type=upstream.content_type)
@@ -1727,7 +1737,7 @@ async def handle_systemone(request):
         raise
     finally:
         if started:
-            await finish_request('winnow', uncertain=forwarded and not complete,
+            await finish_request('startlux', uncertain=forwarded and not complete,
                                  release_chat=client_disconnected(request))
 
 
@@ -1735,8 +1745,9 @@ async def handle_systemone_models(request):
     if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
         raise web.HTTPUnauthorized()
     return web.json_response({'object': 'list', 'data': [
-        {'id': WINNOW_MODEL_ID, 'name': WINNOW_UPSTREAM_ID, 'type': 'decision',
-         'context_length': 65536, 'owned_by': 'winnow-inference'}]})
+        {'id': STARTLUX_MODEL_ID, 'name': STARTLUX_UPSTREAM_ID, 'type': 'decision',
+         'context_length': STARTLUX_CONTEXT, 'work_tokens': STARTLUX_WORK_TOKENS,
+         'owned_by': 'startlux'}]})
 
 
 async def handle_release_chat(request):
@@ -1921,7 +1932,7 @@ async def main():
     global DS4_LAST_REQUEST_AT, INDEPENDENT_SWITCH
     if DUAL_MODELS:
         from managed_switch import ManagedSwitch
-        manager = INDEPENDENT_SWITCH = ManagedSwitch(winnow=WINNOW)
+        manager = INDEPENDENT_SWITCH = ManagedSwitch(startlux=STARTLUX)
         reservation_body.MANAGED_ENGINE_PREPARER = manager.prepare
         reservation_body.MANAGED_ENGINE_RELEASER = manager.release
         reservation_body.INDEPENDENT_ADMITTER = begin_independent_kev

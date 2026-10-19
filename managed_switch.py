@@ -82,9 +82,9 @@ def record(event, **data):
 
 
 class ManagedSwitch:
-    def __init__(self, inherited_lease=None, winnow=None):
+    def __init__(self, inherited_lease=None, startlux=None):
         self.inherited_lease=inherited_lease # controller-owned only in isolated tests
-        self.winnow=winnow
+        self.startlux=startlux
         self.lease=None
         self.model=self.engine=None
         self.blocked=None
@@ -203,18 +203,18 @@ class ManagedSwitch:
         swap_policy.SWAP.start_ready()
         record('switch-complete',model=model,seconds=time.monotonic()-before)
 
-    async def observe_with_winnow(self):
+    async def observe_with_startlux(self):
         # A process/port mismatch is uncertainty, never an empty lane.
-        resident = await asyncio.to_thread(self.winnow.probe)
+        resident = await asyncio.to_thread(self.startlux.probe)
         ds4_pid = service_pid()
         if (resident and ds4_pid) or (not ds4_pid and await asyncio.to_thread(swap_policy.port_listening, 8001)):
             swap_policy.SWAP.adopt_unknown()
-            raise LaneUnproven('conflicting or foreign DS4/Winnow process')
+            raise LaneUnproven('conflicting or foreign DS4/StartLux process')
         if resident:
-            if not await self.winnow.ready(resident):
+            if not await self.startlux.ready(resident):
                 swap_policy.SWAP.adopt_unknown()
-                raise LaneUnproven('Winnow process exists but is not ready')
-            self.model, self.engine = 'winnow-12b', None
+                raise LaneUnproven('StartLux process exists but is not ready')
+            self.model, self.engine = 'startlux-4b-instant', None
             swap_policy.SWAP.adopt(self.model)
         elif ds4_pid:
             self.adopt()  # pinned DS4 binary, native control identity and argv
@@ -222,7 +222,7 @@ class ManagedSwitch:
             self.model = self.engine = None
             swap_policy.SWAP.adopt_empty()
 
-    async def stop_ds4_for_winnow(self):
+    async def stop_ds4_for_startlux(self):
         if not self.engine or self.engine.hold is not None or self.engine.terminal_ticket is not None:
             raise RuntimeError('DS4 native owner not safely stoppable')
         await self.engine.terminal()  # fresh native drain, not HTTP idle telemetry
@@ -236,22 +236,22 @@ class ManagedSwitch:
             await asyncio.sleep(.25)
         raise RuntimeError('DS4 exit/port/service not proven after bootout')
 
-    async def prepare_with_winnow(self, model):
-        if model not in (*MODELS, 'winnow-12b') or self.blocked:
+    async def prepare_with_startlux(self, model):
+        if model not in (*MODELS, 'startlux-4b-instant') or self.blocked:
             raise RuntimeError('managed model unavailable')
         await self.acquire()
         async def settle():
-            await self.observe_with_winnow()
-            if model == 'winnow-12b':
+            await self.observe_with_startlux()
+            if model == 'startlux-4b-instant':
                 try:
-                    await asyncio.to_thread(self.winnow.qualify)
+                    await asyncio.to_thread(self.startlux.qualify)
                 except Exception as exc:
-                    raise LaneUnproven(f'Winnow artifact qualification failed before switch: {exc}') from exc
+                    raise LaneUnproven(f'StartLux artifact qualification failed before switch: {exc}') from exc
             action, resident = swap_policy.SWAP.admit(model, qualified=True)
             if action == 'reuse':
-                if model == 'winnow-12b' and await asyncio.to_thread(mlx_lane_busy):
-                    raise LaneUnproven('mlx lane busy or unproven; Winnow admission refused')
-                return self.winnow if model == 'winnow-12b' else self.binding(model)
+                if model == 'startlux-4b-instant' and await asyncio.to_thread(mlx_lane_busy):
+                    raise LaneUnproven('mlx lane busy or unproven; StartLux admission refused')
+                return self.startlux if model == 'startlux-4b-instant' else self.binding(model)
             if action not in ('stop', 'start'):
                 raise LaneUnproven(f'swap policy refused {model}: {action}')
             if await asyncio.to_thread(mlx_lane_busy):
@@ -259,10 +259,10 @@ class ManagedSwitch:
                 raise LaneUnproven('mlx lane busy or unproven; no transition issued')
             if action == 'stop':
                 try:
-                    if resident == 'winnow-12b':
-                        await self.winnow.stop()  # process exit proves native work gone
+                    if resident == 'startlux-4b-instant':
+                        await self.startlux.stop()  # process exit proves native work gone
                     elif resident in MODELS:
-                        await self.stop_ds4_for_winnow()
+                        await self.stop_ds4_for_startlux()
                     else:
                         swap_policy.SWAP.abort()
                         raise LaneUnproven(f'unmanaged resident {resident}')
@@ -273,8 +273,8 @@ class ManagedSwitch:
                     raise
                 swap_policy.SWAP.stop_done()
             try:
-                if model == 'winnow-12b':
-                    await self.winnow.start()
+                if model == 'startlux-4b-instant':
+                    await self.startlux.start()
                     self.engine = None
                     self.model = model
                 else:
@@ -283,7 +283,7 @@ class ManagedSwitch:
                 swap_policy.SWAP.start_unknown()
                 raise
             swap_policy.SWAP.start_ready()
-            return self.winnow if model == 'winnow-12b' else self.engine
+            return self.startlux if model == 'startlux-4b-instant' else self.engine
         task = asyncio.create_task(settle())
         cancelled = False
         while not task.done():
@@ -303,12 +303,12 @@ class ManagedSwitch:
             raise asyncio.CancelledError()
         return engine
 
-    async def prepare_winnow(self):
-        return await self.prepare_with_winnow('winnow-12b')
+    async def prepare_startlux(self):
+        return await self.prepare_with_startlux('startlux-4b-instant')
 
     async def prepare(self,model):
-        if self.winnow is not None:
-            return await self.prepare_with_winnow(model)
+        if self.startlux is not None:
+            return await self.prepare_with_startlux(model)
         if model not in MODELS or self.blocked: raise RuntimeError('managed model unavailable')
         await self.acquire()
         async def settle():
