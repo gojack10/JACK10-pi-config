@@ -455,7 +455,7 @@ class FailClosedTests(unittest.IsolatedAsyncioTestCase):
         p = load_proxy()
         prefix = "123 /Users/jack/dsv4-qwen38-integration/ds4-server -m /tmp/Qwen3.8-Flash-Next-Q4.gguf --port "
         glm = "124 /Users/jack/dsv4-glm-metal/ds4-server -m /tmp/GLM-5.3-Flash-Q2.gguf --port 8001"
-        ds41 = "125 /Users/jack/dsv4-v41-engram/ds4-server -m /tmp/DeepSeek-V4.1-Flash-Q2.gguf --port 8001"
+        ds41 = "125 /Users/jack/ds4/ds4-server-v41-reservation -m /tmp/DeepSeek-V4.1-Flash-1017-Q2.gguf --port 8001"
         for text, expected in ((prefix + "8001", p.QWEN_NEXT_MODEL_ID), (prefix + "8009", None),
                                (glm, p.GLM_FLASH_MODEL_ID), (ds41, p.DS41_MODEL_ID)):
             with patch.object(p.subprocess, "check_output", return_value=text):
@@ -607,11 +607,17 @@ class WrapperTests(unittest.TestCase):
                     # load relative to cwd, so chdir must name the same tree.
                     self.assertEqual(args[0], str(home / 'ds4/ds4-server-v41-reservation'))
                     self.assertEqual(args[args.index('--chdir') + 1], str(home / 'ds4'))
-                    self.assertIn(str(home / 'dsv4-qwen38-integration/gguf/DeepSeek-V4.1-Flash-Q2.gguf'), args)
+                    self.assertIn(str(home / 'dsv4-qwen38-integration/gguf/DeepSeek-V4.1-Flash-1017-Q2.gguf'), args)
+                    self.assertEqual(args[args.index('--dir-steering-file') + 1],
+                                     str(home / '.dsv4/adapters/msuiche-1017-residual.ds41dir'))
+                    import managed_switch
+                    config = managed_switch.MODELS[model]
+                    self.assertIn('DeepSeek-V4.1-Flash-1017-Q2.gguf', config['args'])
+                    self.assertIn('--dir-steering-strength 0.5', config['args'])
                     self.assertIn('--ssd-streaming', args)
                     self.assertEqual(args[args.index('--ssd-streaming-cache-experts') + 1], '64GB')
                     self.assertIn('--dir-steering-file', args)
-                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '1')
+                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '0.5')
             (home / '.dsv4/desired-model').write_text('typo')
             result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
