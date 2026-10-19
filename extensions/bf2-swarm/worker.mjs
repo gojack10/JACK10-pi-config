@@ -4,15 +4,23 @@ import { CODEX_QUOTA_RETIREMENT } from './lifecycle-store.mjs';
 export const WARNING = 'Context is at least 80%. Preserve useful progress on the tree and consider a handoff/retirement at a sensible boundary. This is one warning, not a forced stop; tools remain available.';
 export const warningType = 'bf2-swarm-warning';
 export const budgetType = 'factory-context-budget';
+export const goalCheckType = 'factory-goal-check';
+export const GOAL_CHECK_MS = 5 * 60 * 1000;
+export const goalCheck = state => `Goal check: Am I stuck, or mistaking finishing one piece for finishing the goal? Use the current goal node ID resolved through this floor's instruction entry ${state.config.instructions} and latest owner direction; reuse unchanged reads.
+What do I now know? What have I observed? Is anything uncertain? Has any observation changed or contributed to your goal?
+If the goal is incomplete, advance it now within your authority. If stuck, what else can you try, learn, unblock, or contribute independently? Check whether a claimed blocker still holds; if none of that is possible, report the concrete blocker and needed input, not completion.
+If evidence supports goal completion, eligible peers evaluate the owner's current ballot condition and vote accordingly.`;
 export const wrapup = (run, state) => `BF2 swarm ${run}: ${state.status}. Finish safely, record ${state.status}/inspection state on experiment node ${state.config.instructions} using its instructions, then board done with a handoff. No replacements while ${state.status}; waiting is not BF2 success.`;
 
 const expand = (text, values) => text.replace(/\{(percent|status|instructions|floor|reason)\}/g, (match, key) => String(values[key] ?? match));
 export function workerWrapup(run, state, session) {
   const row = state.workers.find(w => w.session === session);
   const contextStop = state.status === 'running' && row?.retire_requested === 'context threshold';
-  return state.floor ? expand(contextStop ? row.launch_config.warningText : row?.launch_config?.wrapupText ?? state.floor.wrapupText,
+  if (!state.floor) return wrapup(run, state);
+  const text = expand(contextStop ? row.launch_config.warningText : row?.launch_config?.wrapupText ?? state.floor.wrapupText,
     { percent: row?.launch_config?.contextWarning, status: state.status, instructions: state.config.instructions,
-      floor: state.config.floorId, reason: row?.retire_requested ?? state.status }) : wrapup(run, state);
+      floor: state.config.floorId, reason: row?.retire_requested ?? state.status });
+  return contextStop ? `${text}\n\n${goalCheck(state)}` : text;
 }
 
 export function handoffTool(worker, parameters) {
@@ -31,6 +39,7 @@ export function installWorker(pi, env = process.env, drained = () => true) {
   if (env.BF2_SWARM_WORKER !== '1' && !env.FACTORY_SESSION) return;
   const config = configuration(env);
   let board, timer, warned = false, budgetBucket = 0, pausedNotice, notifying = false, refused = false, settled = true;
+  let goalCheckAt = 0, checkingGoal = false, interrupted = false;
   const close = () => { clearInterval(timer); timer = undefined; board?.close(); board = undefined; };
   const live = ctx => board && ctx.sessionManager.getSessionId() === config.session;
   const exitExhausted = (row, ctx) => {
@@ -62,6 +71,21 @@ export function installWorker(pi, env = process.env, drained = () => true) {
       if (receipt.status === 'admitted') pausedNotice = notice;
     } finally { notifying = false; }
   };
+  const notifyGoal = async ctx => {
+    const allowed = () => !!live(ctx) && !refused && !interrupted && board.lifecycle.acceptsInput();
+    if (!config.floor || checkingGoal || Date.now() - goalCheckAt < GOAL_CHECK_MS || !allowed()) return;
+    checkingGoal = true;
+    try {
+      const receipt = await pi.sendUserMessage(`Five-minute reminder. ${goalCheck(board.lifecycle.status())}`, {
+        deliverAs: 'steer', expandPromptTemplates: false,
+        admissionKey: `factory-goal-check:${config.session}:${goalCheckAt}`, admissionGuard: allowed,
+      });
+      if (allowed() && receipt.status === 'admitted' && ['steer', 'turn'].includes(receipt.delivery)) {
+        goalCheckAt = Date.now();
+        pi.appendEntry(goalCheckType, { at: goalCheckAt });
+      }
+    } finally { checkingGoal = false; }
+  };
   pi.on('session_start', async (_event, ctx) => {
     close();
     refused = true; // Failed startup must never release the native @file input.
@@ -78,9 +102,23 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     board.lifecycle.ready();
     refused = false;
     warned = ctx.sessionManager.getEntries().some(e => e.type === 'custom' && e.customType === warningType);
-    if (config.floor) budgetBucket = ctx.sessionManager.getBranch().reduce((bucket, e) =>
-      e.type === 'custom' && e.customType === budgetType ? Math.max(bucket, e.data.bucket) : bucket, 0);
-    timer = setInterval(() => { void notifyPause(ctx).catch(e => console.error(`BF2 swarm: ${e.message}`)); }, 1000);
+    if (config.floor) {
+      const branch = ctx.sessionManager.getBranch();
+      budgetBucket = branch.reduce((bucket, e) =>
+        e.type === 'custom' && e.customType === budgetType ? Math.max(bucket, e.data.bucket) : bucket, 0);
+      goalCheckAt = branch.findLast(e => e.type === 'custom' && e.customType === goalCheckType)?.data.at;
+      if (!Number.isFinite(goalCheckAt)) {
+        goalCheckAt = Date.now();
+        pi.appendEntry(goalCheckType, { at: goalCheckAt });
+      }
+    }
+    timer = setInterval(() => {
+      void (async () => {
+        if (live(ctx)) board.lifecycle.contextStop(ctx.getContextUsage()?.percent);
+        await notifyPause(ctx);
+        await notifyGoal(ctx);
+      })().catch(e => console.error(`BF2 swarm: ${e.message}`));
+    }, 1000);
     timer.unref();
   });
   pi.on('input', (event, ctx) => {
@@ -108,7 +146,7 @@ export function installWorker(pi, env = process.env, drained = () => true) {
     const bucket = Math.floor(percent / 10) * 10;
     if (state.floor && typeof percent === 'number' && Number.isFinite(percent) && percent < threshold &&
       bucket >= 10 && bucket <= 90 && bucket > budgetBucket && board.lifecycle.acceptsInput()) {
-      const receipt = await pi.sendUserMessage(`Context budget: ${bucket}% used. Follow this floor's current goal and latest owner priorities, using its instruction entry and work owners. Check: advancing the goal? bottleneck?`, {
+      const receipt = await pi.sendUserMessage(`Context budget: ${bucket}% used. ${goalCheck(state)}`, {
         deliverAs: 'steer', expandPromptTemplates: false,
         admissionKey: `factory-context-budget:${config.session}:${bucket}`,
         admissionGuard: () => !!live(ctx) && board.lifecycle.acceptsInput(),
@@ -144,9 +182,10 @@ export function installWorker(pi, env = process.env, drained = () => true) {
   pi.on('message_end', (event, ctx) => {
     if (live(ctx) && event.message?.role === 'assistant') board.lifecycle.recordError(event.message.stopReason === 'error' ? event.message.errorMessage ?? 'assistant ended with error; no further diagnosis available' : null);
   });
-  pi.on('agent_start', () => { settled = false; });
+  pi.on('agent_start', () => { settled = false; interrupted = false; });
   pi.on('agent_settled', (event, ctx) => {
-    settled = !event.interruption;
+    interrupted = !!event.interruption;
+    settled = !interrupted;
     if (!event.interruption && live(ctx) && drained(ctx)) {
       const row = board.lifecycle.status().workers.find(w => w.session === config.session);
       if (exitExhausted(row, ctx)) return;
