@@ -152,16 +152,18 @@ test('budget admission guard suppresses a concurrent owner stop without consumin
 const flushTimers = () => new Promise(resolve => setImmediate(resolve));
 for (const specialist of [false, true]) test(`five-minute USER reminders wake idle and steer busy ${specialist ? 'Pathfinder' : 'peer'} sessions; reload preserves cadence`, async t => {
   t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 1000 });
-  const h = fixture(t, 70, specialist), f = fake(t, h);
+  const h = fixture(t, 70, specialist), f = fake(t, h); f.usage(50);
   await f.handlers.get('session_start')({}, f.ctx);
   const initialPosts = h.floor.snapshot().posts.length;
   const advance = async ms => { t.mock.timers.tick(ms); await flushTimers(); };
   await advance(120000);
   f.handlers.get('session_shutdown')({}, f.ctx); await f.handlers.get('session_start')({}, f.ctx);
   await advance(GOAL_CHECK_MS - 120000 - 1); assert.equal(f.sent.length, 0);
-  await advance(1); assert.equal(f.sent.length, 1, 'idle worker receives real USER input without board activity');
+  await advance(1); assert.equal(f.sent.length, 1, 'idle worker receives real USER input');
+  assert.equal(h.floor.snapshot().posts.length, initialPosts + 1, 'five-minute reminder is visible as a synthetic board post');
+  assert.match(h.floor.snapshot().posts.at(-1).text, /^\[Synthetic five-minute check-in\].*\nContext usage: 50%\./);
   const text = goalCheck(h.board.lifecycle.status());
-  assert.equal(f.sent[0], `Five-minute reminder. ${text}`);
+  assert.equal(f.sent[0], `Context usage: 50%.\n\nFive-minute reminder. ${text}`);
   assert.match(text, /current goal node ID resolved through.*11111111/);
   assert.equal(text.split('\n')[1], 'What do I now know? What have I observed? Is anything uncertain? Has any observation changed or contributed to your goal?');
   assert.match(text, /eligible peers.*current ballot condition and vote accordingly\./);
@@ -172,13 +174,13 @@ for (const specialist of [false, true]) test(`five-minute USER reminders wake id
   f.usage(10); await f.handlers.get('turn_end')({}, f.ctx);
   assert.equal(f.sent.at(-1), `Context budget: 10% used. ${text}`);
   await advance(GOAL_CHECK_MS); assert.equal(f.sent.length, 3, 'busy worker still receives the five-minute steer');
-  assert.equal(f.sent.at(-1), f.sent[0]);
+  assert.equal(f.sent.at(-1), `Context usage: 10%.\n\n${f.sent[0].split('\n\n')[1]}`);
   assert.notEqual(f.deliveries[0].options.admissionKey, f.deliveries.at(-1).options.admissionKey);
   f.handlers.get('agent_settled')({}, f.ctx);
   t.mock.timers.setTime(Date.now() + 4 * GOAL_CHECK_MS);
   await advance(1000); assert.equal(f.sent.length, 4, 'missed intervals coalesce, no catch-up burst');
   await advance(1000); assert.equal(f.sent.length, 4);
-  assert.equal(h.floor.snapshot().posts.length, initialPosts, 'private reminders cannot create board echo loops');
+  assert.equal(h.floor.snapshot().posts.length, initialPosts + 3, 'each admitted reminder creates one visible synthetic post');
   f.handlers.get('session_shutdown')({}, f.ctx);
   await advance(GOAL_CHECK_MS); assert.equal(f.sent.length, 4, 'shutdown releases the timer');
 });
