@@ -613,11 +613,11 @@ class WrapperTests(unittest.TestCase):
                     import managed_switch
                     config = managed_switch.MODELS[model]
                     self.assertIn('DeepSeek-V4.1-Flash-1017-Q2.gguf', config['args'])
-                    self.assertIn('--dir-steering-strength 0.5', config['args'])
+                    self.assertIn('--dir-steering-strength 0.4', config['args'])
                     self.assertIn('--ssd-streaming', args)
                     self.assertEqual(args[args.index('--ssd-streaming-cache-experts') + 1], '64GB')
                     self.assertIn('--dir-steering-file', args)
-                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '0.5')
+                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '0.4')
             (home / '.dsv4/desired-model').write_text('typo')
             result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
