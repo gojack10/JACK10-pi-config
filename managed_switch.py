@@ -29,7 +29,7 @@ MODELS = {
    args=['DeepSeek-V4.1-Flash-1017-Q2.gguf','--metal','--ssd-streaming','--power 100',
          '--ssd-streaming-cache-experts 64GB','--ctx 1000000',
          '--dir-steering-file /Users/jack/.dsv4/adapters/msuiche-1017-residual.ds41dir',
-         '--dir-steering-strength 0.5']),
+         '--dir-steering-strength 0.4']),
 }
 
 
