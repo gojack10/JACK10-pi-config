@@ -72,8 +72,8 @@ Slot IDs are unique/stable. Select an explicitly authorized, installed account
 provider rather than inferring it from registry order. Supported models/thinking:
 `openrouter` / `xiaomi/mimo-v2.6-pro` / `high`; `openai-codex-personal` /
 `gpt-6.1-sol` or `gpt-6-luna` / `high` (explicit existing Codex account routes
-remain compatible); `local` /
-`qwen3.8-flash-next` / `xhigh`. Role is owner-supplied text, not a director.
+remain compatible); `local` / `qwen3.8-flash-next` / `xhigh`; `local` / `deepseek-v4.1-flash` /
+`high` or `xhigh`. Role is owner-supplied text, not a director.
 `contextWarning` is a percentage greater than zero and at most 100. On registered
 peer floors it records a retirement transition, not an advisory checkpoint.
 At most one OSS slot may be configured on a floor. The global OSS selection holds

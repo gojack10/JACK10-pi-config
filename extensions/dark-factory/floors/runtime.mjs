@@ -14,6 +14,8 @@ export const ROUTES = Object.freeze([
   { provider: 'openrouter', model: 'xiaomi/mimo-v2.6-pro', thinking: 'high' },
   { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6.1-sol', thinking: 'high' },
   { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' },
+  { provider: 'local', model: 'deepseek-v4.1-flash', thinking: 'high' },
+  { provider: 'local', model: 'deepseek-v4.1-flash', thinking: 'xhigh' },
   { provider: 'openai-codex-personal', providerPattern: '^openai-codex(?:-[a-z0-9-]+)?$', model: 'gpt-6-luna', thinking: 'high' },
   { provider: 'openai', model: 'gpt-6-luna', thinking: 'high', label: '[openai] (ZDR)' },
   { provider: 'openai', model: 'gpt-6-luna', thinking: 'xhigh', label: '[openai] (ZDR)' },
