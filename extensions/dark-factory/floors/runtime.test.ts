@@ -390,6 +390,8 @@ test('advertised routes use the approved selectors while explicit account routes
     ['openrouter', 'xiaomi/mimo-v2.6-pro', 'high'],
     ['openai-codex-personal', 'gpt-6.1-sol', 'high'],
     ['local', 'qwen3.8-flash-next', 'xhigh'],
+    ['local', 'deepseek-v4.1-flash', 'high'],
+    ['local', 'deepseek-v4.1-flash', 'xhigh'],
     ['openai-codex-personal', 'gpt-6-luna', 'high'],
     ['openai', 'gpt-6-luna', 'high'],
     ['openai', 'gpt-6-luna', 'xhigh'],
