@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import activate from "./index.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRequire } from "node:module";
+
+// Match Pi's runtime package alias without requiring local node_modules.
+const pkg = join(homedir(), ".local/share/pi-mono/packages/coding-agent");
+const { createJiti } = createRequire(join(pkg, "package.json"))("jiti");
+const jiti = createJiti(import.meta.url, { alias: {
+	"@mariozechner/pi-coding-agent": join(pkg, "dist/index.js"),
+} });
+const { getBackgroundJobManager, releaseBackgroundJobManager } = await jiti.import("../background-jobs/manager.ts");
+const { default: activate } = await jiti.import("./index.ts");
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -21,6 +33,7 @@ test("publishes pane and session cache options through tmux", async (t) => {
 	const optionKey = (scope: string, target: string, name: string) =>
 		`${scope}|${target}|${name}`;
 	const pi = {
+		sendUserMessage() {},
 		on(event: string, handler: Handler) {
 			handlers.set(event, handler);
 		},
@@ -81,8 +94,11 @@ test("publishes pane and session cache options through tmux", async (t) => {
 	}) as typeof setInterval;
 	globalThis.clearInterval = (() => {}) as typeof clearInterval;
 
+	const dir = await mkdtemp(join(tmpdir(), "pi-cache-background-"));
 	activate(pi as never);
 	t.after(async () => {
+		releaseBackgroundJobManager(ctx as never);
+		await rm(dir, { recursive: true, force: true });
 		await handlers.get("session_shutdown")?.({}, ctx);
 		globalThis.setInterval = originalSetInterval;
 		globalThis.clearInterval = originalClearInterval;
@@ -115,8 +131,43 @@ test("publishes pane and session cache options through tmux", async (t) => {
 		/BUSY/,
 	);
 
+	const background = getBackgroundJobManager(pi as never, ctx as never);
+	const state = () => JSON.parse(options.get(optionKey("session", "$1", "@pi_cache_state")) ?? "{}");
+	const busyStartedAt = state().busyStartedAt;
+	for (const gate of ["first", "last"]) {
+		background.start({ command: `while [ ! -f '${join(dir, gate)}' ]; do sleep .02; done`, cwd: dir });
+	}
+	const settleWhileWaiting = async () => {
+		handlers.get("agent_settled")?.({}, ctx);
+		await wait();
+		assert.equal(state().agentDone, false, "waiting on background work is not AGENT DONE");
+		assert.equal(state().busyStartedAt, busyStartedAt);
+		assert.match(options.get(optionKey("pane", paneId, "@pi_cache_pane")) ?? "", /BUSY/);
+		assert.doesNotMatch(messages.join("\n"), /AGENT DONE/);
+	};
+	await settleWhileWaiting();
+	const finishJob = async (gate: string, remaining: number) => {
+		await writeFile(join(dir, gate), "");
+		for (let i = 0; i < 300 && background.stats().running !== remaining; i++) await wait();
+		assert.equal(background.stats().running, remaining);
+	};
+	await finishJob("first", 1);
+	await settleWhileWaiting();
+
+	// Reload/branch refresh must not restore a checkmark while the job is live.
+	for (const event of ["session_start", "session_tree", "session_compact"]) {
+		handlers.get(event)?.({}, ctx);
+		await wait();
+		assert.equal(state().agentDone, false);
+		assert.equal(typeof state().busyStartedAt, "number");
+	}
+	await finishJob("last", 0);
+	// The completion notice resumes Pi; only its final settled turn is done.
+	handlers.get("agent_start")?.({}, ctx);
 	handlers.get("agent_settled")?.({}, ctx);
 	await wait();
+	assert.equal(state().agentDone, true);
+	assert.equal(state().busyStartedAt, undefined);
 	const afterAgentSettledCalls = calls.length;
 	assert.ok(afterAgentSettledCalls > afterAgentStartCalls);
 	assert.match(messages.at(-1) ?? "", /\[pi\] \(0\) cache-test: AGENT DONE/);
