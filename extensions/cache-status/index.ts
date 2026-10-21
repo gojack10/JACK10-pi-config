@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { cacheStatus, formatHubTimer, tmuxNotice } from "./store.ts";
+import { getBackgroundJobManager } from "../background-jobs/manager.ts";
 
 const TICK_MS = 1000;
 const FLASH_TICK_MS = 50;
@@ -65,9 +66,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const start = (ctx: ExtensionContext) => {
+		cacheStatus.start(ctx);
+		if (getBackgroundJobManager(pi, ctx).stats().running > 0) cacheStatus.agentStart();
+	};
 	pi.on("session_start", (_event, ctx) => {
 		stopping = false;
-		cacheStatus.start(ctx);
+		start(ctx);
 		paneId = process.env.TMUX_PANE;
 		exec = (args) => pi.exec("tmux", args, { timeout: TICK_MS });
 		if (timer) clearInterval(timer);
@@ -100,7 +105,9 @@ export default function (pi: ExtensionAPI) {
 		void publish();
 		render();
 	});
-	pi.on("agent_settled", () => {
+	pi.on("agent_settled", (_event, ctx) => {
+		// A settled model turn is not done while background/child work can resume it.
+		if (getBackgroundJobManager(pi, ctx).stats().running > 0) return;
 		cacheStatus.agentSettled();
 		void publish(true);
 		render();
@@ -111,7 +118,7 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("model_select", refresh);
 	const restart = (_event: unknown, ctx: ExtensionContext) => {
-		cacheStatus.start(ctx);
+		start(ctx);
 		refresh();
 	};
 	pi.on("session_switch", restart);
