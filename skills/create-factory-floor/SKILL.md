@@ -5,6 +5,8 @@ description: Prepare a project as a stopped Dark Factory peer floor, or adopt an
 
 # Create Factory Floor
 
+Read knowledge nodes and required links from `/Users/jack/sifttext/nodes/<UUID>/node.md` with the file read tool, including cross-tree links. Use the native `sifttext` CLI for local retrieval; discover exact syntax with `sifttext -h`. Any authorized knowledge change uses a private worktree and checked native publication, never hosted mutation tools. Read the complete installed local Worktree Publication procedure at `/Users/jack/.local/share/sifttext/current/nodes/fb1e0c9f-8c04-4baf-91e6-4688856a14af/node.md` before such changes. Existing proposal, approval and stop boundaries below remain in force.
+
 You are the authorized setup code agent, not a project director. Prepare a stopped floor for the owner to configure and start. Do not launch workers/models, select a pause condition, adopt a live run, change hosting/services or expand permissions merely because this skill is loaded.
 
 1. Recover the request: floor name/ID, existing absolute Git cwd, actual starting-root IDs, project-entry ID, approved shared instruction IDs, and authorized slots/roles. Read the project entry and common Peer Worker Instructions `a5de844a-99d2-4db3-893f-fdac3a7a67ff`; inspect the relevant outline and reuse existing ownership. If tree changes are needed, follow [[SiftText Commit|c72d552d-3499-445b-a8d5-05d0ff7824f2@0d937080-fe60-4bc1-8673-d918928a162f]]. This skill grants no tree-write approval.

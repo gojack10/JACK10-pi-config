@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
 import { execFile } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,7 +13,11 @@ import { closeIdleWatches } from './watch.mjs';
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
-const SIFTTEXT = join(homedir(), '.local/bin/sifttext-mcp');
+const knowledge = join(homedir(), 'sifttext');
+const readNode = (id: string) => {
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id)) throw Error('invalid node id');
+  return readFileSync(join(knowledge, 'nodes', id, 'node.md'), 'utf8');
+};
 const CLAUDE = join(homedir(), '.local/bin/claude');
 // One pre-trusted, otherwise empty directory: dispatchers load no project memory or CLAUDE.md from it.
 export const CLAUDE_CWD = join(homedir(), '.pi/agent/factory-runs/parallel/claude-dispatcher');
@@ -23,7 +27,11 @@ const tmux = async (args: string[]) => {
   try { return { code: 0, stdout: (await exec('tmux', args)).stdout }; }
   catch (error) { return { code: 1, stdout: String((error as { stdout?: string }).stdout ?? ''), error }; }
 };
-const sql = async (query: string) => JSON.parse((await exec(SIFTTEXT, ['sql', `query=${query}`], { maxBuffer: 16 * 1024 * 1024 })).stdout);
+// Legacy acceptance metadata uses hosted parent_id/updated_at, absent from native SQLite.
+// Do not fake revisions, use a stale cache, or reconnect the retired service.
+const sql = async (_query: string): Promise<any[]> => {
+  throw Error('Legacy parallel-factory metadata needs native ancestry/revision migration before use; hosted SiftText is retired. Use the stopped peer-floor CLI instead.');
+};
 const idList = (ids: string[]) => {
   if (!ids.every(id => /^[0-9a-f-]{36}$/.test(id))) throw Error('invalid node id');
   return ids.map(id => `'${id}'`).join(',');
@@ -65,8 +73,7 @@ export default function (pi: ExtensionAPI) {
         now: () => Date.now(),
         sleep: (ms: number) => new Promise(resolve => setTimeout(resolve, ms)),
         primaryRequired: async (runNode: string) => {
-          const node = await exec(SIFTTEXT, ['get_node', `node_id=${runNode}`], { maxBuffer: 16 * 1024 * 1024 });
-          return node.stdout.includes('Qwen participation is mandatory throughout active factory work.');
+          return readNode(runNode).includes('Qwen participation is mandatory throughout active factory work.');
         },
         writePolicy: (dir: string, policy: unknown) => {
           const path = join(dir, 'policy.ts');
