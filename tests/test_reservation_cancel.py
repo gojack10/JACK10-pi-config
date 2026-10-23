@@ -240,6 +240,7 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_terminal_retries_busy_but_never_poisoned_receipts(self):
         native = object.__new__(body.FileEngine)
         native.kind, native.hold, native.ticket = 'ds4', None, 0
+        native.shutdown_only = False
         native.control, native.pid, native.incarnation = self.engine.control, os.getpid(), 'native'
         native.serial_key, native.core = ('test', 'terminal', None), self.proxy.COORDINATOR
         native.alive = lambda: True
@@ -269,6 +270,13 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
                 await native.terminal()
             self.assertEqual(commands[-1], (6, 'close'))
             self.assertEqual(len(commands), 6)  # no retry/status/release of poisoned state
+            poisoned = False
+            native.shutdown_only = True
+            previous = body.NATIVE_SERIALS[native.serial_key]
+            await native.terminal()
+            self.assertEqual(body.NATIVE_SERIALS[native.serial_key], previous)
+            with self.assertRaisesRegex(RuntimeError, 'cannot reopen'):
+                await native.release_terminal()
 
     async def test_held_borrower_cancellation_still_uses_checked_stop(self):
         # A direct socket abort cannot bypass a borrower or pending pause.
