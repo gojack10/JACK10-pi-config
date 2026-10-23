@@ -140,6 +140,8 @@ CHAT_OWNER = None
 INDEPENDENT_SWITCH = None
 STARTLUX = StartLuxRuntime()
 MLX = MLXRuntime()
+MAINTENANCE_FILE = Path.home() / '.dsv4/maintenance'
+MAINTENANCE = MAINTENANCE_FILE.exists()
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -1295,6 +1297,8 @@ def check_inference_certainty():
 async def begin_request(backend_name, model_id, request=None, managed=False):
     global ACTIVE_MODEL_ID, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_TICKET, CHAT_OWNER
     global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
+    if MAINTENANCE:
+        raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
     if request is not None and not managed:
         reservation_unavailable(request, backend_name)
     check_inference_certainty()
@@ -1331,6 +1335,8 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
             # request bypasses FIFO, but never an in-flight request.
             while (ACTIVE_REQUESTS or admission_order()[0] is not ticket or
                    (live_chat_owner() and CHAT_OWNER["chat_id"] != chat_id)):
+                if MAINTENANCE:
+                    raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
                 check_inference_certainty()
                 if client_disconnected(request):
                     raise ConnectionResetError("client disconnected while queued")
@@ -1937,6 +1943,38 @@ async def handle_other(request):
                                  release_chat=client_disconnected(request))
 
 
+async def handle_maintenance(request):
+    global MAINTENANCE, DS4_LOADED_MODEL_ID
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized()
+    async with REQUEST_CONDITION:
+        if ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or reservation_body.LIVE is not None:
+            raise web.HTTPConflict(text='Local AI is in use; finish the owning chat before maintenance')
+        MAINTENANCE = True
+        MAINTENANCE_FILE.touch(mode=0o600)
+        try:
+            await INDEPENDENT_SWITCH.stop_all()
+            DS4_LOADED_MODEL_ID = None
+        except Exception as exc:
+            # Keep admission closed on a partial shutdown. Never restart a
+            # component automatically when completion was not established.
+            raise web.HTTPServiceUnavailable(text=str(exc)) from exc
+    return web.json_response({'status': 'maintenance', 'engines': 'off'})
+
+
+async def handle_resume(request):
+    global MAINTENANCE
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized()
+    from local_ai import engines_off
+    async with REQUEST_CONDITION:
+        await asyncio.to_thread(engines_off)
+        MAINTENANCE_FILE.unlink(missing_ok=True)
+        MAINTENANCE = False
+        REQUEST_CONDITION.notify_all()
+    return web.json_response({'status': 'ok', 'engines': 'off'})
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -1964,12 +2002,16 @@ async def main():
     app.router.add_post("/admin/api/login", handle_admin_login)
     app.router.add_get("/admin/api/stats", handle_admin_stats)
     app.router.add_post("/admin/api/release-chat", handle_release_chat)
+    app.router.add_post('/admin/api/maintenance', handle_maintenance)
+    app.router.add_post('/admin/api/resume', handle_resume)
     app.router.add_route("*", "/v1/{tail:.*}", handle_other)
     app.router.add_get("/health", lambda r: web.json_response({
-        "status": "ok",
+        "status": "maintenance" if MAINTENANCE else "ok",
         "models_by_backend": {k: sorted(v["models"]) for k, v in BACKENDS.items()},
         "routes": MODEL_BACKENDS,
         "ds4_loaded_model": DS4_LOADED_MODEL_ID,
+        "active_requests": ACTIVE_REQUESTS,
+        "resident_model": INDEPENDENT_SWITCH.model if INDEPENDENT_SWITCH else None,
         "ds4_active_requests": DS4_ACTIVE_REQUESTS,
         "ds4_idle_timeout": DS4_IDLE_TIMEOUT,
         "ds4_switchable_models": sorted(DS4_MODEL_IDS),

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec uv run --no-project --offline --python "$HOME/.local/share/local-llm-proxy-venv/bin/python" \
+  python "$HOME/.pi/agent/local_ai.py" "$@"

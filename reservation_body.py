@@ -75,7 +75,8 @@ def clean_native(native, ticket=None):
 
 class FileEngine:
     """One qualified native process, one request, one private control directory."""
-    def __init__(self, kind, control, pid, log, binary=None, *, expected_sha=None, terminal_only=False):
+    def __init__(self, kind, control, pid, log, binary=None, *, expected_sha=None, terminal_only=False, shutdown_only=False):
+        self.shutdown_only = shutdown_only
         self.terminal_only = terminal_only
         self.kind, self.control, self.pid = kind, Path(control), int(pid)
         self.log = Path(log)
@@ -115,10 +116,27 @@ class FileEngine:
         else:
             raise RuntimeError('unknown native main')
         self.serial_key = (kind, str(self.control), self.incarnation)
-        if self.serial_key not in NATIVE_SERIALS and any((self.control / name).exists()
-                for name in ('ack', 'ack.json', 'terminal-ack', 'terminal_ack.json')):
-            raise RuntimeError('old control receipts without process-lifetime ticket map')
-        self.ticket = NATIVE_SERIALS.setdefault(self.serial_key, 0)
+        if shutdown_only:
+            if kind != 'ds4':
+                raise RuntimeError('Shutdown recovery is DS4-only')
+            # A one-way maintenance controller may challenge the old process,
+            # but must never adopt receipts as completion or reopen its gate.
+            for name in ('terminal-ack', 'ack'):
+                path = self.control / name
+                if path.exists():
+                    row = json.loads(private_file(path).read_text())
+                    if row.get('pid') != self.pid:
+                        raise RuntimeError('Foreign shutdown receipt')
+                    for field in ('serial', 'ticket'):
+                        value = row.get(field, 0)
+                        if not str(value).isascii() or not str(value).isdecimal():
+                            raise RuntimeError('Invalid shutdown receipt serial')
+                        self.ticket = max(self.ticket, int(value))
+        else:
+            if self.serial_key not in NATIVE_SERIALS and any((self.control / name).exists()
+                    for name in ('ack', 'ack.json', 'terminal-ack', 'terminal_ack.json')):
+                raise RuntimeError('old control receipts without process-lifetime ticket map')
+            self.ticket = NATIVE_SERIALS.setdefault(self.serial_key, 0)
 
     def lines(self):
         path = self.log if self.kind == 'ds4' else self.control / 'engine.jsonl'
@@ -362,11 +380,14 @@ class FileEngine:
         eligible(self.core, dict(fresh=bool(good and self.alive()), closed=bool(good),
                                  drained=bool(good), clean=bool(good)))
         self.ticket = number + 1
-        NATIVE_SERIALS[self.serial_key] = self.ticket
+        if not self.shutdown_only:
+            NATIVE_SERIALS[self.serial_key] = self.ticket
         self.terminal_ticket = ticket
         return fresh
 
     async def release_terminal(self):
+        if self.shutdown_only:
+            raise RuntimeError('Shutdown-only recovery cannot reopen native admission')
         if self.terminal_ticket is None:
             raise RuntimeError('no terminal close to release')
         serial = self.ticket + 1
