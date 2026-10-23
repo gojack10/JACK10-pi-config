@@ -2,22 +2,18 @@ import { execFileSync } from "node:child_process";
 import type {
 	ExtensionAPI,
 	Theme,
-	ThemeColor,
 } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import type { CacheStatusRow } from "./cache-status/store.ts";
 import {
 	type CodexUsageState,
 	quotaBuckets,
 	type QuotaBucketRow,
 } from "./codex-quota-extension/store.ts";
 import {
-	getCacheTimerColor,
 	getCurrentRunUsage,
 	getSessionUsage,
 	type UsageTotals,
 } from "./context-session-footer/session-usage.ts";
-import { formatFooterDuration } from "./context-session-footer/duration.ts";
 import { renderQuotaLines } from "./context-session-footer/quota.ts";
 
 const fitToWidth = (s: string, width: number): string => {
@@ -96,107 +92,6 @@ function formatTokens(count: number): string {
 	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
 	return `${Math.round(count / 1000000)}M`;
 }
-
-const cacheCell = (value: string, width: number): string => {
-	const fitted = truncateToWidth(value, width, "…");
-	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
-};
-
-const CACHE_FLASH_MS = 3000;
-const CACHE_FLASH_HOLD_MS = 1000;
-const CACHE_FLASH_PALETTE = [46, 82, 83, 119, 120, 156, 157, 193, 194, 252];
-
-const cacheFlashText = (
-	theme: Theme,
-	text: string,
-	flashUntil: number,
-): string => {
-	const elapsed = CACHE_FLASH_MS - Math.max(0, flashUntil - Date.now());
-	const progress = Math.max(
-		0,
-		Math.min(1, (elapsed - CACHE_FLASH_HOLD_MS) / (CACHE_FLASH_MS - CACHE_FLASH_HOLD_MS)),
-	);
-	if (theme.getColorMode() === "truecolor") {
-		const redBlue = Math.round(204 * progress);
-		const green = Math.round(255 - 51 * progress);
-		return `\x1b[38;2;${redBlue};${green};${redBlue}m${text}\x1b[39m`;
-	}
-	const color = CACHE_FLASH_PALETTE[
-		Math.min(
-			CACHE_FLASH_PALETTE.length - 1,
-			Math.floor(progress * CACHE_FLASH_PALETTE.length),
-		)
-	];
-	return `\x1b[38;5;${color}m${text}\x1b[39m`;
-};
-
-const appendCacheTable = (
-	state: FooterLineState,
-	rows: CacheStatusRow[],
-	width: number,
-	theme: Theme,
-): void => {
-	if (rows.length === 0) return;
-	flushFooterLine(state, width);
-
-	const headers = ["PROVIDER", "MODEL", "STATUS", "TIME"];
-	const values = rows.map((row) => {
-		const expired =
-			row.result !== "CHECKING" &&
-			row.result !== "NO CACHE" &&
-			row.durationMs !== undefined &&
-			row.remainingMs <= 0;
-		return [
-			row.provider,
-			row.model,
-			expired ? "EXPIRED" : (row.result ?? "NO CACHE"),
-			row.durationMs !== undefined && row.remainingMs > 0
-				? formatCacheTimerValue(row.remainingMs)
-				: "-",
-		];
-	});
-	const desired = headers.map((header, index) =>
-		Math.max(
-			visibleWidth(header),
-			...values.map((row) => visibleWidth(row[index])),
-		),
-	);
-	const available = Math.max(headers.length, width - (headers.length * 3 + 1));
-	const columns = [...desired];
-	while (columns.reduce((sum, value) => sum + value, 0) > available) {
-		const index = columns.indexOf(Math.max(...columns));
-		if (columns[index] <= 1) break;
-		columns[index]--;
-	}
-
-	const border = (left: string, middle: string, right: string) =>
-		`${left}${columns.map((column) => "─".repeat(column + 2)).join(middle)}${right}`;
-	const top = `CACHE${"─".repeat(Math.max(0, columns[0] + 3 - "CACHE".length))}${columns
-		.slice(1)
-		.map((column) => `┬${"─".repeat(column + 2)}`)
-		.join("")}┐`;
-	state.lines.push(theme.fg("dim", top));
-
-	for (const [index, row] of rows.entries()) {
-		const [provider, model, status, time] = values[index];
-		const flashing = (row.flashUntil ?? 0) > Date.now();
-		const statusColor: ThemeColor =
-			status === "EXPIRED" || status === "NO CACHE" ? "text" : "dim";
-		const timeColor: ThemeColor =
-			time === "-" ? "text" : getCacheTimerColor(row.remainingMs, row.durationMs);
-		const paint = (text: string, color: ThemeColor) =>
-			flashing
-				? cacheFlashText(theme, text, row.flashUntil ?? 0)
-				: theme.fg(color, text);
-		state.lines.push(
-			`${theme.fg("dim", "│ ")}${paint(cacheCell(provider, columns[0]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(model, columns[1]), "dim")}${theme.fg("dim", " │ ")}${paint(cacheCell(status, columns[2]), statusColor)}${theme.fg("dim", " │ ")}${paint(cacheCell(time, columns[3]), timeColor)}${theme.fg("dim", " │")}`,
-		);
-	}
-
-	state.lines.push(theme.fg("dim", border("└", "┴", "┘")));
-};
-
-const formatCacheTimerValue = formatFooterDuration;
 
 const appendQuotaLines = (
 	state: FooterLineState,
@@ -282,12 +177,7 @@ function getTemperature(): number | null {
 
 export default function (pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
-	let cacheTimers: CacheStatusRow[] = [];
 	let quotaState: CodexUsageState | undefined;
-	pi.events.on("cache-status:update", (data) => {
-		if (Array.isArray(data)) cacheTimers = data as CacheStatusRow[];
-		requestRender?.();
-	});
 	pi.events.on("codex-usage:update", (data) => {
 		if (!data || typeof data !== "object") return;
 		const update = data as CodexUsageState | { state?: CodexUsageState };
@@ -376,8 +266,6 @@ export default function (pi: ExtensionAPI) {
 						width,
 						dim,
 					);
-					flushFooterLine(lineState, width);
-					appendCacheTable(lineState, cacheTimers, width, theme);
 					flushFooterLine(lineState, width);
 					appendQuotaLines(lineState, quota, width, theme);
 					flushFooterLine(lineState, width);
