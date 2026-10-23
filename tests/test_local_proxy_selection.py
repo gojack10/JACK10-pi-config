@@ -609,15 +609,16 @@ class WrapperTests(unittest.TestCase):
                     self.assertEqual(args[args.index('--chdir') + 1], str(home / 'ds4'))
                     self.assertIn(str(home / 'dsv4-qwen38-integration/gguf/DeepSeek-V4.1-Flash-1017-Q2.gguf'), args)
                     self.assertEqual(args[args.index('--dir-steering-file') + 1],
-                                     str(home / '.dsv4/adapters/msuiche-1017-residual.ds41dir'))
+                                     str(home / '.dsv4/adapters/pqhaz-1017-writer.ds41dir'))
                     import managed_switch
                     config = managed_switch.MODELS[model]
                     self.assertIn('DeepSeek-V4.1-Flash-1017-Q2.gguf', config['args'])
-                    self.assertIn('--dir-steering-strength 0.4', config['args'])
+                    self.assertIn('--dir-steering-file /Users/jack/.dsv4/adapters/pqhaz-1017-writer.ds41dir', config['args'])
+                    self.assertIn('--dir-steering-strength 1.0', config['args'])
                     self.assertIn('--ssd-streaming', args)
                     self.assertEqual(args[args.index('--ssd-streaming-cache-experts') + 1], '64GB')
                     self.assertIn('--dir-steering-file', args)
-                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '0.4')
+                    self.assertEqual(args[args.index('--dir-steering-strength') + 1], '1.0')
             (home / '.dsv4/desired-model').write_text('typo')
             result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)

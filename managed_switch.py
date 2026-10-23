@@ -25,11 +25,11 @@ MODELS = {
    sha='23f9e6d99db3120cc24a32839ea57e6680fbae3de142b424a2780e8aa0494e32',
    args=['Qwen3.8-Flash-Next-Q4.gguf','--mtp','--ctx 750000']),
  'deepseek-v4.1-flash': dict(mode='ds41', binary=HOME/'ds4/ds4-server-v41-reservation',
-   sha='a3897ee4f2a85f51a2b499ede9e4bbd13886ee0b5f9b1d52cd5ed04e5c7d512a',
+   sha='9ea341d6dbda9f260bbc1795f96c1434a15dc89f0e149f046d1a94d21598afce',
    args=['DeepSeek-V4.1-Flash-1017-Q2.gguf','--metal','--ssd-streaming','--power 100',
          '--ssd-streaming-cache-experts 64GB','--ctx 1000000',
-         '--dir-steering-file /Users/jack/.dsv4/adapters/msuiche-1017-residual.ds41dir',
-         '--dir-steering-strength 0.4']),
+         '--dir-steering-file /Users/jack/.dsv4/adapters/pqhaz-1017-writer.ds41dir',
+         '--dir-steering-strength 1.0']),
 }
 
 
