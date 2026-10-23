@@ -1,0 +1,7 @@
+{
+  "lib/python3.14/site-packages/mlx/core.cpython-314-darwin.so": "0cd491c80ae9059121f8fe077e45f44527af7af702f150d4a9f0847890ad3e12",
+  "lib/python3.14/site-packages/mlx/lib/libmlx.dylib": "ebc8a5f5465afb79d3d9c8f5b0929de1a9b277b7179db8672f92da77ae110a1e",
+  "lib/python3.14/site-packages/mlx/lib/mlx.metallib": "95974b7de464ec2be7833a914ca5a53d283a70789470fd84218738fc8fcea3e1",
+  "lib/python3.14/site-packages/mlx_lm/server.py": "57392576de114af80ede723976b9dd156dc234f856b9943b8b44b8b78bc27f79",
+  "lib/python3.14/site-packages/mlx_lm/generate.py": "4a3bf57f5679dac73791f069268866ab5b9336e58582d436b31133984e4b6971"
+}

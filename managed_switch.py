@@ -16,9 +16,10 @@ import time
 from aiohttp import ClientSession, ClientTimeout
 import reservation_body as rb
 import swap_policy
+from mlx_runtime import MODELS as MLX_MODELS
 
-HOME = Path('/Users/jack')
-SERVICE = 'gui/501/com.dsv4.server'
+HOME = Path.home()
+SERVICE = f'gui/{os.getuid()}/com.dsv4.server'
 ROOT = HOME/'research/bend'
 MODELS = {
  'qwen3.8-flash-next': dict(mode='qwen', binary=HOME/'ds4/ds4-server',
@@ -55,7 +56,7 @@ class LaneUnproven(RuntimeError):
 
 
 def ctl(*args):
-    return command('/bin/launchctl','asuser','501','/bin/launchctl',*args)
+    return command('/bin/launchctl','asuser',str(os.getuid()),'/bin/launchctl',*args)
 
 
 def service_pid():
@@ -82,9 +83,10 @@ def record(event, **data):
 
 
 class ManagedSwitch:
-    def __init__(self, inherited_lease=None, startlux=None):
+    def __init__(self, inherited_lease=None, startlux=None, mlx=None):
         self.inherited_lease=inherited_lease # controller-owned only in isolated tests
         self.startlux=startlux
+        self.mlx=mlx
         self.lease=None
         self.model=self.engine=None
         self.blocked=None
@@ -112,6 +114,11 @@ class ManagedSwitch:
         self.lease=None
 
     def binding(self, model):
+        if model in MLX_MODELS and self.mlx is not None:
+            self.mlx.probe()
+            if self.mlx.model != model:
+                raise RuntimeError('MLX model identity mismatch')
+            return self.mlx
         config=MODELS[model]
         p=service_pid()
         if not p: raise RuntimeError('managed engine absent')
@@ -150,7 +157,7 @@ class ManagedSwitch:
 
     async def start(self,model):
         if subprocess.run(['/bin/launchctl','print',SERVICE],capture_output=True).returncode != 0:
-            ctl('bootstrap','gui/501',str(HOME/'Library/LaunchAgents/com.dsv4.server.plist'))
+            ctl('bootstrap',f'gui/{os.getuid()}',str(HOME/'Library/LaunchAgents/com.dsv4.server.plist'))
         control=Path(tempfile.mkdtemp(prefix='reservation-dual-',dir=HOME/'.dsv4'))
         ctl('setenv','DS4_FREEZE_DIR',str(control))
         (HOME/'.dsv4/desired-model').write_text(MODELS[model]['mode']+'\n')
@@ -206,8 +213,9 @@ class ManagedSwitch:
     async def observe_with_startlux(self):
         # A process/port mismatch is uncertainty, never an empty lane.
         resident = await asyncio.to_thread(self.startlux.probe)
+        mlx = await asyncio.to_thread(self.mlx.probe) if self.mlx is not None else None
         ds4_pid = service_pid()
-        if (resident and ds4_pid) or (not ds4_pid and await asyncio.to_thread(swap_policy.port_listening, 8001)):
+        if sum(bool(p) for p in (resident, mlx, ds4_pid)) > 1 or (not ds4_pid and await asyncio.to_thread(swap_policy.port_listening, 8001)):
             swap_policy.SWAP.adopt_unknown()
             raise LaneUnproven('conflicting or foreign DS4/StartLux process')
         if resident:
@@ -215,6 +223,9 @@ class ManagedSwitch:
                 swap_policy.SWAP.adopt_unknown()
                 raise LaneUnproven('StartLux process exists but is not ready')
             self.model, self.engine = 'startlux-4b-instant', None
+            swap_policy.SWAP.adopt(self.model)
+        elif mlx:
+            self.model, self.engine = self.mlx.model, self.mlx
             swap_policy.SWAP.adopt(self.model)
         elif ds4_pid:
             self.adopt()  # pinned DS4 binary, native control identity and argv
@@ -237,16 +248,17 @@ class ManagedSwitch:
         raise RuntimeError('DS4 exit/port/service not proven after bootout')
 
     async def prepare_with_startlux(self, model):
-        if model not in (*MODELS, 'startlux-4b-instant') or self.blocked:
+        if model not in (*MODELS, *MLX_MODELS, 'startlux-4b-instant') or self.blocked:
             raise RuntimeError('managed model unavailable')
         await self.acquire()
         async def settle():
             await self.observe_with_startlux()
-            if model == 'startlux-4b-instant':
+            runtime = self.mlx if model in MLX_MODELS else self.startlux if model == 'startlux-4b-instant' else None
+            if runtime is not None:
                 try:
-                    await asyncio.to_thread(self.startlux.qualify)
+                    await asyncio.to_thread(runtime.qualify)
                 except Exception as exc:
-                    raise LaneUnproven(f'StartLux artifact qualification failed before switch: {exc}') from exc
+                    raise LaneUnproven(f'Artifact qualification failed before switch: {exc}') from exc
             action, resident = swap_policy.SWAP.admit(model, qualified=True)
             if action == 'reuse':
                 if model == 'startlux-4b-instant' and await asyncio.to_thread(mlx_lane_busy):
@@ -254,13 +266,15 @@ class ManagedSwitch:
                 return self.startlux if model == 'startlux-4b-instant' else self.binding(model)
             if action not in ('stop', 'start'):
                 raise LaneUnproven(f'swap policy refused {model}: {action}')
-            if await asyncio.to_thread(mlx_lane_busy):
+            if resident not in MLX_MODELS and await asyncio.to_thread(mlx_lane_busy):
                 if action == 'stop': swap_policy.SWAP.abort()
                 raise LaneUnproven('mlx lane busy or unproven; no transition issued')
             if action == 'stop':
                 try:
                     if resident == 'startlux-4b-instant':
                         await self.startlux.stop()  # process exit proves native work gone
+                    elif resident in MLX_MODELS:
+                        await self.mlx.stop()
                     elif resident in MODELS:
                         await self.stop_ds4_for_startlux()
                     else:
@@ -277,6 +291,9 @@ class ManagedSwitch:
                     await self.startlux.start()
                     self.engine = None
                     self.model = model
+                elif model in MLX_MODELS:
+                    await self.mlx.start(model)
+                    self.engine, self.model = self.mlx, model
                 else:
                     await self.start(model)  # fresh DS4 gate, binary, PID and native receipt
             except BaseException:

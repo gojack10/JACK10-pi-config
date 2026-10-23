@@ -25,6 +25,7 @@ from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
 import swap_policy
 from managed_switch import MODELS as MANAGED_MODELS
+from mlx_runtime import MLXRuntime, MODELS as MLX_CHECKPOINTS
 from startlux_runtime import StartLuxRuntime, MODEL_ID as STARTLUX_MODEL_ID, UPSTREAM_ID as STARTLUX_UPSTREAM_ID, PORT as STARTLUX_PORT, CONTEXT as STARTLUX_CONTEXT, WORK_TOKENS as STARTLUX_WORK_TOKENS
 
 CHAT_TIMEOUT = ClientTimeout(total=None, sock_connect=10, sock_read=None)
@@ -48,8 +49,8 @@ FLASH_MOE_PORT = 8004
 LISTEN_PORT = int(os.getenv('LOCAL_PROXY_PORT', '8002')) if os.getenv('LOCAL_PROXY_RESERVATION') == '1' else 8002
 # Default OFF. This build has no live native adapter; never advertise a grant
 # based on an HTTP stream, an old pause file, or a process-exit observation.
-RESERVATION_TRIAL = os.getenv("LOCAL_PROXY_RESERVATION", "0") == "1"
-DUAL_MODELS = RESERVATION_TRIAL and os.getenv('LOCAL_PROXY_DUAL_MODELS') == '1'
+RESERVATION_TRIAL = os.getenv("LOCAL_PROXY_RESERVATION", "1") == "1"
+DUAL_MODELS = RESERVATION_TRIAL
 COORDINATOR = Path("/Users/jack/research/bend/coordinator/liveness-evidence-20260925/coordinator-cpu")
 COORDINATOR_SHA256 = "eac1a3d92d1e55c0545549dfaaa41d00298a77c4ceff953aec3b563985dd86bd"
 
@@ -64,10 +65,7 @@ QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
 # Native context for all three checkpoints is 262,144; no YaRN scaling anywhere.
 MLX_SERVICE_LABEL = "com.mlx-lm.server"
 MLX_DESIRED_FILE = Path.home() / ".mlx-lm" / "desired-model"
-MLX_MODEL_PATHS = {
-    "qwen3.8-27b-uncensored": ".mlx-lm/models/Qwen3.8-27B-Uncensored-8bit",
-    "gemma-4-31b-mlx": ".mlx-lm/models/mlx-community/gemma-4-31b-it-8bit",
-}
+MLX_MODEL_PATHS = {model: str(path) for model, path in MLX_CHECKPOINTS.items()}
 MLX_MODEL_IDS = set(MLX_MODEL_PATHS)
 MLX_MODEL_METADATA = {
     "qwen3.8-27b-uncensored": {"name": "Qwen3.8 27B Uncensored (MLX 8-bit)", "context_length": 262144},
@@ -141,6 +139,7 @@ REQUEST_QUEUE = []
 CHAT_OWNER = None
 INDEPENDENT_SWITCH = None
 STARTLUX = StartLuxRuntime()
+MLX = MLXRuntime()
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -1345,11 +1344,12 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                 if INDEPENDENT_SWITCH is None:
                     raise web.HTTPServiceUnavailable(text='StartLux managed switch unavailable')
                 engine = await INDEPENDENT_SWITCH.prepare_startlux()
+                DS4_LOADED_MODEL_ID = None
             elif managed:
                 # Switch/verify/rebind while no main is admitted and the same
                 # condition still excludes every queued request and idle task.
                 engine = await reservation_body.prepare_main(model_id)
-                DS4_LOADED_MODEL_ID = model_id
+                DS4_LOADED_MODEL_ID = model_id if backend_name == 'ds4' else None
                 DS4_LOADED_CHECK_AT = time.monotonic()
             elif backend_name == "ds4":
                 await ensure_ds4_model(model_id)
@@ -1469,7 +1469,7 @@ async def finish_independent_kev(engine, stopped):
 
 
 async def finish_request(backend_name, uncertain=False, release_chat=False):
-    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT, ACTIVE_TICKET, CHAT_OWNER
+    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT, MLX_LAST_REQUEST_AT, ACTIVE_TICKET, CHAT_OWNER
     async with REQUEST_CONDITION:
         if uncertain:
             # ponytail: no portable backend completion API. Retain the owner on
@@ -1489,6 +1489,8 @@ async def finish_request(backend_name, uncertain=False, release_chat=False):
         if backend_name == "ds4":
             DS4_ACTIVE_REQUESTS -= 1
             DS4_LAST_REQUEST_AT = time.monotonic()
+        elif backend_name == 'mlx':
+            MLX_LAST_REQUEST_AT = time.monotonic()
         REQUEST_CONDITION.notify_all()
 
 
@@ -1585,7 +1587,7 @@ async def handle_chat(request):
         not RESERVATION_TRIAL or not DUAL_MODELS or model_id not in DS4_MODEL_IDS
     ):
         reservation_body.unavailable(request, 'glm_native_model_unqualified')
-    if RESERVATION_TRIAL and backend_name in ('ds4', 'mlx'):
+    if RESERVATION_TRIAL and backend_name == 'ds4':
         if model_id == GLM_FLASH_MODEL_ID:
             # GLM deliberately skips the retained-owner coordinator, but its
             # CPU native-eligibility authority still needs the same build pin.
@@ -1597,7 +1599,7 @@ async def handle_chat(request):
             BACKENDS[backend_name]['v1'], mark_reservation_blocked)
     started = forwarded = complete = cancelled = False
     try:
-        await begin_request(backend_name, model_id, request)
+        await begin_request(backend_name, model_id, request, managed=backend_name == 'mlx')
         started = True
 
         backend = BACKENDS[backend_name]["v1"]
@@ -1608,6 +1610,8 @@ async def handle_chat(request):
             "Authorization": request.headers.get("Authorization", AUTH_HEADERS["Authorization"]),
             "Content-Type": "application/json",
         }
+        if backend_name == 'mlx':
+            headers.update(MLX.headers)
         for name in ("X-Pi-Request-Id", "X-Pi-Origin", "X-Pi-Live-Answer"):
             if value := request.headers.get(name):
                 headers[name] = value
@@ -1679,11 +1683,18 @@ async def handle_chat(request):
         raise
     finally:
         if started:
+            if backend_name == 'mlx':
+                try:
+                    await MLX.terminal()
+                    await MLX.release_terminal()
+                except BaseException:
+                    await finish_request(backend_name, uncertain=True)
+                    raise
             if cancelled:
                 # Reuse the same quiescence wait model switching already uses: the
                 # next owner is admitted only once the engine reports it stopped.
                 await wait_for_ds4_idle()
-            await finish_request(backend_name, uncertain=forwarded and not complete and not cancelled,
+            await finish_request(backend_name, uncertain=backend_name != 'mlx' and forwarded and not complete and not cancelled,
                                  release_chat=cancelled or client_disconnected(request))
 
 
@@ -1932,7 +1943,7 @@ async def main():
     global DS4_LAST_REQUEST_AT, INDEPENDENT_SWITCH
     if DUAL_MODELS:
         from managed_switch import ManagedSwitch
-        manager = INDEPENDENT_SWITCH = ManagedSwitch(startlux=STARTLUX)
+        manager = INDEPENDENT_SWITCH = ManagedSwitch(startlux=STARTLUX, mlx=MLX)
         reservation_body.MANAGED_ENGINE_PREPARER = manager.prepare
         reservation_body.MANAGED_ENGINE_RELEASER = manager.release
         reservation_body.INDEPENDENT_ADMITTER = begin_independent_kev
@@ -1941,7 +1952,7 @@ async def main():
         DS4_LAST_REQUEST_AT = time.monotonic()
     await discover_models()
     asyncio.create_task(periodic_discover())
-    if not (RESERVATION_TRIAL and os.getenv('LOCAL_PROXY_PRIVATE_LEASE') == '1'):
+    if not RESERVATION_TRIAL:
         asyncio.create_task(ds4_idle_check_loop())
         asyncio.create_task(mlx_idle_check_loop())
 

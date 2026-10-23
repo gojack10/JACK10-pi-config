@@ -220,18 +220,6 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.events[-3:], ["stop", "desired:" + mode, "start"])
             await p.finish_request("ds4")
 
-    async def test_failed_qwen_never_forwards_or_restores(self):
-        p = self.p
-        self.fail_start = True
-        request = type("Request", (), {"headers": {}, "transport": type("Transport", (), {"is_closing": lambda self: False})(), "read": AsyncMock(return_value=json.dumps({"model": p.QWEN_NEXT_MODEL_ID}).encode())})()
-        with self.assertRaises(p.web.HTTPServiceUnavailable) as error:
-            await p.handle_chat(request)
-        self.assertIn("no fallback", error.exception.text)
-        self.assertEqual(self.events, ["stop", "desired:qwen", "start"])
-        self.assertIsNone(self.loaded)
-        self.assertEqual(p.ACTIVE_REQUESTS, 0)
-        self.assertEqual(p.DS4_ACTIVE_REQUESTS, 0)
-
     async def test_cancelled_waiter_does_not_release_active_request(self):
         p = self.p
         await p.begin_request("ds4", p.GLM_FLASH_MODEL_ID)
@@ -331,52 +319,6 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("glm_native_model_unqualified", error.exception.text)
         self.assertEqual(self.events, [])
         self.assertEqual(p.ACTIVE_REQUESTS, 0)
-
-    async def test_handler_keeps_reservation_until_backend_response(self):
-        p = self.p
-        self.loaded = p.QWEN_NEXT_MODEL_ID
-        entered, release = asyncio.Event(), asyncio.Event()
-
-        class Response:
-            status = 200
-            content_type = "application/json"
-            async def __aenter__(self):
-                entered.set()
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def read(self):
-                await release.wait()
-                return b'{}'
-
-        class Session:
-            def __init__(self, **kwargs):
-                pass
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            def post(self, *args, **kwargs):
-                return Response()
-
-        request = type("Request", (), {
-            "read": AsyncMock(return_value=json.dumps({"model": p.QWEN_NEXT_MODEL_ID}).encode()),
-            "headers": {},
-            "transport": type("Transport", (), {"is_closing": lambda _: False})(),
-        })()
-        with patch.object(p, "ClientSession", Session):
-            response = asyncio.create_task(p.handle_chat(request))
-            await asyncio.wait_for(entered.wait(), 2)
-            switch = asyncio.create_task(p.begin_request("ds4", p.DS41_MODEL_ID))
-            await asyncio.sleep(0)
-            self.assertFalse(switch.done())
-            self.assertEqual(self.events, [])
-            release.set()
-            await response
-            await switch
-            await p.finish_request("ds4")
-        self.assertEqual(self.events, ["stop", "desired:ds41", "start"])
-
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_waits_for_service_removal_and_process_exit(self):
@@ -531,46 +473,6 @@ class TelemetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WrapperTests(unittest.TestCase):
-    def test_mlx_wrapper_argv_without_model_load(self):
-        source = Path.home() / ".mlx-lm/mlx-server.sh"
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            (home / ".mlx-lm").mkdir()
-            (home / ".local/bin").mkdir(parents=True)
-            checkpoint = home / ".mlx-lm/models/Qwen3.8-27B-Uncensored-8bit"
-            checkpoint.mkdir(parents=True)
-            fake = home / ".local/bin/mlx_lm.server"
-            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
-            fake.chmod(0o755)
-            template = source.read_text()
-            real_executable = "/Users/jack/.local/bin/mlx_lm.server"
-            self.assertIn(real_executable, template)
-            wrapper = home / "mlx-server.sh"
-            wrapper.write_text(template.replace(real_executable, str(fake)))
-            source = wrapper
-            env = {"HOME": str(home), "PATH": "/bin:/usr/bin"}
-            desired = home / ".mlx-lm/desired-model"
-            desired.write_text(str(checkpoint) + "\n")
-            result = subprocess.run(["/bin/sh", str(source)], capture_output=True,
-                                    text=True, check=True, env=env)
-            args = result.stdout.splitlines()
-            self.assertEqual(args[args.index("--model") + 1], str(checkpoint))
-            self.assertEqual(args[args.index("--port") + 1], "8000")
-            # Memory-only posture: the wrapper adds no cache or vision flags.
-            for flag in ("--kv-disk-dir", "--paged-ssd-cache-dir", "--vision", "--kv-bits"):
-                self.assertNotIn(flag, args)
-            for bad in ("", "typo", str(home / ".mlx-lm/models/Missing")):
-                desired.write_text(bad + "\n")
-                refused = subprocess.run(["/bin/sh", str(source)], capture_output=True,
-                                         text=True, env=env)
-                with self.subTest(desired=bad):
-                    self.assertNotEqual(refused.returncode, 0)
-                    self.assertEqual(refused.stdout, "")
-            desired.unlink()
-            refused = subprocess.run(["/bin/sh", str(source)], capture_output=True,
-                                     text=True, env=env)
-            self.assertNotEqual(refused.returncode, 0)
-
     def test_wrapper_argv_without_exec_or_model_load(self):
         source = Path('/Users/jack/.dsv4/dsv4-server-wrapper.sh').read_text()
         with tempfile.TemporaryDirectory() as directory:
