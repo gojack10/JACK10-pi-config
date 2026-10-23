@@ -6,7 +6,6 @@
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   },
-  "hideThinkingBlock": false,
   "packages": [
     "git:github.com/davebcn87/pi-autoresearch",
     "git:github.com/DietrichGebert/ponytail"
