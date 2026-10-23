@@ -320,6 +320,44 @@ class ManagedSwitch:
             raise asyncio.CancelledError()
         return engine
 
+    async def stop_all(self):
+        """Maintenance only: fresh native drain, process exit, then empty policy."""
+        await asyncio.wait_for(self.acquire(), 90)
+        try:
+            if self.startlux is not None and await asyncio.to_thread(self.startlux.probe):
+                await self.startlux.stop()
+            if self.mlx is not None and await asyncio.to_thread(self.mlx.probe):
+                await self.mlx.stop()
+            pid = service_pid()
+            if pid:
+                argv = command('/bin/ps', '-p', str(pid), '-o', 'command=')
+                config = next((c for c in MODELS.values() if shlex.split(argv)[0] == str(c['binary'])), None)
+                if config is None:
+                    raise RuntimeError('Unknown DS4 executable; maintenance stopped')
+                # Settings may intentionally have changed since this engine
+                # started. Prove its binary and drain, never reuse its cache.
+                self.engine = rb.FileEngine('ds4', ctl('getenv', 'DS4_FREEZE_DIR'), pid,
+                    HOME / '.dsv4/dsv4.log', config['binary'], expected_sha=config['sha'],
+                    terminal_only=config.get('terminal_only', False), shutdown_only=True)
+                self.engine.core = ROOT / 'coordinator/liveness-evidence-20260925/coordinator-cpu'
+                await self.stop_ds4_for_startlux()
+            elif swap_policy.port_listening(8001):
+                raise RuntimeError('Foreign DS4 listener; maintenance stopped')
+            if mlx_lane_busy():
+                raise RuntimeError('Unmanaged MLX service; maintenance stopped')
+            # Empty registered services are removed too; no startup is implied.
+            command('/bin/launchctl', 'bootout', SERVICE, check=False)
+            command('/bin/launchctl', 'bootout', f'gui/{os.getuid()}/com.mlx-lm.server', check=False)
+            self.model = self.engine = None
+            self.blocked = None
+            swap_policy.SWAP.recover()
+        except BaseException as exc:
+            self.blocked = repr(exc)
+            raise
+        finally:
+            if not self.blocked:
+                self.release()
+
     async def prepare_startlux(self):
         return await self.prepare_with_startlux('startlux-4b-instant')
 
