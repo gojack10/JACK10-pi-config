@@ -7,4 +7,4 @@ argument-hint: <session-id-or-jsonl-path>
 duckdb queries tree: `f0000000-0000-4000-8000-f0a4eed4fa92`
 Canonical procedure node: `f0000000-0000-4000-8000-c5ff4f45d78b`
 
-Before acting, call `sifttext_get_node` on the canonical procedure node and follow its current query, session-source resolution rules (explicit path, ID/prefix, or current session), and warnings. If the node cannot be read, halt rather than guessing from memory.
+Before acting, read `/Users/USER/sifttext/nodes/f0000000-0000-4000-8000-c5ff4f45d78b/node.md` with the file read tool and follow its current local DuckDB query, session-source resolution rules (explicit path, ID/prefix, or current session), and warnings. Keep snapshot/cutoff consent for growing sources, branch caveats, and the emitted-file/token/size reporting contract. `get_current_session` remains the local current-session locator; DuckDB SQL is local, not a hosted knowledge tool. If the file cannot be read, halt rather than guessing from memory.

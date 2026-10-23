@@ -65,7 +65,7 @@ export function workerCommand(settings, config, pane, mission, env = process.env
     `@${mission}`];
   return `tmux set-option -w -t "$TMUX_PANE" remain-on-exit on && exec ${args.map(quote).join(' ')}`;
 }
-export const bootMission = settings => `Read SiftText Read node f0000000-0000-4000-8000-8419c1b35e04 first. Then read BF2 root ${settings.root}, then experiment instruction node ${settings.instructions}. Follow that node as an equal peer; it owns the work/policy. Do not launch nested workers. Use board -h for the CLI interface, then board read once after those tree reads.\n`;
+export const bootMission = settings => `Use local file reads at /Users/USER/sifttext/nodes/<UUID>/node.md for knowledge nodes and required links; no hosted SiftText tools. Read SiftText Read node f0000000-0000-4000-8000-8419c1b35e04 first. Then read BF2 root ${settings.root}, then experiment instruction node ${settings.instructions}. Follow that node as an equal peer; it owns the work/policy. Do not launch nested workers. Use board -h for the CLI interface, then board read once after those tree reads.\n`;
 
 export function tmux(args) {
   const result = spawnSync('tmux', args, { encoding: 'utf8' });

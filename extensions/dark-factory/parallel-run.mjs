@@ -12,8 +12,12 @@ import { preflightCode } from './parallel-code.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const home = join(homedir(), '.pi/agent');
 const root = join(home, 'factory-runs', 'parallel');
-const SIFTTEXT = join(homedir(), '.local/bin/sifttext-mcp');
+const knowledge = join(homedir(), 'sifttext');
 const [command, ...rest] = process.argv.slice(2);
+// Only this legacy hosted-metadata scheduler is frozen; stopped peer floors use bin/factory.
+if (['controller', 'start-parallel', 'wake', 'answer', 'resume'].includes(command)) {
+  throw Error('Legacy parallel factory is retired pending native ancestry/revision migration; use bin/factory for stopped peer floors. No hosted SiftText fallback or model launch.');
+}
 const flag = name => { const i = rest.indexOf(name); return i === -1 ? undefined : rest[i + 1]; };
 const quote = x => `'${x.replaceAll("'", "'\\''")}'`;
 const readJson = path => existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
@@ -151,7 +155,7 @@ if (command === 'controller') {
   const runNode = flag('--run');
   if (!isNodeId(runNode)) throw Error('start-parallel requires --run <RUN node UUID>');
   const overrides = flag('--config') ? JSON.parse(readFileSync(resolve(flag('--config')), 'utf8')) : {};
-  const nodeText = execFileSync(SIFTTEXT, ['get_node', `node_id=${runNode}`], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  const nodeText = readFileSync(join(knowledge, 'nodes', runNode, 'node.md'), 'utf8');
   const parsed = parseRunNode(nodeText);
   const owner = overrides.owner ?? parsed.owner;
   if (!isNodeId(owner)) throw Error('RUN node names no OWNER line of the form "OWNER: [[Name|uuid]]"');
