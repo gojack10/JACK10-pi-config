@@ -1,5 +1,6 @@
 import { DEFAULT_MAX_BYTES, truncateTail, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,18 +9,6 @@ import { FOREGROUND_TIMEOUT_SECONDS } from "../bash-timeout/policy.ts";
 
 type UserMessageOptions = Parameters<ExtensionAPI["sendUserMessage"]>[1];
 type SendUserMessage = (content: string, options?: UserMessageOptions) => void | PromiseLike<unknown>;
-
-const admissionAccepted = (result: unknown): boolean => {
-  if (result === undefined || typeof result !== "object" || result === null) return true;
-  return (result as { status?: unknown }).status === "admitted";
-};
-
-const admissionError = (result: unknown): Error => {
-  const error = typeof result === "object" && result !== null && "error" in result
-    ? String((result as { error?: unknown }).error)
-    : "message admission was rejected";
-  return new Error(error);
-};
 
 export interface BackgroundJobStartOptions {
   command: string;
@@ -171,6 +160,7 @@ export class BackgroundJobManager {
   private readonly batches = new Map<string, BatchState>();
   private readonly closedBatchIds = new Set<string>();
   private readonly reports = new Map<string, BackgroundJobReport>();
+  private readonly notificationOwner = randomUUID();
   private nextJobId = 1;
   private nextBatchId = 1;
   private implicitBatchId: string | undefined;
@@ -702,15 +692,23 @@ export class BackgroundJobManager {
     };
   }
 
-  private sendReport(report: BackgroundJobReport, admissionKey: string): void {
+  private sendReport(report: BackgroundJobReport, id: string): void {
+    const failed = (error: unknown) => console.error("background-jobs: notification was not retained:", error);
     try {
-      const result = this.sendUserMessage(report.text, { deliverAs: "steer", admissionKey });
-      if (result !== undefined) {
-        void Promise.resolve(result).then(accepted => {
-          if (!admissionAccepted(accepted)) throw admissionError(accepted);
-        }).catch(() => {});
-      }
-    } catch {}
+      // Pi owns delivery after retaining the notice; Bob only submits the finished result.
+      const result = this.sendUserMessage(report.text, {
+        deliverAs: "steer",
+        notificationId: `${this.notificationOwner}:${id}`,
+      });
+      void Promise.resolve(result).then(receipt => {
+        if (receipt && typeof receipt === "object" && "status" in receipt) {
+          if (receipt.status === "rejected") failed(receipt);
+          else if (!("delivery" in receipt) || receipt.delivery !== "inbox") {
+            failed(new Error("Pi notification inbox support is required; rebuild and restart Pi"));
+          }
+        }
+      }, failed);
+    } catch (error) { failed(error); }
   }
 
   private renderCompletion(completion: BackgroundJobCompletion): string {
