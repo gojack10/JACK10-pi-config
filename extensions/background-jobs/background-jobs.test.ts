@@ -57,6 +57,22 @@ async function harness(t: any, withConsumer = false) {
 const gatedCommand = (gate: string, output: string, exitCode = 0) =>
   `i=0; while [ ! -f '${gate}' ] && [ "$i" -lt 250 ]; do i=$((i+1)); sleep .02; done; printf '${output}'; exit ${exitCode}`;
 
+test('completion uses the retained user-message inbox with identities unique across reload', async t => {
+  const h = await harness(t);
+  const first = await h.call('bash_bg', { command: 'true' });
+  await until(() => h.messages.length === 1);
+  await h.emit('session_shutdown');
+  const second = await h.call('bash_bg', { command: 'true' });
+  await until(() => h.messages.length === 2);
+  assert.equal(first.details.job_id, second.details.job_id, 'Bob restarts his local job counter');
+  for (const message of h.messages) {
+    assert.equal(message.options.deliverAs, 'steer');
+    assert.equal(typeof message.options.notificationId, 'string');
+    assert.equal(message.options.admissionKey, undefined);
+  }
+  assert.notEqual(h.messages[0].options.notificationId, h.messages[1].options.notificationId);
+});
+
 test('default batch holds a nonzero exit until its peer finishes', { timeout: 10000 }, async t => {
   const h = await harness(t);
   const gateA = join(h.dir, 'failed-a'), gateB = join(h.dir, 'success-b');
