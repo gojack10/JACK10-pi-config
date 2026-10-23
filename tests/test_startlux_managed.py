@@ -93,6 +93,32 @@ class ManagedTests(unittest.IsolatedAsyncioTestCase):
             'qualified', 'native-drain+ds4-exit', 'start-startlux'])
         self.assertEqual(swap_policy.SWAP.state, '1/5/0/0/0')
 
+    async def test_mlx_warm_reuse_and_serial_cross_engine_switches(self):
+        state, trace = self.state, self.trace
+        class MLX:
+            model = None
+            def probe(engine):
+                return (200, 'mlx') if state['resident'] in ms.MLX_MODELS else None
+            def qualify(engine):
+                pass
+            async def start(engine, model):
+                assert state['resident'] is None, 'overlapping engines'
+                trace.append('load-' + model)
+                state['resident'] = engine.model = model
+            async def stop(engine):
+                trace.append('drain+exit-' + engine.model)
+                state['resident'] = None
+        self.manager.mlx = MLX()
+        def bind(manager, model):
+            return manager.mlx if model in ms.MLX_MODELS else self.engine
+        with patch.object(ms.ManagedSwitch, 'binding', bind), \
+             patch.object(ms, 'service_pid', side_effect=lambda: 500 if state['resident'] in ms.MODELS else None):
+            for model in ('qwen3.8-27b-uncensored', 'qwen3.8-27b-uncensored', 'gemma-4-31b-mlx', ID):
+                await self.prepare(model)
+        self.assertEqual(trace, ['native-drain+ds4-exit', 'load-qwen3.8-27b-uncensored',
+            'drain+exit-qwen3.8-27b-uncensored', 'load-gemma-4-31b-mlx',
+            'qualified', 'drain+exit-gemma-4-31b-mlx', 'start-startlux'])
+
     async def test_uncertain_stop_refuses_next_start(self):
         with patch.object(ms.ManagedSwitch, 'stop_ds4_for_startlux', AsyncMock(side_effect=RuntimeError('unknown drain'))):
             with self.assertRaisesRegex(RuntimeError, 'unknown drain'):
