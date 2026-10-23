@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from aiohttp import ClientSession, ClientTimeout, web
+from native_files import private_file, publish
 
 MAX_WAIT = 90
 NATIVE_SERIALS = {}
@@ -38,31 +39,6 @@ def ms(origin_ns):
     # Bend's runtime overflows on large absolute monotonic times; each owner
     # has an immutable origin shared with the challenged native observer.
     return max(1, (time.monotonic_ns() - origin_ns) // 1_000_000)
-
-
-def private_file(path):
-    path = Path(path)
-    st = path.lstat()
-    if not path.is_file() or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise RuntimeError(f"untrusted control file {path}")
-    return path
-
-
-def publish(directory, name, content):
-    directory = Path(directory)
-    st = directory.lstat()
-    if not directory.is_dir() or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise RuntimeError("untrusted control directory")
-    tmp = directory / ("." + name + "." + secrets.token_hex(8))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, 'w') as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, directory / name)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 async def until(read, description, seconds=MAX_WAIT):
@@ -936,10 +912,9 @@ async def handle_main(request, body, backend_name, model_id, checked,
     log = os.getenv('LOCAL_PROXY_DS4_LOG')
     binary = os.getenv('LOCAL_PROXY_DS4_BINARY')
     pid = os.getenv('LOCAL_PROXY_DS4_PID')
-    port = os.getenv('LOCAL_PROXY_DS4_PORT')
-    if (MANAGED_ENGINE_PREPARER is None and not all((control, log, binary, pid))) or \
-       not port or backend != f'http://127.0.0.1:{port}/v1' or \
-       os.getenv('LOCAL_PROXY_PRIVATE_LEASE') != '1':
+    port = os.getenv('LOCAL_PROXY_DS4_PORT', '8001')
+    if (MANAGED_ENGINE_PREPARER is None and (not all((control, log, binary, pid)) or
+        os.getenv('LOCAL_PROXY_PRIVATE_LEASE') != '1')) or backend != f'http://127.0.0.1:{port}/v1':
         unavailable(request, 'native_reservation_adapter_unavailable')
     if MANAGED_ENGINE_PREPARER is None:
         models = {'qwen3.8-flash-next'}
