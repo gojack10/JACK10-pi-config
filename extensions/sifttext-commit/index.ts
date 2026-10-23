@@ -1,48 +1,14 @@
-/**
- * /sifttext-commit — fetch a SiftText node via MCP and send it as a user message.
- *
- * Connects to app.sifttext.com/mcp, calls sifttext_get_node with a
- * hardcoded node ID, and injects the result as a user message so the LLM
- * can read and act on it immediately (no tool round-trip, no token waste).
- *
- * Usage:
- *   /sifttext-commit              — prompts for focus
- *   /sifttext-commit refactor auth — uses focus directly
- */
+/** /sifttext-commit — load the canonical local procedure, then request an in-chat commit. */
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { callMcpTool, mcpTextContent } from "../_shared/mcp-http";
-import { siftTextKey } from "../_shared/sifttext-key";
-
-const NODE_ID = "c72d552d-3499-445b-a8d5-05d0ff7824f2";
-const MCP_URL = "https://app.sifttext.com/mcp";
-
-async function fetchNodeContent(): Promise<string> {
-  const token = siftTextKey();
-  if (!token) {
-    throw new Error("SiftText key not found (set SIFTTEXT_API_KEY or write ~/.pi/agent/.sifttext-key)");
-  }
-
-  const result = await callMcpTool(
-    MCP_URL,
-    token,
-    "sifttext-commit",
-    "sifttext_get_node",
-    { node_id: NODE_ID },
-  );
-
-  const text = mcpTextContent(result);
-
-  if (result.isError) {
-    throw new Error(`MCP tool error: ${text}`);
-  }
-
-  return text;
-}
+const NODE_PATH = join(homedir(), "sifttext/nodes/c72d552d-3499-445b-a8d5-05d0ff7824f2/node.md");
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("sifttext-commit", {
-    description: "Fetch node c72d552d… via MCP, prompt for focus, send as user message",
+    description: "Read the local SiftText Commit procedure, prompt for focus, send as user message",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       try {
         // Use provided focus or prompt if blank
@@ -53,14 +19,14 @@ export default function (pi: ExtensionAPI) {
               "",
             );
 
-        const content = await fetchNodeContent();
+        const content = await readFile(NODE_PATH, "utf8");
 
         const focusBlock = focus?.trim()
           ? `Focus: ${focus.trim()}`
           : "Focus: (model decides based on full context)";
 
         pi.sendUserMessage(
-          `Run the regular in-chat SiftText Commit for this current conversation, using the current chat context.\n\n${focusBlock}\n\nDo not invoke Commit RLM. Do not snapshot or inspect session JSONL. Do not launch a retrospective synthesis agent. Still satisfy the regular SiftText Commit pre-write reads and human approval gates, and persist only after explicit human approval.\n\n${content}`,
+          `Run the regular in-chat SiftText Commit for this current conversation, using the current chat context.\n\n${focusBlock}\n\nDo not invoke Commit RLM. Do not snapshot or inspect session JSONL. Do not launch a retrospective synthesis agent. Still satisfy the regular SiftText Commit pre-write reads and human approval gates, and persist only after explicit human approval.\n\nSource: ${NODE_PATH}. Use local file reads for linked procedures and native private-worktree publication; no hosted tool or server gate. Read the installed local Worktree Publication procedure at /Users/jack/.local/share/sifttext/current/nodes/fb1e0c9f-8c04-4baf-91e6-4688856a14af/node.md before persistence. Existing semantic pre-reads, explicit approval and narrower grants still apply.\n\n${content}`,
         );
         ctx.ui.notify("Node content sent to agent", "success");
       } catch (err: unknown) {

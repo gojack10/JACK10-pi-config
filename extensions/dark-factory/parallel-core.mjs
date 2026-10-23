@@ -511,7 +511,7 @@ export function dispatcherPrompt({ role, run, events, state, report, setup, prev
 
 export function workerPrompt({ role, run, task, report, previous, artifacts, code, routeVerdict }) {
   return [
-    'You are a factory worker. Read the ROLE node with your SiftText tools and follow it exactly.',
+    'You are a factory worker. Read the ROLE node with local file tools at /Users/jack/sifttext/nodes/<UUID>/node.md, follow its required local links and procedure exactly. Use native private-worktree publication only within the actual grant; no hosted SiftText fallback.',
     `ROLE: ${role}`, `RUN: ${run}`, `TASK: ${task}`, `REPORT: ${report}`,
     ...(previous ? [`PREVIOUS: ${previous}`] : []),
     `ARTIFACTS: ${artifacts} (directory for any files you create)`,

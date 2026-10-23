@@ -7,4 +7,4 @@ argument-hint: "[leaf mission]"
 SHOTGUN tree: `ebc1156f-2fcf-424e-bf56-238e910497fc`
 Canonical procedure node: `f7bf9107-0f0e-4420-b1cc-b0e55149daca`
 
-Before acting, call `sifttext_get_node` on the canonical procedure node and follow its current ceremony with the supplied mission. If the node cannot be read, halt rather than guessing from memory.
+Before acting, read `/Users/jack/sifttext/nodes/f7bf9107-0f0e-4420-b1cc-b0e55149daca/node.md` with the file read tool and follow its current ceremony with the supplied mission. Resolve linked required nodes at `/Users/jack/sifttext/nodes/<UUID>/node.md`, including cross-tree links. Keep `subagent_launch`, `subagent_followup`, `report_outcome` and completion/route checks unchanged; these transport tools do not require hosted knowledge. If a required file cannot be read, halt the affected dispatch rather than guessing from memory.
