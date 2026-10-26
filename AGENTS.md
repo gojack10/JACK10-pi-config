@@ -1,20 +1,24 @@
 # Pi Agent Repository
 
+## Jack's developer conventions
+
+Before developer work, read `/Users/jack/sifttext/nodes/ab1fe127-52f8-4bc5-b5ca-2cda47f5849e/node.md`. It is the always-read entrance; follow its task-specific children just in time. The tree owns the conventions and their evidence; do not duplicate them in report files.
+
+Jack owns testing. Never write or run tests unless he explicitly requests and designs them. The routine check is only whether the project builds and starts. No screenshots for any purpose unless he explicitly asks for screenshots. This overrides the ponytail skill's runnable-self-check requirement. The tree's Testing node owns the complete rule.
+
 ## Extension discovery
 
 Pi auto-loads every direct `extensions/*.ts` and `extensions/*.js` file as an extension. Each such file must default-export a valid extension factory; support modules and tests at that level will fail startup.
 
 Keep helper and test files in a subdirectory without `index.ts`, `index.js`, or a `package.json` that declares Pi extensions. Pi only discovers a subdirectory when one of those entry points explicitly makes it an extension.
 
-Before finishing an extension change that adds or moves source files:
+Before finishing an extension change that adds or moves source files, confirm Pi starts with normal extension discovery, without making a model request:
 
 ```bash
-# Run the focused tests.
-node --test extensions/<support-directory>/*.test.ts
-
-# Exercise normal extension discovery without making a model request.
 pi --list-models '<provider/model>'
 ```
+
+Do not add a test-suite or browser-verification pass.
 
 Do not validate only with `pi --no-extensions -e <entrypoint>`: that bypasses normal discovery and will miss accidental top-level helper/test files.
 
@@ -35,7 +39,7 @@ Scoped Commit format, title 100 characters or fewer:
 
 Workflow: read `git status` and the diff, split unrelated changes into separate commits, stage only the intended files and verify with `git diff --cached --check`, then commit. Push only when asked, and report the hash. Never sweep someone else's pre-existing work into the commit you were asked to make.
 
-When a change is too large to review as one commit, segment it into independently reviewable commits rather than describing several concerns in one message. If a hunk-level split cannot produce an intermediate commit that passes the tests, it is one commit — measure with the test suite instead of forcing the split.
+When a change is too large to review as one commit, segment it into independently reviewable commits rather than describing several concerns in one message. If a hunk-level split cannot produce an intermediate commit that still builds and starts, it is one commit; do not force the split or add a test pass.
 
 ## New machine
 
