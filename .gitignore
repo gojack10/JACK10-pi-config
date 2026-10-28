@@ -9,6 +9,11 @@ sessions/
 git/
 model-recency.json
 models-store.json
+local-models.json
+/bin/local-chat
+*.safetensors
+*.gguf
+*.ds41dir
 tool-cache.json
 codex-usage-cache.json
 codex-usage-state.json*
