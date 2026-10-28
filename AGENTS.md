@@ -4,7 +4,7 @@
 
 Before developer work, read `/Users/USER/sifttext/nodes/f0000000-0000-4000-8000-0621b39e5798/node.md`. It is the always-read entrance; follow its task-specific children just in time. The tree owns the conventions and their evidence; do not duplicate them in report files.
 
-Jack owns testing. Never write or run tests unless he explicitly requests and designs them. The routine check is only whether the project builds and starts. No screenshots for any purpose unless he explicitly asks for screenshots. This overrides the ponytail skill's runnable-self-check requirement. The tree's Testing node owns the complete rule.
+Jack owns testing. Never write or run tests unless he explicitly requests and designs them. The routine check is only whether the project builds and starts. No screenshots for any purpose unless he explicitly asks for screenshots. The tree's Testing node owns the complete rule.
 
 ## Extension discovery
 

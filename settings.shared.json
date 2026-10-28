@@ -7,8 +7,7 @@
     "keepRecentTokens": 20000
   },
   "packages": [
-    "git:github.com/davebcn87/pi-autoresearch",
-    "git:github.com/DietrichGebert/ponytail"
+    "git:github.com/davebcn87/pi-autoresearch"
   ],
   "terminal": {
     "showTerminalProgress": true
