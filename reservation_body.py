@@ -975,10 +975,9 @@ async def handle_main(request, body, backend_name, model_id, checked,
                     headers = dict(Authorization=request.headers.get('Authorization') or
                                    'Bearer ' + (Path(__file__).parent / '.proxy-key').read_text().strip(),
                                    **{'X-Pi-Request-Id': request_id, 'Content-Type': 'application/json'})
-                    if model_id == 'glm-5.3-flash':
-                        for name in ('X-Pi-Origin', 'X-Pi-Live-Answer'):
-                            if value := request.headers.get(name):
-                                headers[name] = value
+                    for name in ('X-Pi-Origin', 'X-Pi-Live-Answer'):
+                        if value := request.headers.get(name):
+                            headers[name] = value
                     async with session.post(backend + '/chat/completions', data=body, headers=headers) as upstream:
                         if upstream.status != 200 or upstream.content_type != 'text/event-stream':
                             raise RuntimeError(f'unqualified upstream response {upstream.status}/{upstream.content_type}')
