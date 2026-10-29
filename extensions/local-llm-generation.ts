@@ -474,6 +474,10 @@ export default function (pi: ExtensionAPI) {
     isLocalModel = false;
     requestId = undefined;
 
+    // Ownership headers and release hooks still run in SDK/print mode. Progress
+    // timers are terminal-only and must not outlive a disposed headless session.
+    if (ctx.mode !== "tui") return;
+
     const monitor = loadMonitorConfig(ctx);
     if (!monitor) return;
     isLocalModel = true;
@@ -690,7 +694,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    if (abortedToken === sessionToken) {
+    if (sessionToken !== null && abortedToken === sessionToken) {
       if (animTimer) { clearInterval(animTimer); animTimer = null; }
       ctx.ui.setWorkingMessage(STOPPING_MESSAGE);
       return;
