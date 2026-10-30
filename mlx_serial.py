@@ -118,8 +118,31 @@ def main():
             self.gate.admit()
             return super().generate(request, args, *rest, **kwargs)
 
+        def _apply_steering_overlay(self):
+            if getattr(self, '_steering_applied', False):
+                return
+            self._steering_applied = True
+            overlay = Path(checkpoint) / 'steering_bias.safetensors'
+            if not overlay.exists():
+                return
+            model = self.model_provider.model
+            if model is None:
+                return
+            arrays = mx.load(str(overlay))
+            modules = dict(model.named_modules())
+            applied = 0
+            for key, value in arrays.items():
+                module = modules.get(key)
+                if module is None or not hasattr(module, 'weight'):
+                    continue
+                module.bias = value
+                applied += 1
+            if applied:
+                mx.eval(model.parameters())
+
         def _serve_single(self, request, stream):
             try:
+                self._apply_steering_overlay()
                 return super()._serve_single(request, stream)
             finally:
                 self.gate.finished()
