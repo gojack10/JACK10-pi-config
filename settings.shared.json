@@ -10,7 +10,8 @@
     "git:github.com/davebcn87/pi-autoresearch"
   ],
   "terminal": {
-    "showTerminalProgress": true
+    "showTerminalProgress": true,
+    "hyperlinks": false
   },
   "enableInstallTelemetry": false,
   "defaultProjectTrust": "always",
