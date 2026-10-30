@@ -73,6 +73,16 @@ MLX_MODEL_METADATA = {
     "qwen3.8-27b-uncensored": {"name": "Qwen3.8 27B Uncensored (MLX 8-bit)", "context_length": 262144},
     "gemma-4-31b-mlx": {"name": "Gemma 4 31B IT (MLX 8-bit)", "context_length": 262144},
 }
+
+# Local-only model adverts: names live in an untracked file so no model identity
+# is committed. Paths and IDs are merged from mlx_runtime.MODELS at import.
+_local_registry = Path(__file__).resolve().parent / 'local-models.json'
+if _local_registry.exists():
+    for _entry in json.loads(_local_registry.read_text()).get('models', []):
+        MLX_MODEL_METADATA[_entry['id']] = {
+            "name": _entry['display'],
+            "context_length": _entry.get('context_length', 262144),
+        }
 MLX_SUPPORTED_PARAMETERS = [
     "tools", "tool_choice", "max_tokens", "temperature", "top_p", "top_k",
     "min_p", "stop", "seed", "stream",

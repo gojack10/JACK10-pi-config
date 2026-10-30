@@ -26,6 +26,13 @@ MODELS = {
     'gemma-4-31b-mlx': HOME / '.mlx-lm/models/mlx-community/gemma-4-31b-it-8bit',
 }
 
+# Local-only checkpoints: names and paths live in an untracked file so no model
+# identity is committed. Absence is normal.
+_local_registry = ROOT / 'local-models.json'
+if _local_registry.exists():
+    for _entry in json.loads(_local_registry.read_text()).get('models', []):
+        MODELS[_entry['id']] = Path(_entry['path']).expanduser()
+
 
 class MLXRuntime:
     def __init__(self):

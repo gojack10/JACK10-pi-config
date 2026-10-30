@@ -13,6 +13,7 @@ the policy; callers must not recreate it and must not issue a physical effect
 that the frozen policy did not authorize.
 """
 import hashlib
+import json
 import socket
 import subprocess
 from pathlib import Path
@@ -35,6 +36,14 @@ MODEL_TAGS = {
     'qwen3.5-4b-bf16': 7,            # mlx-lm :8000, distinct precision
 }
 TAG_MODELS = {tag: model for model, tag in MODEL_TAGS.items()}
+
+# Local-only model identities: names and tags live in an untracked file so no
+# model identity is committed. Absence is normal.
+_local_registry = Path(__file__).resolve().parent / 'local-models.json'
+if _local_registry.exists():
+    for _entry in json.loads(_local_registry.read_text()).get('models', []):
+        MODEL_TAGS[_entry['id']] = int(_entry['tag'])
+    TAG_MODELS = {tag: model for model, tag in MODEL_TAGS.items()}
 
 ACTION_TAGS = {0: 'no-action', 1: 'wait', 2: 'reuse', 3: 'stop',
                4: 'start', 5: 'keep', 6: 'unload', 7: 'refuse'}
