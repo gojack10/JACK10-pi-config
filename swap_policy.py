@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 
 POLICY_BINARY = Path(__file__).resolve().parent / 'startlux-service/swap-cpu'
-POLICY_SHA256 = '69b74155c37e9242640d8c35877379658b7176a5f8a8bbe0ab164acba1231320'
+POLICY_SHA256 = 'd3784ac9b41097a29d5ed81c65048d4f0e969c39e96a619fcf15337f4e15c9da'
 MAX_NAT = 281474976410654
 
 # Slot 5 is a one-for-one replacement, NOT a second identity or alias. The
@@ -31,6 +31,8 @@ MODEL_TAGS = {
     'qwen3.8-27b-uncensored': 3,      # mlx-lm :8000
     'gemma-4-31b-mlx': 4,             # mlx-lm :8000
     'startlux-4b-instant': 5,          # decision-only, sticky
+    'qwen3.5-4b-8bit': 6,            # mlx-lm :8000, distinct precision
+    'qwen3.5-4b-bf16': 7,            # mlx-lm :8000, distinct precision
 }
 TAG_MODELS = {tag: model for model, tag in MODEL_TAGS.items()}
 

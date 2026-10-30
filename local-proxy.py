@@ -62,12 +62,14 @@ QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
 # mlx-lm serves exactly one checkpoint per process and has no admin API, so the
 # proxy owns its lifecycle the way it owns dsv4: the desired checkpoint goes in a
 # file, bootout frees the whole footprint, and only one model is ever resident.
-# Native context for all three checkpoints is 262,144; no YaRN scaling anywhere.
+# Native context for these checkpoints is 262,144; no YaRN scaling anywhere.
 MLX_SERVICE_LABEL = "com.mlx-lm.server"
 MLX_DESIRED_FILE = Path.home() / ".mlx-lm" / "desired-model"
 MLX_MODEL_PATHS = {model: str(path) for model, path in MLX_CHECKPOINTS.items()}
 MLX_MODEL_IDS = set(MLX_MODEL_PATHS)
 MLX_MODEL_METADATA = {
+    "qwen3.5-4b-8bit": {"name": "Qwen3.5 4B (MLX 8-bit)", "context_length": 262144},
+    "qwen3.5-4b-bf16": {"name": "Qwen3.5 4B (MLX BF16)", "context_length": 262144},
     "qwen3.8-27b-uncensored": {"name": "Qwen3.8 27B Uncensored (MLX 8-bit)", "context_length": 262144},
     "gemma-4-31b-mlx": {"name": "Gemma 4 31B IT (MLX 8-bit)", "context_length": 262144},
 }

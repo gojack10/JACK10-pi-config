@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parent
 PYTHON = HOME / '.local/share/uv/tools/mlx-lm/bin/python'
 PORT = 8000
 MODELS = {
+    'qwen3.5-4b-8bit': HOME / '.mlx-lm/models/mlx-community/Qwen3.5-4B-8bit',
+    'qwen3.5-4b-bf16': HOME / '.mlx-lm/models/mlx-community/Qwen3.5-4B-bf16',
     'qwen3.8-27b-uncensored': HOME / '.mlx-lm/models/Qwen3.8-27B-Uncensored-8bit',
     'gemma-4-31b-mlx': HOME / '.mlx-lm/models/mlx-community/gemma-4-31b-it-8bit',
 }

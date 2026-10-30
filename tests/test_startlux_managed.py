@@ -22,6 +22,7 @@ def load_proxy():
     proxy = importlib.util.module_from_spec(spec)
     with patch.dict(os.environ, {'LOCAL_LLM_PROXY_API_KEY': 'cpu-test-key'}):
         spec.loader.exec_module(proxy)
+    proxy.MAINTENANCE = False  # Offline admission tests ignore the host maintenance marker.
     return proxy
 
 
@@ -113,10 +114,14 @@ class ManagedTests(unittest.IsolatedAsyncioTestCase):
             return manager.mlx if model in ms.MLX_MODELS else self.engine
         with patch.object(ms.ManagedSwitch, 'binding', bind), \
              patch.object(ms, 'service_pid', side_effect=lambda: 500 if state['resident'] in ms.MODELS else None):
-            for model in ('qwen3.8-27b-uncensored', 'qwen3.8-27b-uncensored', 'gemma-4-31b-mlx', ID):
+            for model in ('qwen3.8-27b-uncensored', 'qwen3.8-27b-uncensored',
+                          'qwen3.5-4b-8bit', 'qwen3.5-4b-8bit', 'qwen3.5-4b-bf16',
+                          'gemma-4-31b-mlx', ID):
                 await self.prepare(model)
         self.assertEqual(trace, ['native-drain+ds4-exit', 'load-qwen3.8-27b-uncensored',
-            'drain+exit-qwen3.8-27b-uncensored', 'load-gemma-4-31b-mlx',
+            'drain+exit-qwen3.8-27b-uncensored', 'load-qwen3.5-4b-8bit',
+            'drain+exit-qwen3.5-4b-8bit', 'load-qwen3.5-4b-bf16',
+            'drain+exit-qwen3.5-4b-bf16', 'load-gemma-4-31b-mlx',
             'qualified', 'drain+exit-gemma-4-31b-mlx', 'start-startlux'])
 
     async def test_uncertain_stop_refuses_next_start(self):
