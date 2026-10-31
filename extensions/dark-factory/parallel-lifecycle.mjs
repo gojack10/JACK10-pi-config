@@ -38,7 +38,7 @@ export function readPiOutcome(receipt, monitorFinal) {
     if (status === 'failed' || source !== 'model') return { status: 'failed', source, summary };
     try {
       const result = readAttemptResult(receipt);
-      return { status, source, summary, text: result.text, contextStopped: result.contextStopped };
+      return { status, source, summary, text: result.text };
     } catch (error) {
       return { status: 'failed', source: 'protocol', summary: `unreadable settled outcome: ${String(error)}` };
     }

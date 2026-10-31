@@ -58,8 +58,7 @@ function releaseLock(config, directory) {
 }
 function launchController(directory, config) {
   const label = `pf-${config.run_node.slice(0, 8)}-ctl-${Date.now().toString(36)}`;
-  const clean = ['env', '-u', 'PI_SUBAGENT_MANIFEST', '-u', 'SIFTWORKS_SEAT', '-u', 'PI_RLM_FRIENDLY_STOP_TOKENS', '-u', 'PI_RLM_FRIENDLY_STOP_MODEL',
-    '-u', 'PI_RLM_FRIENDLY_STOP_PERCENT', '-u', 'PI_RLM_ROLLOVER_DIR'];
+  const clean = ['env', '-u', 'PI_SUBAGENT_MANIFEST', '-u', 'SIFTWORKS_SEAT'];
   const boot = [...clean, process.execPath, fileURLToPath(import.meta.url), 'controller', directory].map(quote).join(' ');
   execFileSync('tmux', ['new-session', '-d', '-s', label, '-c', home, `${boot} >> ${quote(join(directory, 'controller.log'))} 2>&1`]);
   return label;

@@ -26,7 +26,7 @@ Dependency-free Node 24 SQLite CLI, optional Pi USER-input receiver, and a separ
 experimental three-peer lifecycle and localhost factory room. The board still works alone. The swarm never
 uses the existing factory/task-report contract. No dispatcher, routing, assigned
 tasks, subscriptions, ACK rules, tree-status interpretation or dependencies.
-Existing factory/outcome/friendly-stop/settings sources remain untouched.
+Existing factory/outcome/settings sources remain untouched.
 
 ## Swarm controls (later authorized live trial only)
 
@@ -73,8 +73,7 @@ both `all` in current settings (the parent's separate queue change). The launche
 checks current settings; the opt-in extension independently checks effective Pi
 settings before releasing startup input. Do not reload old runs. Ordinary extensions
 and skills autoload. Swarm adds `optional-extensions/bf2-swarm.ts` then `bf2-board.ts`;
-it does not add the global optional `rlm-friendly-stop.ts`. Explicit friendly-stop
-configuration is rejected. Use normal project trust; unexpected input-transforming
+use normal project trust; unexpected input-transforming
 or lifecycle-changing extensions remain outside this experiment's tested path.
 
 Each new run has one controller session `bf2-<run UUID>` and three separate child
@@ -88,7 +87,7 @@ windows or session renames. The controller itself retains one `controller` windo
 Route is the explicit configured selector provider plus fixed model/high; the
 launcher performs only offline model-list preflight before its first start. It
 passes board env and the checkout's bin directory on PATH. It strips inherited task
-manifest, old board and RLM env. There is no task launch contract or report. The
+manifest and old board env. There is no task launch contract or report. The
 minimal native USER @file points to SiftText Read, BF2 root and instruction node,
 then `board -h`/startup `board read`; actual BF2 work policy lives on the tree. The
 parent authors it. The boot asks for no nested workers, without adding enforcement.

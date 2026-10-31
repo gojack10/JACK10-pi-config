@@ -3,28 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runLoop, save, taskSettings } from './core.mjs';
+import { save } from './core.mjs';
 import { aggregateInputs, suiteStatus, waitAggregateInputs } from './parallel.mjs';
-
-test('reader assignment survives a context handoff and advances without a planner', async t => {
-  const directory = mkdtempSync(join(tmpdir(), 'factory-reader-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const assignments = ['a', 'b'].map(tree_id => ({ tree_id, root_id: `root-${tree_id}` })), seen = [];
-  await runLoop({ directory, assignments, project: { ...taskSettings('task', {}), ready: 'reads_complete' },
-    runStep: async ({ role, task, previous }) => {
-      seen.push(task.tree_id); assert.equal(role, 'worker');
-      if (seen.length === 2) assert.ok(previous);
-      if (task.tree_id === 'b') assert.equal(previous, null);
-      const packet = join(directory, `${task.tree_id}.json`);
-      save(packet, { ...task, outline_complete: true, content_read_ids: [task.root_id], findings: [], exclusions: [], remaining_work: [] });
-      return { text: JSON.stringify({ version: 1, role, disposition: seen.length === 1 ? 'continue' : 'worked',
-        tree_id: task.tree_id, tree_packet: packet, evidence: [packet], updated_nodes: [], summary: 'fixture result' }),
-        receipt: { job: seen.length }, contextStopped: seen.length === 1 };
-    } });
-  assert.deepEqual(seen, ['a', 'a', 'b']);
-  assert.equal(JSON.parse(readFileSync(join(directory, 'state.json'), 'utf8')).status, 'reads_complete');
-  assert.equal(JSON.parse(readFileSync(join(directory, 'completed-trees.json'), 'utf8')).length, 2);
-});
 
 test('aggregate waits for reader receipts; completion needs exact population and prerequisite', { timeout: 5000 }, async t => {
   const directory = mkdtempSync(join(tmpdir(), 'factory-suite-'));

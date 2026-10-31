@@ -36,7 +36,6 @@ export function validateLaunch(options, env = process.env) {
   const agentDir = realpathSync(checkPath(env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi/agent'), 'Pi agent dir'));
   const settings = settingsFor(agentDir, cwd);
   if (settings.steeringMode !== 'all' || settings.followUpMode !== 'all') throw new Error('NEW swarm sessions require native steeringMode=all and followUpMode=all in current Pi settings');
-  if ((settings.extensions ?? []).some(e => String(e).includes('rlm-friendly-stop') && !String(e).startsWith('-'))) throw new Error('remove global friendly-stop from swarm launch settings; it must not load here');
   for (const key of ['root', 'instructions']) {
     if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(options[key] ?? '')) throw new Error(`${key} must be a configured tree node UUID`);
   }
@@ -47,9 +46,9 @@ export function validateLaunch(options, env = process.env) {
     provider: options.provider, model: 'gpt-6.1-sol', thinking: 'high', code };
 }
 
-// No inherited task contract, old board namespace, or global friendly-stop flags.
+// No inherited task contract or old board namespace.
 export function launchEnvironment(env = process.env) {
-  const remove = Object.keys(env).filter(key => /^(BF2_|FACTORY_|PI_SUBAGENT|PI_RLM_)/.test(key) ||
+  const remove = Object.keys(env).filter(key => /^(BF2_|FACTORY_|PI_SUBAGENT)/.test(key) ||
     ['TMUX', 'TMUX_PANE', 'PI_SESSION_FILE', 'PI_SESSION_ID'].includes(key));
   return ['env', ...remove.flatMap(key => ['-u', key])];
 }
@@ -181,7 +180,7 @@ Room survives controller stop; room reopens it without starting peers.
 Start defaults run dir to ~/.local/state/bf2-swarm/<new UUID>. Cwd may use BF2_REPO.
 Uses gpt-6.1-sol/high and your explicit authorized Codex provider. Preflight is
 --offline --list-models, never a model call. Requires native all/all settings.
-Normal extensions autoload; global optional friendly-stop must not be configured.
+Normal extensions autoload.
 Start creates ONE controller session with THREE nested child sessions in tmux-oil.
 Run recovers only the controller inside that parent, preserving running/waiting/stop.
 Retired/dead child sessions close only after actual process exit; logs are retained.

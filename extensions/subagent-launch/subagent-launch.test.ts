@@ -136,22 +136,16 @@ sleep .5
     assert.ok(result.details.jobs[0].manifest_file);
     const manifest = JSON.parse(await readFile(result.details.jobs[0].manifest_file, "utf8"));
     assert.equal(manifest.model, "gpt-6-astra");
-    assert.equal(manifest.friendlyStopPercent, undefined);
-    // No checkpoint configuration: the explicitly loaded extension always reports at 80%.
-    assert.equal(manifest.friendlyStopDirectory, undefined);
     const childPane = await tmux(["list-panes", "-t", childSession!, "-F", "#{pane_id}"]);
     const parentId = await tmux(["display-message", "-p", "-t", parentPane, "#{session_id}"]);
     const childId = await tmux(["display-message", "-p", "-t", childPane, "#{session_id}"]);
     const rows = await tmux(["list-sessions", "-F", "#{session_id}|#{@pi_subagent_parent_id}"]);
     assert.ok(rows.split("\n").includes(`${childId}|${parentId}`));
     const boot = await readFile(await tmux(["show-options", "-qv", "-t", childPane, "@pi_subagent_boot_file"]), "utf8");
-    // Scrubbing inherited variables with -u is expected; arming any of them is not.
-    assert.doesNotMatch(boot, /PI_RLM_[A-Z_]+=/);
     assert.doesNotMatch(boot, /openai-272k-guard/);
     assert.doesNotMatch(boot, /--no-extensions/);
     assert.match(boot, /--extension/);
     assert.match(boot, /local-llm-generation\.ts/);
-    assert.match(boot, /rlm-friendly-stop\.ts/);
     assert.equal(await readFile(mission, "utf8"), "Do the fake task.\n");
     await until(() => messages.length === 1);
     assert.equal(messages[0].options.deliverAs, "steer");
@@ -433,9 +427,6 @@ done
       model: "gpt-5.6-sol", thinking: "xhigh", mission_file: followupMission, cwd: dir, session_label: "dialogue", mode: "dialogue" };
     const second: any = await followup.execute("test", continuation, undefined, undefined, ctx);
     assert.equal(second.details.status, "running");
-    const saved = JSON.parse(await readFile(second.details.manifest_file, "utf8"));
-    assert.equal(saved.friendlyStopPercent, undefined);
-    assert.equal(saved.friendlyStopDirectory, undefined);
     await until(() => messages.some(message => message.text.endsWith("  follow-up 😀  ")));
     assert.equal(messages.filter(message => message.text.includes("follow-up 😀")).length, 1);
     assert.equal(messages.find(message => message.text.includes("follow-up 😀"))!.options.deliverAs, "steer");

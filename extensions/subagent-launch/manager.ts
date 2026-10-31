@@ -26,7 +26,6 @@ import { FOLLOWUP_CAPABILITY_OPTION, FOLLOWUP_COMMAND, registerQueuedFollowup } 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const MAX_JOBS = 16;
 const START_WAIT_MS = 8_000;
 const MONITOR_START_MS = 30_000;
 const POLL_MS = 100;
@@ -213,7 +212,6 @@ const extensionPaths = (): string[] => {
     // tmux-turn-signal must run afterward to await its publication.
     join(extensionsDir, "tmux-turn-signal.ts"),
     join(extensionsDir, "subagent-launch.ts"),
-    join(dirname(extensionsDir), "optional-extensions", "rlm-friendly-stop.ts"),
   ];
 };
 
@@ -241,8 +239,8 @@ export class SubagentLauncher {
   }
 
   async launch(inputs: readonly SubagentJobInput[]): Promise<{ batch_id: string; jobs: Receipt[] }> {
-    if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > MAX_JOBS) {
-      throw new Error(`jobs must contain 1-${MAX_JOBS} items`);
+    if (!Array.isArray(inputs) || inputs.length < 1) {
+      throw new Error("jobs must contain at least one item");
     }
     const parentPane = safeText(process.env.TMUX_PANE, "TMUX_PANE", 32);
     if (!/^%[0-9]+$/.test(parentPane)) throw new Error("subagent_launch must run inside a tmux pane");
@@ -751,10 +749,7 @@ export class SubagentLauncher {
       "--name", item.sessionLabel,
       "--", `@${item.missionFile}`,
     ];
-    const friendlyNames = ["PI_RLM_FRIENDLY_STOP_TOKENS", "PI_RLM_FRIENDLY_STOP_MODEL", "PI_RLM_FRIENDLY_STOP_PERCENT", "PI_RLM_ROLLOVER_DIR", "PI_RLM_FRIENDLY_STOP_GRACE_TURNS"];
-    // Legacy checkpoint configuration must not leak into the automatic 80% reporting policy.
-    const command = ["env", ...friendlyNames.flatMap(name => ["-u", name]), ...args];
-    await writeFile(bootPath, `exec ${command.map(shellQuote).join(" ")}\n`, { flag: "wx" });
+    await writeFile(bootPath, `exec ${args.map(shellQuote).join(" ")}\n`, { flag: "wx" });
     await this.set(paneId, "@pi_subagent_boot_file", bootPath);
     return {
       jobId: item.jobId,
@@ -1055,7 +1050,7 @@ export const launchJobSchema = Type.Object({
   report_file: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
 }, { additionalProperties: false });
 
-export const launchSchema = Type.Object({ jobs: Type.Array(launchJobSchema, { minItems: 1, maxItems: MAX_JOBS }) }, { additionalProperties: false });
+export const launchSchema = Type.Object({ jobs: Type.Array(launchJobSchema, { minItems: 1 }) }, { additionalProperties: false });
 export const followupSchema = Type.Object({
   job_id: Type.String({ minLength: 1, maxLength: 128 }),
   session_id: Type.String({ minLength: 1, maxLength: 128 }),

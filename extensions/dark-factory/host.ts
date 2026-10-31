@@ -98,7 +98,7 @@ export default function (pi: ExtensionAPI) {
                 !['completed', 'blocked'].includes(final.status) || final.source !== 'model') await pause();
             const result = readAttemptResult(receipt);
             const report = validateReport(result.text, role, config.smoke, project);
-            const contextCheckpoint = isContinuation(report, result.contextStopped);
+            const contextCheckpoint = isContinuation(report);
             if (config.readers && role === 'planner' && report.disposition === 'next') {
               const inputs = JSON.parse(readFileSync(join(directory, 'reader-inputs.json'), 'utf8'));
               if (inputs.pending.length && !inputs.pending.some(p => p.tree_id === report.task?.tree_id)) {
@@ -113,7 +113,7 @@ export default function (pi: ExtensionAPI) {
             if (closed.code !== 0) throw Error(`cannot close completed worker: ${closed.stderr}`);
             safe = true;
             appendFileSync(join(directory, 'events.jsonl'), JSON.stringify({ step, role,
-              event: contextCheckpoint ? (result.contextStopped ? 'verified_context_checkpoint' : 'verified_incomplete_checkpoint') : 'verified_completed', at: Date.now(), job: receipt.job }) + '\n');
+              event: contextCheckpoint ? 'verified_incomplete_checkpoint' : 'verified_completed', at: Date.now(), job: receipt.job }) + '\n');
             if (config.readers && role === 'worker' && report.disposition === 'worked' && task?.tree_id) {
               const path = join(directory, 'merged-trees.json');
               const merged = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : [];

@@ -877,11 +877,6 @@ export class ParallelController {
       try {
         const text = result.text ?? readFileSync(attempt.report, 'utf8');
         const report = attempt.kind === 'worker' ? P.validateWorkerReport(text) : P.validateDispatcherReport(text);
-        if (attempt.kind === 'dispatcher' && result.contextStopped && report.disposition === 'blocked') report.disposition = 'continue';
-        if (attempt.kind === 'worker' && result.contextStopped && report.disposition === 'blocked') {
-          report.disposition = 'continue';
-          if (this.state.tasks[attempt.task].code && !report.next_action.trim()) throw Error('code context checkpoint requires next_action');
-        }
         outcome = { kind: 'report', report, reportPath: attempt.report };
       } catch (error) {
         outcome = { kind: 'error', summary: `invalid ${attempt.kind} report: ${error.message}` };

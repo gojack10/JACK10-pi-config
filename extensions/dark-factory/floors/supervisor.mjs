@@ -29,7 +29,6 @@ export function validateFloorLaunch(settings) {
   realpathSync(settings.agentDir);
   const pi = settingsFor(settings.agentDir, settings.cwd);
   if (pi.steeringMode !== 'all' || pi.followUpMode !== 'all') throw new Error('NEW floor sessions require native steeringMode=all and followUpMode=all');
-  if ((pi.extensions ?? []).some(e => String(e).includes('rlm-friendly-stop') && !String(e).startsWith('-'))) throw new Error('global friendly-stop must not load in floor workers');
 }
 export function ensureFloorController(floor, execute = tmux, env = process.env) {
   const state = floor.board.lifecycle.status();

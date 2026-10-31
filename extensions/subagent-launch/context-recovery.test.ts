@@ -39,9 +39,6 @@ for (const scenario of ['complete', 'insufficient', 'cancel', 'queued', 'busy', 
   process.env.PI_TEST_RECOVERY_CASE = scenario;
   process.env.PI_TEST_PACKAGE = packageDir;
   process.env.PI_TEST_EXTENSIONS = extensionsDir;
-  // Even inherited legacy limits must not leak into an unconfigured child.
-  process.env.PI_RLM_FRIENDLY_STOP_TOKENS = '1';
-  process.env.PI_RLM_FRIENDLY_STOP_PERCENT = '99';
   const { loadExtensions } = await import(pathToFileURL(`${packageDir}/dist/core/extensions/loader.js`).href);
   const { SessionManager } = await import(pathToFileURL(`${packageDir}/dist/index.js`).href);
   await tmux(['new-session', '-d', '-s', 'parent', '-c', dir]);

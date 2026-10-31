@@ -7,9 +7,6 @@ import { join } from 'node:path';
 const { loadExtensions } = await import(pathToFileURL(`${process.env.PI_TEST_PACKAGE}/dist/core/extensions/loader.js`));
 const { SessionManager, estimateTokens } = await import(pathToFileURL(`${process.env.PI_TEST_PACKAGE}/dist/index.js`));
 const initialTokens = 259495;
-if (Object.keys(process.env).some(key => key.startsWith('PI_RLM_FRIENDLY_STOP_') || key === 'PI_RLM_ROLLOVER_DIR')) {
-  throw new Error('worker inherited obsolete checkpoint settings');
-}
 const pane = process.env.TMUX_PANE;
 const tmux = args => execFileSync('tmux', args, { encoding: 'utf8' }).trim();
 const manifest = JSON.parse(await import('node:fs/promises').then(fs => fs.readFile(tmux(['show-options', '-qv', '-t', pane, '@pi_subagent_manifest']), 'utf8')));
@@ -120,7 +117,6 @@ if (process.env.PI_TEST_RECOVERY_CASE === 'drain') {
 }
 idle = false;
 await emit('agent_start');
-// A real context pause still uses explicit maintenance; friendly reporting no longer creates one.
 if (!task().pauseForContext('synthetic context guard reason', 256000)) throw new Error('synthetic pause was not retained');
 ctx.abort({ kind: 'context', reason: 'synthetic context guard reason' });
 if (!aborted) throw new Error('synthetic pause did not abort the turn');

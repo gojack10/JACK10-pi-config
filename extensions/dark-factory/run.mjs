@@ -21,7 +21,7 @@ const runs = taskRuns(join(home, 'factory-runs'), project.name);
 const lock = join(runs, 'LOCK');
 const quote = x => `'${x.replaceAll("'", "'\\''")}'`;
 const launchController = (directory, label) => {
-  const clean = ['env', '-u', 'PI_SUBAGENT_MANIFEST', '-u', 'PI_RLM_FRIENDLY_STOP_TOKENS', '-u', 'PI_RLM_FRIENDLY_STOP_MODEL', '-u', 'PI_RLM_FRIENDLY_STOP_PERCENT', '-u', 'PI_RLM_ROLLOVER_DIR'];
+  const clean = ['env', '-u', 'PI_SUBAGENT_MANIFEST'];
   const boot = [...clean, process.execPath, fileURLToPath(import.meta.url), 'controller', directory].map(quote).join(' ');
   execFileSync('tmux', ['new-session', '-d', '-s', label, '-c', home, `${boot} > ${quote(join(directory, 'controller.log'))} 2>&1`]);
 };
@@ -167,14 +167,14 @@ if (command === 'controller') {
     try {
       const result = readAttemptResult(JSON.parse(readFileSync(launchPath, 'utf8')).jobs[0]);
       const report = validateReport(result.text, failed.role, config.smoke, config.project ?? taskSettings());
-      contextResume = isContinuation(report, result.contextStopped);
+      contextResume = isContinuation(report);
       blockedResume = failed.status === 'blocked' && process.argv.includes('--retry-blocked') && report.disposition === 'blocked';
     } catch (error) {
       if (['blocked', 'context_checkpoint'].includes(failed.status)) throw error;
     }
   }
   if ((!['error', 'paused', 'stopped'].includes(failed.status) && !contextResume && !blockedResume) || !failed.step || !['planner', 'worker'].includes(failed.role)) {
-    throw Error('Resume requires a stopped/paused/error checkpoint or a verified friendly-stop report.');
+    throw Error('Resume requires a stopped/paused/error checkpoint or a verified continuation report.');
   }
   let prior = failed.previous ? JSON.parse(readFileSync(failed.previous, 'utf8')) : undefined;
   if (contextResume && failed.role === 'worker' && !failed.task) {

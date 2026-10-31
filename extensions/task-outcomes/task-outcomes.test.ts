@@ -424,27 +424,6 @@ test("historical release eligibility and persistence fail closed before any new 
   }
 });
 
-test("friendly reporting retains an active contract and accepts an uncapped current-progress report", async t => {
-  const h = await harness(t);
-  await h.call("task_outcomes_consumer", contract(h.dir, "friendly", "A"));
-  const loaded = await loadExtensions([fileURLToPath(new URL("../../optional-extensions/rlm-friendly-stop.ts", import.meta.url))], h.dir);
-  assert.deepEqual(loaded.errors, []);
-  loaded.runtime.appendEntry = h.runtime.appendEntry;
-  const ctx: any = {
-    sessionManager: h.sm, model: { provider: "local", id: "qwen3.8-flash-next" },
-    getContextUsage: () => ({ tokens: 80, contextWindow: 100, percent: 80 }),
-    abort: () => assert.fail("friendly reporting must not abort"),
-  };
-  const result = await loaded.extensions[0].handlers.get("turn_end")[0]({ entries: [] }, ctx);
-  assert.match(result.entries.at(-1).content, /report_outcome/);
-  assert.equal(h.manager.snapshot().active.state, "active");
-  const findings = "partial findings and remaining work\n".repeat(1000);
-  await writeFile(join(h.dir, "friendly-A.md"), findings);
-  await h.settle({ outcome: "completed", summary: findings });
-  assert.equal(h.manager.snapshot().outcomes.at(-1).summary, findings);
-  assert.equal(h.persisted.some(row => row.data.kind === "context_pause"), false);
-});
-
 test("typed context stops retain pauses while every terminal source wins exactly once", async t => {
   for (const phase of ["context", "pending"]) for (const source of [undefined, "escape", "task_cancel", "extension"]) {
     const h = await harness(t);

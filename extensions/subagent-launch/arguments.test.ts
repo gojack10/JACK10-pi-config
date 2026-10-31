@@ -53,22 +53,3 @@ test("registered launch leaves malformed, non-array and double-encoded jobs for 
     assert.throws(() => validate(input), /Validation failed for tool "subagent_launch"/);
   }
 });
-
-test("registered launch retains array bounds and strict item/top-level validation", () => {
-  for (const jobs of [
-    [], Array(17).fill(job), [null], ["not an object"], [JSON.stringify(job)], [{}],
-    [{ ...job, provider: "" }], [{ ...job, thinking: "auto" }], [{ ...job, mode: "other" }],
-    [{ ...job, cwd: {} }], [{ ...job, extra: true }],
-    ...[40, 80].map(friendly_stop_percent => [{ ...job, friendly_stop_percent }]),
-    [{ ...job, friendly_stop_directory: "/tmp/obsolete" }],
-  ]) {
-    for (const value of [jobs, JSON.stringify(jobs)]) {
-      assert.throws(() => validate({ jobs: value }), /Validation failed for tool "subagent_launch"/, JSON.stringify(value));
-    }
-  }
-  for (const jobs of [[job], saved.jobs]) {
-    assert.throws(() => validate({ jobs, extra: true }), /Validation failed for tool "subagent_launch"/);
-  }
-  const maximum = { jobs: Array(16).fill(job) };
-  assert.deepEqual(validate({ jobs: JSON.stringify(maximum.jobs) }), maximum);
-});

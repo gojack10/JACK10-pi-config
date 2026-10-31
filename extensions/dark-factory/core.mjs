@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
-import { readMonitorReceipt, sessionBranch } from '../task-outcomes/monitor-receipt.mjs';
+import { readMonitorReceipt } from '../task-outcomes/monitor-receipt.mjs';
 import { homedir } from 'node:os';
 
 export const ROUTE = { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' };
@@ -58,7 +58,7 @@ export function validateReport(text, role, smoke = false, project = taskSettings
   return r;
 }
 
-// Use the monitor-selected ancestry and exact attempt identity, never a prose mention of 80%.
+// Use the monitor-selected ancestry and exact attempt identity, never report prose.
 export function readAttemptResult(receipt) {
   const manifest = JSON.parse(readFileSync(receipt.manifest_file, 'utf8'));
   if (manifest.jobId !== receipt.job || manifest.attemptId !== receipt.attempt_id || manifest.reportPath !== receipt.report_file) {
@@ -77,14 +77,11 @@ export function readAttemptResult(receipt) {
   }
   const reportText = readFileSync(receipt.report_file, 'utf8');
   if (outcome.payload.report_text !== undefined && outcome.payload.report_text !== reportText) throw Error('factory report changed after settlement');
-  const contextStopped = sessionBranch(text, sessionId, outcome.branchLeafId).some(entry =>
-    entry.type === 'custom' && entry.customType === 'rlm-friendly-stop-state' && entry.data?.version === 2 &&
-    entry.data.jobId === receipt.job && entry.data.attemptId === receipt.attempt_id);
-  return { text: reportText, receipt, outcome, contextStopped };
+  return { text: reportText, receipt, outcome };
 }
 
-export function isContinuation(report, contextStopped) {
-  return report.disposition === 'continue' || (contextStopped && report.disposition === 'blocked');
+export function isContinuation(report) {
+  return report.disposition === 'continue';
 }
 
 export function continuationAfterStop(state, history) {
@@ -118,7 +115,7 @@ export async function runLoop({ directory, smoke, runStep, project = taskSetting
     const reportPath = join(directory, `${step}-${role}.json`);
     const result = await runStep({ step, role, reportPath, previous, task });
     const report = validateReport(result.text, role, smoke, project);
-    const contextCheckpoint = isContinuation(report, result.contextStopped);
+    const contextCheckpoint = isContinuation(report);
     if (assignments && !nodeAssignments && ['worked', 'excluded'].includes(report.disposition)) {
       if (report.tree_id !== task.tree_id || report.updated_nodes.length) throw Error('reader report tree identity/write mismatch');
       const inline = project.lean && report.tree_packet && typeof report.tree_packet === 'object' && !Array.isArray(report.tree_packet);
@@ -185,9 +182,8 @@ ${role === 'planner' ? `Illustrative next-report shape (replace placeholders wit
 ## Return protocol: work status is not report delivery
 The report's disposition describes the work. report_outcome describes delivery to the controller. outcome:"completed" accepts the report for review; it does NOT claim the assignment, experiment, tree persistence or project succeeded. Only the report's disposition and verified evidence can establish those claims.
 1. Choose the report disposition: continue when authorized work remains and a fresh agent can resume; blocked for a real prerequisite/authority/safety blocker, not context capacity; otherwise use the role's completed-work disposition only when its acceptance checks are satisfied. Record findings, exact evidence, actually verified changes, pending/unverified effects, remaining work and the next bounded action. A failed or inconclusive experiment is a finding, not a failed delivery.
-2. At FRIENDLY STOP, stop substantive work and tree writes immediately. Do not try to finish reconciliation first: preserve unverified writes and remaining checks in the continue report. Drain already-running tracked child/background work; do not launch more.
-3. Write the JSON report in place to the reserved path above, then read it back to verify valid JSON, required fields and truthful completed-versus-unfinished claims. Check the selected disposition's required fields too: parsing JSON alone is not schema validation. If report validation rejects delivery, repair the JSON from existing work—do not repeat the research or tree writes, weaken validation, invent evidence or disguise unfinished work as finished. Once the report is valid and tracked work has drained, call report_outcome({outcome:"completed",summary:"<honest report summary, including unfinished work>"}) and end the turn. This applies to continue and blocked reports too. Use outcome:"failed" only when a technical/protocol failure prevents delivery of a valid report or continuation checkpoint; never merely because substantive work, a read-back or reconciliation remains unfinished.
-4. The controller validates the report and durable receipt. A continue report hands the same role and assignment to a fresh agent; blocked stops for resolution; verified finished work advances to the next role or the project-specific human boundary. A successor first reads the preceding report and owner checkpoint, verifies uncertain effects before writing, and resumes only remaining work: never replay completed actions or spend an already-used launch budget. An operator stop or narrower human authorization still limits advancement; a delivered report grants no new authority.
+2. Write the JSON report in place to the reserved path above, then read it back to verify valid JSON, required fields and truthful completed-versus-unfinished claims. Check the selected disposition's required fields too: parsing JSON alone is not schema validation. If report validation rejects delivery, repair the JSON from existing work—do not repeat the research or tree writes, weaken validation, invent evidence or disguise unfinished work as finished. Once the report is valid and tracked work has drained, call report_outcome({outcome:"completed",summary:"<honest report summary, including unfinished work>"}) and end the turn. This applies to continue and blocked reports too. Use outcome:"failed" only when a technical/protocol failure prevents delivery of a valid report or continuation checkpoint; never merely because substantive work, a read-back or reconciliation remains unfinished.
+3. The controller validates the report and durable receipt. A continue report hands the same role and assignment to a fresh agent; blocked stops for resolution; verified finished work advances to the next role or the project-specific human boundary. A successor first reads the preceding report and owner checkpoint, verifies uncertain effects before writing, and resumes only remaining work: never replay completed actions or spend an already-used launch budget. An operator stop or narrower human authorization still limits advancement; a delivered report grants no new authority.
 Examples: unfinished reconciliation at the context limit -> disposition:"continue" + outcome:"completed"; a disproved hypothesis with checks and reconciliation finished -> disposition:"worked" + outcome:"completed"; missing required permission with a valid blocker report -> disposition:"blocked" + outcome:"completed"; unreadable/unwritable report with no valid checkpoint -> outcome:"failed".`;
   if (smoke) return `Read-only transport smoke, not project research. Do not read SiftText or methodology nodes: this is a bounded file-reading fixture. No bash, network, game launch, code edits, or tree writes. Use read on ${join(directory, 'fixture.txt')}${previous ? ` and preceding report ${previous}` : ''}. ${role === 'planner' ? 'Return next with a tiny task asking the worker to report the fixture text, acceptance exact fixture text.' : 'Report the fixture text and whether the preceding planner report was readable; return worked.'} Evidence lists the fixture path. updated_nodes is []. Your only write is your reserved report. ${schema}`;
   return `Read /Users/USER/sifttext/nodes/${project.root}/node.md with local file tools for current project authority and acceptance conditions. Resolve required links at /Users/USER/sifttext/nodes/<UUID>/node.md; use native private-worktree publication only within the actual grant, never hosted SiftText tools. The knowledge base, not repository contract files, owns the assignment.\n${contract ?? ''}\n\nROLE: ${role}. Run directory: ${directory}. Previous report: ${previous ?? 'none (initial entry)'}.\n${role === 'planner'

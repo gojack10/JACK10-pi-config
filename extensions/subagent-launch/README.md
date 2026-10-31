@@ -26,7 +26,7 @@ The offline `node --test extensions/subagent-launch/busy-followup.test.ts` check
 
 ## Scope and loading
 
-Reload the parent before launching workers with this change. The launcher explicitly loads the recovery command in new children. Already-finalized failures, lost parent launcher state after restart, arbitrary provider overflows, automatic cleanup, friendly-stop thresholds and checkpoint rollover are **not** implemented by this recovery path. It does not alter ordinary Pi shutdown or cancellation behavior.
+Reload the parent before launching workers with this change. The launcher explicitly loads the recovery command in new children. Already-finalized failures, lost parent launcher state after restart, arbitrary provider overflows, automatic cleanup and checkpoint rollover are **not** implemented by this recovery path. It does not alter ordinary Pi shutdown or cancellation behavior.
 
 Cleanup uses Pi's context estimator, not a promise about exact provider tokens; a subsequent oversized request can pause again. The parent chooses whether to clean, compact manually, or checkpoint into a fresh session. Cleaning cannot remove retained thinking or large user inputs.
 
@@ -45,14 +45,8 @@ A user-approved Luna task passed the real provider/TUI happy path on 2026-09-11:
 
 Evidence and runnable receipt check: `/Users/USER/.cache/pi-context-recovery-live.Ay1VVX/` (`report.md`, `verify-receipts.mjs`). This qualifies one live task path, not dialogue, every provider, cancellation or crash recovery.
 
-## Automatic friendly reports
+## Subagent limits
 
-Every canonical task/dialogue subagent loads `optional-extensions/rlm-friendly-stop.ts`. Friendly stop is **always on at 80% of the effective runtime context window, for every model**. It uses Pi's context estimate, not an exact provider-token boundary. Unknown usage does not trigger it. Ordinary chats without a task/dialogue contract are unaffected.
+Launch batches have no job-count cap. Subagents have no extension-imposed context threshold or forced reporting stop. Actual model context windows, provider failures, human cancellation and task-outcome requirements still apply. Context pauses can use the explicit `subagent_clean_and_continue` maintenance path above.
 
-At the threshold the agent must stop new work, write its current report in the assignment's format, and call `report_outcome` honestly. Include evidence, unfinished work and the next step; completing a progress report does not prove the assignment is complete. Report text and `report_outcome.summary` have no policy length cap, and there is no wrap-up turn limit. Transport/status summaries may still be condensed; the report file and durable declaration retain the full text.
-
-Report IO and draining existing background work remain available; new agents, new background work, tree mutations and cleanup tools are blocked. The final actionable settlement boundary requests another reporting turn if the agent gives prose without a declaration. Escape, provider errors and actual context/maintenance pauses are not overridden. No rollover packet, checkpoint tool, forced abort, automatic compaction or tool-call cleanup is used.
-
-The old `friendly_stop_percent` and `friendly_stop_directory` launch/follow-up fields are removed. Legacy environment settings are scrubbed and no longer configure the policy. Existing saved manifest settings do not constrain fresh follow-ups. New attempts arm independently; the same attempt retains its reporting requirement across reload and branch-safe restoration.
-
-Reload existing parents/workers to replace already-loaded code; fresh canonical workers load the new policy automatically. Actual context pauses can still use the separate explicit `subagent_clean_and_continue` maintenance path above. Tests include a provider-free real Pi lifecycle crossing 80%, refusing prose-only settlement, writing a long current-progress report, and completing the same attempt through `report_outcome` without checkpoint or cleanup. This is not live-provider qualification.
+Restart existing workers to unload a previously loaded stop extension. Reload the parent before launching fresh workers.

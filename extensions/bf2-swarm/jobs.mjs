@@ -150,7 +150,7 @@ export function launchJob(board, config, { id, command, cwd, owner = null, stopp
     try {
       // Spawn gated on stdin: commit registration before a command can execute.
       child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--runner', join(dir, 'manifest.json')], { detached: true, stdio: ['pipe', fd, fd],
-        env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(BF2_|FACTORY_|PI_SUBAGENT|PI_RLM_)/.test(key) && !['TMUX','TMUX_PANE','PI_SESSION_ID','PI_SESSION_FILE'].includes(key))) });
+        env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(BF2_|FACTORY_|PI_SUBAGENT)/.test(key) && !['TMUX','TMUX_PANE','PI_SESSION_ID','PI_SESSION_FILE'].includes(key))) });
       child.on('error', error => console.error(`Independent job ${id}: ${error.message}; inspect retained registration`));
       child.stdin?.on('error', error => console.error(`Independent job ${id}: boot release ${error.message}`));
       if (!child.pid) throw new Error('runner PID absent; no command release');
