@@ -26,7 +26,7 @@ Ufortunately for my personal preferences Pi's built-in subagent setup wasn't cut
 
 ## Memory and skills
 
-I frequently work through complex problems with agents. [SiftText](https://sifttext.com) is my methodology for efficiently doing so, and my product. `sifttext-mcp/` gives pi the 28 tools that make the interface work. `sifttext-commit/` turns a finished session into commits in a tree. My skill files are mainly sifttext node pointers.
+I frequently work through complex problems with agents. [SiftText](https://sifttext.com) is my methodology for efficiently doing so, and my product. `sifttext-mcp/` gives pi the 28 tools that make the interface work. `skills/sifttext-commit/SKILL.md` points to the local SiftText Commit procedure. My skill files are mainly sifttext node pointers.
 
 ## Local AI maintenance
 
