@@ -70,12 +70,13 @@ export function registerQueuedFollowup(pi: ExtensionAPI): void {
             deliverAs: 'followUp',
             admissionKey: `subagent-followup:${request.jobId}@${request.attemptId}`,
             admissionGuard: () => {
-              if (!ctx.isIdle() || ctx.hasPendingMessages() ||
-                  ctx.model?.provider !== request.provider || ctx.model?.id !== request.model ||
+              if (ctx.model?.provider !== request.provider || ctx.model?.id !== request.model ||
                   pi.getThinkingLevel() !== request.thinking || ctx.sessionManager.getSessionId() !== sessionId ||
                   show('@pi_session_id') !== sessionId || show('@pi_subagent_job_id') !== request.jobId || show('@pi_subagent_session_id') !== request.sessionId) return false;
+              // Pi rechecks the guard after marking this admitted run busy.
+              // Idle/pending are handoff prerequisites, not invariants of its preparation.
               if (armed) return show(TASK_LAUNCH_MANIFEST_OPTION) === path;
-              if (!eligible()) return false;
+              if (!ctx.isIdle() || ctx.hasPendingMessages() || !eligible()) return false;
               const oldPath = show(TASK_LAUNCH_MANIFEST_OPTION);
               const old = JSON.parse(readFileSync(oldPath, 'utf8'));
               if (old.jobId !== request.jobId || old.sessionId !== request.sessionId || old.mode !== request.mode ||
