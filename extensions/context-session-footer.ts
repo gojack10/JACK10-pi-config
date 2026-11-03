@@ -3,7 +3,11 @@ import type {
 	ExtensionAPI,
 	Theme,
 } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import {
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@mariozechner/pi-tui";
 import {
 	type CodexUsageState,
 	quotaBuckets,
@@ -267,6 +271,10 @@ export default function (pi: ExtensionAPI) {
 						dim,
 					);
 					flushFooterLine(lineState, width);
+					const sessionFile = ctx.sessionManager.getSessionFile();
+					lineState.lines.push(
+						...wrapTextWithAnsi(dim(`SESSION: ${sessionFile ?? "(not saved)"}`), width),
+					);
 					appendQuotaLines(lineState, quota, width, theme);
 					flushFooterLine(lineState, width);
 
