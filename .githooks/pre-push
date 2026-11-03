@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+updates=$(while IFS= read -r line; do printf '%s\n' "$line"; done)
+[ -n "$updates" ] || exit 0
+root=$(git rev-parse --show-toplevel)
+review_dir=$(git rev-parse --git-path public-push-review)
+mkdir -p "$review_dir"
+key=$(printf '%s\n' "$2" "$updates" | git hash-object --stdin)
+[ ! -f "$review_dir/$key.approved" ] || exit 0
+
+pending=$(mktemp "$review_dir/.pending.XXXXXX")
+printf '%s\n' "$updates" > "$pending"
+mv "$pending" "$review_dir/$key.pending"
+
+printf '\n%s\n\n' 'Public Pi Config Portfolio Push Paused 0_0' >&2
+printf '%s\n' \
+  'Review everything this push would publish, including commit messages.' \
+  'Anything private or unsuitable for public release?' \
+  'If no, acknowledge this exact push. If yes, remove it or obtain Jack’s explicit' \
+  'approval to publish that material. Permission to implement or push is not' \
+  'permission to disclose private information.' >&2
+printf '\nOutgoing refs (local ref, local commit, remote ref, previous remote commit):\n%s\n' "$updates" >&2
+printf '\nAfter review, run one of:\n  "%s/bin/public-push-review" safe %s\n  "%s/bin/public-push-review" jack-approved %s "specific publication approval"\n\nThen retry the original push. Changed commits or destination require a new review.\n' "$root" "$key" "$root" "$key" >&2
+exit 1

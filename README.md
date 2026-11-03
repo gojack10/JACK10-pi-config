@@ -39,7 +39,21 @@ For a new machine, configure the named knowledge bindings required by the skills
 mkdir -p local/knowledge
 ln -s "$HOME/sifttext/nodes/LOCAL_NODE_ID/node.md" local/knowledge/git-commit.md
 cp APPEND_SYSTEM.example.md APPEND_SYSTEM.md
+git config --local core.hooksPath .githooks
 ```
+
+### Public push review
+
+The pre-push hook pauses the first attempt for each exact outgoing ref/commit set and
+remote destination. Review the content and commit messages, then use the printed
+`bin/public-push-review safe KEY` command. If private material remains, only use
+`jack-approved KEY "specific publication approval"` after Jack explicitly approves
+publishing that material. Retry the original push; changed commits or destinations
+require a new review. Approval is stored only inside Git's local administrative directory.
+
+The hook is a deliberate agent review stop, not a secret detector or server-side security
+boundary. Git can bypass local hooks; GitHub CI cannot prevent disclosure after upload.
+Never use a bypass to avoid the review.
 
 # Highlights
 

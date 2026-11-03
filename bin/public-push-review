@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+
+usage() {
+  printf '%s\n' 'Usage: bin/public-push-review safe KEY' \
+    '       bin/public-push-review jack-approved KEY "specific publication approval"' >&2
+  exit 1
+}
+[ "$#" -ge 2 ] || usage
+verdict=$1
+key=$2
+case "$key" in *[!0-9a-f]*|'') usage ;; esac
+case ${#key} in 40|64) ;; *) usage ;; esac
+case "$verdict" in
+  safe) [ "$#" -eq 2 ] || usage ;;
+  jack-approved) [ "$#" -eq 3 ] && [ -n "$3" ] || usage ;;
+  *) usage ;;
+esac
+review_dir=$(git rev-parse --git-path public-push-review)
+if [ ! -f "$review_dir/$key.pending" ]; then
+  printf '%s\n' 'No paused push matches that key. Attempt the intended push first.' >&2
+  exit 1
+fi
+receipt=$(mktemp "$review_dir/.approval.XXXXXX")
+printf '%s\n' "$verdict" "${3:-reviewed; no private material}" > "$receipt"
+mv "$receipt" "$review_dir/$key.approved"
+rm "$review_dir/$key.pending"
+printf '%s\n' 'Review acknowledged for that exact push. Retry the original push.'
