@@ -10,6 +10,37 @@ Don't expect to clone this and use it. It relies on [my branch of the pi](https:
 
 My harness heavily depends upon [SiftText](https://sifttext.com)
 
+## Public portfolio, local machine
+
+This is the working harness and its public portfolio, not a separately maintained export.
+Reusable code and portable templates are tracked. Machine identities, credentials,
+private knowledge bindings, deployed infrastructure and run artifacts stay local.
+The displayed footer image is intentionally public.
+
+- `APPEND_SYSTEM.md` remains local; `APPEND_SYSTEM.example.md` shows the portable policy.
+- `local/knowledge/*.md` are ignored symlinks to this machine's canonical SiftText procedures.
+  Resolve them before following relative knowledge links. The skills use these named bindings
+  rather than publishing private node IDs. Generated factory prompts resolve the same bindings.
+- Knowledge files default to `~/sifttext`; set `SIFTTEXT_HOME` for a different home.
+- `local/native-models.json` optionally supplies `args` arrays for already registered native models.
+  Keep actual steering paths there; binary qualification and model admission remain in code.
+  Changing those settings still requires the normal authorized maintenance procedure.
+- `extensions/bf2-swarm/hosting-config/` is the ignored deployment; `hosting-config.example/`
+  contains substitutes. Copying a template is not a service restart or hosting authorization.
+- `startlux-service/pyproject.toml` and `uv.lock` are installed, machine-local manifests covered
+  by artifact pins. Portable `.example` versions remain tracked. Preserve the installed bytes;
+  a new installation can use an `upstream` link to its qualified source checkout.
+- `factory-runs/` is always ignored. Two existing host-bound fixture files also remain local;
+  the reusable implementation and other fixtures stay tracked.
+
+For a new machine, configure the named knowledge bindings required by the skills you use:
+
+```sh
+mkdir -p local/knowledge
+ln -s "$HOME/sifttext/nodes/LOCAL_NODE_ID/node.md" local/knowledge/git-commit.md
+cp APPEND_SYSTEM.example.md APPEND_SYSTEM.md
+```
+
 # Highlights
 
 ## Riced Custom Status Bar

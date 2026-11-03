@@ -1,13 +1,14 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { fileScope, sha, validateCodeConfig } from './parallel-code.mjs';
+import { knowledgeHome, knowledgeGuideId } from '../_shared/knowledge.mjs';
 
 // Pure seat/event/report rules for the parallel factory (Parallel Execution Contract d96507db).
 // No model turns, no IO beyond existence checks for reported evidence paths.
 
 export const ROLE_NODES = {
-  dispatcher: 'f0000000-0000-4000-8000-c99946d417e9',
-  worker: 'f0000000-0000-4000-8000-fde2da114297',
+  dispatcher: knowledgeGuideId('factory-dispatcher'),
+  worker: knowledgeGuideId('factory-worker'),
 };
 export const ROUTES = {
   oss: { provider: 'local', model: 'qwen3.8-flash-next', thinking: 'xhigh' },
@@ -511,7 +512,7 @@ export function dispatcherPrompt({ role, run, events, state, report, setup, prev
 
 export function workerPrompt({ role, run, task, report, previous, artifacts, code, routeVerdict }) {
   return [
-    'You are a factory worker. Read the ROLE node with local file tools at /Users/USER/sifttext/nodes/<UUID>/node.md, follow its required local links and procedure exactly. Use native private-worktree publication only within the actual grant; no hosted SiftText fallback.',
+    `You are a factory worker. Read the ROLE node with local file tools at ${knowledgeHome}/nodes/<UUID>/node.md, follow its required local links and procedure exactly. Use native private-worktree publication only within the actual grant; no hosted SiftText fallback.`,
     `ROLE: ${role}`, `RUN: ${run}`, `TASK: ${task}`, `REPORT: ${report}`,
     ...(previous ? [`PREVIOUS: ${previous}`] : []),
     `ARTIFACTS: ${artifacts} (directory for any files you create)`,

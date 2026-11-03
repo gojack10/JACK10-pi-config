@@ -1,0 +1,7 @@
+# Substitute a private tunnel identity and hostname in ignored hosting-config/.
+tunnel: 00000000-0000-4000-8000-000000000000
+credentials-file: /etc/cloudflared/credentials.json
+ingress:
+  - hostname: factory.example.test
+    service: http://127.0.0.1:18080
+  - service: http_status:404

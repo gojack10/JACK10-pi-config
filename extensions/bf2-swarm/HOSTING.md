@@ -48,20 +48,21 @@ and restarting only the adapter. New run selection is an explicit operator chang
 not automatic DB discovery/adoption. The adapter is local-user trusted, not an
 agent sandbox.
 
-## Existing REMOTE_HOST infrastructure
+## Existing remote-host infrastructure
 
 Use an independently owned reverse SSH forward, remote bind **127.0.0.1 only**:
 
 ```sh
 ssh -NT -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-  -o ServerAliveCountMax=3 -R 127.0.0.1:18080:127.0.0.1:18081 remote-host
+  -o ServerAliveCountMax=3 -R 127.0.0.1:18080:127.0.0.1:18081 factory-host
 ```
 
 Supervise adapter and forward as separate Mac LaunchAgents with KeepAlive and
 throttled restart. Do not edit/restart the existing private SSH/LLM forwards.
-Use a factory-only named cloudflared tunnel/container on REMOTE_HOST, reusing its
+Use a factory-only named cloudflared tunnel/container on the remote host, reusing its
 installed infrastructure but not restarting the shared transcription tunnel/NPM.
-Ingress is exact `factory.example.test` to `http://127.0.0.1:18080` with a final
+Ingress is the configured public hostname (for example `factory.example.test`) to
+`http://127.0.0.1:18080` with a final
 404 catch-all. TLS terminates at Cloudflare; the remaining hops are host loopback
 and SSH. The adapter validates the public HTTPS origin and requires Cloudflare's
 edge-overwritten `X-Forwarded-Proto: https`; plaintext edge hops get no Basic
@@ -73,16 +74,18 @@ Keep tunnel credential files private and outside source control.
 
 ## Deployed configuration custody
 
-`hosting-config/` holds the nonsecret installed Mac LaunchAgent plists and
-factory-only cloudflared ingress. Their paths are machine-specific; the private
-JSON, password and tunnel credentials are deliberately NOT tracked. The adapter
+`hosting-config/` holds the ignored installed Mac LaunchAgent plists and
+factory-only cloudflared ingress. `hosting-config.example/` contains portable
+templates; substitute local paths, ports, SSH alias and tunnel identity privately.
+Launchd requires absolute paths and does not expand `~` in plist strings. The
+actual deployment files, private JSON, password and tunnel credentials are NOT tracked. The adapter
 runs a durable source copy at `~/.local/state/bf2-room-hosting/runtime/hosting.mjs`,
 independent of this implementation worktree. Update that copy only after review.
-The two Mac labels are `com.jack.factory-room-ingress` and
-`com.jack.factory-room-tunnel`. Logs live below the owned private directory.
+The example Mac labels are `com.example.factory-room-ingress` and
+`com.example.factory-room-tunnel`; retain the installed labels on an existing machine. Logs live below the owned private directory.
 
-On REMOTE_HOST, the owned config/credential mount is
-`/home/USER/.cloudflared/factory-room` (0700; files 0600). The factory container is
+On the remote host, the owned config/credential mount is under the operator's
+home, for example `/home/USER/.cloudflared/factory-room` (0700; files 0600). The factory container is
 `factory-room-cloudflared`, image `cloudflare/cloudflared:2026.6.0`, host networking
 but **no published port**, existing user UID/GID, read-only config mount,
 `--restart unless-stopped`, `--log-driver none`. Its command is:
@@ -92,7 +95,7 @@ tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
 ```
 
 This does not edit the shared `vega-config.yml`, NPM hosts or existing containers.
-DNS is one proxied factory CNAME to the UUID in `factory-cloudflared.yml`. The
+DNS is one proxied factory CNAME to the privately configured tunnel UUID. The
 exact creation, acceptance evidence and credential locator belong to the private
 execution report, never a tracked password or capability.
 

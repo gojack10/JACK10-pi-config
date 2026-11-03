@@ -28,9 +28,7 @@ MODELS = {
  'deepseek-v4.1-flash': dict(mode='ds41', binary=HOME/'ds4/ds4-server-v41-reservation',
    sha='9ea341d6dbda9f260bbc1795f96c1434a15dc89f0e149f046d1a94d21598afce',
    args=['DeepSeek-V4.1-Flash-1017-Q2.gguf','--metal','--ssd-streaming','--power 100',
-         '--ssd-streaming-cache-experts 64GB','--ctx 1000000',
-         '--dir-steering-file /Users/USER/.dsv4/adapters/local-steering.ds41dir',
-         '--dir-steering-strength 1.0']),
+         '--ssd-streaming-cache-experts 64GB','--ctx 1000000']),
 }
 
 
@@ -43,9 +41,18 @@ GLM_CANDIDATE = dict(mode='glm', binary=HOME/'ds4/runtimes/glm-1485eb283928/ds4-
           '--metal', '--power', '100', '--ctx', '500000', '--port', '8001'])
 
 
-# Exact-byte GLM terminal-only qualification: reports/live-qualification in
-# /Users/USER/research/glm-restore-20261012. No retained borrowing.
+# Exact-byte GLM terminal-only qualification is retained in private local evidence.
+# No retained borrowing.
 MODELS['glm-5.3-flash'] = dict(GLM_CANDIDATE, sha='1485eb2839289b738f2fb90c6e99034a7ca7fc6e652cd881ec2266a617fcd986')
+
+# Host-specific steering/settings stay local; binary pins and model admission do not change.
+local_settings = Path(__file__).resolve().parent / 'local/native-models.json'
+if local_settings.exists():
+    for model, settings in json.loads(local_settings.read_text()).items():
+        if model not in MODELS or set(settings) != {'args'} or not isinstance(settings['args'], list) or \
+           not all(isinstance(arg, str) for arg in settings['args']):
+            raise RuntimeError('Invalid local native-model arguments')
+        MODELS[model]['args'] = settings['args']
 
 def command(*args, check=True):
     return subprocess.run(args, check=check, capture_output=True, text=True).stdout.strip()

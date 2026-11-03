@@ -13,10 +13,11 @@
  */
 
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
-const SKILL_PATH = join(process.env.HOME || "/Users/USER", "projects", "browser-harness", "SKILL.md");
+const SKILL_PATH = join(homedir(), "projects", "browser-harness", "SKILL.md");
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("browser", {

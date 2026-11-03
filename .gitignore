@@ -61,7 +61,16 @@ handoffs/
 skills/browser-harness/
 prompt-stashes.jsonl
 
+# Machine-local instructions, knowledge bindings and deployed infrastructure.
+/APPEND_SYSTEM.md
+/local/
+/extensions/bf2-swarm/hosting-config/
+# Existing host-bound fixtures remain available locally, without editing or running them.
+/extensions/bf2-swarm/lifecycle.test.ts
+/tests/test_local_proxy_selection.py
+
 # Private run artifacts / local identity (local-only)
+/factory-runs/
 run-packets/
 codex-accounts.json
 transcript-*.md
@@ -93,8 +102,11 @@ extensions/dark-factory/*-contract.md
 /startlux-*-??????/
 
 # Local service installations and private research-policy executables.
-# Keep the serving adapters, provisioning source, patches and tests tracked.
+# Keep the serving adapters, provisioning source, patches, tests and portable templates tracked.
 /startlux-service/.venv/
+/startlux-service/pyproject.toml
+/startlux-service/uv.lock
+/startlux-service/upstream/
 /startlux-service/pin.json
 /startlux-service/model-pin.json
 /startlux-service/swap-cpu

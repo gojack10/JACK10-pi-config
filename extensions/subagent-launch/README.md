@@ -43,7 +43,7 @@ The test owns a disposable tmux socket and uses a fake interactive child with re
 
 A user-approved Luna task passed the real provider/TUI happy path on 2026-09-11: the native guard paused at ~300,373 estimated tokens, the parent received that actual reason, and `subagent_clean_and_continue` resumed the same job/attempt/session/report. The worker verified a preserved thinking block, progress marker and backup, then completed through the original monitor. A run-scoped tool supplied removable padding; request audit confirmed the blocked payload was stripped to 356 characters and the separate safety interlock did not fire. No global settings or production code changed for the trial.
 
-Evidence and runnable receipt check: `/Users/USER/.cache/pi-context-recovery-live.Ay1VVX/` (`report.md`, `verify-receipts.mjs`). This qualifies one live task path, not dialogue, every provider, cancellation or crash recovery.
+The private qualification report and receipt-check script remain in machine-local evidence, not this public repository. This qualifies one live task path, not dialogue, every provider, cancellation or crash recovery.
 
 ## Subagent limits
 

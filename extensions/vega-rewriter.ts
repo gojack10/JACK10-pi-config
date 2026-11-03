@@ -2,11 +2,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rmdir, stat } from "node:fs/promises";
 import { connect } from "node:net";
+import { fileURLToPath } from "node:url";
 import { DisplayRewrites, runStreamingPi, textOf } from "./vega-rewriter-lib/vega-rewriter-process.ts";
 
-const PROMPT_PATH = "/Users/USER/.pi/agent/vega-presenter.md";
-const PROVIDER_EXTENSION = "/Users/USER/.pi/agent/extensions/tunnel-llm-proxy.ts";
-const CODEX_EXTENSION = "/Users/USER/.pi/agent/extensions/codex-workspaces.ts";
+const PROMPT_PATH = fileURLToPath(new URL("../vega-presenter.md", import.meta.url));
+const PROVIDER_EXTENSION = fileURLToPath(new URL("./tunnel-llm-proxy.ts", import.meta.url));
+const CODEX_EXTENSION = fileURLToPath(new URL("./codex-workspaces.ts", import.meta.url));
 const LOCAL_LOCK = "/tmp/vega-rewriter-local.lock";
 const NORMAL_TIMEOUT_MS = 30_000;
 

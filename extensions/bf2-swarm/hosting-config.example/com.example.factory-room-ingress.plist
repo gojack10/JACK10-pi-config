@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key><true/>
+	<key>Label</key><string>com.example.factory-room-ingress</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/absolute/path/to/node</string>
+		<string>/absolute/path/to/private/runtime/hosting.mjs</string>
+		<string>/absolute/path/to/private/hosting.json</string>
+	</array>
+	<key>RunAtLoad</key><true/>
+	<key>StandardErrorPath</key><string>/absolute/path/to/private/ingress.log</string>
+	<key>StandardOutPath</key><string>/absolute/path/to/private/ingress.log</string>
+	<key>ThrottleInterval</key><integer>30</integer>
+</dict>
+</plist>

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import * as P from './parallel-core.mjs';
 import * as G from './parallel-code.mjs';
 import {applyBaseline} from './parallel-baseline.mjs';
+import { knowledgeHome } from '../_shared/knowledge.mjs';
 
 // Deterministic parallel-factory controller. Transport/tree access uses injected deps;
 // opt-in code tasks use the native Git helper against explicitly configured repositories.
@@ -784,7 +785,7 @@ export class ParallelController {
     attempt.setup_packet = join(attempt.dir, 'setup-packet.json');
     const prompt = P.dispatcherPrompt({ role: this.config.roles.dispatcher, run: this.config.run_node, events: eventsPath,
       state: statePath, report: attempt.report, setup: this.config.code?.integration === 'dispatcher' ? undefined : attempt.setup_packet,
-      previous: this.state.dispatcher.previous, tools: 'local file reads at /Users/USER/sifttext/nodes/<UUID>/node.md (including required linked procedures), or the native `sifttext` CLI through Bash' });
+      previous: this.state.dispatcher.previous, tools: `local file reads at ${knowledgeHome}/nodes/<UUID>/node.md (including required linked procedures), or the native sifttext CLI through Bash` });
     const missionFile = join(attempt.dir, 'mission.md');
     writeFileSync(missionFile, prompt);
     const fault = engine === 'claude' && this.config.faults?.claude_failure?.wake === this.state.dispatcher.wakes;

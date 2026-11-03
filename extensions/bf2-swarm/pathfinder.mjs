@@ -1,3 +1,5 @@
+import { knowledgeGuideId } from '../_shared/knowledge.mjs';
+
 // Pathfinder uses the existing session substrate, outside configured peer membership.
 export const PATHFINDER_SLOT = '@PATHFINDER';
 export const ABSENCE_MS = 30 * 60 * 1000;
@@ -35,9 +37,10 @@ export function pathfinderStore(db, config) {
   };
 }
 
-export const PATHFINDER_ENTRY = 'f0000000-0000-4000-8000-b91bb3775ebe';
-export const PATHFINDER_AGENT = 'f0000000-0000-4000-8000-04eb02f78378';
+export const PATHFINDER_ENTRY = knowledgeGuideId('pathfinder-entry');
+export const PATHFINDER_AGENT = knowledgeGuideId('pathfinder-agent');
 export function pathfinderMission(settings) {
+  if (!PATHFINDER_ENTRY || !PATHFINDER_AGENT) throw Error('Configure the local Pathfinder knowledge bindings before launch');
   return `You are @PATHFINDER, the floor's Pathfinder. Complete the common launch instructions' required reads below, then read Factory Pathfinder Entry ${PATHFINDER_ENTRY} and Pathfinder Agent ${PATHFINDER_AGENT} before choosing work. Pathfinder replaces the common entry's peer identity and self-selected worker assignment; its project reads, board and lifecycle mechanics still apply.
 Use the floor's current goal resolved through that same project entry. Directed @PATHFINDER board requests supply review questions; the continuation locator preserves unfinished review state.
 Use the floor checkout and project instructions to find relevant code. Preserve existing project permissions and write boundaries; discovering another path grants no write authority. Model settings and project instructions govern resources. Return findings through the factory board and existing work owners. Stop dependent work and report missing required reads or authority. Follow the common Stop, settlement and recovery instructions.

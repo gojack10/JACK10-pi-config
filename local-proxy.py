@@ -1035,7 +1035,7 @@ def _detect_ds4_loaded_model_sync():
     for line in out.splitlines():
         fields = line.split(None, 2)
         if len(fields) < 2 or (Path(fields[1]).name != "ds4-server" and
-                              fields[1] != '/Users/USER/ds4/ds4-server-v41-reservation'):
+                              fields[1] != str(Path.home() / 'ds4/ds4-server-v41-reservation')):
             continue
         args = shlex.split(line)
         if "--port" not in args or args[args.index("--port") + 1:][:1] != [str(DS4_PORT)]:
