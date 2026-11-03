@@ -205,6 +205,17 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	};
 	pi.registerProvider(umbrella as Provider);
 
+	const setRouteModel = async (model: Model): Promise<boolean> => {
+		// Account routing is not a user model change. setModel reapplies saved
+		// thinking defaults, so restore the session's level (with native clamping).
+		const thinkingLevel = pi.getThinkingLevel();
+		try {
+			return await pi.setModel(model);
+		} finally {
+			pi.setThinkingLevel(thinkingLevel);
+		}
+	};
+
 	const reroute = async (ctx: ExtensionContext) => {
 		const model = ctx.model;
 		if (
@@ -212,7 +223,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 			(model.provider !== registry.umbrellaProviderId && !registry.accounts.some((account) => account.providerId === model.provider))
 		) return;
 		const selector = ctx.modelRegistry.find(registry.umbrellaProviderId, model.id);
-		if (!selector || !(await pi.setModel(selector))) throw new Error("Codex Personal provider resolution failed");
+		if (!selector || !(await setRouteModel(selector))) throw new Error("Codex Personal provider resolution failed");
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -260,7 +271,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				},
 				excludedAccountKeys: failedAccounts,
 			});
-			if (!resolved.pin || !(await pi.setModel(resolved.model)))
+			if (!resolved.pin || !(await setRouteModel(resolved.model)))
 				throw new Error(`AUTH UNAVAILABLE: ${resolved.pin?.actualProviderId ?? "next Codex account"}`);
 			pin = resolved.pin;
 			pi.appendEntry("codex-route/v1", pin);
