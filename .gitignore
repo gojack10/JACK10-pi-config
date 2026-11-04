@@ -65,7 +65,7 @@ prompt-stashes.jsonl
 /APPEND_SYSTEM.md
 /local/
 /extensions/bf2-swarm/hosting-config/
-# Existing host-bound fixtures remain available locally, without editing or running them.
+# Host-bound fixtures remain local rather than publishing machine-specific paths.
 /extensions/bf2-swarm/lifecycle.test.ts
 /tests/test_local_proxy_selection.py
 
