@@ -121,11 +121,7 @@ class ManagedSwitch:
         self.lease=None
 
     def binding(self, model):
-        if model in MLX_MODELS and self.mlx is not None:
-            self.mlx.probe()
-            if self.mlx.model != model:
-                raise RuntimeError('MLX model identity mismatch')
-            return self.mlx
+        """Qualify a newly started or adopted DS4 process, never each request."""
         config=MODELS[model]
         p=service_pid()
         if not p: raise RuntimeError('managed engine absent')
@@ -138,14 +134,14 @@ class ManagedSwitch:
             valid = all(arg in argv for arg in config['args'])
         if not valid:
             raise RuntimeError('unqualified model settings')
-        e=rb.FileEngine('ds4',ctl('getenv','DS4_FREEZE_DIR'),p,HOME/'.dsv4/dsv4.log',
-                        config['binary'],expected_sha=config['sha'],
-                        terminal_only=config.get('terminal_only', False))
-        e.core=ROOT/'coordinator/liveness-evidence-20260925/coordinator-cpu'
-        return e
+        return rb.FileEngine(ctl('getenv','DS4_FREEZE_DIR'),p,HOME/'.dsv4/dsv4.log',
+                             config['binary'],expected_sha=config['sha'],
+                             terminal_only=config.get('terminal_only', False))
 
-    def adopt(self):
-        p=service_pid()
+    def adopt(self, p):
+        if self.model in MODELS and self.engine is not None and self.engine.pid == p and self.engine.alive():
+            swap_policy.SWAP.adopt(self.model)
+            return  # Same process: retain qualification and native command serials.
         if not p:
             swap_policy.SWAP.adopt_empty()
             raise RuntimeError('startup engine missing; supervised recovery required')
@@ -187,36 +183,6 @@ class ManagedSwitch:
                         LOCAL_PROXY_DS4_BINARY=str(MODELS[model]['binary'])).items(): ctl('setenv',k,v)
         record('switch-ready',model=model,pid=self.engine.pid,gate=str(control),receipt=receipt)
 
-    async def transition(self,model):
-        if self.engine.hold is not None or self.engine.terminal_ticket is not None:
-            raise RuntimeError('held or terminal owner cannot switch')
-        before=time.monotonic()
-        record('switch-plan',old=self.model,new=model,pid=self.engine.pid,
-               policy='checked stop-then-start: close/status -> SIGTERM -> exit -> fresh gate/settings -> start -> native verify/release')
-        try:
-            receipt=await self.engine.terminal()
-        except BaseException:
-            try: swap_policy.SWAP.stop_unknown()
-            except swap_policy.SwapPolicyError as exc: record('switch-policy-blocked',reason=str(exc))
-            raise
-        record('switch-old-drained',model=self.model,receipt=receipt)
-        try:
-            command('/bin/launchctl','kill','SIGTERM',SERVICE)
-            while self.engine.alive(): await asyncio.sleep(.1) # never SIGKILL
-        except BaseException:
-            try: swap_policy.SWAP.stop_unknown()
-            except swap_policy.SwapPolicyError as exc: record('switch-policy-blocked',reason=str(exc))
-            raise
-        swap_policy.SWAP.stop_done()
-        try:
-            await self.start(model)
-        except BaseException:
-            try: swap_policy.SWAP.start_unknown()
-            except swap_policy.SwapPolicyError as exc: record('switch-policy-blocked',reason=str(exc))
-            raise
-        swap_policy.SWAP.start_ready()
-        record('switch-complete',model=model,seconds=time.monotonic()-before)
-
     async def observe_with_startlux(self):
         # A process/port mismatch is uncertainty, never an empty lane.
         resident = await asyncio.to_thread(self.startlux.probe)
@@ -235,13 +201,13 @@ class ManagedSwitch:
             self.model, self.engine = self.mlx.model, self.mlx
             swap_policy.SWAP.adopt(self.model)
         elif ds4_pid:
-            self.adopt()  # pinned DS4 binary, native control identity and argv
+            self.adopt(ds4_pid)  # Qualify only when the process identity changes.
         else:
             self.model = self.engine = None
             swap_policy.SWAP.adopt_empty()
 
     async def stop_ds4_for_startlux(self):
-        if not self.engine or self.engine.hold is not None or self.engine.terminal_ticket is not None:
+        if not self.engine or self.engine.terminal_ticket is not None:
             raise RuntimeError('DS4 native owner not safely stoppable')
         await self.engine.terminal()  # fresh native drain, not HTTP idle telemetry
         ctl('bootout', SERVICE)
@@ -260,8 +226,9 @@ class ManagedSwitch:
         await self.acquire()
         async def settle():
             await self.observe_with_startlux()
+            # Artifact checks belong to a process transition, not resident reuse.
             runtime = self.mlx if model in MLX_MODELS else self.startlux if model == 'startlux-4b-instant' else None
-            if runtime is not None:
+            if runtime is not None and self.model != model:
                 try:
                     await asyncio.to_thread(runtime.qualify)
                 except Exception as exc:
@@ -270,7 +237,7 @@ class ManagedSwitch:
             if action == 'reuse':
                 if model == 'startlux-4b-instant' and await asyncio.to_thread(mlx_lane_busy):
                     raise LaneUnproven('mlx lane busy or unproven; StartLux admission refused')
-                return self.startlux if model == 'startlux-4b-instant' else self.binding(model)
+                return self.startlux if model == 'startlux-4b-instant' else self.engine
             if action not in ('stop', 'start'):
                 raise LaneUnproven(f'swap policy refused {model}: {action}')
             if resident not in MLX_MODELS and await asyncio.to_thread(mlx_lane_busy):
@@ -343,10 +310,9 @@ class ManagedSwitch:
                     raise RuntimeError('Unknown DS4 executable; maintenance stopped')
                 # Settings may intentionally have changed since this engine
                 # started. Prove its binary and drain, never reuse its cache.
-                self.engine = rb.FileEngine('ds4', ctl('getenv', 'DS4_FREEZE_DIR'), pid,
+                self.engine = rb.FileEngine(ctl('getenv', 'DS4_FREEZE_DIR'), pid,
                     HOME / '.dsv4/dsv4.log', config['binary'], expected_sha=config['sha'],
                     terminal_only=config.get('terminal_only', False), shutdown_only=True)
-                self.engine.core = ROOT / 'coordinator/liveness-evidence-20260925/coordinator-cpu'
                 await self.stop_ds4_for_startlux()
             elif swap_policy.port_listening(8001):
                 raise RuntimeError('Foreign DS4 listener; maintenance stopped')
@@ -368,41 +334,5 @@ class ManagedSwitch:
     async def prepare_startlux(self):
         return await self.prepare_with_startlux('startlux-4b-instant')
 
-    async def prepare(self,model):
-        if self.startlux is not None:
-            return await self.prepare_with_startlux(model)
-        if model not in MODELS or self.blocked: raise RuntimeError('managed model unavailable')
-        await self.acquire()
-        async def settle():
-            if self.engine is None: self.adopt()
-            action,resident=swap_policy.SWAP.admit(model,qualified=model in MODELS)
-            if action=='reuse':
-                pass  # checked policy: identity match, no transition
-            elif action=='stop':
-                if await asyncio.to_thread(mlx_lane_busy):
-                    swap_policy.SWAP.abort()  # authorized stop, never issued
-                    raise LaneUnproven('mlx lane busy or unproven; no DS4 transition issued')
-                await self.transition(model)
-            else:
-                raise RuntimeError(f'swap policy {action} for {model}; no transition issued')
-            self.engine=self.binding(model) # fresh request log offset; shared process ticket map
-            return self.engine
-        task=asyncio.create_task(settle())
-        cancelled=False
-        while not task.done():
-            try: await asyncio.shield(task)
-            except asyncio.CancelledError: cancelled=True
-            except Exception: break
-        try: engine=task.result()
-        except LaneUnproven as exc:
-            self.release()
-            record('switch-lane-unproven',reason=repr(exc))
-            raise
-        except BaseException as exc:
-            self.blocked=repr(exc)
-            record('switch-blocked',reason=self.blocked)
-            raise
-        if cancelled:
-            self.release()
-            raise asyncio.CancelledError()
-        return engine
+    async def prepare(self, model):
+        return await self.prepare_with_startlux(model)

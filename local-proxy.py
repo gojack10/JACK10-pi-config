@@ -16,15 +16,13 @@ import json
 import logging
 import os
 import subprocess
-import hashlib
 import shlex
 import time
 import uuid
 from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
-import swap_policy
-from managed_switch import MODELS as MANAGED_MODELS
+from managed_switch import ManagedSwitch, MODELS as MANAGED_MODELS
 from mlx_runtime import MLXRuntime, MODELS as MLX_CHECKPOINTS
 from startlux_runtime import StartLuxRuntime, MODEL_ID as STARTLUX_MODEL_ID, UPSTREAM_ID as STARTLUX_UPSTREAM_ID, PORT as STARTLUX_PORT, CONTEXT as STARTLUX_CONTEXT, WORK_TOKENS as STARTLUX_WORK_TOKENS
 
@@ -42,29 +40,18 @@ class _AccessNoiseFilter(logging.Filter):
 
 logging.getLogger("aiohttp.access").addFilter(_AccessNoiseFilter())
 
-DS4_PORT = int(os.getenv('LOCAL_PROXY_DS4_PORT', '8001')) if os.getenv('LOCAL_PROXY_RESERVATION') == '1' else 8001
+DS4_PORT = int(os.getenv('LOCAL_PROXY_DS4_PORT', '8001'))
 MLX_PORT = 8000
 TUNNEL_PORT = 8003
 FLASH_MOE_PORT = 8004
-LISTEN_PORT = int(os.getenv('LOCAL_PROXY_PORT', '8002')) if os.getenv('LOCAL_PROXY_RESERVATION') == '1' else 8002
-# Default OFF. This build has no live native adapter; never advertise a grant
-# based on an HTTP stream, an old pause file, or a process-exit observation.
-RESERVATION_TRIAL = os.getenv("LOCAL_PROXY_RESERVATION", "1") == "1"
-DUAL_MODELS = RESERVATION_TRIAL
-COORDINATOR = Path("/Users/USER/research/bend/coordinator/liveness-evidence-20260925/coordinator-cpu")
-COORDINATOR_SHA256 = "eac1a3d92d1e55c0545549dfaaa41d00298a77c4ceff953aec3b563985dd86bd"
+LISTEN_PORT = int(os.getenv('LOCAL_PROXY_PORT', '8002'))
 
 QWEN_FLASH_MODEL_ID = "qwen36-35b-a3b-flash-moe"
 DS4_FLASH_MODEL_ID = "tunnel-model"
 DS4_PRO_MODEL_ID = "deepseek-v4-pro"
 GLM_FLASH_MODEL_ID = "glm-5.3-flash"
 QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
-# mlx-lm serves exactly one checkpoint per process and has no admin API, so the
-# proxy owns its lifecycle the way it owns dsv4: the desired checkpoint goes in a
-# file, bootout frees the whole footprint, and only one model is ever resident.
-# Native context for these checkpoints is 262,144; no YaRN scaling anywhere.
-MLX_SERVICE_LABEL = "com.mlx-lm.server"
-MLX_DESIRED_FILE = Path.home() / ".mlx-lm" / "desired-model"
+# ManagedSwitch owns checkpoint residency; these records only name public models.
 MLX_MODEL_PATHS = {model: str(path) for model, path in MLX_CHECKPOINTS.items()}
 MLX_MODEL_IDS = set(MLX_MODEL_PATHS)
 MLX_MODEL_METADATA = {
@@ -87,16 +74,10 @@ MLX_SUPPORTED_PARAMETERS = [
     "tools", "tool_choice", "max_tokens", "temperature", "top_p", "top_k",
     "min_p", "stop", "seed", "stream",
 ]
-MLX_START_TIMEOUT = 900
-MLX_IDLE_TIMEOUT = 30 * 60
-MLX_LAST_REQUEST_AT = 0.0
 DS41_MODEL_ID = "deepseek-v4.1-flash"
 # Only the reviewed native registry advertises switchable DS4 models. A staged
 # candidate (including GLM) is neither admission nor qualification evidence.
 DS4_MODEL_IDS = set(MANAGED_MODELS)
-DS4_SERVICE_LABEL = "com.dsv4.server"
-DS4_DESIRED_FILE = Path.home() / ".dsv4" / "desired-model"
-DS4_SWITCH_TIMEOUT = 600
 DS4_CACHE_TTL = 5.0
 DS4_SUPPORTED_PARAMETERS = [
     "tools",
@@ -157,8 +138,6 @@ MAINTENANCE = MAINTENANCE_FILE.exists()
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
-DS4_LAST_REQUEST_AT = 0.0
-DS4_IDLE_TASK = None
 
 
 # Localhost-only proxy key: env override, then the gitignored .proxy-key next to this file.
@@ -210,113 +189,14 @@ MODEL_BACKENDS = dict(STATIC_MODEL_BACKENDS)
 FLASH_ACTIVE = {}
 
 
-class CheckedReservation:
-    """CPU-only checked-core continuation. No HTTP/client data can supply an ack.
-
-    The engine adapters must establish the host facts in HOST_CONTRACT before
-    wiring any action to hardware. Until then this record is deliberately not
-    adoptable by live traffic. Effects are never inferred from core state.
-    """
-
-    MAX_NAT = 281474976410654
-
-    def __init__(self, owner, journal):
-        if len(owner) != 4 or owner[0] not in (0, 1) or any(
-            type(n) is not int or not 0 <= n <= self.MAX_NAT for n in owner
-        ):
-            raise ValueError("invalid owner binding")
-        if hashlib.sha256(COORDINATOR.read_bytes()).hexdigest() != COORDINATOR_SHA256:
-            raise RuntimeError("unqualified coordinator binary")
-        self.owner = "/".join(map(str, owner))
-        self.journal = Path(journal)
-        self.state = None
-        self.version = 0
-        self.blocked = None
-        self.dispatched = set()
-        self.calls = {}
-        self.returned = set()
-        self.lifecycle = "active"
-        self.apply(None)
-
-    def apply(self, event, effect_id=None):
-        """Serialize externally; an effect ID must remain unique across retries.
-
-        Events are internal, constructed only from identity-bound host evidence.
-        A bad CLI reply freezes this record; it cannot reset/re-begin ownership.
-        """
-        if self.blocked:
-            raise RuntimeError(f"reservation blocked: {self.blocked}")
-        if event is not None:
-            fields = event.split("/")
-            if len(event) > 4096 or not fields or any(
-                not f.isascii() or not f.isdecimal() or int(f) > self.MAX_NAT for f in fields
-            ):
-                raise ValueError("invalid private coordinator event")
-        args = [self.owner] if event is None and self.state is None else [self.state, event]
-        try:
-            new_call = int(event.split("/")[1]) if event and event.startswith("0/") else None
-            if new_call is not None and new_call in self.calls:
-                raise ValueError("duplicate accepted call")
-            result = subprocess.run([str(COORDINATOR), "--gpu", "off", *args],
-                                    capture_output=True, check=True, timeout=5)
-            text = result.stdout.decode("ascii")
-            if result.stderr or not text.endswith("\n") or text.count("\n") != 1:
-                raise ValueError("invalid coordinator framing")
-            parts = text[:-1].split(" ")
-            if len(parts) != 3 or parts[0] != "OK":
-                raise ValueError("invalid coordinator reply")
-            state, action = parts[1:]
-            for field in (state, action):
-                if len(field) > 4096 or not field or any(
-                    not f.isascii() or not f.isdecimal() or int(f) > self.MAX_NAT
-                    for f in field.split("/")
-                ):
-                    raise ValueError("invalid coordinator fields")
-            if not state.startswith(self.owner + "/") or action.split("/")[0] not in map(str, range(9)):
-                raise ValueError("foreign coordinator reply")
-            if effect_id is not None and effect_id in self.dispatched:
-                raise ValueError("reused physical effect")
-            action_fields = list(map(int, action.split("/")))
-            returned = action_fields[6:] if action_fields[0] == 7 else (
-                action_fields[1:] if action_fields[0] == 8 else []
-            )
-            if action_fields[0] == 7 and action_fields[1:5] != list(map(int, self.owner.split("/"))):
-                raise ValueError("foreign closed owner")
-            if any(call not in self.calls and call != new_call or call in self.returned for call in returned):
-                raise ValueError("foreign or reused returned call")
-            with self.journal.open("a") as output:
-                output.write(json.dumps({"version": self.version, "input": args,
-                                         "state": state, "action": action, "effect": effect_id}) + "\n")
-                output.flush()
-                os.fsync(output.fileno())
-            self.state, self.version = state, self.version + 1
-            if new_call is not None:
-                self.calls[new_call] = "accepted"
-            for call in returned:
-                self.calls[call] = "returned"
-                self.returned.add(call)
-            if effect_id is not None:
-                self.dispatched.add(effect_id)
-            if action.startswith("7/"):
-                self.lifecycle = "retiring"  # Closed is not physical release.
-            if action.startswith("6/"):
-                self.lifecycle = "blocked"
-            return action
-        except Exception as exc:
-            self.blocked = f"checked core/journal unavailable: {exc!r}"
-            self.lifecycle = "blocked"
-            raise
-
-
-def reservation_unavailable(request, backend_name):
-    """No qualified physical owner/borrower mapping exists on this build."""
-    if RESERVATION_TRIAL and (DUAL_MODELS or backend_name in ("ds4", "mlx")):
-        request_id = request.headers.get("X-Pi-Request-Id") or str(uuid.uuid4())
-        raise web.HTTPServiceUnavailable(
-            text=json.dumps({"admitted": False, "request_id": request_id,
-                             "reason": "native_reservation_adapter_unavailable"}),
-            content_type="application/json",
-        )
+def reservation_unavailable(request):
+    """Reject routes without a managed native adapter."""
+    request_id = request.headers.get("X-Pi-Request-Id") or str(uuid.uuid4())
+    raise web.HTTPServiceUnavailable(
+        text=json.dumps({"admitted": False, "request_id": request_id,
+                         "reason": "native_reservation_adapter_unavailable"}),
+        content_type="application/json",
+    )
 
 
 async def fetch_backend_models(sess, backend_name):
@@ -629,27 +509,7 @@ def build_flash_admin_models():
     return models
 
 
-# ── Memory cop: pre-emptive unload coordination ─────────────────────────────
-
-
-async def _mlx_launchctl(*args, timeout=15):
-    proc = await asyncio.create_subprocess_exec(
-        "/bin/launchctl", *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    return proc.returncode, (stdout or b"") + (stderr or b"")
-
-
-def _mlx_unavailable(message):
-    return web.HTTPServiceUnavailable(
-        text=json.dumps({"error": {
-            "type": "mlx_unavailable",
-            "message": f"{message}; no fallback or automatic restore was attempted.",
-        }}),
-        content_type="application/json",
-    )
+# ── Backend identity helpers ───────────────────────────────────────────────
 
 
 def mlx_model_path(model_id):
@@ -662,304 +522,7 @@ def mlx_model_path(model_id):
     return str((Path.home() / MLX_MODEL_PATHS[model_id]).resolve())
 
 
-def _write_mlx_desired_sync(path):
-    # Atomic publication: the wrapper either sees the old path or the new one.
-    MLX_DESIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MLX_DESIRED_FILE.with_name("desired-model.tmp")
-    tmp.write_text(path + "\n")
-    tmp.replace(MLX_DESIRED_FILE)
-
-
-async def mlx_resident_model():
-    """Model ID whose checkpoint the loaded job reports, or None.
-
-    mlx-lm lists the resolved --model path among /v1/models ids, which is the
-    only residency signal it offers (it has no admin API).
-    """
-    try:
-        async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
-            async with sess.get(
-                f"{BACKENDS['mlx']['v1']}/models", headers=AUTH_HEADERS,
-            ) as r:
-                if r.status != 200:
-                    return None
-                ids = {m.get("id") for m in (await r.json()).get("data", [])}
-    except Exception:
-        return None
-    for model_id in MLX_MODEL_IDS:
-        if mlx_model_path(model_id) in ids:
-            return model_id
-    return None
-
-
-async def mlx_service_loaded():
-    code, _ = await _mlx_launchctl("print", f"gui/{os.getuid()}/{MLX_SERVICE_LABEL}")
-    return code == 0
-
-
-async def stop_mlx():
-    """Free the whole mlx-lm footprint by booting its job out. Idempotent."""
-    global MLX_LAST_REQUEST_AT
-    label = f"gui/{os.getuid()}/{MLX_SERVICE_LABEL}"
-    if not await mlx_service_loaded():
-        return
-    log.info("stopping mlx-lm")
-    try:
-        async with asyncio.timeout(90):
-            code, out = await _mlx_launchctl("bootout", label)
-            if code != 0 and b"Could not find service" not in out:
-                raise RuntimeError(f"launchctl bootout: {out.decode()[:200]}")
-            # The Metal footprint is only gone once launchd reports the job gone.
-            while await mlx_service_loaded():
-                await asyncio.sleep(0.25)
-    except Exception as e:
-        raise _mlx_unavailable(f"mlx-lm shutdown failed: {e!r}") from e
-    MLX_LAST_REQUEST_AT = 0.0
-
-
-async def start_mlx():
-    uid = os.getuid()
-    plist = str(Path.home() / "Library" / "LaunchAgents" / f"{MLX_SERVICE_LABEL}.plist")
-    label = f"gui/{uid}/{MLX_SERVICE_LABEL}"
-    log.info("starting mlx-lm")
-    try:
-        # The job runs with RunAtLoad=false so no activation or login can load a
-        # checkpoint beside ds4; bootstrap only registers it, so kick it off.
-        code, out = await _mlx_launchctl("bootstrap", f"gui/{uid}", plist)
-        if code != 0 and b"already bootstrapped" not in out:
-            raise RuntimeError(f"launchctl bootstrap: {out.decode()[:200]}")
-        code, out = await _mlx_launchctl("kickstart", label)
-        if code != 0:
-            raise RuntimeError(f"launchctl kickstart: {out.decode()[:200]}")
-        deadline = time.monotonic() + MLX_START_TIMEOUT
-        while time.monotonic() < deadline:
-            if await mlx_resident_model() is not None:
-                log.info("mlx-lm backend ready")
-                return
-            await asyncio.sleep(1)
-        raise RuntimeError(f"mlx-lm served no known checkpoint within {MLX_START_TIMEOUT}s")
-    except Exception as e:
-        raise _mlx_unavailable(f"failed to start mlx-lm: {e!r}") from e
-
-
-async def ensure_mlx_model(model_id):
-    """Called under the admission gate: make model_id the one resident checkpoint.
-
-    The checked swap policy decides reuse / stop-then-start / refuse; the host
-    proves identity, service exit and readiness.
-    """
-    global MLX_LAST_REQUEST_AT
-    resident, mlx_unproven = await refresh_swap_residency()
-    if mlx_unproven:
-        raise _mlx_unavailable("mlx lane is occupied/unproven; no MLX admission was attempted")
-    action, target = swap_policy.SWAP.admit(model_id, qualified=model_id in MLX_MODEL_IDS)
-    if action == "reuse":
-        if await mlx_resident_model() == model_id:
-            MLX_LAST_REQUEST_AT = time.monotonic()
-            return
-        swap_policy.SWAP.adopt_unknown()
-        raise _mlx_unavailable(f"mlx reports no ready {model_id!r} after an identity match; no repair was attempted")
-    if action not in ("stop", "start"):
-        raise _mlx_unavailable(f"swap policy refused {model_id!r} ({action}); resident {resident!r} retained")
-    if action == "stop":
-        try:
-            if target in MLX_MODEL_IDS:
-                await stop_mlx()
-            else:
-                await unload_ds4_if_idle("mlx")
-        except BaseException:
-            try:
-                swap_policy.SWAP.stop_unknown()
-            except swap_policy.SwapPolicyError as exc:
-                log.warning(f"swap policy blocked after stop failure: {exc}")
-            raise
-        swap_policy.SWAP.stop_done()
-    try:
-        await asyncio.to_thread(_write_mlx_desired_sync, mlx_model_path(model_id))
-        await start_mlx()
-        resident_now = await mlx_resident_model()
-        if resident_now != model_id:
-            raise _mlx_unavailable(f"mlx-lm reports {resident_now!r} instead of {model_id!r}")
-    except BaseException:
-        try:
-            swap_policy.SWAP.start_unknown()
-        except swap_policy.SwapPolicyError as exc:
-            log.warning(f"swap policy blocked after start failure: {exc}")
-        raise
-    swap_policy.SWAP.start_ready()
-    MLX_LAST_REQUEST_AT = time.monotonic()
-
-
-async def mlx_idle_check_loop():
-    global MLX_LAST_REQUEST_AT
-    while True:
-        await asyncio.sleep(30)
-        try:
-            if ACTIVE_REQUESTS > 0 or live_chat_owner():
-                continue
-            now = time.monotonic()
-            if MLX_LAST_REQUEST_AT == 0.0:
-                if await mlx_resident_model() is not None:
-                    MLX_LAST_REQUEST_AT = now
-                continue
-            if now - MLX_LAST_REQUEST_AT < MLX_IDLE_TIMEOUT:
-                continue
-            # Same shared admission lock as ds4 switching: no lifecycle action can
-            # overlap an admitted request on either backend.
-            async with DS4_SWITCH_LOCK:
-                if ACTIVE_REQUESTS > 0 or live_chat_owner():
-                    MLX_LAST_REQUEST_AT = time.monotonic()
-                    continue
-                if await mlx_resident_model() is None:
-                    MLX_LAST_REQUEST_AT = 0.0
-                    continue
-                log.info(f"mlx-lm idle {now - MLX_LAST_REQUEST_AT:.0f}s; policy check")
-                resident, mlx_unproven = await refresh_swap_residency()
-                if mlx_unproven:
-                    continue  # foreign/unproven mlx listener: never release or adopt it
-                action, _target = swap_policy.SWAP.idle_tick(
-                    int((time.monotonic() - MLX_LAST_REQUEST_AT) * 1000),
-                    MLX_IDLE_TIMEOUT * 1000, False)
-                if action != "unload":
-                    continue  # Keep: sticky StartLux, unknown identity or active owner
-                await stop_mlx()
-                swap_policy.SWAP.release_done()
-        except Exception as e:
-            log.warning(f"mlx idle loop: {e}")
-
-
-async def stop_dsv4():
-    uid = os.getuid()
-    label = f"gui/{uid}/{DS4_SERVICE_LABEL}"
-    log.info("stopping dsv4")
-    try:
-        async with asyncio.timeout(90):
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/launchctl", "bootout", label,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0 and b"Could not find service" not in stderr:
-                raise RuntimeError(f"launchctl bootout: {stderr.decode()[:200]}")
-            # Process exit can precede launchd removing the old service. Starting
-            # then can address that dying registration instead of a new job.
-            while True:
-                proc = await asyncio.create_subprocess_exec(
-                    "/bin/launchctl", "print", label,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-                if proc.returncode != 0:
-                    if b"Could not find service" not in stderr:
-                        raise RuntimeError(f"launchctl print: {stderr.decode()[:200]}")
-                    if await detect_ds4_loaded_model(refresh=True) is None:
-                        break
-                await asyncio.sleep(0.25)
-    except Exception as e:
-        raise web.HTTPServiceUnavailable(text=f"DS4 shutdown failed; no replacement started: {str(e) or type(e).__name__}") from e
-    global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
-    DS4_LOADED_MODEL_ID = None
-    DS4_LOADED_CHECK_AT = 0.0
-
-
-async def start_dsv4():
-    uid = os.getuid()
-    plist = str(Path.home() / "Library" / "LaunchAgents" / "com.dsv4.server.plist")
-    label = f"gui/{uid}/{DS4_SERVICE_LABEL}"
-    log.info("starting dsv4")
-
-    for attempt in range(2):
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/launchctl", "bootstrap", f"gui/{uid}", plist,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode != 0:
-                err = (stderr or stdout).decode()[:300]
-                log.warning(f"launchctl bootstrap note: {err}")
-            proc2 = await asyncio.create_subprocess_exec(
-                "/bin/launchctl", "kickstart", label,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=15)
-            if proc2.returncode != 0:
-                err2 = (stderr2 or stdout2).decode()[:300]
-                log.warning(f"launchctl kickstart: {err2}")
-        except Exception as e:
-            log.warning(f"start_dsv4 error: {e}")
-
-        # Verify the service actually exists in launchd (race: bootout between
-        # idle stop and this start can leave no service loaded).
-        try:
-            proc3 = await asyncio.create_subprocess_exec(
-                "/bin/launchctl", "print", label,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout3, stderr3 = await asyncio.wait_for(proc3.communicate(), timeout=10)
-            if proc3.returncode == 0:
-                return  # service is loaded
-            log.warning(f"dsv4 not loaded after attempt {attempt+1}, retrying")
-        except Exception as e:
-            log.warning(f"dsv4 verify error: {e}")
-
-        if attempt == 0:
-            await asyncio.sleep(1)
-
-    log.error("dsv4 failed to load after 2 attempts")
-    raise web.HTTPServiceUnavailable(text="DS4 launch failed after 2 attempts; no fallback was attempted")
-
-
-async def ds4_idle_check_loop():
-    global DS4_LAST_REQUEST_AT
-    while True:
-        await asyncio.sleep(30)
-        try:
-            now = time.monotonic()
-            if DS4_ACTIVE_REQUESTS > 0 or live_chat_owner():
-                continue
-            if DS4_LAST_REQUEST_AT == 0.0:
-                if await detect_ds4_loaded_model(refresh=True) is not None:
-                    DS4_LAST_REQUEST_AT = now
-                continue
-            if now - DS4_LAST_REQUEST_AT < DS4_IDLE_TIMEOUT:
-                continue
-            loaded = await detect_ds4_loaded_model(refresh=True)
-            if loaded is None:
-                DS4_LAST_REQUEST_AT = 0.0
-                continue
-            if await ds4_is_busy():
-                DS4_LAST_REQUEST_AT = now
-                continue
-            log.info(f"dsv4 idle {now - DS4_LAST_REQUEST_AT:.0f}s; stopping")
-            async with DS4_SWITCH_LOCK:
-                loaded2 = await detect_ds4_loaded_model(refresh=True)
-                if loaded2 is None:
-                    continue
-                if DS4_ACTIVE_REQUESTS > 0 or live_chat_owner() or await ds4_is_busy():
-                    DS4_LAST_REQUEST_AT = time.monotonic()
-                    continue
-                if time.monotonic() - DS4_LAST_REQUEST_AT < DS4_IDLE_TIMEOUT:
-                    continue
-                await refresh_swap_residency()
-                action, _target = swap_policy.SWAP.idle_tick(
-                    int((time.monotonic() - DS4_LAST_REQUEST_AT) * 1000),
-                    DS4_IDLE_TIMEOUT * 1000, False)
-                if action != "unload":
-                    continue  # Keep: sticky StartLux, unknown identity or active owner
-                await stop_dsv4()
-                swap_policy.SWAP.release_done()
-                DS4_LAST_REQUEST_AT = 0.0
-        except Exception as e:
-            log.warning(f"idle loop: {e}")
-
-
-# ── DS4 model switching ──────────────────────────────────────────────────────
+# ── Model metadata and residency telemetry ──────────────────────────────────
 
 
 def mlx_static_model(model_id, cfg):
@@ -998,27 +561,6 @@ def ds4_static_model(model_id):
         },
         "supported_parameters": DS4_SUPPORTED_PARAMETERS,
     }
-
-
-def _model_id_from_mode(value):
-    value = (value or "").strip()
-    if value in ("flash", DS4_FLASH_MODEL_ID):
-        return DS4_FLASH_MODEL_ID
-    if value in ("pro", DS4_PRO_MODEL_ID):
-        return DS4_PRO_MODEL_ID
-    if value in ("glm", GLM_FLASH_MODEL_ID):
-        return GLM_FLASH_MODEL_ID
-    if value in ("qwen", QWEN_NEXT_MODEL_ID):
-        return QWEN_NEXT_MODEL_ID
-    return None
-
-
-def _mode_from_model_id(model_id):
-    return {
-        GLM_FLASH_MODEL_ID: "glm",
-        QWEN_NEXT_MODEL_ID: "qwen",
-        DS41_MODEL_ID: "ds41",
-    }[model_id]
 
 
 def _detect_ds4_loaded_model_sync():
@@ -1074,213 +616,11 @@ async def detect_ds4_loaded_model(refresh=False):
     return model_id
 
 
-def _write_ds4_desired_model_sync(model_id):
-    DS4_DESIRED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DS4_DESIRED_FILE.write_text(f"{model_id}\n")
-
-
-async def ds4_v1_ready():
-    try:
-        async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
-            async with sess.get(f"{BACKENDS['ds4']['v1']}/models", headers=AUTH_HEADERS) as r:
-                return r.status == 200
-    except Exception:
-        return False
-
-
-async def ds4_is_busy():
-    try:
-        async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
-            async with sess.get(f"{BACKENDS['ds4']['admin']}/api/stats", headers=AUTH_HEADERS) as r:
-                if r.status != 200:
-                    return True  # Unknown activity is not permission to stop.
-                data = await r.json()
-        models = data["active_models"]["models"]
-        if not isinstance(models, list):
-            return True
-    except Exception:
-        return True
-
-    for model in models:
-        if model.get("prefilling") or model.get("generating"):
-            return True
-    return False
-
-
-async def wait_for_ds4_model(model_id):
-    deadline = time.monotonic() + DS4_SWITCH_TIMEOUT
-    while time.monotonic() < deadline:
-        loaded = await detect_ds4_loaded_model(refresh=True)
-        if loaded == model_id and await ds4_v1_ready():
-            return True
-        await asyncio.sleep(1)
-    return False
-
-
-async def wait_for_ds4_idle():
-    # Also account for work left running after a client disconnect or proxy restart.
-    while await detect_ds4_loaded_model(refresh=True) is not None and await ds4_is_busy():
-        await asyncio.sleep(1)
-
-
-# Models whose lifecycle this proxy owns and whose swaps the checked policy
-# decides. tunnel/flash-moe backends are external and stay host-side.
-DS4_SWAP_MODELS = DS4_MODEL_IDS | {GLM_FLASH_MODEL_ID}
-
-
-async def refresh_swap_residency():
-    """Host-side identity composition for the checked swap policy.
-
-    Loaded-model identity, service state and readiness are foreign observations
-    the policy cannot prove. `mlx_unproven` is a host guard fact: the managed
-    mlx job is absent (or its checkpoint identity is unproven) while its
-    proxy-owned port is occupied, so a listener that is not the managed job may
-    be a foreign engine. The policy still models proxy-owned engines only; the
-    guard makes transitions fail closed while exclusivity is unproven.
-
-    Returns (resident_model_id_or_None, mlx_unproven).
-    """
-    try:
-        if await asyncio.to_thread(STARTLUX.probe):
-            # The ordinary path has no native StartLux adapter. Never adopt
-            # it as empty and start a second engine after a proxy restart.
-            swap_policy.SWAP.adopt_unknown()
-            return None, True
-    except Exception as exc:
-        log.warning(f"swap residency: StartLux identity unproven: {exc}")
-        swap_policy.SWAP.adopt_unknown()
-        return None, True
-    try:
-        ds4 = await detect_ds4_loaded_model(refresh=True)
-    except Exception as exc:
-        log.warning(f"swap residency: ds4 identity unproven: {exc}")
-        ds4 = "unknown"
-    mlx = None
-    mlx_unproven = False
-    try:
-        if await mlx_service_loaded():
-            mlx = await mlx_resident_model()
-            if mlx is None:
-                mlx_unproven = True
-        elif await asyncio.to_thread(swap_policy.port_listening, MLX_PORT):
-            # The managed job is not loaded but its port is occupied: the
-            # listener is foreign/unproven. Listening is not native-quiescence
-            # evidence; it only proves the lane is not proven empty.
-            mlx_unproven = True
-    except Exception as exc:
-        log.warning(f"swap residency: mlx identity unproven: {exc}")
-        mlx_unproven = True
-    if ds4 == "unknown":
-        swap_policy.SWAP.adopt_unknown()
-        return None, True
-    if mlx is None:
-        if mlx_unproven:
-            if ds4 is None:
-                swap_policy.SWAP.adopt_unknown()
-                return None, True
-            swap_policy.SWAP.adopt(ds4)
-            return ds4, True
-        if ds4 is None:
-            swap_policy.SWAP.adopt_empty()
-            return None, False
-        swap_policy.SWAP.adopt(ds4)
-        return ds4, False
-    if ds4 is None:
-        swap_policy.SWAP.adopt(mlx)
-        return mlx, False
-    # One engine at a time; two proven residents is a contradiction.
-    swap_policy.SWAP.adopt_unknown()
-    return None, False
-
-
-async def ensure_ds4_model(model_id):
-    """Called with REQUEST_CONDITION held and no admitted requests.
-
-    The checked swap policy decides reuse / stop-then-start / refuse; this host
-    proves native quiescence and service exit, executes the physical effects and
-    reports the receipts back to the policy.
-    """
-    resident, mlx_unproven = await refresh_swap_residency()
-    if mlx_unproven and resident != model_id:
-        raise web.HTTPServiceUnavailable(
-            text=json.dumps({"error": {
-                "message": f"mlx lane is occupied/unproven; no {model_id} transition while exclusivity is unproven.",
-                "type": "swap_lane_unproven",
-            }}),
-            content_type="application/json",
-        )
-    action, target = swap_policy.SWAP.admit(model_id, qualified=model_id in DS4_SWAP_MODELS)
-    if action == "reuse":
-        if await ds4_v1_ready():
-            await wait_for_ds4_idle()  # same-model reuse still waits for foreign decode
-            return
-        swap_policy.SWAP.adopt_unknown()
-        raise web.HTTPServiceUnavailable(
-            text=json.dumps({"error": {
-                "message": f"{model_id} identity matches but backend readiness is unproven; no repair was attempted.",
-                "type": "model_switch_unready",
-            }}),
-            content_type="application/json",
-        )
-    if action not in ("stop", "start"):
-        raise web.HTTPServiceUnavailable(
-            text=json.dumps({"error": {
-                "message": f"swap policy refused {model_id} ({action}); resident {resident!r} retained.",
-                "type": "model_switch_refused",
-            }}),
-            content_type="application/json",
-        )
-    mode = _mode_from_model_id(model_id)
-    if action == "stop":
-        try:
-            await wait_for_ds4_idle()  # native quiescence: host fact, not policy state
-            if target in MLX_MODEL_IDS:
-                await stop_mlx()
-            else:
-                await stop_dsv4()
-        except BaseException:
-            try:
-                swap_policy.SWAP.stop_unknown()
-            except swap_policy.SwapPolicyError as exc:
-                log.warning(f"swap policy blocked after stop failure: {exc}")
-            raise
-        swap_policy.SWAP.stop_done()
-    try:
-        log.info(f"switching ds4 backend to {model_id}")
-        await asyncio.to_thread(_write_ds4_desired_model_sync, mode)
-        await start_dsv4()
-        if not await wait_for_ds4_model(model_id):
-            raise web.HTTPServiceUnavailable(
-                text=json.dumps({"error": {
-                    "message": f"Failed to load {model_id} ({mode}); no fallback or automatic restore was attempted.",
-                    "type": "model_switch_timeout",
-                }}),
-                content_type="application/json",
-            )
-    except BaseException:
-        try:
-            swap_policy.SWAP.start_unknown()
-        except swap_policy.SwapPolicyError as exc:
-            log.warning(f"swap policy blocked after start failure: {exc}")
-        raise
-    swap_policy.SWAP.start_ready()
-    log.info(f"ds4 backend ready: {model_id}")
-
-
 def client_disconnected(request):
     if request is None:
         return False
     transport = request.transport
     return transport is None or transport.is_closing()
-
-
-# Cancel means cancel. Measured 2026-09-22 on the live ds4 engine: closing the
-# upstream connection aborts decode in the same second
-# (`request aborted; restoring clean abort checkpoint ... reason="cancelled
-# during generation"`), so a cancelled request stops working instead of draining
-# to EOF. The queue still never overlaps: the successor waits until the engine
-# is proven idle below. Backends with no verified abort path keep draining.
-ABORT_CONFIRMED_BACKENDS = {"ds4"}
 
 
 def live_chat_owner():
@@ -1312,7 +652,7 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
     if MAINTENANCE:
         raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
     if request is not None and not managed:
-        reservation_unavailable(request, backend_name)
+        reservation_unavailable(request)
     check_inference_certainty()
     if request is not None and request.headers.get("X-Pi-Origin") == "vega-rewriter" and (
         ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or DS4_SWITCH_LOCK.locked()
@@ -1364,15 +704,10 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                 engine = await INDEPENDENT_SWITCH.prepare_startlux()
                 DS4_LOADED_MODEL_ID = None
             elif managed:
-                # Switch/verify/rebind while no main is admitted and the same
-                # condition still excludes every queued request and idle task.
-                engine = await reservation_body.prepare_main(model_id)
+                # The manager reuses its process binding; admission remains serialized.
+                engine = await INDEPENDENT_SWITCH.prepare(model_id)
                 DS4_LOADED_MODEL_ID = model_id if backend_name == 'ds4' else None
                 DS4_LOADED_CHECK_AT = time.monotonic()
-            elif backend_name == "ds4":
-                await ensure_ds4_model(model_id)
-            else:
-                await prepare_non_ds4_backend(backend_name, model_id)
             if client_disconnected(request):
                 raise ConnectionResetError("client disconnected while queued")
             REQUEST_QUEUE.remove(ticket)
@@ -1389,8 +724,8 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                 DS4_ACTIVE_REQUESTS += 1
             return engine
     except BaseException:
-        if engine is not None and reservation_body.MANAGED_ENGINE_RELEASER:
-            reservation_body.MANAGED_ENGINE_RELEASER()
+        if engine is not None:
+            INDEPENDENT_SWITCH.release()
         if ticket in REQUEST_QUEUE:
             REQUEST_QUEUE.remove(ticket)
         if CHAT_OWNER and CHAT_OWNER["chat_id"] == chat_id:
@@ -1405,89 +740,8 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
         raise
 
 
-async def begin_independent_kev(request):
-    """Borrow the ordinary seat without switching/evicting the idle main model."""
-    global ACTIVE_TICKET, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_MODEL_ID
-    if not DUAL_MODELS or INDEPENDENT_SWITCH is None:
-        raise RuntimeError('native_independent_adapter_unavailable')
-    check_inference_certainty()
-    if ACTIVE_REQUESTS and (not ACTIVE_TICKET or not ACTIVE_TICKET.get('independent')) and reservation_body.LIVE is None:
-        raise RuntimeError('main_native_binding_pending_or_unsupported_owner')
-    ticket = dict(chat_id=None, request_id=str(uuid.uuid4()), backend='ds4',
-                  managed=True, independent=True, identity=object())
-    REQUEST_QUEUE.append(ticket)
-    manager = INDEPENDENT_SWITCH
-    try:
-        async with REQUEST_CONDITION:
-            while ACTIVE_REQUESTS or admission_order()[0] is not ticket:
-                check_inference_certainty()
-                if reservation_body.LIVE is not None:
-                    return None  # take the existing checked pause path instead
-                if client_disconnected(request):
-                    raise ConnectionResetError('borrower_client_disconnected')
-                try:
-                    await asyncio.wait_for(REQUEST_CONDITION.wait(), .1)
-                except asyncio.TimeoutError:
-                    pass
-            if reservation_body.LIVE is not None:
-                return None
-            if client_disconnected(request):
-                raise ConnectionResetError('borrower_client_disconnected')
-            # A running MLX job can submit without this DS4 terminal gate.
-            code, output = await _mlx_launchctl('print', f'gui/{os.getuid()}/{MLX_SERVICE_LABEL}')
-            lines = [line.strip() for line in output.splitlines()]
-            if code == 0 and (any(line.startswith(b'pid = ') for line in lines) or
-                              b'state = waiting' not in lines):
-                raise RuntimeError('mlx_native_gate_not_qualified_for_independent_kev')
-            if code != 0 and b'Could not find service' not in output:
-                raise RuntimeError('mlx_process_state_unknown')
-            if manager.blocked:
-                raise RuntimeError('managed_native_owner_blocked')
-            # ponytail: lease wait holds the admission lock for up to 90s; split it if contention matters.
-            await asyncio.wait_for(manager.acquire(), 90)
-            try:
-                manager.adopt()  # existing pinned Qwen/V4.1 only; never start/switch a model
-                engine = manager.engine
-                if getattr(engine, 'terminal_only', False):
-                    raise RuntimeError('terminal_only_main_cannot_borrow')
-                if hashlib.sha256(engine.core.read_bytes()).hexdigest() != COORDINATOR_SHA256:
-                    raise RuntimeError('unqualified coordinator binary')
-            except BaseException:
-                manager.release()  # no native control issued yet
-                raise
-            ACTIVE_TICKET = ticket
-            ACTIVE_REQUESTS = 1
-            DS4_ACTIVE_REQUESTS += 1
-            ACTIVE_MODEL_ID = manager.model
-            try:
-                # This native close/status proves idle ownership, not HTTP-idle telemetry.
-                await engine.terminal()
-            except BaseException as exc:
-                ticket['uncertain'] = True
-                manager.blocked = repr(exc)
-                REQUEST_CONDITION.notify_all()
-                raise
-            return engine
-    finally:
-        if ticket in REQUEST_QUEUE:
-            REQUEST_QUEUE.remove(ticket)
-
-
-async def finish_independent_kev(engine, stopped):
-    if not stopped:
-        await finish_request('ds4', uncertain=True)
-        return False  # native borrower stop unknown: keep seat, closed terminal and lease
-    try:
-        await engine.release_terminal()
-    except BaseException:
-        await finish_request('ds4', uncertain=True)
-        raise
-    await finish_request('ds4')
-    return True
-
-
 async def finish_request(backend_name, uncertain=False, release_chat=False):
-    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, DS4_LAST_REQUEST_AT, MLX_LAST_REQUEST_AT, ACTIVE_TICKET, CHAT_OWNER
+    global ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_TICKET, CHAT_OWNER
     async with REQUEST_CONDITION:
         if uncertain:
             # ponytail: no portable backend completion API. Retain the owner on
@@ -1495,41 +749,17 @@ async def finish_request(backend_name, uncertain=False, release_chat=False):
             ACTIVE_TICKET["uncertain"] = True
             REQUEST_CONDITION.notify_all()
             return
-        if ACTIVE_TICKET.get('managed') and reservation_body.MANAGED_ENGINE_RELEASER:
-            reservation_body.MANAGED_ENGINE_RELEASER()
+        if ACTIVE_TICKET.get('managed'):
+            INDEPENDENT_SWITCH.release()
         ACTIVE_REQUESTS -= 1
         if CHAT_OWNER:
-            if not ACTIVE_TICKET.get('independent'):
-                CHAT_OWNER["last_request_at"] = time.monotonic()
+            CHAT_OWNER["last_request_at"] = time.monotonic()
             if release_chat or CHAT_OWNER.get("release_pending"):
                 CHAT_OWNER = None
         ACTIVE_TICKET = None
         if backend_name == "ds4":
             DS4_ACTIVE_REQUESTS -= 1
-            DS4_LAST_REQUEST_AT = time.monotonic()
-        elif backend_name == 'mlx':
-            MLX_LAST_REQUEST_AT = time.monotonic()
         REQUEST_CONDITION.notify_all()
-
-
-async def unload_ds4_if_idle(reason):
-    await wait_for_ds4_idle()
-    if await detect_ds4_loaded_model(refresh=True) is not None:
-        log.info(f"unloading dsv4 before {reason} request")
-        await stop_dsv4()
-
-
-async def prepare_non_ds4_backend(backend_name, model_id):
-    if backend_name == "mlx":
-        # Policy-owned swap: any DS4 eviction is the policy's Stop directive.
-        await ensure_mlx_model(model_id)
-    else:
-        # External backends have no checked StartLux handoff. Refuse rather than
-        # overlap an unmanaged request with its resident Metal process.
-        if await asyncio.to_thread(STARTLUX.probe):
-            raise web.HTTPServiceUnavailable(text='StartLux resident; external backend handoff unqualified')
-        await unload_ds4_if_idle(backend_name)
-        await stop_mlx()
 
 
 # ── /v1/models (merge) ───────────────────────────────────────────────────────
@@ -1584,11 +814,6 @@ async def handle_models(request):
 
 # ── /v1/chat/completions (route by model) ───────────────────────────────────
 
-def mark_reservation_blocked():
-    if ACTIVE_TICKET:
-        ACTIVE_TICKET['uncertain'] = True
-
-
 async def handle_chat(request):
     """Route /v1/chat/completions to the right backend, streaming passthrough."""
     global DS4_ACTIVE_REQUESTS
@@ -1601,21 +826,14 @@ async def handle_chat(request):
         is_stream = bool(payload.get("stream", False))
 
     backend_name = get_backend_name(model_id)
-    if model_id == GLM_FLASH_MODEL_ID and (
-        not RESERVATION_TRIAL or not DUAL_MODELS or model_id not in DS4_MODEL_IDS
-    ):
+    if model_id == GLM_FLASH_MODEL_ID and model_id not in DS4_MODEL_IDS:
         reservation_body.unavailable(request, 'glm_native_model_unqualified')
-    if RESERVATION_TRIAL and backend_name == 'ds4':
+    if backend_name == 'ds4':
         if model_id == GLM_FLASH_MODEL_ID:
-            # GLM deliberately skips the retained-owner coordinator, but its
-            # CPU native-eligibility authority still needs the same build pin.
-            if hashlib.sha256(COORDINATOR.read_bytes()).hexdigest() != COORDINATOR_SHA256:
-                reservation_body.unavailable(request, 'unqualified_coordinator_binary')
             body = normalize_ds4_chat_body(backend_name, body)
         return await reservation_body.handle_main(request, body, backend_name, model_id,
-            CheckedReservation, begin_request, finish_request, REQUEST_CONDITION,
-            BACKENDS[backend_name]['v1'], mark_reservation_blocked)
-    started = forwarded = complete = cancelled = False
+            begin_request, finish_request, BACKENDS[backend_name]['v1'])
+    started = forwarded = complete = False
     try:
         await begin_request(backend_name, model_id, request, managed=backend_name == 'mlx')
         started = True
@@ -1661,16 +879,8 @@ async def handle_chat(request):
                             client_gone = True
                     flash_req_id = flash_start(model_id) if backend_name == "flash_moe" else None
                     flash_buf = ""
-                    abort_on_cancel = backend_name in ABORT_CONFIRMED_BACKENDS
                     try:
                         async for chunk in resp.content.iter_any():
-                            if client_gone and abort_on_cancel:
-                                # Stop forwarding and close upstream now; the engine
-                                # aborts on close. Proven quiescence in the outer
-                                # finally gates the next owner, so requests still
-                                # never share it.
-                                cancelled = True
-                                break
                             if flash_req_id:
                                 flash_buf = flash_observe_chunk(flash_req_id, flash_buf, chunk)
                             if not client_gone:
@@ -1678,9 +888,6 @@ async def handle_chat(request):
                                     await response.write(chunk)
                                 except (ConnectionResetError, ConnectionAbortedError):
                                     client_gone = True
-                                    if abort_on_cancel:
-                                        cancelled = True
-                                        break
                         complete = True
                         if not client_gone:
                             await response.write_eof()
@@ -1688,10 +895,6 @@ async def handle_chat(request):
                         flash_finish(flash_req_id)
                     return response
 
-                if backend_name in ABORT_CONFIRMED_BACKENDS and client_disconnected(request):
-                    # Already cancelled: do not start reading a response nobody wants.
-                    cancelled = True
-                    return web.Response(status=499, text="client cancelled")
                 data = await resp.read()
                 complete = True
                 return web.Response(status=resp.status, body=data, content_type=resp.content_type)
@@ -1708,12 +911,8 @@ async def handle_chat(request):
                 except BaseException:
                     await finish_request(backend_name, uncertain=True)
                     raise
-            if cancelled:
-                # Reuse the same quiescence wait model switching already uses: the
-                # next owner is admitted only once the engine reports it stopped.
-                await wait_for_ds4_idle()
-            await finish_request(backend_name, uncertain=backend_name != 'mlx' and forwarded and not complete and not cancelled,
-                                 release_chat=cancelled or client_disconnected(request))
+            await finish_request(backend_name, uncertain=backend_name != 'mlx' and forwarded and not complete,
+                                 release_chat=client_disconnected(request))
 
 
 async def handle_systemone(request):
@@ -1873,10 +1072,6 @@ async def handle_admin_stats(request):
         "chat_owner": (dict(CHAT_OWNER, held_seconds=time.monotonic() - CHAT_OWNER["held_since"])
                        if live_chat_owner() else None),
     }
-    # Only authenticated, matching request IDs may see retained-owner telemetry.
-    if RESERVATION_TRIAL and request.headers.get('Authorization') == AUTH_HEADERS['Authorization'] and request_id:
-        if detail := reservation_body.status(request_id):
-            merged['reservation'] = detail
     # No correlated poll may display another owner, including a turnover during
     # the backend poll. Uncorrelated admin clients retain the global view.
     if request_id and (state != "active" or owner is not ACTIVE_TICKET):
@@ -1905,54 +1100,17 @@ async def handle_admin_stats(request):
 # ── Catch-all: proxy any other /v1/* request ────────────────────────────────
 
 async def handle_other(request):
-    """Proxy any other /v1/* request to the right backend."""
-    global DS4_ACTIVE_REQUESTS
-    path = request.path[len("/v1"):]
+    """Other /v1/* routes have no managed adapter; never bypass admission."""
     body = await request.read() if request.method in ("POST", "PUT") else None
-
     model_id = ""
     if body:
         payload, err = parse_json_body(body)
         if not err and isinstance(payload, dict):
             model_id = payload.get("model", "")
-    backend_name = get_backend_name(model_id)
+    get_backend_name(model_id)
     if model_id == GLM_FLASH_MODEL_ID:
-        # GLM is prepared only for native terminal-only streaming chat. Never
-        # bypass its adapter through /completions, /responses or the catch-all.
         reservation_body.unavailable(request, 'unsupported_native_reservation_path')
-    started = forwarded = complete = False
-
-    try:
-        await begin_request(backend_name, model_id, request)
-        started = True
-        if body:
-            body = maybe_prepare_flash_body(backend_name, body)
-
-        backend = BACKENDS[backend_name]["v1"]
-        headers = {
-            "Authorization": request.headers.get("Authorization", AUTH_HEADERS["Authorization"]),
-            "Cookie": request.headers.get("Cookie", ""),
-        }
-        if body:
-            headers["Content-Type"] = request.headers.get("Content-Type", "application/json")
-        if request.query_string:
-            path = f"{path}?{request.query_string}"
-
-        async with ClientSession(timeout=CHAT_TIMEOUT) as sess:
-            meth = getattr(sess, request.method.lower())
-            forwarded = True
-            async with meth(f"{backend}{path}", data=body, headers=headers) as resp:
-                data = await resp.read()
-                complete = True
-                return web.Response(status=resp.status, body=data, content_type=resp.content_type)
-    except ConnectionResetError:
-        if not started:
-            return web.Response(status=499, text="client cancelled before admission")
-        raise
-    finally:
-        if started:
-            await finish_request(backend_name, uncertain=forwarded and not complete,
-                                 release_chat=client_disconnected(request))
+    reservation_unavailable(request)
 
 
 async def handle_maintenance(request):
@@ -1960,7 +1118,7 @@ async def handle_maintenance(request):
     if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
         raise web.HTTPUnauthorized()
     async with REQUEST_CONDITION:
-        if ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or reservation_body.LIVE is not None:
+        if ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner():
             raise web.HTTPConflict(text='Local AI is in use; finish the owning chat before maintenance')
         MAINTENANCE = True
         MAINTENANCE_FILE.touch(mode=0o600)
@@ -1990,21 +1148,11 @@ async def handle_resume(request):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    global DS4_LAST_REQUEST_AT, INDEPENDENT_SWITCH
-    if DUAL_MODELS:
-        from managed_switch import ManagedSwitch
-        manager = INDEPENDENT_SWITCH = ManagedSwitch(startlux=STARTLUX, mlx=MLX)
-        reservation_body.MANAGED_ENGINE_PREPARER = manager.prepare
-        reservation_body.MANAGED_ENGINE_RELEASER = manager.release
-        reservation_body.INDEPENDENT_ADMITTER = begin_independent_kev
-        reservation_body.INDEPENDENT_RELEASER = finish_independent_kev
-    if await detect_ds4_loaded_model(refresh=True) is not None:
-        DS4_LAST_REQUEST_AT = time.monotonic()
+    global INDEPENDENT_SWITCH
+    INDEPENDENT_SWITCH = ManagedSwitch(startlux=STARTLUX, mlx=MLX)
+    await detect_ds4_loaded_model(refresh=True)
     await discover_models()
     asyncio.create_task(periodic_discover())
-    if not RESERVATION_TRIAL:
-        asyncio.create_task(ds4_idle_check_loop())
-        asyncio.create_task(mlx_idle_check_loop())
 
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
