@@ -101,7 +101,7 @@ to overlap local engines or to interrupt another owning chat.
 
 The combined desktop gateway lives at `/backend-api/codex`. Its `/models`
 endpoint combines the signed-in user's current OpenAI catalog with managed
-local models.
+local models, Pi's Meta Muse model and Claude Opus on Amazon Bedrock.
 OpenAI inference is forwarded to OpenAI with that user's existing
 ChatGPT credential and account header; credentials and prompts are not stored.
 The local model `deepseek-v4.1-flash-1017-local` routes to the existing
@@ -110,6 +110,61 @@ model identity and native model configuration keep their existing names.
 The other managed menu aliases are `glm-5.3-flash-local` and
 `qwen3.8-flash-next-local`; each routes to the existing canonical ID without
 the `-local` suffix. Existing chats using the canonical IDs still route locally.
+
+`muse-wonder-full-1.0` routes to Meta through `codex_meta.py` and
+`codex_meta.mjs`. The helper imports the configured installed Pi runtime and
+reads the configured agent directory's `models.json`. It uses Pi's
+locked OAuth renewal and the same subscription tool-name compatibility code
+as Pi. A Meta subscription login in Pi is required; this route does not fall
+back to pay-as-you-go credentials. Meta receives its own credential, never
+the incoming ChatGPT token or account header. The integration retains Pi's
+unofficial subscription compatibility boundary.
+
+Muse's context, input modalities and thinking choices come from Pi's model
+definition when the proxy starts. The current choices are `minimal`, `low`,
+`medium`, `high`, `xhigh`, `max`, with `max` as the model's fallback. Thinking
+off is not advertised because Pi marks it unsupported. The desktop's saved
+model selection/default is unchanged.
+
+Machine paths belong in ignored `local/codex-gateway.json`. Copy
+`codex-gateway.example.json` there and supply the Node executable (`node`), Pi
+checkout (`pi_root`), Pi agent directory (`agent_dir`) and Bedrock credential-file
+path (`bedrock_env_file`). The committed example contains placeholders only.
+Use absolute paths, `~/` paths, or paths relative to this repository.
+`CODEX_GATEWAY_CONFIG` can select another configuration file. Environment
+overrides are `CODEX_PI_NODE`, `CODEX_PI_ROOT`, `CODEX_PI_AGENT_DIR` and
+`CODEX_BEDROCK_ENV_FILE`. Node can also be discovered on PATH. No host checkout
+or project credential-file path is built into the adapters.
+
+Meta Responses stream directly through the adapter. Function namespaces are
+restored for Codex; custom text tools use a JSON string argument upstream and
+return their raw text once the call arguments complete. Meta reasoning items
+are marked and replayed intact; foreign encrypted reasoning is omitted while
+its visible text is retained. Text and image inputs, cancellation, tool calls
+and usage use this cloud route without entering the local GPU queue. Hosted
+OpenAI search is omitted in favor of available browser/search functions, just
+as on the local route. Stored response references, schema-constrained final
+output and remote compaction are unavailable; unsupported Meta auxiliary
+operations fail here rather than sending the conversation to OpenAI.
+
+`us.anthropic.claude-opus-5-5` uses Pi's native `amazon-bedrock` provider via
+`codex_bedrock.py` and `codex_bedrock.mjs`. Its helper reads the configured
+`bedrock_env_file` each time it starts, including each model
+request, so the LaunchAgent does not need an interactive shell or exported keys.
+Only the helper process loads its AWS variables; credentials are not copied into tracked code, Codex's
+configuration, or the gateway's parent environment. The file must supply
+`AWS_BEARER_TOKEN_BEDROCK`; its `AWS_REGION` is passed through to Pi.
+
+Bedrock requests select Pi's `cacheRetention: "long"` behavior, matching
+`PI_CACHE_RETENTION=long`. Context, image support and thinking levels come from
+Pi's registered regional model, currently off (`none`), `minimal`, `low`,
+`medium`, `high`, `xhigh`, `max`. The route translates Codex's conversation and
+tools into Pi's provider-neutral context and translates Pi's streamed events
+back into Responses events. Provider-signed thinking is carried back to Codex
+in an opaque, versioned replay envelope; this envelope is transport encoding,
+not gateway encryption. No server-side conversation storage is added. The
+same stored-reference, hosted-search and remote-compaction limitations as the
+Meta route apply. The default model selection is not changed.
 
 For separate local-only clients, the proxy also serves `/v1/responses` and
 `/v1/codex/models`. A `/v1/models` request with Codex's `client_version` query
@@ -169,8 +224,8 @@ maintenance procedure once the owning chat has finished, from an independent
 terminal or Pi session. Both local and OpenAI Codex requests depend on this
 process: a Codex chat cannot stop its own gateway and then continue to repair it.
 Restarting the proxy alone over a retained engine loses its native ownership
-state. Maintenance refuses active local generation; finish cloud gateway requests
-before restarting too, since they use the same process. Disconnected cloud
+state. Finish local work and release conversation ownership before maintenance;
+finish cloud gateway requests before restarting too, since they use the same process. Disconnected cloud
 clients cancel their upstream I/O even before output arrives.
 Do not bypass a refusal with `launchctl bootout`.
 

@@ -25,6 +25,8 @@ from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
 import codex_provider
 import codex_gateway
+import codex_meta
+import codex_bedrock
 from managed_switch import ManagedSwitch, MODELS as MANAGED_MODELS
 from mlx_runtime import MLXRuntime, MODELS as MLX_CHECKPOINTS
 from startlux_runtime import StartLuxRuntime, MODEL_ID as STARTLUX_MODEL_ID, UPSTREAM_ID as STARTLUX_UPSTREAM_ID, PORT as STARTLUX_PORT, CONTEXT as STARTLUX_CONTEXT, WORK_TOKENS as STARTLUX_WORK_TOKENS
@@ -877,7 +879,7 @@ async def route_codex_gateway(request):
     codex_gateway.request_headers(request, PROXY_API_KEY)
     tail = request.match_info['tail']
     if request.method == 'GET' and tail == 'models':
-        models = {'models': codex_models()['models']}
+        models = {'models': codex_models()['models'] + codex_meta.catalog()['models'] + codex_bedrock.catalog()['models']}
         return await codex_gateway.while_connected(request,
             codex_gateway.catalog(request, models, PROXY_API_KEY))
     if request.method == 'GET' and tail == 'responses':
@@ -900,6 +902,12 @@ async def route_codex_gateway(request):
         model = payload.get('model')
         if not isinstance(model, str):
             raise codex_provider.invalid('A model name is required')
+        for provider in (codex_meta, codex_bedrock):
+            if model == provider.MODEL:
+                if tail != 'responses':
+                    raise codex_provider.invalid(
+                        f'{model} does not support /{tail}; the request was not sent to OpenAI')
+                return await codex_gateway.while_connected(request, provider.forward(request, payload))
         canonical = codex_provider.MODEL_ALIASES.get(model, model)
         if model in codex_provider.MODEL_ALIASES or canonical in MANAGED_MODELS or canonical in MODEL_BACKENDS:
             # Auxiliary Responses operations (notably remote compaction) carry
@@ -1255,6 +1263,14 @@ async def main():
     await detect_ds4_loaded_model(refresh=True)
     await discover_models()
     asyncio.create_task(periodic_discover())
+
+    for provider in (codex_meta, codex_bedrock):
+        try:
+            await provider.load_catalog()
+            log.info('Pi cloud model catalog loaded: %s', provider.MODEL)
+        except Exception as exc:
+            # A Pi installation problem must not take OpenAI/local inference down.
+            log.warning('Pi cloud catalog unavailable (%s): %s', provider.MODEL, exc)
 
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)

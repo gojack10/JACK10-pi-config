@@ -1,0 +1,6 @@
+{
+  "node": "/path/to/node",
+  "pi_root": "/path/to/pi-checkout",
+  "agent_dir": "/path/to/pi-agent",
+  "bedrock_env_file": "/path/to/bedrock.env"
+}
