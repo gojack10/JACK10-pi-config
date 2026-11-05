@@ -5,6 +5,7 @@ retains both barriers. Launchd keeps its existing wrapper/model settings.
 import asyncio
 import fcntl
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -20,9 +21,8 @@ from mlx_runtime import MODELS as MLX_MODELS
 
 HOME = Path.home()
 SERVICE = f'gui/{os.getuid()}/com.dsv4.server'
-ROOT = HOME/'research/bend'
 MODELS = {
- 'qwen3.8-flash-next': dict(mode='qwen', binary=HOME/'ds4/ds4-server',
+ 'qwen3.8-flash-next': dict(mode='qwen', binary=HOME/'ds4/runtimes/qwen-23f9e6d99db3/ds4-server',
    sha='23f9e6d99db3120cc24a32839ea57e6680fbae3de142b424a2780e8aa0494e32',
    args=['Qwen3.8-Flash-Next-Q4.gguf','--mtp','--ctx 750000']),
  'deepseek-v4.1-flash': dict(mode='ds41', binary=HOME/'ds4/ds4-server-v41-reservation',
@@ -37,7 +37,7 @@ MODELS = {
 GLM_CANDIDATE = dict(mode='glm', binary=HOME/'ds4/runtimes/glm-1485eb283928/ds4-server', sha=None, terminal_only=True,
     args=['GLM-5.3-Flash-Q2.gguf', '--metal', '--power 100', '--ctx 500000'],
     argv=['--chdir', str(HOME/'ds4/runtimes/glm-1485eb283928'),
-          '-m', str(HOME/'dsv4/gguf/GLM-5.3-Flash-Q2.gguf'),
+          '-m', str(HOME/'.dsv4/models/GLM-5.3-Flash-Q2.gguf'),
           '--metal', '--power', '100', '--ctx', '500000', '--port', '8001'])
 
 
@@ -84,9 +84,7 @@ def mlx_lane_busy():
 
 def record(event, **data):
     row=dict(time=time.time(),event=event,**data)
-    with (ROOT/'enablement-log.md').open('a') as out:
-        out.write('\nDual-model supervised lifecycle: '+json.dumps(row)+'\n')
-        out.flush(); os.fsync(out.fileno())
+    logging.getLogger('local-proxy').info('model lifecycle %s', json.dumps(row))
 
 
 class ManagedSwitch:

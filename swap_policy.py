@@ -1,7 +1,6 @@
 """Bend-checked model-swap policy bridge for proxy-owned local models.
 
-`~/research/bend/swap-policy/swap-cpu` (source + proof in that
-directory) is the only decision authority for reuse / stop-then-start swap /
+`startlux-service/swap-cpu` (source and proof in `model-swap/`) is the only decision authority for reuse / stop-then-start swap /
 fail-closed refuse / idle release across DS4, mlx-lm and the
 decision-only StartLux. This module encodes host facts and decodes directives;
 it keeps no second transition table. The host still owns the foreign
