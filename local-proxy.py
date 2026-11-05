@@ -5,6 +5,7 @@ SSH tunnel (:8003), and local Flash-MoE llama-server (:8004) under one
 endpoint.
 
 Routes /v1/chat/completions to the right backend based on model ID.
+Adapts Codex /v1/responses to the same managed native chat route.
 Merges /v1/models from all reachable backends.
 Merges /admin/api/stats from admin-capable backends and synthesizes Flash-MoE
 progress from llama.cpp streaming prompt_progress chunks so pi's local LLM
@@ -22,6 +23,8 @@ import uuid
 from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
+import codex_provider
+import codex_gateway
 from managed_switch import ManagedSwitch, MODELS as MANAGED_MODELS
 from mlx_runtime import MLXRuntime, MODELS as MLX_CHECKPOINTS
 from startlux_runtime import StartLuxRuntime, MODEL_ID as STARTLUX_MODEL_ID, UPSTREAM_ID as STARTLUX_UPSTREAM_ID, PORT as STARTLUX_PORT, CONTEXT as STARTLUX_CONTEXT, WORK_TOKENS as STARTLUX_WORK_TOKENS
@@ -127,6 +130,7 @@ DS4_SWITCH_LOCK = asyncio.Lock()
 REQUEST_CONDITION = asyncio.Condition(DS4_SWITCH_LOCK)
 ACTIVE_MODEL_ID = None
 ACTIVE_REQUESTS = 0
+CODEX_GATEWAY_REQUESTS = 0
 ACTIVE_TICKET = None
 REQUEST_QUEUE = []
 CHAT_OWNER = None
@@ -766,6 +770,8 @@ async def finish_request(backend_name, uncertain=False, release_chat=False):
 
 async def handle_models(request):
     """Merge /v1/models from all reachable backends."""
+    if 'client_version' in request.query:
+        return await handle_codex_models(request)
     async with ClientSession(timeout=DISCOVERY_TIMEOUT) as sess:
         async def one_backend(name, backend):
             try:
@@ -810,6 +816,102 @@ async def handle_models(request):
             merged.append(model)
 
     return web.json_response({"object": "list", "data": merged})
+
+
+def codex_models():
+    models = [dict(id=mid, **DS4_MODEL_METADATA[mid]) for mid in sorted(MANAGED_MODELS)]
+    return codex_provider.model_catalog(models)
+
+
+async def handle_codex_models(request):
+    return web.json_response(codex_models())
+
+
+def codex_local_request(request):
+    headers = codex_provider.request_headers(request.headers)
+    # ChatGPT credentials stay on the OpenAI path; native inference uses the
+    # proxy's own key, including when selected from the combined desktop menu.
+    headers['Authorization'] = AUTH_HEADERS['Authorization']
+    headers.popall('ChatGPT-Account-ID', None)
+    headers.popall('Cookie', None)
+    return request.clone(headers=headers)
+
+
+async def local_codex_response(request, payload):
+    if not isinstance(payload, dict):
+        raise codex_provider.invalid('Expected a JSON Responses object')
+    public_model = payload.get('model')
+    model_id = codex_provider.MODEL_ALIASES.get(public_model, public_model)
+    backend = get_backend_name(model_id)
+    if backend != 'ds4' or model_id not in MANAGED_MODELS:
+        raise codex_provider.invalid('Codex requires a model from this proxy\'s Codex catalog')
+    body, stream = codex_provider.chat_request(dict(payload, model=model_id))
+    stream.model = public_model
+    return await reservation_body.handle_main(request, body, backend, model_id,
+        begin_request, finish_request, BACKENDS[backend]['v1'], response_stream=stream)
+
+
+async def handle_responses(request):
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized(text='The local Responses endpoint requires the proxy key')
+    request = codex_local_request(request)
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        raise codex_provider.invalid('Expected a JSON Responses request')
+    return await local_codex_response(request, payload)
+
+
+async def handle_codex_gateway(request):
+    global CODEX_GATEWAY_REQUESTS
+    if MAINTENANCE:
+        raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
+    CODEX_GATEWAY_REQUESTS += 1
+    try:
+        return await route_codex_gateway(request)
+    finally:
+        CODEX_GATEWAY_REQUESTS -= 1
+
+
+async def route_codex_gateway(request):
+    codex_gateway.request_headers(request, PROXY_API_KEY)
+    tail = request.match_info['tail']
+    if request.method == 'GET' and tail == 'models':
+        models = {'models': codex_models()['models']}
+        return await codex_gateway.while_connected(request,
+            codex_gateway.catalog(request, models, PROXY_API_KEY))
+    if request.method == 'GET' and tail == 'responses':
+        # The built-in OpenAI provider tries WebSockets first. Codex interprets
+        # 426 as a request to use streamed HTTP for the rest of this session.
+        raise web.HTTPUpgradeRequired(text='Use streaming HTTP POST /responses')
+    if request.method == 'POST' and (tail == 'responses' or tail.startswith('responses/')):
+        if request.headers.get('Content-Encoding', 'identity') != 'identity':
+            raise web.HTTPUnsupportedMediaType(text='Disable request compression for this gateway')
+        # Clone before reading the body: aiohttp shares its payload and writer,
+        # while the local route receives only native credentials/provenance.
+        local_request = codex_local_request(request)
+        body = await request.read()
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeError):
+            raise codex_provider.invalid('Expected a JSON Responses request')
+        if not isinstance(payload, dict):
+            raise codex_provider.invalid('Expected a JSON Responses object')
+        model = payload.get('model')
+        if not isinstance(model, str):
+            raise codex_provider.invalid('A model name is required')
+        canonical = codex_provider.MODEL_ALIASES.get(model, model)
+        if model in codex_provider.MODEL_ALIASES or canonical in MANAGED_MODELS or canonical in MODEL_BACKENDS:
+            # Auxiliary Responses operations (notably remote compaction) carry
+            # conversation input too. Never send a local conversation to OpenAI.
+            if tail != 'responses':
+                raise codex_provider.invalid(
+                    f'Local Codex does not support /{tail}; the request was not sent to OpenAI')
+            return await local_codex_response(local_request, payload)
+        return await codex_gateway.while_connected(request,
+            codex_gateway.forward(request, PROXY_API_KEY, body))
+    return await codex_gateway.while_connected(request,
+        codex_gateway.forward(request, PROXY_API_KEY))
 
 
 # ── /v1/chat/completions (route by model) ───────────────────────────────────
@@ -1156,6 +1258,9 @@ async def main():
 
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
+    app.router.add_get("/v1/codex/models", handle_codex_models)
+    app.router.add_post("/v1/responses", handle_responses)
+    app.router.add_route('*', '/backend-api/codex/{tail:.*}', handle_codex_gateway)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post('/v1/systemone', handle_systemone)
     app.router.add_get('/v1/systemone/models', handle_systemone_models)
@@ -1171,6 +1276,7 @@ async def main():
         "routes": MODEL_BACKENDS,
         "ds4_loaded_model": DS4_LOADED_MODEL_ID,
         "active_requests": ACTIVE_REQUESTS,
+        "codex_gateway_requests": CODEX_GATEWAY_REQUESTS,
         "resident_model": INDEPENDENT_SWITCH.model if INDEPENDENT_SWITCH else None,
         "ds4_active_requests": DS4_ACTIVE_REQUESTS,
         "ds4_idle_timeout": DS4_IDLE_TIMEOUT,
@@ -1179,12 +1285,12 @@ async def main():
         "ds4_models": sorted(BACKENDS["ds4"]["models"]),
     }))
 
-    log.info(f"local-proxy listening on :{LISTEN_PORT}")
     # Keep draining admitted work after client disconnect; never cancel its owner.
     runner = web.AppRunner(app, handler_cancellation=False)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", LISTEN_PORT)
     await site.start()
+    log.info(f"local-proxy listening on :{LISTEN_PORT}")
 
     while True:
         await asyncio.sleep(3600)

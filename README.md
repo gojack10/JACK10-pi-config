@@ -97,6 +97,90 @@ Runtime changes require requalifying `mlx-service/pin.json`, not silently
 accepting new library bytes. Stop/start is a maintenance command, not permission
 to overlap local engines or to interrupt another owning chat.
 
+## Codex desktop
+
+The combined desktop gateway lives at `/backend-api/codex`. Its `/models`
+endpoint combines the signed-in user's current OpenAI catalog with managed
+local models.
+OpenAI inference is forwarded to OpenAI with that user's existing
+ChatGPT credential and account header; credentials and prompts are not stored.
+The local model `deepseek-v4.1-flash-1017-local` routes to the existing
+`deepseek-v4.1-flash` backend. Its ID and menu label use the public alias; Pi's
+model identity and native model configuration keep their existing names.
+The other managed menu aliases are `glm-5.3-flash-local` and
+`qwen3.8-flash-next-local`; each routes to the existing canonical ID without
+the `-local` suffix. Existing chats using the canonical IDs still route locally.
+
+For separate local-only clients, the proxy also serves `/v1/responses` and
+`/v1/codex/models`. A `/v1/models` request with Codex's `client_version` query
+parameter returns the local catalog; ordinary Pi discovery keeps its format.
+
+Codex requests are translated into the existing managed native chat route.
+They retain the queue, chat ownership, GPU lease, cancellation and native
+completion/release sequence. Text, reasoning, function tools and custom text
+tools are supported. Codex must replay full conversation input; stored response
+IDs, images and provider-hosted tools are not implemented by the local adapter.
+Codex adds hosted web search at the provider level even when a local model is
+selected. The adapter omits that declaration only for local inference, tells the
+model to use available browser/search functions instead, and preserves function
+and custom tools. Explicitly forcing hosted search returns an error rather than
+silently changing the requested tool. OpenAI requests keep their hosted search.
+Local auxiliary Responses operations, including remote compaction, are rejected
+locally rather than forwarding local conversation input to OpenAI.
+The local catalog lists the registered managed DwarfStar models. Their reasoning
+options are only thinking off (`none`), `high` and `xhigh`; `xhigh` selects native
+Think Max. Other requested levels are rejected. OpenAI model capabilities pass
+through from OpenAI's catalog.
+
+Keep the built-in `openai` provider so existing OpenAI chats can resume. Set
+these top-level keys in the user-level Codex configuration:
+
+```toml
+model = "gpt-6.1-sol"
+model_provider = "openai"
+openai_base_url = "http://127.0.0.1:8002/backend-api/codex"
+
+[features]
+enable_request_compression = false
+```
+
+The built-in provider discovers the combined catalog at `/models` using existing
+ChatGPT sign-in. Do not define a replacement `[model_providers.openai]` table;
+Codex reserves that provider ID. A separate combined provider ID prevents
+existing `openai` chats from resuming. The gateway returns HTTP 426 on the
+Responses WebSocket handshake, which tells Codex to use streamed HTTP for that
+session. Request compression is disabled so the gateway can route JSON by model.
+The desktop may save the last model selected in its picker; that changes the
+model default, not the `openai` provider identity.
+
+The local-only provider instead uses `http://127.0.0.1:8002/v1` and a credential
+command reading the existing `.proxy-key`. Local native requests never receive
+ChatGPT tokens. Finish running desktop tasks before using Settings > Model
+Providers > Reload ChatGPT to load the saved configuration and catalog. Existing
+OpenAI chats keep their provider identity and use the configured gateway.
+
+Codex session headers provide chat identity. Ownership stays held across tool
+calls and releases after the final answer, an incomplete response or an active
+request cancellation. The existing idle lease and authenticated chat-release
+operation still cover an abandoned session between model requests.
+
+Activate proxy source changes with the documented `local-ai stop` / `start`
+maintenance procedure once the owning chat has finished, from an independent
+terminal or Pi session. Both local and OpenAI Codex requests depend on this
+process: a Codex chat cannot stop its own gateway and then continue to repair it.
+Restarting the proxy alone over a retained engine loses its native ownership
+state. Maintenance refuses active local generation; finish cloud gateway requests
+before restarting too, since they use the same process. Disconnected cloud
+clients cancel their upstream I/O even before output arrives.
+Do not bypass a refusal with `launchctl bootout`.
+
+If the gateway is already down, `local-ai start` checks that engines are off and
+restores reception without loading a model. A direct-OpenAI recovery is to remove
+`openai_base_url`, select an OpenAI model, retain `model_provider = "openai"`, and
+reload the desktop after its tasks finish. This temporarily removes the combined
+menu, not the saved chats. Restore the gateway URL after maintenance to use local
+models again.
+
 ## Pi fork
 
 Sometimes Pi can't do certain stuff, so I run [gojack10/pi-mono](https://github.com/gojack10/pi-mono). If you install upstream pi, some extensions will load and do nothing.

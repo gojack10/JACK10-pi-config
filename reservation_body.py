@@ -168,7 +168,7 @@ def unavailable(request, reason):
 
 
 async def handle_main(request, body, backend_name, model_id,
-                      begin_request, finish_request, backend):
+                      begin_request, finish_request, backend, response_stream=None):
     global MAIN_TASK
     from managed_switch import MODELS
     request_id = request.headers.get('X-Pi-Request-Id')
@@ -198,6 +198,7 @@ async def handle_main(request, body, backend_name, model_id,
 
     async def forward():
         nonlocal forwarding
+        terminal_output = b''
         try:
             try:
                 engine.begin_request()
@@ -217,26 +218,40 @@ async def handle_main(request, body, backend_name, model_id,
                         await engine.bind(request_id)
                         async for chunk in upstream.content.iter_any():
                             if not disconnected:
-                                await queue.put(chunk)
+                                output = response_stream.feed(chunk) if response_stream else chunk
+                                if output:
+                                    await queue.put(output)
+                        if response_stream and not disconnected:
+                            terminal_output = response_stream.finish()
             except asyncio.CancelledError:
                 if not disconnected:
                     raise
+            except Exception as error:
+                if response_stream is None:
+                    raise
+                terminal_output = response_stream.fail(error)
             finally:
                 forwarding = False
             # EOF and socket cancellation are not GPU completion. All models
             # use the same post-unwind native close/status/release sequence.
             await engine.terminal()
             await engine.release_terminal()
-            await finish_request(backend_name, release_chat=disconnected)
-        except BaseException:
+            await finish_request(backend_name, release_chat=disconnected or
+                                 bool(response_stream and response_stream.release_chat))
+            if terminal_output and not disconnected:
+                await queue.put(terminal_output)
+        except BaseException as error:
             logging.getLogger('local-proxy').exception('Native request %s remains blocked', request_id)
+            if response_stream and not disconnected:
+                await queue.put(response_stream.fail(error, terminal_failure=True))
             await finish_request(backend_name, uncertain=True)
         finally:
             await queue.put(None)
 
     forward_task = MAIN_TASK = asyncio.create_task(forward())
     response = web.StreamResponse(headers={'Content-Type': 'text/event-stream',
-                           'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+                           'Cache-Control': 'no-cache', 'Connection': 'keep-alive',
+                           'x-request-id': request_id})
     try:
         await response.prepare(request)
         while True:
