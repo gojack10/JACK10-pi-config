@@ -6,6 +6,8 @@ import re
 from aiohttp import ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
 
+from codex_provider import invalid
+
 OPENAI_BASE = 'https://chatgpt.com/backend-api/codex'
 TIMEOUT = ClientTimeout(total=None, sock_connect=15, sock_read=None)
 HOP_HEADERS = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -13,6 +15,32 @@ HOP_HEADERS = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authoriz
 FOREIGN_REASONING_IDS = ('rs_local_', 'rs_meta_', 'rs_bedrock_', 'rs_openai_api_', 'rs_openrouter_')
 PI_REASONING_ENVELOPES = ('pi-meta-v1:', 'pi-bedrock-v1:', 'pi-openai-api-v1:', 'pi-openrouter-v1:')
 LEGACY_LOCAL_REASONING_ID = re.compile(r'rs_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}')
+COMPACTION_HANDOFF = re.compile(r'\[Codex handoff for (cmp_[\w-]+)\]\n\S')
+
+
+def portable_compaction_input(items):
+    """Remove an opaque checkpoint only when Codex carries its text handoff."""
+    if not isinstance(items, list):
+        return items
+    checkpoints = [item for item in items if isinstance(item, dict) and item.get('type') == 'compaction']
+    if not checkpoints:
+        return items
+    handoffs = set()
+    for item in items:
+        if not isinstance(item, dict) or item.get('type') != 'message' or item.get('role') not in ('assistant', 'user'):
+            continue
+        content = item.get('content')
+        if isinstance(content, list):
+            for part in content:
+                if (isinstance(part, dict) and part.get('type') in ('input_text', 'output_text')
+                        and isinstance(part.get('text'), str)):
+                    match = COMPACTION_HANDOFF.match(part['text'])
+                    if match:
+                        handoffs.add(match[1])
+    for item in checkpoints:
+        if not isinstance(item.get('id'), str) or item['id'] not in handoffs:
+            raise invalid('This model needs a text handoff for the encrypted compaction in this chat.')
+    return [item for item in items if not isinstance(item, dict) or item.get('type') != 'compaction']
 
 
 def openai_body(payload, original):
