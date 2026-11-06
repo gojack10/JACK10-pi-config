@@ -140,7 +140,6 @@ def chat_request(payload):
         else:
             raise invalid(f"Unsupported Responses input item: {kind}")
     chat = {"model": payload.get("model"), "messages": messages, "stream": True,
-            "temperature": payload.get("temperature", 0),
             "stream_options": {"include_usage": True}}
     choice = payload.get("tool_choice", "auto")
     if isinstance(choice, dict):
@@ -167,7 +166,7 @@ def chat_request(payload):
         chat["thinking"] = {"type": "disabled" if effort == "none" else "enabled"}
         if effort != "none":
             chat["reasoning_effort"] = "max" if effort == "xhigh" else "high"
-    for key in ("top_p", "seed", "stop"):
+    for key in ("temperature", "top_p", "seed", "stop"):
         if key in payload:
             chat[key] = payload[key]
     return json.dumps(chat, separators=(",", ":")).encode(), ResponsesStream(chat["model"], names)
