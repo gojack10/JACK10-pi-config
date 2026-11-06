@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 
 POLICY_BINARY = Path(__file__).resolve().parent / 'startlux-service/swap-cpu'
-POLICY_SHA256 = 'd3784ac9b41097a29d5ed81c65048d4f0e969c39e96a619fcf15337f4e15c9da'
+POLICY_SHA256 = 'a9c35aea6ac680ac1de410b03a846fb0c4dd92dd8728a427c4ef73df36252dd7'
 MAX_NAT = 281474976410654
 
 # Slot 5 is a one-for-one replacement, NOT a second identity or alias. The
