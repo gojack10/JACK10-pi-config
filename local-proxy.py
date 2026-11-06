@@ -701,6 +701,8 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                     await asyncio.wait_for(REQUEST_CONDITION.wait(), 0.1)
                 except asyncio.TimeoutError:
                     pass
+            if MAINTENANCE:
+                raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
             if client_disconnected(request):
                 raise ConnectionResetError("client disconnected while queued")
             if managed and backend_name == 'startlux':
@@ -1223,13 +1225,15 @@ async def handle_other(request):
 
 
 async def handle_maintenance(request):
-    global MAINTENANCE, DS4_LOADED_MODEL_ID
+    global MAINTENANCE, DS4_LOADED_MODEL_ID, CHAT_OWNER
     if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
         raise web.HTTPUnauthorized()
     async with REQUEST_CONDITION:
-        if ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner():
-            raise web.HTTPConflict(text='Local AI is in use; finish the owning chat before maintenance')
+        if ACTIVE_REQUESTS:
+            raise web.HTTPConflict(text='Local AI is generating; finish the active request before maintenance')
         MAINTENANCE = True
+        CHAT_OWNER = None
+        REQUEST_CONDITION.notify_all()
         MAINTENANCE_FILE.touch(mode=0o600)
         try:
             await INDEPENDENT_SWITCH.stop_all()

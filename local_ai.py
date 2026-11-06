@@ -1,8 +1,10 @@
-"""Maintenance switch: local-ai stop | start | status. Never loads a model."""
+"""Maintenance switch: local-ai stop | start | status | restart [-- command ...]. Never loads a model."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import time
@@ -14,6 +16,10 @@ DOMAIN = f'gui/{os.getuid()}'
 PROXY = DOMAIN + '/com.local.llm.proxy'
 PLIST = HOME / 'Library/LaunchAgents/com.local.llm.proxy.plist'
 MAINTENANCE_FILE = HOME / '.dsv4/maintenance'
+RESTART_LABEL = 'com.local.llm.restart'
+RESTART_JOB = DOMAIN + '/' + RESTART_LABEL
+RESTART_PLIST = HOME / '.dsv4/local-ai-restart.plist'
+RESTART_LOG = HOME / '.dsv4/local-ai-restart.log'
 
 
 def ctl(*args):
@@ -103,15 +109,85 @@ def start():
     print('Panel waiting; all engines off. Your next model request selects the engine.')
 
 
+def run_restart(command):
+    # A refused/partial stop must not reopen admission over uncertain engines.
+    stop()
+    try:
+        if command:
+            subprocess.run(command, check=True)
+    finally:
+        # Even a failed promotion must attempt to restore reception. start()
+        # still requires engines off; executable qualification is unchanged.
+        start()
+    print('Restart complete.')
+
+
+def restart(command):
+    RESTART_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with (RESTART_PLIST.parent / 'local-ai-restart.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another restart is being scheduled') from None
+        previous = ctl('print', RESTART_JOB)
+        if previous.returncode == 0:
+            if (re.search(r'^\s*pid = \d+', previous.stdout, re.M)
+                    or not re.search(r'^\s*last exit code = ', previous.stdout, re.M)):
+                raise RuntimeError(f'Restart already pending/running; see {RESTART_LOG}')
+            result = ctl('bootout', RESTART_JOB)
+            if result.returncode:
+                raise RuntimeError(result.stderr)
+        RESTART_LOG.touch(mode=0o600)
+        RESTART_LOG.write_text('')
+        spec = {
+            'Label': RESTART_LABEL,
+            'ProgramArguments': [str(HOME / '.pi/agent/local-ai'), '_restart', '--', *command],
+            'WorkingDirectory': os.getcwd(),
+            'EnvironmentVariables': {
+                'HOME': str(HOME), 'PATH': os.environ['PATH'], 'PYTHONUNBUFFERED': '1',
+            },
+            'RunAtLoad': True,
+            'KeepAlive': False,
+            'StandardOutPath': str(RESTART_LOG),
+            'StandardErrorPath': str(RESTART_LOG),
+        }
+        RESTART_PLIST.touch(mode=0o600)
+        RESTART_PLIST.write_bytes(plistlib.dumps(spec))
+        result = ctl('bootstrap', DOMAIN, str(RESTART_PLIST))
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+    print(f'Restart queued independently of Codex; not yet complete. Log: {RESTART_LOG}')
+    print('Use local-ai status for the outcome. Codex may briefly retry its connection.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('stop', 'start', 'status'))
-    action = parser.parse_args().action
+    parser.add_argument('action', choices=('stop', 'start', 'status', 'restart', '_restart'),
+                        metavar='{stop,start,status,restart}')
+    parser.add_argument('command', nargs=argparse.REMAINDER,
+                        help='optional command to run with engines off during restart')
+    args = parser.parse_args()
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if command and args.action not in ('restart', '_restart'):
+        parser.error('Only restart accepts a command')
     try:
-        if action == 'status':
+        if args.action == 'status':
+            state = ctl('print', RESTART_JOB)
+            if state.returncode == 0:
+                exit_code = re.search(r'^\s*last exit code = (\d+)', state.stdout, re.M)
+                running = re.search(r'^\s*pid = \d+', state.stdout, re.M)
+                outcome = f'exit {exit_code[1]}' if exit_code and not running else 'pending/running'
+                print(f'Restart: {outcome}. Log: {RESTART_LOG}')
             print(json.dumps(request('/health'), indent=2) if proxy_pid() else 'Panel off.')
+        elif args.action == 'restart':
+            restart(command)
+        elif args.action == '_restart':
+            run_restart(command)
         else:
-            globals()[action]()
+            globals()[args.action]()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors='replace').strip()
+        parser.exit(1, f'local-ai: HTTP {exc.code}: {detail or exc.reason}\n')
     except Exception as exc:
         parser.exit(1, f'local-ai: {exc}\n')
 

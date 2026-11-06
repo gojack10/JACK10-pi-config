@@ -6,6 +6,17 @@ Before developer work, read `local/knowledge/developer.md` relative to this repo
 
 Jack owns testing. Never write or run tests unless he explicitly requests and designs them. The routine check is only whether the project builds and starts. No screenshots for any purpose unless he explicitly asks for screenshots. The tree's Testing node owns the complete rule.
 
+## Local proxy maintenance
+
+Codex cloud and local models both depend on the local proxy. Use
+`~/.pi/agent/local-ai restart` to activate prepared changes, never separate stop
+and start across model calls. Restart queues an independent one-shot launchd job;
+`local-ai status` and `~/.dsv4/local-ai-restart.log` report its actual outcome.
+Build first; for a promotion that requires engines off, use
+`local-ai restart -- /absolute/path/to/promotion-script`. Existing native shutdown
+and active-generation refusals remain; do not bypass them. Manual stop/start is
+only for an independent operator that can complete both without the gateway.
+
 ## Extension discovery
 
 Pi auto-loads every direct `extensions/*.ts` and `extensions/*.js` file as an extension. Each such file must default-export a valid extension factory; support modules and tests at that level will fail startup.

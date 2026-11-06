@@ -84,9 +84,22 @@ The next request to `127.0.0.1:8002` selects the engine; models stay warm betwee
 requests, and switches wait for native completion and process exit. Use
 `~/.pi/agent/local-ai status` to inspect reception and the resident model.
 
-For a settings change: stop, edit the setting, start, then request the desired
-model. Don't restart just the proxy over retained engines or use `launchctl
-kickstart -k` as a shortcut. Home Manager's changed-proxy activation uses the
+Use `~/.pi/agent/local-ai restart` to activate prepared changes from Codex. It
+queues a one-shot launchd job that performs the existing safe stop/start without
+needing another model response. Codex may briefly retry while the gateway is
+down; the job restores reception with all engines off. A queued receipt is not
+completion: `local-ai status` reports the job's exit code, and
+`~/.dsv4/local-ai-restart.log` contains its output (replaced on the next restart).
+An active/uncertain engine still causes refusal; no automatic retry or forced kill.
+
+Build before downtime. If promotion must run with engines off, use
+`local-ai restart -- /absolute/path/to/promotion-script` (arguments are passed
+directly, without a shell). The worker attempts to restore reception even if the
+promotion command fails, retaining a failed exit status; it does not undo partial
+file changes or qualify a new executable. A refused stop does not trigger start.
+Don't split stop and start across Codex turns. Manual settings maintenance from an
+independent terminal can still use stop, edit, start. Don't restart just the proxy
+over retained engines or use `launchctl kickstart -k` as a shortcut. Home Manager's changed-proxy activation uses the
 same maintenance commands; it no longer starts Qwen or sends a model request.
 The short `local-ai` command is installed by the M5 Home Manager configuration;
 the full path works without an activation.
@@ -219,15 +232,15 @@ calls and releases after the final answer, an incomplete response or an active
 request cancellation. The existing idle lease and authenticated chat-release
 operation still cover an abandoned session between model requests.
 
-Activate proxy source changes with the documented `local-ai stop` / `start`
-maintenance procedure once the owning chat has finished, from an independent
-terminal or Pi session. Both local and OpenAI Codex requests depend on this
-process: a Codex chat cannot stop its own gateway and then continue to repair it.
+Activate prepared proxy changes with `local-ai restart`. Both local and OpenAI
+Codex requests depend on this process, so the one-shot launchd worker owns the
+entire safe stop/start while Codex reconnects. Never issue stop and expect a
+subsequent model response to issue start. Finish other gateway tasks first;
+disconnected cloud clients cancel their upstream I/O even before output arrives.
 Restarting the proxy alone over a retained engine loses its native ownership
-state. Finish local work and release conversation ownership before maintenance;
-finish cloud gateway requests before restarting too, since they use the same process. Disconnected cloud
-clients cancel their upstream I/O even before output arrives.
-Do not bypass a refusal with `launchctl bootout`.
+state. The existing maintenance path still refuses active local generation and
+requires native completion and engine exit. Do not bypass a refusal with
+`launchctl bootout`.
 
 If the gateway is already down, `local-ai start` checks that engines are off and
 restores reception without loading a model. A direct-OpenAI recovery is to remove
