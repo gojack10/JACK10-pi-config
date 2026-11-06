@@ -1,4 +1,4 @@
-"""Pipe Codex requests to Pi's Meta adapter; credentials stay inside Pi."""
+"""Catalog and pipe transport for Codex models backed by Pi providers."""
 import asyncio
 import json
 import os
@@ -9,49 +9,58 @@ from aiohttp import web
 
 import codex_provider
 
-MODEL = 'muse-wonder-full-1.0'
-HELPER = Path(__file__).with_suffix('.mjs')
-_catalog = None
+ROOT = Path(__file__).resolve().parent
+# Slug, helper arguments, and display metadata are shared by startup and dispatch.
+MODELS = {
+    'muse-wonder-full-1.0': ('codex_meta.mjs', (), 'muse-wonder-full-1.0',
+                             'Meta Muse subscription through Pi'),
+    'us.anthropic.claude-opus-5-5': ('codex_bedrock.mjs', (), 'us.anthropic.claude-opus-5-5',
+                                    'Claude Opus 5.5 through Amazon Bedrock'),
+    'gpt-6.1-sol-zdr': ('codex_pi_stream.mjs', ('openai', 'gpt-6.1-sol'), 'GPT-6.1 Sol - ZDR',
+                       'OpenAI API through Pi with response storage disabled'),
+    'muse-wonder-1.0': ('codex_meta.mjs', (), 'Muse Wonder 1.0',
+                       'Meta Muse subscription through Pi'),
+    'muse-wonder-openrouter': ('codex_pi_stream.mjs', ('openrouter', 'meta/muse-wonder'),
+                              'Meta Muse Wonder - OpenRouter', 'OpenRouter through Pi'),
+}
+_catalog = {}
 
 
 def node_command():
-    root = Path(__file__).resolve().parent
-    config_path = Path(os.getenv('CODEX_GATEWAY_CONFIG', str(root / 'local/codex-gateway.json'))).expanduser()
+    config_path = Path(os.getenv('CODEX_GATEWAY_CONFIG', str(ROOT / 'local/codex-gateway.json'))).expanduser()
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
     node = os.getenv('CODEX_PI_NODE') or config.get('node') or shutil.which('node')
     if not node:
         raise RuntimeError('Configure node in local/codex-gateway.json or set CODEX_PI_NODE')
     path = Path(node).expanduser()
-    return str(path if path.is_absolute() else root / path)
+    return str(path if path.is_absolute() else ROOT / path)
 
 
-async def read_catalog(helper, description):
-    process = await asyncio.create_subprocess_exec(node_command(), str(helper), '--catalog',
+async def load_catalog(model):
+    helper, args, display_name, description = MODELS[model]
+    process = await asyncio.create_subprocess_exec(node_command(), str(ROOT / helper), '--catalog', model, *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     stdout, _ = await process.communicate()
     data = json.loads(stdout)
     if process.returncode:
         raise RuntimeError(data.get('error', {}).get('message', 'Pi cloud adapter did not start'))
     entry = codex_provider.model_catalog([dict(data, name=data['id'])])['models'][0]
-    entry.update(display_name=data['id'], description=description,
+    entry.update(display_name=display_name, description=description,
         input_modalities=data['input_modalities'],
         default_reasoning_level=data['thinking_levels'][-1],
         supported_reasoning_levels=[dict(effort=level, description=f'{level.capitalize()} reasoning')
                                    for level in data['thinking_levels']])
-    return entry
-
-
-async def load_catalog():
-    global _catalog
-    _catalog = await read_catalog(HELPER, 'Meta Muse subscription through Pi')
+    _catalog[model] = entry
 
 
 def catalog():
-    return {'models': [_catalog] if _catalog else []}
+    return list(_catalog.values())
 
 
-async def forward(request, payload, helper=HELPER):
-    process = await asyncio.create_subprocess_exec(node_command(), str(helper),
+async def forward(request, payload):
+    model = payload['model']
+    helper, args, _, _ = MODELS[model]
+    process = await asyncio.create_subprocess_exec(node_command(), str(ROOT / helper), model, *args,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL)
     response = None

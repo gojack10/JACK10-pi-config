@@ -114,8 +114,8 @@ to overlap local engines or to interrupt another owning chat.
 
 The combined desktop gateway lives at `/backend-api/codex`. Its `/models`
 endpoint combines the signed-in user's current OpenAI catalog with managed
-local models, Pi's Meta Muse model and Claude Opus on Amazon Bedrock.
-OpenAI inference is forwarded to OpenAI with that user's existing
+local models and the Pi cloud routes registered in `codex_cloud.py`.
+The ChatGPT catalog's models use that user's existing
 ChatGPT credential and account header; credentials and prompts are not stored.
 The local model `deepseek-v4.1-flash-1017-local` routes to the existing
 `deepseek-v4.1-flash` backend. Its ID and menu label use the public alias; Pi's
@@ -124,7 +124,7 @@ The other managed menu aliases are `glm-5.3-flash-local` and
 `qwen3.8-flash-next-local`; each routes to the existing canonical ID without
 the `-local` suffix. Existing chats using the canonical IDs still route locally.
 
-`muse-wonder-full-1.0` routes to Meta through `codex_meta.py` and
+`muse-wonder-1.0` and `muse-wonder-full-1.0` route to Meta through
 `codex_meta.mjs`. The helper imports the configured installed Pi runtime and
 reads the configured agent directory's `models.json`. It uses Pi's
 locked OAuth renewal and the same subscription tool-name compatibility code
@@ -160,8 +160,12 @@ as on the local route. Stored response references, schema-constrained final
 output and remote compaction are unavailable; unsupported Meta auxiliary
 operations fail here rather than sending the conversation to OpenAI.
 
+`gpt-6.1-sol-zdr` uses Pi's `openai/gpt-6.1-sol` route with `store: false`.
+`muse-wonder-openrouter` uses Pi's `openrouter/meta/muse-wonder` route.
+Both use the API key configured for their provider in Pi.
+
 `us.anthropic.claude-opus-5-5` uses Pi's native `amazon-bedrock` provider via
-`codex_bedrock.py` and `codex_bedrock.mjs`. Its helper reads the configured
+`codex_bedrock.mjs` and `codex_pi_stream.mjs`. Its helper reads the configured
 `bedrock_env_file` each time it starts, including each model
 request, so the LaunchAgent does not need an interactive shell or exported keys.
 Only the helper process loads its AWS variables; credentials are not copied into tracked code, Codex's

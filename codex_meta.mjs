@@ -1,12 +1,13 @@
 /** Meta Responses transport using the installed Pi runtime, auth and tool adapters. */
-import { Tools } from "./codex_cloud_tools.mjs";
+import { META_REPLAY, Tools } from "./codex_cloud_tools.mjs";
 import { gatewayPath } from "./codex_cloud_config.mjs";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const MODEL = "muse-wonder-full-1.0";
+const MODEL = process.argv.slice(2).find((argument) => argument !== "--catalog") || "muse-wonder-full-1.0";
 const BASE = "https://api.meta.ai/v1";
 const piRoot = () => gatewayPath("pi_root", "CODEX_PI_ROOT");
 const agentDir = () => gatewayPath("agent_dir", "CODEX_PI_AGENT_DIR", dirname(fileURLToPath(import.meta.url)));
@@ -19,6 +20,7 @@ const write = (text) => new Promise((resolve, reject) => {
   process.stdout.write(text, (error) => error ? reject(error) : resolve());
 });
 const invalid = (message) => Object.assign(new Error(message), { status: 400 });
+const itemId = (prefix, id) => prefix + createHash("sha256").update(id).digest("hex").slice(0, 48);
 
 async function runtime() {
   const { ModelRuntime } = await load("coding-agent/dist/core/model-runtime.js");
@@ -42,7 +44,7 @@ async function prepare(payload, session, model, levels) {
   const effort = payload.reasoning?.effort || levels.at(-1);
   const level = effort === "none" ? "off" : effort;
   if (!levels.includes(level)) throw invalid(`Meta reasoning effort must be one of: ${levels.join(", ")}`);
-  const tools = new Tools();
+  const tools = new Tools("meta", MODEL);
   tools.register(payload.tools || []);
   const input = tools.input(payload.input || []);
   const { convertResponsesTools } = await load("ai/dist/api/openai-responses-shared.js");
@@ -70,7 +72,7 @@ class Output {
   sequence = 0;
   items = new Map();
   ids = new Map();
-  customDone = new Set();
+  callsDone = new Set();
   response;
   terminal = false;
 
@@ -78,7 +80,15 @@ class Output {
 
   item(item, complete) {
     if (item.type === "reasoning") {
-      const id = "rs_meta_" + item.id;
+      const id = itemId("rs_meta_", item.id);
+      this.ids.set(item.id, id);
+      // IDs stay within OpenAI's 64-character limit. Keep Meta's original ID
+      // and encrypted state in a replay envelope instead of appending the ID.
+      const replay = { model: MODEL, id: item.id, encrypted_content: item.encrypted_content };
+      return { ...item, id, encrypted_content: META_REPLAY + Buffer.from(JSON.stringify(replay)).toString("base64") };
+    }
+    if (item.type === "message") {
+      const id = itemId("msg_meta_", item.id);
       this.ids.set(item.id, id);
       return { ...item, id };
     }
@@ -86,15 +96,16 @@ class Output {
     const spec = this.tools.byName.get(this.wireNames.get(item.name) || item.name);
     if (!spec) throw new Error("Meta returned an undeclared tool");
     this.items.set(item.id, spec);
-    const result = { ...item, name: spec.name };
+    const result = { ...item, id: itemId(spec.type === "custom" ? "ctc_meta_" : "fc_meta_", item.id), name: spec.name };
+    this.ids.set(item.id, result.id);
     delete result.namespace;
     if (spec.namespace) result.namespace = spec.namespace;
     if (spec.type === "custom") {
       result.type = "custom_tool_call";
-      result.id = "ctc_meta_" + item.id;
-      this.ids.set(item.id, result.id);
       result.input = complete ? this.customInput(item.arguments) : "";
       delete result.arguments;
+    } else {
+      result.arguments = complete ? this.tools.codexArguments(spec, item.arguments) : "";
     }
     return result;
   }
@@ -111,29 +122,36 @@ class Output {
     await write(`event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
-  async finishCustom(event, arguments_) {
-    if (this.customDone.has(event.item_id)) return;
-    const input = this.customInput(arguments_);
+  async finishCall(event, arguments_) {
+    const spec = this.items.get(event.item_id);
+    if (!spec || this.callsDone.has(event.item_id)) return;
     const fields = { item_id: event.item_id, output_index: event.output_index };
-    await this.emit({ type: "response.custom_tool_call_input.delta", ...fields, delta: input });
-    await this.emit({ type: "response.custom_tool_call_input.done", ...fields, input });
-    this.customDone.add(event.item_id);
+    if (spec.type === "custom") {
+      const input = this.customInput(arguments_);
+      await this.emit({ type: "response.custom_tool_call_input.delta", ...fields, delta: input });
+      await this.emit({ type: "response.custom_tool_call_input.done", ...fields, input });
+    } else {
+      const decoded = this.tools.codexArguments(spec, arguments_);
+      await this.emit({ type: "response.function_call_arguments.delta", ...fields, delta: decoded });
+      await this.emit({ type: "response.function_call_arguments.done", ...fields, arguments: decoded });
+    }
+    this.callsDone.add(event.item_id);
   }
 
   async event(event) {
     if (event.type.startsWith("response.function_call_arguments.")) {
       const spec = this.items.get(event.item_id);
-      if (spec?.type === "custom") {
-        if (event.type.endsWith(".done")) await this.finishCustom(event, event.arguments);
-        return;
-      }
-      if (spec && event.name) event = { ...event, name: spec.name };
+      if (!spec) throw new Error("Meta returned arguments for an undeclared tool");
+      // Complete arguments before restoring their schema and integer syntax;
+      // raw deltas would expose the provider's incompatible representation.
+      if (event.type.endsWith(".done")) await this.finishCall(event, event.arguments);
+      return;
     }
     if (event.item) {
       const complete = event.type === "response.output_item.done";
       const item = this.item(event.item, complete);
-      if (complete && item.type === "custom_tool_call") {
-        await this.finishCustom({ item_id: event.item.id, output_index: event.output_index }, event.item.arguments);
+      if (complete && event.item.type === "function_call") {
+        await this.finishCall({ item_id: event.item.id, output_index: event.output_index }, event.item.arguments);
       }
       event = { ...event, item };
     }
