@@ -704,6 +704,7 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
                 raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
             if client_disconnected(request):
                 raise ConnectionResetError("client disconnected while queued")
+            ticket["phase"] = "loading"
             if managed and backend_name == 'startlux':
                 if INDEPENDENT_SWITCH is None:
                     raise web.HTTPServiceUnavailable(text='StartLux managed switch unavailable')
@@ -1128,6 +1129,47 @@ async def handle_admin_login(request):
 
 # ── /admin/api/stats (merge from backends) ──────────────────────────────────
 
+async def handle_local_progress(request):
+    """Versioned, prompt-free telemetry shared by desktop and plugin clients."""
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized()
+    thread_id = request.query.get('thread_id', '')
+    if not thread_id or len(thread_id) > 128 or not all(c.isascii() and (c.isalnum() or c in '-_') for c in thread_id):
+        raise web.HTTPBadRequest(text='A thread_id is required')
+    chat_id = codex_provider.chat_identity(thread_id)
+    ticket = next((t for t in [ACTIVE_TICKET, *REQUEST_QUEUE]
+                   if t and t['chat_id'] == chat_id), None)
+    data = dict(version=1, thread_id=thread_id, request_id=None, model=None,
+                phase='idle', queue_position=None, prefill=[], decode=[])
+    if ticket:
+        data.update(request_id=ticket['request_id'], model=ticket['model'])
+        if ticket.get('ambiguous') or ticket.get('uncertain'):
+            data['phase'] = 'blocked'
+        elif ticket is not ACTIVE_TICKET:
+            data['phase'] = ticket.get('phase', 'queued')
+            data['queue_position'] = admission_order().index(ticket) + 1
+        else:
+            headers = request.headers.copy()
+            headers['X-Pi-Request-Id'] = ticket['request_id']
+            response = await handle_admin_stats(request.clone(headers=headers))
+            stats = json.loads(response.body)
+            # Never attach a successor's telemetry to the previous request.
+            if ACTIVE_TICKET is not ticket:
+                data['phase'] = 'idle'
+            else:
+                fields = {'processed', 'total', 'speed', 'eta', 'generated_tokens',
+                          'tokens', 'tokens_per_second', 'tok_s', 'origin', 'stopping'}
+                for model in stats['active_models']['models']:
+                    if model['id'] != ticket['model']:
+                        continue
+                    for source, target in (('prefilling', 'prefill'), ('generating', 'decode')):
+                        data[target].extend({k: v for k, v in sample.items() if k in fields}
+                                            for sample in model.get(source, []))
+                data['phase'] = ('stopping' if any(s.get('stopping') for s in data['prefill'] + data['decode'])
+                                 else 'prefill' if data['prefill'] else 'decode' if data['decode'] else 'preparing')
+    return web.json_response(data, headers={'Cache-Control': 'no-store'})
+
+
 async def handle_admin_stats(request):
     """Poll admin/stats and merge results with synthesized Flash-MoE activity."""
     owner = ACTIVE_TICKET
@@ -1287,6 +1329,7 @@ async def main():
     app.router.add_get('/v1/systemone/models', handle_systemone_models)
     app.router.add_post("/admin/api/login", handle_admin_login)
     app.router.add_get("/admin/api/stats", handle_admin_stats)
+    app.router.add_get('/v1/local-progress', handle_local_progress)
     app.router.add_post("/admin/api/release-chat", handle_release_chat)
     app.router.add_post('/admin/api/maintenance', handle_maintenance)
     app.router.add_post('/admin/api/resume', handle_resume)

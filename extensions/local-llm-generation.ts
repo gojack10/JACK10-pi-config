@@ -25,6 +25,9 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 
+import { PrefillProgress, CHUNK_MIN_TOKENS, formatPrefill, formatDecode, formatQueued } from "./local-llm-generation/progress.js";
+export { buildChunkBar, originLabel, formatPrefill, formatDecode, formatQueued, formatPrefillChunks } from "./local-llm-generation/progress.js";
+
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -36,28 +39,14 @@ function bitesPath(): string {
 }
 const POLL_MS = 250;
 const ANIM_MS = 33;
-const BAR_WIDTH = 20;
-const MAX_CHUNK_CELLS = 12;
 /* The engine's batched bites are >= 256 tokens; anything smaller means it is
  * running token-by-token (short appends and the final tail). */
-const CHUNK_MIN_TOKENS = 256;
 const STOPPING_STATUS = "local-llm-stopping";
 const STOPPING_MESSAGE = "Local LLM stopping...";
 const STOPPING_APPEAR_MS = 2_000;
 const STOPPING_MAX_MS = 60_000;
 
 // ── Types ───────────────────────────────────────────────────────────────────
-
-interface ProgressData {
-  phase: "prefill" | "decode";
-  processed: number;
-  total: number;
-  tokens: number;
-  tok_s: number;
-  eta?: number;
-  count?: number;
-  origin?: string;
-}
 
 interface LoadedModel {
   id: string;
@@ -74,63 +63,6 @@ interface MonitorConfig {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-const PARTIAL_BLOCKS: Record<number, string> = {
-  1: "\u258F", 2: "\u258E", 3: "\u258D", 4: "\u258C",
-  5: "\u258B", 6: "\u258A", 7: "\u2589",
-};
-
-function buildBar(filled: number, total: number): string {
-  const pct = total > 0 ? Math.min(filled / total, 1) : 0;
-  const eighths = Math.floor(pct * BAR_WIDTH * 8);
-  const full = Math.floor(eighths / 8);
-  const rem = eighths % 8;
-  const empty = BAR_WIDTH - full - (rem > 0 ? 1 : 0);
-  return "\u2588".repeat(full) + (rem > 0 ? PARTIAL_BLOCKS[rem] : "") + "\u2591".repeat(empty);
-}
-
-/* One cell per bite, separated so the segmentation is visible. Cells fill only
- * when a bite completes; the final (possibly token-by-token) bite fills its
- * cell gradually. Scaled down to MAX_CHUNK_CELLS when there are more bites. */
-export function buildChunkBar(
-  processed: number,
-  total: number,
-  cellTokens: number,
-  cellsTotal: number,
-  cells: number,
-): string {
-  if (cellTokens <= 0 || cellsTotal <= 0 || cells <= 0) return "";
-  const fullBites = Math.floor(processed / cellTokens);
-  const cellsFilled = Math.min(cells, Math.floor(fullBites * cells / cellsTotal));
-  const unscaled = cells === cellsTotal;
-  const finalBite = Math.max(1, total - (cellsTotal - 1) * cellTokens);
-  const parts: string[] = [];
-  for (let i = 0; i < cells; i++) {
-    if (i < cellsFilled) { parts.push("\u2588"); continue; }
-    if (unscaled && i === cellsFilled && fullBites >= cellsTotal - 1) {
-      const frac = Math.min(1, (processed - (cellsTotal - 1) * cellTokens) / finalBite);
-      if (frac > 0) {
-        const eighth = Math.round(frac * 8);
-        parts.push(eighth >= 8 ? "\u2588" : (PARTIAL_BLOCKS[Math.max(1, eighth)] ?? "\u2591"));
-        continue;
-      }
-    }
-    parts.push("\u2591");
-  }
-  return parts.join(" ");
-}
-
-function formatTokS(tok_s: number): string {
-  if (tok_s <= 0) return "";
-  if (tok_s >= 1000) return `${(tok_s / 1000).toFixed(1)}k tok/s`;
-  return `${Math.round(tok_s)} tok/s`;
-}
-
-function formatRemaining(seconds: number): string {
-  if (!seconds || seconds <= 0 || seconds > 36000) return "";
-  if (seconds >= 60) return `, ${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s left`;
-  return `, ${Math.round(seconds)}s left`;
-}
 
 function nowMs(): number {
   return (typeof performance !== "undefined" && performance.now?.()) || Date.now();
@@ -213,31 +145,9 @@ function hasStoppingActivity(loaded: LoadedModel[]): boolean {
 // ── State ───────────────────────────────────────────────────────────────────
 
 // Smooth prefill (warm-up and token-level trickle)
-let barPos     = 0;     // current bar position (tokens)
-let barStart   = 0;     // when current motion segment began
-let apiSpeed   = 0;     // real API tok/s (what we display as speed)
-let dispSpeed  = 0;     // display speed: how fast barPos advances (tokens/s)
-
-let gtProcessed = 0;
-let gtTotal   = 0;
-let gtEta: number | undefined;
-let gtCount: number | undefined;
-let gtOrigin: string | undefined;
-let gtSpeed   = 0;
-let gtLastPollTime = 0;
+const prefill = new PrefillProgress();
 let hasActivity = false;
 
-// Chunk ledger
-let cellTokens = 0;        // tokens per bite, learned from completed bites
-let cellsTotal = 0;        // ceil(total / cellTokens)
-let biteKnown = false;     // the first real bite of this prefill has been seen
-let bitesSeen = 0;
-let lastProcessed = 0;     // authoritative processed at the last observed bite
-let lastBiteAt = 0;
-let tailActive = false;    // engine switched to token-by-token at the end
-let tailBase = 0;
-let tailRate = 0;
-let tailStart = 0;
 // Decode odometer
 let decodeTokens = 0;
 let decodeSpeed  = 0;
@@ -247,82 +157,14 @@ let decodeCount: number | undefined;
 // Local-provider gate for the decode odometer and stream events
 let isLocalModel = false;
 
-function resetPrefill() {
-  barPos = 0; barStart = 0; apiSpeed = 0; dispSpeed = 0;
-  gtProcessed = 0; gtTotal = 0; gtEta = undefined; gtCount = undefined;
-  gtOrigin = undefined; gtSpeed = 0; gtLastPollTime = 0;
-  cellTokens = 0; cellsTotal = 0; biteKnown = false; bitesSeen = 0;
-  lastProcessed = 0; lastBiteAt = 0;
-  tailActive = false; tailBase = 0; tailRate = 0; tailStart = 0;
-}
-
 function resetDecode() {
   decodeTokens = 0; decodeSpeed = 0; decodeOrigin = undefined; decodeCount = undefined;
 }
 
 function reset() {
-  resetPrefill();
+  prefill.reset();
   resetDecode();
   hasActivity = false;
-}
-
-function getInterpolated(now: number): number {
-  if (dispSpeed <= 0) return barPos;
-  const elapsed = (now - barStart) / 1000;
-  const ceiling = gtProcessed < gtTotal ? gtTotal - 1 : gtTotal;
-  return Math.min(barPos + dispSpeed * elapsed, ceiling);
-}
-
-// ── Display Formatting ──────────────────────────────────────────────────────
-
-export function originLabel(origin?: string): string {
-  const value = typeof origin === "string" ? origin.trim() : "";
-  return !value || value.toLowerCase() === "user" ? "" : ` (${value.toUpperCase()})`;
-}
-
-export function formatPrefill(data: ProgressData, interpolated: number): string {
-  const clamped = Math.min(Math.max(interpolated, 0), data.total);
-  const bar = buildBar(clamped, data.total);
-  const speed = formatTokS(data.tok_s);
-  const clbl = (data.count != null && data.count > 1) ? ` (${data.count} PP)` : "";
-  const eta = formatRemaining(data.eta ?? 0);
-  const sp = speed ? `  (${speed})` : "";
-  return `Prefill${originLabel(data.origin)}${clbl} ${bar}  ${Math.floor(clamped)}/${data.total} tokens${eta}${sp}`;
-}
-
-export function formatDecode(data: ProgressData): string {
-  const speed = formatTokS(data.tok_s);
-  const clbl = (data.count != null && data.count > 1) ? ` (${data.count})` : "";
-  const sp = speed ? `  (${speed})` : "";
-  return `Decoding${originLabel(data.origin)}${clbl} - ${data.tokens} tokens${sp}`;
-}
-
-export function formatQueued(position: number): string {
-  const mod100 = position % 100;
-  const suffix = mod100 >= 11 && mod100 <= 13 ? "th"
-    : position % 10 === 1 ? "st" : position % 10 === 2 ? "nd" : position % 10 === 3 ? "rd" : "th";
-  return `Queued (${position}${suffix})`;
-}
-
-export function formatPrefillChunks(data: {
-  processed: number;
-  total: number;
-  cellTokens: number;
-  cellsTotal: number;
-  tok_s: number;
-  eta?: number;
-  origin?: string;
-  count?: number;
-}): string {
-  const cells = Math.min(data.cellsTotal, MAX_CHUNK_CELLS);
-  const bar = buildChunkBar(data.processed, data.total, data.cellTokens, data.cellsTotal, cells);
-  const done = Math.min(Math.floor(data.processed / data.cellTokens), data.cellsTotal);
-  const speed = formatTokS(data.tok_s);
-  const clbl = (data.count != null && data.count > 1) ? ` (${data.count} PP)` : "";
-  const eta = formatRemaining(data.eta ?? 0).replace(/^,\s*/, "");
-  const sp = speed ? ` (${speed})` : "";
-  const left = eta ? ` ${eta}` : "";
-  return `Prefill${originLabel(data.origin)}${clbl} ${bar} ${done}/${data.cellsTotal} chunks${sp}${left}`;
 }
 
 // ── Extension ───────────────────────────────────────────────────────────────
@@ -381,37 +223,6 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify?.(`Chat release failed: ${error}; lease/operator release remains available`, "warning");
       }
     }
-  }
-
-  function chunkDisplayProcessed(now: number): number {
-    if (!tailActive || tailRate <= 0) return gtProcessed;
-    return Math.min(tailBase + tailRate * (now - tailStart) / 1000, gtTotal);
-  }
-
-  function renderPrefill(now: number): string {
-    if (cellTokens > 0 && cellsTotal > 0) {
-      return formatPrefillChunks({
-        processed: chunkDisplayProcessed(now),
-        total: gtTotal,
-        cellTokens,
-        cellsTotal,
-        tok_s: gtSpeed,
-        eta: gtEta,
-        origin: gtOrigin,
-        count: gtCount,
-      });
-    }
-    const interpolated = getInterpolated(now);
-    return formatPrefill({
-      phase: "prefill",
-      processed: interpolated,
-      total: gtTotal,
-      tokens: 0,
-      tok_s: apiSpeed,
-      eta: gtEta,
-      count: gtCount,
-      origin: gtOrigin,
-    }, interpolated);
   }
 
   function renderDecode(): string {
@@ -576,8 +387,8 @@ export default function (pi: ExtensionAPI) {
 
         if (pf.length > 0) {
           if (pf.length > 1) {
-            gtCount = pf.length;
-            gtLastPollTime = 0;
+            prefill.gtCount = pf.length;
+            prefill.gtLastPollTime = 0;
             phase = "prefill";
             ctx.ui.setWorkingMessage(pf.map((p: any) => formatPrefill({
               phase: "prefill", processed: numeric(p.processed), total: numeric(p.total),
@@ -587,76 +398,14 @@ export default function (pi: ExtensionAPI) {
           }
 
           const first = pf[0];
-          const processed = numeric(first.processed);
-          const total = numeric(first.total);
-          const speed = getItemSpeed(first);
-
-          if (!wasActivity || total !== gtTotal || processed < lastProcessed) {
-            resetPrefill();
-            // Reuse the learned bite size so the ledger shows from the start,
-            // but only while it still describes this prompt scale; the first
-            // completed bite corrects it.
-            const guess = biteGuesses[ctx.model?.id || ""] || 0;
-            if (guess > 0 && total > 0 && total <= guess * 8) {
-              cellTokens = guess;
-              cellsTotal = Math.ceil(total / cellTokens);
-            }
-          }
-
-          if (processed > lastProcessed) {
-            const delta = processed - lastProcessed;
-            const bite = lastBiteAt > 0 ? (now - lastBiteAt) / 1000 : 0;
-            if (delta >= CHUNK_MIN_TOKENS) {
-              bitesSeen += 1;
-              if (!biteKnown) {
-                biteKnown = true;
-                if (delta !== cellTokens) {
-                  cellTokens = delta;
-                  cellsTotal = Math.ceil(total / cellTokens);
-                }
-                // Only remember a bite that is part of a multi-bite prompt; a
-                // one-bite total would poison the next prompt's guess.
-                if (delta < total) rememberBite(ctx.model?.id || "", delta);
-              }
-            } else if (bitesSeen === 0) {
-              // Whole prefill is token-by-token: keep the smooth bar.
-              cellTokens = 0;
-              cellsTotal = 0;
-            } else {
-              // Token-level tail: let the final cell fill smoothly.
-              tailActive = true;
-              tailBase = processed;
-              tailStart = now;
-              if (bite > 0) {
-                const inst = delta / bite;
-                tailRate = tailRate > 0 ? tailRate + (inst - tailRate) * 0.3 : inst;
-              }
-            }
-            lastProcessed = processed;
-            lastBiteAt = now;
-          }
-
-          if (cellTokens === 0) {
-            if (speed > 0) apiSpeed = apiSpeed === 0 ? speed : apiSpeed + (speed - apiSpeed) * 0.2;
-            barPos = processed;
-            barStart = now;
-            dispSpeed = apiSpeed;
-          }
-
-          gtProcessed = processed;
-          gtTotal = total;
-          gtEta = numeric(first.eta);
-          gtCount = pf.length;
-          gtOrigin = first.origin;
-          gtSpeed = speed;
-          gtLastPollTime = now;
+          prefill.observe(first, pf.length, now, wasActivity, (bite) => rememberBite(ctx.model?.id || "", bite), biteGuesses[ctx.model?.id || ""] || 0);
           phase = "prefill";
-          ctx.ui.setWorkingMessage(renderPrefill(now));
+          ctx.ui.setWorkingMessage(prefill.text(now));
           return;
         }
 
         if (gen.length > 0) {
-          resetPrefill();
+          prefill.reset();
           phase = "decode";
           if (gen.length > 1) {
             ctx.ui.setWorkingMessage(gen.map((g: any) => formatDecode({
@@ -685,8 +434,8 @@ export default function (pi: ExtensionAPI) {
 
     animTimer = setInterval(() => {
       if (sessionToken !== myToken) return;
-      if (phase === "prefill" && gtTotal > 0 && gtLastPollTime > 0) {
-        ctx.ui.setWorkingMessage(renderPrefill(nowMs()));
+      if (phase === "prefill" && prefill.gtTotal > 0 && prefill.gtLastPollTime > 0) {
+        ctx.ui.setWorkingMessage(prefill.text(nowMs()));
       } else if (phase === "decode" && decodeTokens > 0) {
         ctx.ui.setWorkingMessage(renderDecode());
       }

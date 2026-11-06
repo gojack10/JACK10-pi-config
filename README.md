@@ -253,6 +253,62 @@ reload the desktop after its tasks finish. This temporarily removes the combined
 menu, not the saved chats. Restore the gateway URL after maintenance to use local
 models again.
 
+## Native local inference progress
+
+`codex-desktop-progress/` builds a local desktop copy with a native progress
+line in Codex's existing above-composer portal. Each portal supplies its own
+conversation ID, so split views and separate windows correlate independently.
+The renderer uses the same formatting, chunk ledger and interpolation code as
+Pi, extracted into `extensions/local-llm-generation/progress.ts`. Pi retains
+its stream-driven decode counter; the desktop reads authoritative decode counts
+from the telemetry feed at 250 ms intervals. Neither client invents decode
+tokens or an estimated completion percentage for generation.
+
+The desktop main process reads `.proxy-key` and brokers telemetry over IPC.
+The renderer never receives that credential. The main-frame bridge only accepts
+a thread ID and calls the fixed loopback endpoint below.
+
+The reusable feed is `GET /v1/local-progress?thread_id=<codex-thread-id>`,
+authenticated with the proxy's bearer key. Its version 1 JSON fields are:
+
+- `version`, `thread_id`, `request_id`, and canonical `model`.
+- `phase`: `idle`, `queued`, `loading`, `preparing`, `prefill`, `decode`,
+  `stopping`, or `blocked`.
+- `queue_position`, and arrays `prefill` and `decode`.
+- Samples contain only measured counts, speed, ETA, origin and stopping state.
+
+It returns no conversation content or another request's activity. A plugin can
+consume this same endpoint from its server without depending on desktop IPC.
+The feed reuses existing FIFO admission, native model ownership and admin stats.
+
+Build the local app using the installed Pi runtime's esbuild:
+
+```sh
+node ~/.pi/agent/codex-desktop-progress/build.mjs
+```
+
+The builder uses `pi_root` and `agent_dir` from the same ignored gateway
+configuration to locate esbuild and the proxy key file. The local app embeds
+only that configured key-file location; the credential is read at runtime and
+never included in the tracked source or build output. App source and destination
+can be supplied as positional arguments to the builder.
+
+The default destination is `~/Applications/ChatGPT Local.app`. The builder uses
+an independent APFS copy, updates the archive's integrity and its Info.plist hash,
+and reseals the framework's embedded integrity-dictionary digest. It signs the
+framework helpers, framework and app inside-out and disables the copied app's
+vendor updater. Stock `/Applications/ChatGPT.app` stays the source
+for future builds. Supply another destination as the second positional argument
+after the source app when that destination already exists.
+
+Local signing removes vendor-restricted signing entitlements, including shared
+keychain and communication-notification groups. This local build is not an
+equivalent vendor-signed distribution. It keeps the existing bundle ID and
+application data; opening it while stock is running hands off to that instance.
+Quit stock after its tasks finish, then open the local copy to activate the UI.
+Activate prepared proxy changes separately through `local-ai restart` once other
+gateway requests and active local generation have finished.
+
 ## Pi fork
 
 Sometimes Pi can't do certain stuff, so I run [gojack10/pi-mono](https://github.com/gojack10/pi-mono). If you install upstream pi, some extensions will load and do nothing.
