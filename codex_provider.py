@@ -215,7 +215,7 @@ class ResponsesStream:
         out = b""
         if reasoning:
             if self.reasoning is None:
-                item = {"id": "rs_" + uuid.uuid4().hex, "type": "reasoning", "summary": []}
+                item = {"id": "rs_local_" + uuid.uuid4().hex, "type": "reasoning", "summary": []}
                 self.reasoning, out = self.add_item(item)
                 item["summary"].append({"type": "summary_text", "text": ""})
                 out += self.event("response.reasoning_summary_part.added", item_id=item["id"],
@@ -305,7 +305,7 @@ class ResponsesStream:
             custom = spec["type"] == "custom"
             value = json.loads(call["arguments"])["input"] if custom else call["arguments"]
             field = "input" if custom else "arguments"
-            item = {"id": "call_" + uuid.uuid4().hex,
+            item = {"id": ("ctc_" if custom else "fc_") + uuid.uuid4().hex,
                 "type": "custom_tool_call" if custom else "function_call",
                 "call_id": call["id"] or "call_" + uuid.uuid4().hex,
                 "name": spec["name"], field: "", "status": "in_progress"}

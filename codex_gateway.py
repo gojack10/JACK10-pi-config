@@ -1,5 +1,7 @@
 """Combined OpenAI and local-model gateway for the Codex desktop picker."""
 import asyncio
+import json
+import re
 
 from aiohttp import ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
@@ -8,6 +10,45 @@ OPENAI_BASE = 'https://chatgpt.com/backend-api/codex'
 TIMEOUT = ClientTimeout(total=None, sock_connect=15, sock_read=None)
 HOP_HEADERS = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
                'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length'}
+FOREIGN_REASONING_IDS = ('rs_local_', 'rs_meta_', 'rs_bedrock_', 'rs_openai_api_', 'rs_openrouter_')
+PI_REASONING_ENVELOPES = ('pi-meta-v1:', 'pi-bedrock-v1:', 'pi-openai-api-v1:', 'pi-openrouter-v1:')
+LEGACY_LOCAL_REASONING_ID = re.compile(r'rs_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}')
+
+
+def openai_body(payload, original):
+    """Keep visible foreign history without replaying another provider's state."""
+    if not isinstance(payload.get('input'), list):
+        return original
+    items, changed = [], False
+    for item in payload['input']:
+        if not isinstance(item, dict):
+            items.append(item)
+            continue
+        identity = item.get('id') or ''
+        encrypted = item.get('encrypted_content') or ''
+        kind = item.get('type')
+        foreign_reasoning = kind == 'reasoning' and (
+            isinstance(identity, str) and (identity.startswith(FOREIGN_REASONING_IDS) or
+                (not encrypted and LEGACY_LOCAL_REASONING_ID.fullmatch(identity))) or
+            isinstance(encrypted, str) and encrypted.startswith(PI_REASONING_ENVELOPES))
+        if foreign_reasoning:
+            text = '\n'.join(part['text'] for part in
+                (item.get('summary') or []) + (item.get('content') or [])
+                if isinstance(part, dict) and isinstance(part.get('text'), str))
+            if text:
+                items.append({'type': 'message', 'role': 'assistant', 'content': [
+                    {'type': 'output_text', 'text': text}]})
+            changed = True
+            continue
+        if isinstance(identity, str) and kind in ('message', 'function_call', 'custom_tool_call') and (
+                identity.startswith(('msg_meta_', 'fc_meta_', 'ctc_meta_')) or len(identity) > 64 or
+                (kind != 'message' and identity.startswith('call_'))):
+            # Replay IDs are optional here. Tool result pairing uses call_id,
+            # which must remain unchanged when switching providers.
+            item = {key: value for key, value in item.items() if key != 'id'}
+            changed = True
+        items.append(item)
+    return json.dumps(dict(payload, input=items), separators=(',', ':')).encode() if changed else original
 
 
 def request_headers(request, local_key):

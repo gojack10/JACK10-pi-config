@@ -918,7 +918,7 @@ async def route_codex_gateway(request):
                     f'Local Codex does not support /{tail}; the request was not sent to OpenAI')
             return await local_codex_response(local_request, payload)
         return await codex_gateway.while_connected(request,
-            codex_gateway.forward(request, PROXY_API_KEY, body))
+            codex_gateway.forward(request, PROXY_API_KEY, codex_gateway.openai_body(payload, body)))
     return await codex_gateway.while_connected(request,
         codex_gateway.forward(request, PROXY_API_KEY))
 
