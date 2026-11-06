@@ -5,6 +5,7 @@ import type { Model, OAuthCredential, Provider } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseRegistry } from "./codex-quota-extension/store.ts";
+import { codexAccountStreamOptions, withCodexFastModels } from "./codex-personal/models.ts";
 import {
 	isTerminalCodexUsageLimit,
 	isZeroOutputFailure,
@@ -81,6 +82,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 	let startupFallbackWarning: string | undefined;
 	const failedAccounts = new Set<string>();
 	for (const account of registry.accounts) {
+		const accountModels = new Set(account.supportedModels);
 		if (account.credentialRef !== account.providerId)
 			throw new Error(`Unsupported credentialRef for ${account.accountKey}`);
 		const accountOauth = withFreshLoginProbe(
@@ -127,8 +129,9 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					},
 				},
 			},
-			getModels: () => source.getModels().map((model) => ({ ...model, provider: account.providerId })),
-			getAllModels: () => (source.getAllModels?.() ?? source.getModels())
+			getModels: () => withCodexFastModels(source.getModels(), accountModels)
+				.map((model) => ({ ...model, provider: account.providerId })),
+			getAllModels: () => withCodexFastModels(source.getAllModels?.() ?? source.getModels(), accountModels)
 				.map((model) => ({ ...model, provider: account.providerId })),
 			stream: (model, context, options) => {
 				if (
@@ -136,7 +139,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
 				)
 					throw new Error("ROUTE DENIED: Codex account has no matching session pin");
-				return source.stream(model, context, { ...options, transport: "sse" });
+				return source.stream(model, context, codexAccountStreamOptions(model.id, options));
 			},
 			streamSimple: (model, context, options) => {
 				if (
@@ -144,7 +147,7 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 					process.env.PI_CODEX_ACCOUNT_MAINTENANCE !== account.providerId
 				)
 					throw new Error("ROUTE DENIED: Codex account has no matching session pin");
-				return source.streamSimple(model, context, { ...options, transport: "sse" });
+				return source.streamSimple(model, context, codexAccountStreamOptions(model.id, options));
 			},
 		} as Provider);
 	}
@@ -169,14 +172,14 @@ export default function codexWorkspaces(pi: ExtensionAPI) {
 				resolve: async () => ({ auth: { apiKey: "selector-only" }, source: "local selector" }),
 			},
 		},
-		getModels: () =>
-			source
-				.getModels()
-				.filter((model) => supportedModels.has(model.id))
-				.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
-		getAllModels: () => (source.getAllModels?.() ?? source.getModels())
-			.filter((model) => supportedModels.has(model.id))
-			.map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
+		getModels: () => withCodexFastModels(
+			source.getModels().filter((model) => supportedModels.has(model.id)),
+			supportedModels,
+		).map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
+		getAllModels: () => withCodexFastModels(
+			(source.getAllModels?.() ?? source.getModels()).filter((model) => supportedModels.has(model.id)),
+			supportedModels,
+		).map((model) => ({ ...model, provider: registry.umbrellaProviderId })),
 		modelSelectionError: selectionError,
 		resolveModel: async (model, context) => {
 			const resolved = await resolveCodexPersonalSelection({

@@ -11,6 +11,7 @@ import {
 	parseUsageState,
 	type RegistryAccount,
 } from "../codex-quota-extension/store.ts";
+import { codexBaseModelId } from "./models.ts";
 
 export type RouteCandidate = {
 	accountKey: string;
@@ -96,7 +97,7 @@ const formatBlockedError = (
 					.map(({ account, reasons }) => `${account.label}(${account.accountKey}): ${reasons.join(", ") || "eligible"}`)
 					.join("; ")
 			: "registry unavailable";
-	const headline = accounts.some(({ account }) => account.supportedModels.includes(model))
+	const headline = accounts.some(({ account }) => account.supportedModels.includes(codexBaseModelId(model)))
 		? `MODEL UNAVAILABLE: openai-codex-personal/${model} — no routable Codex account supports this model.`
 		: `MODEL UNAVAILABLE: openai-codex-personal/${model} — no configured Codex account supports this model.`;
 	return `${headline}\nEarliest recovery: ${earliestRecovery} / earliest notBefore: ${notBeforeText}.\nFeed: ${feedPath}; ${feedSummary}.\nAccounts: ${accountText}.`;
@@ -131,7 +132,7 @@ export const evaluateCodexRoute = (options: {
 		const telemetry = telemetryByKey.get(account.accountKey);
 		const reasons: string[] = [];
 		const degradations: string[] = options.feedNotice ? [options.feedNotice] : [];
-		if (!account.supportedModels.includes(model)) reasons.push("UNSUPPORTED MODEL");
+		if (!account.supportedModels.includes(codexBaseModelId(model))) reasons.push("UNSUPPORTED MODEL");
 		if (!telemetry)
 			return {
 				account,
