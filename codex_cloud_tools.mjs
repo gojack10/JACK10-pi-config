@@ -164,7 +164,7 @@ export class Tools {
         const { id, status, ...message } = item;
         return [message];
       }
-      throw invalid(`Unsupported Meta Responses input item: ${type}`);
+      throw invalid(`Unsupported Responses input item: ${type}`);
     });
   }
 }

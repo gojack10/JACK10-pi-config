@@ -18,12 +18,11 @@ LEGACY_LOCAL_REASONING_ID = re.compile(r'rs_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-
 COMPACTION_HANDOFF = re.compile(r'\[Codex handoff for (cmp_[\w-]+)\]\n\S')
 
 
-def portable_compaction_input(items):
-    """Remove an opaque checkpoint only when Codex carries its text handoff."""
+def portable_compaction_input(items, native_replay_prefix=None):
+    """Replay a text handoff in place of opaque compaction state."""
     if not isinstance(items, list):
         return items
-    checkpoints = [item for item in items if isinstance(item, dict) and item.get('type') == 'compaction']
-    if not checkpoints:
+    if not any(isinstance(item, dict) and item.get('type') == 'compaction' for item in items):
         return items
     handoffs = set()
     for item in items:
@@ -37,10 +36,20 @@ def portable_compaction_input(items):
                     match = COMPACTION_HANDOFF.match(part['text'])
                     if match:
                         handoffs.add(match[1])
-    for item in checkpoints:
-        if not isinstance(item.get('id'), str) or item['id'] not in handoffs:
-            raise invalid('This model needs a text handoff for the encrypted compaction in this chat.')
-    return [item for item in items if not isinstance(item, dict) or item.get('type') != 'compaction']
+    replay = []
+    for item in items:
+        if not isinstance(item, dict) or item.get('type') != 'compaction':
+            replay.append(item)
+            continue
+        identity = item.get('id')
+        encrypted = item.get('encrypted_content')
+        if native_replay_prefix and isinstance(encrypted, str) and encrypted.startswith(native_replay_prefix):
+            replay.append(item)
+            continue
+        if isinstance(identity, str) and identity in handoffs:
+            continue
+        raise invalid('This model needs a text handoff for the encrypted compaction in this chat.')
+    return replay
 
 
 def openai_body(payload, original):

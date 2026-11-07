@@ -1,6 +1,7 @@
 /** Translate Codex Responses through Pi's installed streaming providers. */
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -82,6 +83,33 @@ function context(payload, tools, route) {
   }
   if (tools.hostedSearch) systemPrompt += "\nOpenAI-hosted web search is unavailable on this model. Use an available browser or search function tool; do not claim to have searched without using one.";
   return { systemPrompt, messages, tools: [...tools.declared.values()] };
+}
+
+function openAIInput(input, route, tools) {
+  if (!Array.isArray(input)) return input;
+  return input.flatMap((item) => {
+    if (item.type === "agent_message") return tools.input([item]);
+    if (!["reasoning", "compaction"].includes(item.type)) return [item];
+    if (item.encrypted_content?.startsWith(route.replay)) {
+      const replay = JSON.parse(Buffer.from(item.encrypted_content.slice(route.replay.length), "base64").toString());
+      if (replay.model === route.model.id) {
+        if (replay.item) return [replay.item];
+        // Earlier Pi-backed turns stored the native reasoning item in this signature.
+        if (item.type === "reasoning" && replay.block?.thinkingSignature) {
+          return [JSON.parse(replay.block.thinkingSignature)];
+        }
+      }
+    }
+    if (item.type === "compaction") throw invalid("This checkpoint belongs to a different model; a text handoff is required");
+    const text = [...(item.summary || []), ...(item.content || [])].map((part) => part.text || "").join("\n");
+    return text ? [{ role: "assistant", content: [{ type: "output_text", text }] }] : [];
+  });
+}
+
+function openAIOutputItem(item, route) {
+  if (!["reasoning", "compaction"].includes(item.type) || !item.encrypted_content) return item;
+  const replay = { model: route.model.id, item };
+  return { ...item, encrypted_content: route.replay + Buffer.from(JSON.stringify(replay)).toString("base64") };
 }
 
 /** Turn Pi's provider-neutral incremental events into Codex Responses events. */
@@ -233,13 +261,66 @@ export async function run({ slug, provider, id }) {
     if (!levels.includes(level)) throw invalid(`Reasoning must be one of: ${levels.join(", ")}`);
     const route = { slug, model, replay: `pi-${profile.replay}-v1:`, reasoningId: `rs_${profile.replay.replaceAll("-", "_")}_` };
     const tools = new Tools(profile.schemas);
+    response = new Responses(tools, route);
+    let auth;
+    if (!bedrock) {
+      auth = await models.getAuth(model, { signal: abort.signal });
+      if (auth?.type !== "api_key" || !auth.auth.apiKey) {
+        throw Object.assign(new Error(`Configure the ${provider} API key in Pi`), { status: 401 });
+      }
+      if (auth.auth.baseUrl && auth.auth.baseUrl.replace(/\/+$/, "") !== profile.base) {
+        throw new Error(`Pi ${provider} authentication resolved an unexpected endpoint`);
+      }
+      const { configureHttpDispatcher } = await load("coding-agent/dist/core/http-dispatcher.js");
+      configureHttpDispatcher(0);
+    }
+    if (provider === "openai") {
+      // Preserve native Responses items and events, including compaction.
+      const require = createRequire(join(piRoot(), "package.json"));
+      const OpenAI = require("openai");
+      const { clampOpenAIPromptCacheKey } = await load("ai/dist/api/openai-prompt-cache.js");
+      const client = new OpenAI({ apiKey: auth.auth.apiKey, baseURL: profile.base, maxRetries: 0,
+        timeout: 2147483647, defaultHeaders: { ...model.headers, ...auth.auth.headers,
+          ...(sessionId ? { session_id: sessionId } : {}) } });
+      const params = {
+        model: model.id, input: openAIInput(payload.input || [], route, tools), stream: true, store: false,
+        max_output_tokens: Math.min(payload.max_output_tokens || model.maxTokens, model.maxTokens),
+        prompt_cache_key: clampOpenAIPromptCacheKey(payload.prompt_cache_key || sessionId),
+        include: [...new Set([...(payload.include || []), "reasoning.encrypted_content"])],
+        reasoning: { summary: "auto", ...payload.reasoning,
+          effort: model.thinkingLevelMap?.[level] || (level === "off" ? "none" : level) },
+      };
+      for (const key of ["instructions", "tools", "tool_choice", "parallel_tool_calls", "text",
+        "temperature", "top_p", "context_management", "truncation", "service_tier", "safety_identifier"]) {
+        if (payload[key] !== undefined) params[key] = payload[key];
+      }
+      const { data: stream } = await client.responses.create(params, { signal: abort.signal }).withResponse();
+      await write(JSON.stringify({ status: 200 }) + "\n");
+      started = true;
+      let terminal = false;
+      for await (const event of stream) {
+        const data = { ...event };
+        if (data.item) data.item = openAIOutputItem(data.item, route);
+        if (data.response) {
+          data.response = { ...data.response, model: slug,
+            output: (data.response.output || []).map((item) => openAIOutputItem(item, route)) };
+          response.id = data.response.id;
+          response.created = data.response.created_at;
+          response.output = data.response.output;
+        }
+        response.sequence = (data.sequence_number ?? response.sequence) + 1;
+        await write(`event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
+        if (["response.completed", "response.incomplete", "response.failed", "error"].includes(data.type)) terminal = true;
+      }
+      if (!terminal) throw new Error("OpenAI stream ended without a terminal response event");
+      return;
+    }
     const ctx = context(payload, tools, route);
     const choice = tools.choice(payload.tool_choice || "auto");
     if (model.api !== "openai-responses" && choice?.type === "allowed_tools") {
       throw invalid("tool_choice must be auto, none, required, or a named tool");
     }
 
-    response = new Responses(tools, route);
     const options = {
       signal: abort.signal, sessionId,
       maxTokens: payload.max_output_tokens || model.maxTokens,
@@ -255,24 +336,9 @@ export async function run({ slug, provider, id }) {
         toolChoice: choice === "required" ? "any" : typeof choice === "object" ? { type: "tool", name: choice.name } : choice,
       });
     } else {
-      const auth = await models.getAuth(model, { signal: abort.signal });
-      if (auth?.type !== "api_key" || !auth.auth.apiKey) {
-        throw Object.assign(new Error(`Configure the ${provider} API key in Pi`), { status: 401 });
-      }
-      if (auth.auth.baseUrl && auth.auth.baseUrl.replace(/\/+$/, "") !== profile.base) {
-        throw new Error(`Pi ${provider} authentication resolved an unexpected endpoint`);
-      }
-      const { configureHttpDispatcher } = await load("coding-agent/dist/core/http-dispatcher.js");
-      configureHttpDispatcher(0);
       Object.assign(options, { apiKey: auth.auth.apiKey, cacheRetention: "short", reasoningEffort: reasoning,
-        maxTokens: Math.min(options.maxTokens, model.maxTokens) });
-      if (model.api === "openai-responses") {
-        options.toolChoice = choice;
-        options.reasoningSummary = payload.reasoning?.summary;
-        options.onPayload = (params) => ({ ...params, store: false });
-      } else {
-        options.toolChoice = typeof choice === "object" ? { type: "function", function: { name: choice.name } } : choice;
-      }
+        maxTokens: Math.min(options.maxTokens, model.maxTokens),
+        toolChoice: typeof choice === "object" ? { type: "function", function: { name: choice.name } } : choice });
     }
     if (model.api !== "openai-responses" && payload.temperature !== undefined) options.temperature = payload.temperature;
     for await (const event of models.stream(model, ctx, options)) await response.event(event);

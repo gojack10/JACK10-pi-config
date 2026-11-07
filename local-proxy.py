@@ -908,7 +908,8 @@ async def route_codex_gateway(request):
         local_model = (model in codex_provider.MODEL_ALIASES or canonical in MANAGED_MODELS
                        or canonical in MODEL_BACKENDS)
         if (cloud_model or local_model) and 'input' in payload:
-            payload['input'] = codex_gateway.portable_compaction_input(payload['input'])
+            native_replay_prefix = 'pi-openai-api-v1:' if model == 'gpt-6.1-sol-zdr' else None
+            payload['input'] = codex_gateway.portable_compaction_input(payload['input'], native_replay_prefix)
         if cloud_model:
             if tail != 'responses':
                 raise codex_provider.invalid(f'{model} does not support /{tail}')
