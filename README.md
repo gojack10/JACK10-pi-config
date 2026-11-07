@@ -256,8 +256,10 @@ models again.
 ## Native local inference progress
 
 `codex-desktop-progress/` builds a local desktop copy with a native progress
-line in Codex's existing above-composer portal. Each portal supplies its own
-conversation ID, so split views and separate windows correlate independently.
+line in Codex's existing above-composer portal. It also preserves model names
+verbatim instead of applying Codex's GPT capitalization and spacing. Each portal
+supplies its own conversation ID, so split views and separate windows correlate
+independently.
 The renderer uses the same formatting, chunk ledger and interpolation code as
 Pi, extracted into `extensions/local-llm-generation/progress.ts`. Pi retains
 its stream-driven decode counter; the desktop reads authoritative decode counts

@@ -146,6 +146,8 @@ async def catalog(request, local_models, local_key):
         if model['slug'] not in existing:
             models.append(dict(model, priority=priority))
             priority += 1
+    for model in models:
+        model['display_name'] = model['slug']
     return web.json_response(data, headers={'Cache-Control': 'private, no-store'})
 
 

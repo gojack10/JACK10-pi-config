@@ -97,6 +97,23 @@ try {
 		);
 		if (patched !== original) additions.set(filename, Buffer.from(patched));
 	}
+	// Keep catalog names verbatim; Codex otherwise reformats every GPT-prefixed name.
+	let modelNameFormatterFound = false;
+	for (const name of Object.keys(header.files.webview.files.assets.files.async.files)) {
+		if (!name.endsWith(".js")) continue;
+		const filename = "webview/assets/async/" + name;
+		const original = read(filename).toString();
+		const patched = original.replace(
+			/function ([\w$]+)\(([\w$]+),\{stripGptPrefix:[\w$]+=!1\}=\{\}\)\{.*?return [\w$]+\?[\w$]+\.replace\(\/\^GPT-\/iu,""\):[\w$]+\}/g,
+			(_, functionName, argument) => {
+				modelNameFormatterFound = true;
+				return `function ${functionName}(${argument}){return ${argument}}`;
+			},
+		);
+		if (patched !== original) additions.set(filename, Buffer.from(patched));
+	}
+	if (!modelNameFormatterFound)
+		throw new Error("Could not find the desktop model-name formatter");
 	// ASAR keeps per-file integrity; rebuild only changed files' integrity blocks.
 	for (const [name, buffer] of additions) {
 		const parts = name.split("/");
