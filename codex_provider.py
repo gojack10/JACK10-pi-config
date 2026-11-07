@@ -38,7 +38,8 @@ def text_content(value):
 
 
 def tool_name(name, namespace=None):
-    return f"{namespace}__{name}" if namespace else name
+    # Codex declares native tools in functions, but dispatches them unqualified.
+    return f"{namespace}__{name}" if namespace and namespace != "functions" else name
 
 
 def chat_identity(identity):
@@ -67,11 +68,14 @@ def chat_request(payload):
     output_format = (payload.get("text") or {}).get("format") or {}
     if output_format.get("type", "text") != "text":
         raise invalid("Schema-constrained final output is unavailable on this local route")
-    tools, names = [], {}
+    tools, names = {}, {}
+    request_tools = set()
     hosted_search = False
 
-    def register(specs, namespace=None):
+    def register(specs, namespace=None, *, replay=False):
         nonlocal hosted_search
+        if namespace == "functions":
+            namespace = None
         for spec in specs:
             kind = spec.get("type")
             # Codex adds hosted search for the openai provider regardless of
@@ -80,30 +84,32 @@ def chat_request(payload):
                 hosted_search = True
                 continue
             if kind == "namespace":
-                register(spec.get("tools", []), spec["name"])
+                register(spec.get("tools", []), spec["name"], replay=replay)
                 continue
             if kind not in ("function", "custom"):
                 raise invalid(f"Unsupported local Codex tool: {kind}")
             alias = tool_name(spec["name"], namespace)
+            identity = {"name": spec["name"], "namespace": namespace, "type": kind}
             if alias in names:
-                raise invalid(f"Duplicate tool name: {alias}")
-            names[alias] = {"name": spec["name"], "namespace": namespace, "type": kind}
+                if not replay or names[alias] != identity:
+                    raise invalid(f"Duplicate tool name: {alias}")
+                if alias in request_tools:
+                    continue
+            names[alias] = identity
             parameters = spec.get("parameters") if kind == "function" else {
                 "type": "object", "properties": {"input": {"type": "string"}},
                 "required": ["input"], "additionalProperties": False}
-            tools.append({"type": "function", "function": {
+            tools[alias] = {"type": "function", "function": {
                 "name": alias, "description": spec.get("description", ""),
-                "parameters": parameters or {"type": "object", "properties": {}}}})
+                "parameters": parameters or {"type": "object", "properties": {}}}}
 
     register(payload.get("tools", []))
+    # The current request's definitions take precedence over replayed ones.
+    request_tools.update(tools)
     messages = []
     if payload.get("instructions"):
         messages.append({"role": "system", "content": payload["instructions"]})
-    if hosted_search:
-        messages.append({"role": "system", "content":
-            "OpenAI-hosted web search is unavailable for this local model. "
-            "Use an available browser or search function tool instead; "
-            "do not claim to have searched without actually using one."})
+    system_message_count = len(messages)
     items = payload.get("input", [])
     if isinstance(items, str):
         items = [{"role": "user", "content": items}]
@@ -112,7 +118,9 @@ def chat_request(payload):
     reasoning = ""
     for item in items:
         kind = item.get("type", "message")
-        if kind == "reasoning":
+        if kind == "additional_tools":
+            register(item.get("tools", []), replay=True)
+        elif kind == "reasoning":
             reasoning += text_content(item.get("content") or item.get("summary") or [])
         elif kind == "message":
             role = item.get("role", "user")
@@ -139,6 +147,11 @@ def chat_request(payload):
                              "content": text_content(output)})
         else:
             raise invalid(f"Unsupported Responses input item: {kind}")
+    if hosted_search:
+        messages.insert(system_message_count, {"role": "system", "content":
+            "OpenAI-hosted web search is unavailable for this local model. "
+            "Use an available browser or search function tool instead; "
+            "do not claim to have searched without actually using one."})
     chat = {"model": payload.get("model"), "messages": messages, "stream": True,
             "stream_options": {"include_usage": True}}
     choice = payload.get("tool_choice", "auto")
@@ -154,7 +167,7 @@ def chat_request(payload):
     if choice == "required" and not tools:
         raise invalid("tool_choice=required has no available local tools")
     if tools:
-        chat["tools"] = tools
+        chat["tools"] = list(tools.values())
         chat["tool_choice"] = choice
         chat["parallel_tool_calls"] = False
     if "max_output_tokens" in payload:
