@@ -364,7 +364,7 @@ def model_catalog(models):
     aliases = {canonical: alias for alias, canonical in MODEL_ALIASES.items()}
     for priority, model in enumerate(models):
         alias = aliases.get(model["id"])
-        result.append({"slug": alias or model["id"],
+        entry = {"slug": alias or model["id"],
             "display_name": alias or model["name"] + " (Local proxy)",
             "description": "Local inference through managed proxy admission",
             "default_reasoning_level": "high", "supported_reasoning_levels": [
@@ -382,5 +382,9 @@ def model_catalog(models):
             "effective_context_window_percent": 95, "experimental_supported_tools": [],
             "input_modalities": ["text"], "supports_search_tool": False,
             "supports_experimental_context": False, "use_responses_lite": False,
-            "supports_reasoning_effort_updates": False})
+            "supports_reasoning_effort_updates": False}
+        if model["id"] == "deepseek-v4.1-flash":
+            # Use the same Codex tool runtime as Sol when switching models.
+            entry["tool_mode"] = "code_mode_only"
+        result.append(entry)
     return {"models": result}
