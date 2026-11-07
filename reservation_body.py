@@ -254,6 +254,9 @@ async def handle_main(request, body, backend_name, model_id,
                            'x-request-id': request_id})
     try:
         await response.prepare(request)
+        if response_stream:
+            await response.write(response_stream.start())
+        last_write = time.monotonic()
         while True:
             if request.transport is None or request.transport.is_closing():
                 disconnect()
@@ -261,10 +264,16 @@ async def handle_main(request, body, backend_name, model_id,
             try:
                 chunk = await asyncio.wait_for(queue.get(), .1)
             except asyncio.TimeoutError:
+                if response_stream and time.monotonic() - last_write >= 15:
+                    # Codex times out between parsed SSE events, so comments
+                    # alone cannot keep a long prefill or generation connected.
+                    await response.write(b'event: ping\ndata: {"type":"ping"}\n\n')
+                    last_write = time.monotonic()
                 continue
             if chunk is None:
                 break
             await response.write(chunk)
+            last_write = time.monotonic()
         if not disconnected:
             await response.write_eof()
         return response
