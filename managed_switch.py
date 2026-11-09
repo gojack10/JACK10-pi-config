@@ -293,7 +293,7 @@ class ManagedSwitch:
         return engine
 
     async def stop_all(self):
-        """Maintenance only: fresh native drain, process exit, then empty policy."""
+        """Operator shutdown: fresh native drain, process exit, then empty policy."""
         await asyncio.wait_for(self.acquire(), 90)
         try:
             if self.startlux is not None and await asyncio.to_thread(self.startlux.probe):

@@ -1,4 +1,4 @@
-"""Maintenance switch: local-ai stop | start | status | restart [-- command ...]. Never loads a model."""
+"""Manage local inference: local-ai unload | stop | start | status | restart [-- command ...]."""
 import argparse
 import fcntl
 import json
@@ -52,6 +52,13 @@ def engines_off():
 def panel_off():
     import swap_policy
     return proxy_pid() is None and not swap_policy.port_listening(8002)
+
+
+def unload():
+    result = request('/admin/api/unload', 'POST')
+    if result != {'status': 'ok', 'engines': 'off'}:
+        raise RuntimeError('Proxy did not confirm that all managed engines are off')
+    print('All managed engines off. The proxy is ready for the next model request.')
 
 
 def stop():
@@ -162,8 +169,8 @@ def restart(command):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('stop', 'start', 'status', 'restart', '_restart'),
-                        metavar='{stop,start,status,restart}')
+    parser.add_argument('action', choices=('unload', 'stop', 'start', 'status', 'restart', '_restart'),
+                        metavar='{unload,stop,start,status,restart}')
     parser.add_argument('command', nargs=argparse.REMAINDER,
                         help='optional command to run with engines off during restart')
     args = parser.parse_args()

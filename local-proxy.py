@@ -1161,25 +1161,36 @@ async def handle_other(request):
     reservation_unavailable(request)
 
 
-async def handle_maintenance(request):
+async def shutdown_engines(request, *, maintenance):
     global MAINTENANCE, DS4_LOADED_MODEL_ID, CHAT_OWNER
     if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
         raise web.HTTPUnauthorized()
     async with REQUEST_CONDITION:
+        if not maintenance and MAINTENANCE:
+            raise web.HTTPConflict(text='Local AI is stopped for maintenance')
         if ACTIVE_REQUESTS:
-            raise web.HTTPConflict(text='Local AI is generating; finish the active request before maintenance')
-        MAINTENANCE = True
+            action = 'maintenance' if maintenance else 'unload'
+            raise web.HTTPConflict(text=f'Local AI is generating; finish the active request before {action}')
+        if maintenance:
+            MAINTENANCE = True
+            MAINTENANCE_FILE.touch(mode=0o600)
         CHAT_OWNER = None
         REQUEST_CONDITION.notify_all()
-        MAINTENANCE_FILE.touch(mode=0o600)
         try:
             await INDEPENDENT_SWITCH.stop_all()
-            DS4_LOADED_MODEL_ID = None
         except Exception as exc:
-            # Keep admission closed on a partial shutdown. Never restart a
-            # component automatically when completion was not established.
+            # The manager retains the GPU lease after an unproven shutdown.
             raise web.HTTPServiceUnavailable(text=str(exc)) from exc
-    return web.json_response({'status': 'maintenance', 'engines': 'off'})
+        DS4_LOADED_MODEL_ID = None
+    return web.json_response({'status': 'maintenance' if maintenance else 'ok', 'engines': 'off'})
+
+
+async def handle_maintenance(request):
+    return await shutdown_engines(request, maintenance=True)
+
+
+async def handle_unload(request):
+    return await shutdown_engines(request, maintenance=False)
 
 
 async def handle_resume(request):
@@ -1215,6 +1226,7 @@ async def main():
     app.router.add_get("/admin/api/stats", handle_admin_stats)
     app.router.add_get('/v1/local-progress', handle_local_progress)
     app.router.add_post("/admin/api/release-chat", handle_release_chat)
+    app.router.add_post('/admin/api/unload', handle_unload)
     app.router.add_post('/admin/api/maintenance', handle_maintenance)
     app.router.add_post('/admin/api/resume', handle_resume)
     app.router.add_route("*", "/v1/{tail:.*}", handle_other)
