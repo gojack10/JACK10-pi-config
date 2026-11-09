@@ -2,7 +2,7 @@
 
 ## Jack's developer conventions
 
-Before developer work, read `local/knowledge/developer.md` relative to this repository. This ignored local binding points to the machine's developer conventions; resolve guide symlinks before following relative knowledge links, and follow task-specific children just in time. If it is missing, ask the owner to configure it rather than guessing. The tree owns the conventions and their evidence; do not duplicate them in report files.
+Before developer work, read Jack Developer Tree at `/Users/jack/sifttext/nodes/ab1fe127-52f8-4bc5-b5ca-2cda47f5849e/node.md` and follow task-specific children just in time. The tree owns the conventions and their evidence; do not duplicate them in report files or require a repository-local binding.
 
 Jack owns testing. Never write or run tests unless he explicitly requests and designs them. The routine check is only whether the project builds and starts. No screenshots for any purpose unless he explicitly asks for screenshots. The tree's Testing node owns the complete rule.
 
