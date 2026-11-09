@@ -8,6 +8,7 @@ import shutil
 from aiohttp import web
 
 import codex_provider
+from codex_gateway import gateway_config
 
 ROOT = Path(__file__).resolve().parent
 # Slug, helper arguments, and display metadata are shared by startup and dispatch.
@@ -27,8 +28,7 @@ _catalog = {}
 
 
 def node_command():
-    config_path = Path(os.getenv('CODEX_GATEWAY_CONFIG', str(ROOT / 'local/codex-gateway.json'))).expanduser()
-    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    config = gateway_config()
     node = os.getenv('CODEX_PI_NODE') or config.get('node') or shutil.which('node')
     if not node:
         raise RuntimeError('Configure node in local/codex-gateway.json or set CODEX_PI_NODE')

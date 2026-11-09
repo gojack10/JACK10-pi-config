@@ -1,6 +1,9 @@
 """Combined OpenAI and local-model gateway for the Codex desktop picker."""
 import asyncio
+from hashlib import sha256
 import json
+import os
+from pathlib import Path
 import re
 
 from aiohttp import ClientConnectorError, ClientSession, ClientTimeout, web
@@ -18,6 +21,12 @@ FOREIGN_REASONING_IDS = ('rs_local_', 'rs_meta_', 'rs_bedrock_', 'rs_openai_api_
 PI_REASONING_ENVELOPES = ('pi-meta-v1:', 'pi-bedrock-v1:', 'pi-openai-api-v1:', 'pi-openrouter-v1:')
 LEGACY_LOCAL_REASONING_ID = re.compile(r'rs_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}')
 COMPACTION_HANDOFF = re.compile(r'\[Codex handoff for (cmp_[\w-]+)\]\n\S')
+
+
+def gateway_config():
+    default = Path(__file__).resolve().parent / 'local/codex-gateway.json'
+    path = Path(os.getenv('CODEX_GATEWAY_CONFIG', str(default))).expanduser()
+    return json.loads(path.read_text()) if path.exists() else {}
 
 
 def portable_compaction_input(items, native_replay_prefix=None):
@@ -50,7 +59,12 @@ def portable_compaction_input(items, native_replay_prefix=None):
             continue
         if isinstance(identity, str) and identity in handoffs:
             continue
-        raise invalid('This model needs a text handoff for the encrypted compaction in this chat.')
+        digest = sha256(encrypted.encode()).hexdigest() if isinstance(encrypted, str) else ''
+        text = gateway_config().get('compaction_handoffs', {}).get(digest)
+        if not text:
+            raise invalid('This model needs a text handoff for the encrypted compaction in this chat.')
+        replay.append({'type': 'message', 'role': 'assistant', 'content': [
+            {'type': 'output_text', 'text': text}]})
     return replay
 
 
