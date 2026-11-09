@@ -8,14 +8,21 @@ Jack owns testing. Never write or run tests unless he explicitly requests and de
 
 ## Local proxy maintenance
 
-Codex cloud and local models both depend on the local proxy. Use
-`~/.pi/agent/local-ai restart` to activate prepared changes, never separate stop
-and start across model calls. Restart queues an independent one-shot launchd job;
-`local-ai status` and `~/.dsv4/local-ai-restart.log` report its actual outcome.
-Build first; for a promotion that requires engines off, use
+Codex's combined gateway is the independent `com.codex.gateway` service on
+`:8005`; local inference is `com.local.llm.proxy` on `:8002`. Cloud requests must
+never depend on local admission, engine health or maintenance. Only selected
+local models forward to the local proxy; never fall back to cloud implicitly.
+
+Use `~/.pi/agent/local-ai restart` to activate prepared local-inference changes,
+never separate stop and start across local-model calls. Restart queues an
+independent one-shot launchd job; `local-ai status` and
+`~/.dsv4/local-ai-restart.log` report its actual outcome. Build first; for a
+promotion that requires engines off, use
 `local-ai restart -- /absolute/path/to/promotion-script`. Existing native shutdown
 and active-generation refusals remain; do not bypass them. Manual stop/start is
-only for an independent operator that can complete both without the gateway.
+only for an independent operator that can complete both without local inference.
+Gateway-only changes require restarting its own service after active gateway
+work finishes, not restarting local inference or its engines.
 
 ## Extension discovery
 

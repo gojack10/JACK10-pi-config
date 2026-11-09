@@ -24,8 +24,7 @@ from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 import reservation_body
 import codex_provider
-import codex_gateway
-import codex_cloud
+from local_model_catalog import DS4_MODEL_METADATA, mlx_model_metadata
 from managed_switch import ManagedSwitch, MODELS as MANAGED_MODELS
 from mlx_runtime import MLXRuntime, MODELS as MLX_CHECKPOINTS
 from startlux_runtime import StartLuxRuntime, MODEL_ID as STARTLUX_MODEL_ID, UPSTREAM_ID as STARTLUX_UPSTREAM_ID, PORT as STARTLUX_PORT, CONTEXT as STARTLUX_CONTEXT, WORK_TOKENS as STARTLUX_WORK_TOKENS
@@ -58,22 +57,7 @@ QWEN_NEXT_MODEL_ID = "qwen3.8-flash-next"
 # ManagedSwitch owns checkpoint residency; these records only name public models.
 MLX_MODEL_PATHS = {model: str(path) for model, path in MLX_CHECKPOINTS.items()}
 MLX_MODEL_IDS = set(MLX_MODEL_PATHS)
-MLX_MODEL_METADATA = {
-    "qwen3.5-4b-8bit": {"name": "Qwen3.5 4B (MLX 8-bit)", "context_length": 262144},
-    "qwen3.5-4b-bf16": {"name": "Qwen3.5 4B (MLX BF16)", "context_length": 262144},
-    "qwen3.8-27b-uncensored": {"name": "Qwen3.8 27B Uncensored (MLX 8-bit)", "context_length": 262144},
-    "gemma-4-31b-mlx": {"name": "Gemma 4 31B IT (MLX 8-bit)", "context_length": 262144},
-}
-
-# Local-only model adverts: names live in an untracked file so no model identity
-# is committed. Paths and IDs are merged from mlx_runtime.MODELS at import.
-_local_registry = Path(__file__).resolve().parent / 'local-models.json'
-if _local_registry.exists():
-    for _entry in json.loads(_local_registry.read_text()).get('models', []):
-        MLX_MODEL_METADATA[_entry['id']] = {
-            "name": _entry['display'],
-            "context_length": _entry.get('context_length', 262144),
-        }
+MLX_MODEL_METADATA = mlx_model_metadata()
 MLX_SUPPORTED_PARAMETERS = [
     "tools", "tool_choice", "max_tokens", "temperature", "top_p", "top_k",
     "min_p", "stop", "seed", "stream",
@@ -96,42 +80,12 @@ DS4_SUPPORTED_PARAMETERS = [
     "stream",
     "reasoning_effort",
 ]
-DS4_MODEL_METADATA = {
-    DS4_FLASH_MODEL_ID: {
-        "name": "DeepSeek V4 Flash",
-        "context_length": 1048576,
-        "max_completion_tokens": 1048576,
-    },
-    DS4_PRO_MODEL_ID: {
-        "name": "DeepSeek V4 Pro",
-        "context_length": 1048576,
-        "max_completion_tokens": 1048576,
-    },
-    QWEN_NEXT_MODEL_ID: {
-        "name": "Qwen3.8 Flash Next",
-        "context_length": 750000,
-        "max_completion_tokens": 750000,
-    },
-    GLM_FLASH_MODEL_ID: {
-        "name": "GLM 5.3 Flash",
-        "context_length": 500000,
-        "max_completion_tokens": 393216,
-    },
-    # Must match the wrapper's --ctx for the ds41 case; a mismatch desyncs Pi's
-    # view from the resident engine.
-    DS41_MODEL_ID: {
-        "name": "DeepSeek V4.1 Flash",
-        "context_length": 1000000,
-        "max_completion_tokens": 1000000,
-    },
-}
 DS4_LOADED_MODEL_ID = None
 DS4_LOADED_CHECK_AT = 0.0
 DS4_SWITCH_LOCK = asyncio.Lock()
 REQUEST_CONDITION = asyncio.Condition(DS4_SWITCH_LOCK)
 ACTIVE_MODEL_ID = None
 ACTIVE_REQUESTS = 0
-CODEX_GATEWAY_REQUESTS = 0
 ACTIVE_TICKET = None
 REQUEST_QUEUE = []
 CHAT_OWNER = None
@@ -865,68 +819,6 @@ async def handle_responses(request):
     return await local_codex_response(request, payload)
 
 
-async def handle_codex_gateway(request):
-    global CODEX_GATEWAY_REQUESTS
-    if MAINTENANCE:
-        raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
-    CODEX_GATEWAY_REQUESTS += 1
-    try:
-        return await route_codex_gateway(request)
-    finally:
-        CODEX_GATEWAY_REQUESTS -= 1
-
-
-async def route_codex_gateway(request):
-    codex_gateway.request_headers(request, PROXY_API_KEY)
-    tail = request.match_info['tail']
-    if request.method == 'GET' and tail == 'models':
-        models = {'models': codex_models()['models'] + codex_cloud.catalog()}
-        return await codex_gateway.while_connected(request,
-            codex_gateway.catalog(request, models, PROXY_API_KEY))
-    if request.method == 'GET' and tail == 'responses':
-        # The built-in OpenAI provider tries WebSockets first. Codex interprets
-        # 426 as a request to use streamed HTTP for the rest of this session.
-        raise web.HTTPUpgradeRequired(text='Use streaming HTTP POST /responses')
-    if request.method == 'POST' and (tail == 'responses' or tail.startswith('responses/')):
-        if request.headers.get('Content-Encoding', 'identity') != 'identity':
-            raise web.HTTPUnsupportedMediaType(text='Disable request compression for this gateway')
-        # Clone before reading the body: aiohttp shares its payload and writer,
-        # while the local route receives only native credentials/provenance.
-        local_request = codex_local_request(request)
-        body = await request.read()
-        try:
-            payload = json.loads(body)
-        except (ValueError, UnicodeError):
-            raise codex_provider.invalid('Expected a JSON Responses request')
-        if not isinstance(payload, dict):
-            raise codex_provider.invalid('Expected a JSON Responses object')
-        model = payload.get('model')
-        if not isinstance(model, str):
-            raise codex_provider.invalid('A model name is required')
-        cloud_model = model in codex_cloud.MODELS
-        canonical = codex_provider.MODEL_ALIASES.get(model, model)
-        local_model = (model in codex_provider.MODEL_ALIASES or canonical in MANAGED_MODELS
-                       or canonical in MODEL_BACKENDS)
-        if (cloud_model or local_model) and 'input' in payload:
-            native_replay_prefix = 'pi-openai-api-v1:' if model == 'gpt-6.1-sol-zdr' else None
-            payload['input'] = codex_gateway.portable_compaction_input(payload['input'], native_replay_prefix)
-        if cloud_model:
-            if tail != 'responses':
-                raise codex_provider.invalid(f'{model} does not support /{tail}')
-            return await codex_gateway.while_connected(request, codex_cloud.forward(request, payload))
-        if local_model:
-            # Auxiliary Responses operations (notably remote compaction) carry
-            # conversation input too. Never send a local conversation to OpenAI.
-            if tail != 'responses':
-                raise codex_provider.invalid(
-                    f'Local Codex does not support /{tail}; the request was not sent to OpenAI')
-            return await local_codex_response(local_request, payload)
-        return await codex_gateway.while_connected(request,
-            codex_gateway.forward(request, PROXY_API_KEY, codex_gateway.openai_body(payload, body)))
-    return await codex_gateway.while_connected(request,
-        codex_gateway.forward(request, PROXY_API_KEY))
-
-
 # ── /v1/chat/completions (route by model) ───────────────────────────────────
 
 async def handle_chat(request):
@@ -1312,19 +1204,10 @@ async def main():
     await discover_models()
     asyncio.create_task(periodic_discover())
 
-    for model in codex_cloud.MODELS:
-        try:
-            await codex_cloud.load_catalog(model)
-            log.info('Pi cloud model catalog loaded: %s', model)
-        except Exception as exc:
-            # A Pi installation problem must not take OpenAI/local inference down.
-            log.warning('Pi cloud catalog unavailable (%s): %s', model, exc)
-
     app = web.Application(client_max_size=1024 * 1024 * 1024)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/v1/codex/models", handle_codex_models)
     app.router.add_post("/v1/responses", handle_responses)
-    app.router.add_route('*', '/backend-api/codex/{tail:.*}', handle_codex_gateway)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post('/v1/systemone', handle_systemone)
     app.router.add_get('/v1/systemone/models', handle_systemone_models)
@@ -1341,7 +1224,6 @@ async def main():
         "routes": MODEL_BACKENDS,
         "ds4_loaded_model": DS4_LOADED_MODEL_ID,
         "active_requests": ACTIVE_REQUESTS,
-        "codex_gateway_requests": CODEX_GATEWAY_REQUESTS,
         "resident_model": INDEPENDENT_SWITCH.model if INDEPENDENT_SWITCH else None,
         "ds4_active_requests": DS4_ACTIVE_REQUESTS,
         "ds4_idle_timeout": DS4_IDLE_TIMEOUT,

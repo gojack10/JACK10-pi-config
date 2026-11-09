@@ -3,13 +3,15 @@ import asyncio
 import json
 import re
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientConnectorError, ClientSession, ClientTimeout, web
 from multidict import CIMultiDict
 
 from codex_provider import invalid
 
 OPENAI_BASE = 'https://chatgpt.com/backend-api/codex'
+LOCAL_BASE = 'http://127.0.0.1:8002/v1'
 TIMEOUT = ClientTimeout(total=None, sock_connect=15, sock_read=None)
+LOCAL_TIMEOUT = ClientTimeout(total=None, sock_connect=2, sock_read=None)
 HOP_HEADERS = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
                'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length'}
 FOREIGN_REASONING_IDS = ('rs_local_', 'rs_meta_', 'rs_bedrock_', 'rs_openai_api_', 'rs_openrouter_')
@@ -108,9 +110,9 @@ def response_headers(response):
 async def while_connected(request, operation):
     """Cancel cloud I/O on disconnect, including before its first response byte.
 
-    The server keeps handler cancellation off for native GPU cleanup. Cloud
-    forwarding has no native lease and must not hold maintenance after its
-    downstream client disappears. This is not an inference timeout.
+    The gateway owns no native GPU lease. Closing its local upstream leaves
+    native cancellation and drain with the local inference proxy. This is not
+    an inference timeout.
     """
     task = asyncio.create_task(operation)
     try:
@@ -151,23 +153,35 @@ async def catalog(request, local_models, local_key):
     return web.json_response(data, headers={'Cache-Control': 'private, no-store'})
 
 
-async def forward(request, local_key, body=None):
-    """Forward to the fixed OpenAI origin without retaining credentials or prompts."""
+async def forward(request, local_key, body=None, *, local=False):
+    """Forward only to fixed origins; never send ChatGPT credentials locally."""
     headers = request_headers(request, local_key)
-    tail = request.match_info['tail']
+    if local:
+        headers['Authorization'] = 'Bearer ' + local_key
+        headers.popall('ChatGPT-Account-ID', None)
+        url, timeout = LOCAL_BASE + '/responses', LOCAL_TIMEOUT
+    else:
+        url = OPENAI_BASE + '/' + request.match_info['tail']
+        timeout = TIMEOUT
     if body is None and request.can_read_body:
         body = await request.read()
-    async with ClientSession(timeout=TIMEOUT, auto_decompress=False) as session:
-        async with session.request(request.method, OPENAI_BASE + '/' + tail,
-                params=request.query, data=body, headers=headers,
-                allow_redirects=False) as upstream:
-            response = web.StreamResponse(status=upstream.status, headers=response_headers(upstream))
-            await response.prepare(request)
-            try:
-                async for chunk in upstream.content.iter_any():
-                    await response.write(chunk)
-                await response.write_eof()
-            except ConnectionError:
-                # Closing the upstream context cancels only this OpenAI request.
+    try:
+        async with ClientSession(timeout=timeout, auto_decompress=False) as session:
+            async with session.request(request.method, url,
+                    params=request.query, data=body, headers=headers,
+                    allow_redirects=False) as upstream:
+                response = web.StreamResponse(status=upstream.status, headers=response_headers(upstream))
+                await response.prepare(request)
+                try:
+                    async for chunk in upstream.content.iter_any():
+                        await response.write(chunk)
+                    await response.write_eof()
+                except ConnectionError:
+                    # The local proxy retains responsibility for native drain.
+                    return response
                 return response
-            return response
+    except (ClientConnectorError, asyncio.TimeoutError) as exc:
+        if local:
+            raise web.HTTPServiceUnavailable(
+                text='Local inference is unavailable. Cloud models remain available.') from exc
+        raise

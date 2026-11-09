@@ -86,8 +86,9 @@ requests, and switches wait for native completion and process exit. Use
 
 Use `~/.pi/agent/local-ai restart` to activate prepared changes from Codex. It
 queues a one-shot launchd job that performs the existing safe stop/start without
-needing another model response. Codex may briefly retry while the gateway is
-down; the job restores reception with all engines off. A queued receipt is not
+needing another model response. Only local model requests lose reception;
+Codex cloud routes use an independent gateway. The job restores local reception
+with all engines off. A queued receipt is not
 completion: `local-ai status` reports the job's exit code, and
 `~/.dsv4/local-ai-restart.log` contains its output (replaced on the next restart).
 An active/uncertain engine still causes refusal; no automatic retry or forced kill.
@@ -112,9 +113,19 @@ to overlap local engines or to interrupt another owning chat.
 
 ## Codex desktop
 
-The combined desktop gateway lives at `/backend-api/codex`. Its `/models`
-endpoint combines the signed-in user's current OpenAI catalog with managed
-local models and the Pi cloud routes registered in `codex_cloud.py`.
+The combined desktop gateway is `codex-proxy.py`, served by the independent
+`com.codex.gateway` LaunchAgent at `127.0.0.1:8005/backend-api/codex`.
+Its `/models` endpoint combines the signed-in user's current OpenAI catalog
+with managed local models and the Pi cloud routes registered in `codex_cloud.py`.
+
+Cloud requests never consult local inference health, admission, maintenance,
+GPU ownership or backend discovery. Local catalog metadata lives in
+`local_model_catalog.py`, without engine imports or a running local server.
+Only a selected local model forwards to `127.0.0.1:8002/v1/responses` with the
+proxy key, never the caller's ChatGPT credentials. That local server owns the
+queue, chat reservation, native cancellation and engine lifecycle. If it is
+busy, stopped, unhealthy or in maintenance, cloud models remain available.
+There is no automatic cloud fallback for a failed local request.
 The ChatGPT catalog's models use that user's existing
 ChatGPT credential and account header; credentials and prompts are not stored.
 The local model `deepseek-v4.1-flash-1017-local` routes to the existing
@@ -134,7 +145,7 @@ the incoming ChatGPT token or account header. The integration retains Pi's
 unofficial subscription compatibility boundary.
 
 Muse's context, input modalities and thinking choices come from Pi's model
-definition when the proxy starts. The current choices are `minimal`, `low`,
+definition when the Codex gateway starts. The current choices are `minimal`, `low`,
 `medium`, `high`, `xhigh`, `max`, with `max` as the model's fallback. Thinking
 off is not advertised because Pi marks it unsupported. The desktop's saved
 model selection/default is unchanged.
@@ -210,7 +221,7 @@ these top-level keys in the user-level Codex configuration:
 ```toml
 model = "gpt-6.1-sol"
 model_provider = "openai"
-openai_base_url = "http://127.0.0.1:8002/backend-api/codex"
+openai_base_url = "http://127.0.0.1:8005/backend-api/codex"
 
 [features]
 enable_request_compression = false
@@ -236,22 +247,26 @@ calls and releases after the final answer, an incomplete response or an active
 request cancellation. The existing idle lease and authenticated chat-release
 operation still cover an abandoned session between model requests.
 
-Activate prepared proxy changes with `local-ai restart`. Both local and OpenAI
-Codex requests depend on this process, so the one-shot launchd worker owns the
-entire safe stop/start while Codex reconnects. Never issue stop and expect a
-subsequent model response to issue start. Finish other gateway tasks first;
-disconnected cloud clients cancel their upstream I/O even before output arrives.
-Restarting the proxy alone over a retained engine loses its native ownership
-state. The existing maintenance path still refuses active local generation and
-requires native completion and engine exit. Do not bypass a refusal with
-`launchctl bootout`.
+Activate prepared local-inference changes with `local-ai restart`. Its one-shot
+launchd worker owns the entire native-safe stop/start. This operates only on
+`com.local.llm.proxy` and its engines, never `com.codex.gateway`. Starting or
+stopping local inference does not restart cloud adapters or the combined picker.
+Restarting the local proxy alone over a retained engine loses its native
+ownership state; native completion and engine exit remain required. Do not
+bypass a local shutdown refusal with `launchctl bootout`.
 
-If the gateway is already down, `local-ai start` checks that engines are off and
-restores reception without loading a model. A direct-OpenAI recovery is to remove
-`openai_base_url`, select an OpenAI model, retain `model_provider = "openai"`, and
-reload the desktop after its tasks finish. This temporarily removes the combined
-menu, not the saved chats. Restore the gateway URL after maintenance to use local
-models again.
+Gateway code changes instead require restarting `com.codex.gateway` after its
+active work finishes; no GPU shutdown or local-AI restart is needed. The two
+services share an installed Python environment, not a process or maintenance
+switch. Both LaunchAgents are defined in the Home Manager local-LLM module.
+
+If local inference is down, `local-ai start` checks that engines are off and
+restores local reception without loading a model. It is not a cloud recovery
+command. If the Codex gateway itself is unavailable, a direct-OpenAI recovery
+is to remove `openai_base_url`, select an OpenAI model, retain
+`model_provider = "openai"`, and reload the desktop after its tasks finish.
+This temporarily removes the combined menu, not the saved chats. Restore the
+`:8005` gateway URL to use the combined menu again.
 
 ## Native local inference progress
 

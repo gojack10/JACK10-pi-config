@@ -40,7 +40,15 @@ async def load_catalog(model):
     helper, args, display_name, description = MODELS[model]
     process = await asyncio.create_subprocess_exec(node_command(), str(ROOT / helper), '--catalog', model, *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    stdout, _ = await process.communicate()
+    try:
+        stdout, _ = await process.communicate()
+    finally:
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+        await asyncio.shield(process.wait())
     data = json.loads(stdout)
     if process.returncode:
         raise RuntimeError(data.get('error', {}).get('message', 'Pi cloud adapter did not start'))

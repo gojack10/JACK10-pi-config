@@ -156,8 +156,8 @@ def restart(command):
         result = ctl('bootstrap', DOMAIN, str(RESTART_PLIST))
         if result.returncode:
             raise RuntimeError(result.stderr)
-    print(f'Restart queued independently of Codex; not yet complete. Log: {RESTART_LOG}')
-    print('Use local-ai status for the outcome. Codex may briefly retry its connection.')
+    print(f'Local-inference restart queued; not yet complete. Log: {RESTART_LOG}')
+    print('Use local-ai status for the outcome. The independent Codex cloud gateway stays available.')
 
 
 def main():
