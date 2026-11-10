@@ -1,6 +1,6 @@
 import type { AssistantMessage, Model, ModelResolutionContext } from "@earendil-works/pi-ai";
 import type { CodexAccountRegistry } from "../codex-quota-extension/store.ts";
-import { codexBaseModelId } from "./models.ts";
+import { codexBaseModelId, codexRequiresPro } from "./models.ts";
 import type { RouteEvaluation } from "./router.ts";
 
 export const isTerminalCodexUsageLimit = (message: AssistantMessage): boolean =>
@@ -61,7 +61,7 @@ export async function resolveCodexPersonalSelection(options: {
 		throw new Error(`MODEL UNAVAILABLE: no Codex Personal account supports ${model.id}`);
 	const evaluation = options.evaluate();
 	if (evaluation.allBlocked) {
-		const fallback = options.fallbackProviderId
+		const fallback = options.fallbackProviderId && !codexRequiresPro(model.id)
 			? context.getModel(options.fallbackProviderId, model.id)
 			: undefined;
 		if (fallback && (await context.hasAuth(fallback.provider)))

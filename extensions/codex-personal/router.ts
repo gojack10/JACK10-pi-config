@@ -11,7 +11,7 @@ import {
 	parseUsageState,
 	type RegistryAccount,
 } from "../codex-quota-extension/store.ts";
-import { codexBaseModelId } from "./models.ts";
+import { codexBaseModelId, codexRequiresPro } from "./models.ts";
 
 export type RouteCandidate = {
 	accountKey: string;
@@ -140,6 +140,8 @@ export const evaluateCodexRoute = (options: {
 				reasons: [...reasons, "TELEMETRY MISSING"],
 				degradations,
 			};
+		if (codexRequiresPro(model) && !telemetry.plan.toLowerCase().startsWith("pro"))
+			reasons.push("PRO PLAN REQUIRED");
 		if (telemetry.id !== account.providerId || telemetry.policyClass !== account.policyClass)
 			reasons.push("REGISTRY/FEED MISMATCH");
 		const quota = evaluateQuotaAccount(telemetry, now);

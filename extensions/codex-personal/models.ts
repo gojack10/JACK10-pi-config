@@ -2,6 +2,8 @@ import type { StreamOptions } from "@earendil-works/pi-ai";
 
 const FAST_SUFFIX = "-fast";
 
+export const codexRequiresPro = (modelId: string): boolean => modelId === "gpt-6.1-sol-fast";
+
 export const codexBaseModelId = (modelId: string): string =>
 	modelId.endsWith(FAST_SUFFIX) ? modelId.slice(0, -FAST_SUFFIX.length) : modelId;
 
