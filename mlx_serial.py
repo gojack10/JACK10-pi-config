@@ -4,6 +4,7 @@ The gate runs on mlx-lm's only submitting thread, after generation and cache
 updates. It synchronizes that worker's stream before acknowledging a close.
 No retained borrowing, fabricated GPU counters, or patched MLX library.
 """
+import copy
 import json
 import os
 from pathlib import Path
@@ -92,6 +93,9 @@ def main():
     import time
     import mlx.core as mx
     from mlx_lm import server
+    from mlx_lm.models.cache import can_trim_prompt_cache
+
+    stream_generate = server.stream_generate
 
     directory = os.environ['MLX_CONTROL_DIR']
     checkpoint = str(Path(sys.argv[sys.argv.index('--model') + 1]).resolve())
@@ -102,6 +106,7 @@ def main():
     class SerialGenerator(server.ResponseGenerator):
         def __init__(self, *args, **kwargs):
             self.gate = SerialGate(directory, lambda: mx.synchronize(mx.default_stream(mx.default_device())))
+            self._prompt_tokens = None
             super().__init__(*args, **kwargs)
 
         def _is_batchable(self, args):
@@ -117,6 +122,27 @@ def main():
             validate_model(self.model_provider, args.model, checkpoint)
             self.gate.admit()
             return super().generate(request, args, *rest, **kwargs)
+
+        def _tokenize(self, *args, **kwargs):
+            result = super()._tokenize(*args, **kwargs)
+            self._prompt_tokens = result[0]
+            return result
+
+        def stream_generate(self, **kwargs):
+            cache = kwargs['prompt_cache']
+            upstream_progress = kwargs['prompt_progress_callback']
+
+            def progress(processed, total):
+                if processed > 0 and processed == total - 1 and not can_trim_prompt_cache(cache):
+                    # This callback follows evaluated prefill, BEFORE the last
+                    # prompt token. The total/total callback is too late: upstream
+                    # has already advanced recurrent state into generation.
+                    self.prompt_cache.insert_cache(self.model_provider.model_key,
+                        self._prompt_tokens[:-1], copy.deepcopy(cache), cache_type='user')
+                upstream_progress(processed, total)
+
+            kwargs['prompt_progress_callback'] = progress
+            yield from stream_generate(**kwargs)
 
         def _apply_steering_overlay(self):
             if getattr(self, '_steering_applied', False):
@@ -145,6 +171,7 @@ def main():
                 self._apply_steering_overlay()
                 return super()._serve_single(request, stream)
             finally:
+                self._prompt_tokens = None
                 self.gate.finished()
 
     class PrivateHandler(server.APIHandler):
@@ -159,6 +186,7 @@ def main():
         if mx.distributed.init().size() != 1:
             raise RuntimeError('Managed MLX requires one device')
         generator = SerialGenerator(model_provider, server.LRUPromptCache(model_provider.cli_args.prompt_cache_size))
+        server.stream_generate = generator.stream_generate
         server._run_http_server(host, port, generator, handler_class=PrivateHandler)
 
     server.run = run
