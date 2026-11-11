@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import threading
+import time
 
 from native_files import private_file, publish
 
@@ -90,7 +91,6 @@ def validate_model(provider, model, checkpoint):
 
 def main():
     import sys
-    import time
     import mlx.core as mx
     from mlx_lm import server
     from mlx_lm.models.cache import can_trim_prompt_cache
@@ -107,6 +107,9 @@ def main():
         def __init__(self, *args, **kwargs):
             self.gate = SerialGate(directory, lambda: mx.synchronize(mx.default_stream(mx.default_device())))
             self._prompt_tokens = None
+            self._request_id = None
+            self._progress_phase = None
+            self._progress_at = 0
             super().__init__(*args, **kwargs)
 
         def _is_batchable(self, args):
@@ -128,8 +131,22 @@ def main():
             self._prompt_tokens = result[0]
             return result
 
+        def _publish_progress(self, phase, **sample):
+            now = time.monotonic()
+            if phase == self._progress_phase and now - self._progress_at < .25:
+                return
+            self._progress_phase, self._progress_at = phase, now
+            # One bounded record: counters and request identity, never messages or token IDs.
+            try:
+                publish(directory, 'progress', json.dumps(dict(
+                    **self.gate.identity(), request_id=self._request_id, phase=phase, **sample)))
+            except (OSError, RuntimeError):
+                pass  # Optional telemetry must not interrupt inference/native cleanup.
+
         def stream_generate(self, **kwargs):
             cache = kwargs['prompt_cache']
+            cached = len(self._prompt_tokens) - len(kwargs['prompt'])
+            started = time.perf_counter()
             upstream_progress = kwargs['prompt_progress_callback']
 
             def progress(processed, total):
@@ -139,10 +156,17 @@ def main():
                     # has already advanced recurrent state into generation.
                     self.prompt_cache.insert_cache(self.model_provider.model_key,
                         self._prompt_tokens[:-1], copy.deepcopy(cache), cache_type='user')
+                elapsed = time.perf_counter() - started
+                speed = processed / elapsed if elapsed > 0 else 0
+                self._publish_progress('prefill', processed=processed, total=total,
+                    cache=cached, speed=speed, eta=(total - processed) / speed if speed > 0 else 0)
                 upstream_progress(processed, total)
 
             kwargs['prompt_progress_callback'] = progress
-            yield from stream_generate(**kwargs)
+            for response in stream_generate(**kwargs):
+                self._publish_progress('decode', generated_tokens=response.generation_tokens,
+                    speed=response.generation_tps, cache=cached)
+                yield response
 
         def _apply_steering_overlay(self):
             if getattr(self, '_steering_applied', False):
@@ -167,14 +191,21 @@ def main():
                 mx.eval(model.parameters())
 
         def _serve_single(self, request, stream):
+            self._request_id = getattr(request[1], 'request_id', None)
+            self._progress_phase = None
             try:
                 self._apply_steering_overlay()
                 return super()._serve_single(request, stream)
             finally:
-                self._prompt_tokens = None
+                self._publish_progress('idle')
+                self._prompt_tokens = self._request_id = None
                 self.gate.finished()
 
     class PrivateHandler(server.APIHandler):
+        def handle_completion(self, request, stop_words):
+            request.request_id = self.headers.get('X-Pi-Request-Id')
+            return super().handle_completion(request, stop_words)
+
         def do_POST(self):
             if self.headers.get('Authorization') != 'Bearer ' + key:
                 self.send_error(401)

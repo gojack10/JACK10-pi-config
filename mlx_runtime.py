@@ -86,6 +86,24 @@ class MLXRuntime:
             raise RuntimeError('MLX worker identity lost or replaced')
         return self.identity
 
+    def stats(self, request_id):
+        """Prompt-free progress, correlated to the admitted request, never stop proof."""
+        if self.identity is None or not request_id:
+            return []
+        try:
+            row = json.loads(private_file(self.control / 'progress').read_text())
+        except (OSError, RuntimeError, ValueError):
+            return []
+        if not isinstance(row, dict) or row.get('pid') != self.identity[0] or row.get('request_id') != request_id:
+            return []
+        phase = row.get('phase')
+        if phase not in ('prefill', 'decode'):
+            return []
+        sample = {key: row[key] for key in ('processed', 'total', 'cache', 'speed', 'eta', 'generated_tokens')
+                  if key in row}
+        return [dict(id=self.model, prefilling=[sample] if phase == 'prefill' else [],
+                     generating=[sample] if phase == 'decode' else [])]
+
     async def ready(self):
         path = self.control / 'terminal-engine'
         if not path.exists():

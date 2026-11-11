@@ -1075,7 +1075,7 @@ async def handle_local_progress(request):
 
 
 async def handle_admin_stats(request):
-    """Poll admin/stats and merge results with synthesized Flash-MoE activity."""
+    """Merge backend admin stats with managed MLX and Flash-MoE progress."""
     owner = ACTIVE_TICKET
     cookie = request.headers.get("Cookie", "")
     auth = request.headers.get("Authorization", AUTH_HEADERS["Authorization"])
@@ -1135,6 +1135,8 @@ async def handle_admin_stats(request):
     # the backend poll. Uncorrelated admin clients retain the global view.
     if request_id and (state != "active" or owner is not ACTIVE_TICKET):
         return web.json_response(merged)
+    if owner and owner is ACTIVE_TICKET and owner['backend'] == 'mlx':
+        results.append(MLX.stats(owner['request_id']))
     seen_ids = set()
     for models in results:
         if isinstance(models, Exception):
