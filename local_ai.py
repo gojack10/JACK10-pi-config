@@ -35,7 +35,8 @@ def request(path, method='GET'):
     key = (HOME / '.pi/agent/.proxy-key').read_text().strip()
     req = urllib.request.Request('http://127.0.0.1:8002' + path, method=method,
                                  headers={'Authorization': 'Bearer ' + key})
-    with urllib.request.urlopen(req, timeout=5 if path == '/health' else 300) as response:
+    timeout = None if path == '/admin/api/unload' else 5 if path == '/health' else 300
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -55,6 +56,7 @@ def panel_off():
 
 
 def unload():
+    print('Cancelling any active generation, then unloading managed engines...', flush=True)
     result = request('/admin/api/unload', 'POST')
     if result != {'status': 'ok', 'engines': 'off'}:
         raise RuntimeError('Proxy did not confirm that all managed engines are off')

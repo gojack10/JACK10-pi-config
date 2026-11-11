@@ -94,6 +94,7 @@ STARTLUX = StartLuxRuntime()
 MLX = MLXRuntime()
 MAINTENANCE_FILE = Path.home() / '.dsv4/maintenance'
 MAINTENANCE = MAINTENANCE_FILE.exists()
+UNLOAD_PENDING = False
 
 DS4_IDLE_TIMEOUT = 30 * 60
 DS4_ACTIVE_REQUESTS = 0
@@ -604,7 +605,7 @@ def check_inference_certainty():
         raise web.HTTPServiceUnavailable(text="Backend completion unknown; admission closed pending operator recovery")
 
 
-async def begin_request(backend_name, model_id, request=None, managed=False):
+async def begin_request(backend_name, model_id, request=None, managed=False, cancel=None):
     global ACTIVE_MODEL_ID, ACTIVE_REQUESTS, DS4_ACTIVE_REQUESTS, ACTIVE_TICKET, CHAT_OWNER
     global DS4_LOADED_MODEL_ID, DS4_LOADED_CHECK_AT
     if MAINTENANCE:
@@ -613,7 +614,7 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
         reservation_unavailable(request)
     check_inference_certainty()
     if request is not None and request.headers.get("X-Pi-Origin") == "vega-rewriter" and (
-        ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or DS4_SWITCH_LOCK.locked()
+        UNLOAD_PENDING or ACTIVE_REQUESTS or REQUEST_QUEUE or live_chat_owner() or DS4_SWITCH_LOCK.locked()
     ):
         raise web.HTTPConflict(text="local inference busy; VEGA must reroute")
     request_id = request.headers.get("X-Pi-Request-Id") if request is not None else None
@@ -633,6 +634,8 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
         "model": model_id,
         "request_id": request_id,
         "managed": managed,
+        "cancel": cancel,
+        "transport": request.transport if request is not None else None,
     }
     # Appending before the first await preserves arrival order even while the
     # head holds DS4_SWITCH_LOCK for a safe backend transition.
@@ -643,7 +646,7 @@ async def begin_request(backend_name, model_id, request=None, managed=False):
         async with REQUEST_CONDITION:
             # Track all pending IDs for collision/poll safety. An owner's next
             # request bypasses FIFO, but never an in-flight request.
-            while (ACTIVE_REQUESTS or admission_order()[0] is not ticket or
+            while (UNLOAD_PENDING or ACTIVE_REQUESTS or admission_order()[0] is not ticket or
                    (live_chat_owner() and CHAT_OWNER["chat_id"] != chat_id)):
                 if MAINTENANCE:
                     raise web.HTTPServiceUnavailable(text='Local AI is stopped for maintenance')
@@ -840,9 +843,16 @@ async def handle_chat(request):
             body = normalize_ds4_chat_body(backend_name, body)
         return await reservation_body.handle_main(request, body, backend_name, model_id,
             begin_request, finish_request, BACKENDS[backend_name]['v1'])
-    started = forwarded = complete = False
+    started = forwarded = complete = cleaning = False
+    task = asyncio.current_task()
+
+    def cancel_generation():
+        if not cleaning:
+            task.cancel()  # Close upstream; the finally block still proves native completion.
+
     try:
-        await begin_request(backend_name, model_id, request, managed=backend_name == 'mlx')
+        await begin_request(backend_name, model_id, request, managed=backend_name == 'mlx',
+                            cancel=cancel_generation)
         started = True
 
         backend = BACKENDS[backend_name]["v1"]
@@ -910,6 +920,7 @@ async def handle_chat(request):
             return web.Response(status=499, text="client cancelled before admission")
         raise
     finally:
+        cleaning = True
         if started:
             if backend_name == 'mlx':
                 try:
@@ -1190,7 +1201,34 @@ async def handle_maintenance(request):
 
 
 async def handle_unload(request):
-    return await shutdown_engines(request, maintenance=False)
+    global UNLOAD_PENDING
+    if request.headers.get('Authorization') != AUTH_HEADERS['Authorization']:
+        raise web.HTTPUnauthorized()
+    async with REQUEST_CONDITION:
+        if MAINTENANCE:
+            raise web.HTTPConflict(text='Local AI is stopped for maintenance')
+        if UNLOAD_PENDING:
+            raise web.HTTPConflict(text='Local AI unload is already in progress')
+        check_inference_certainty()
+        UNLOAD_PENDING = True
+    try:
+        async with REQUEST_CONDITION:
+            if ACTIVE_TICKET:
+                log.info('operator unload cancelling active model=%s', ACTIVE_TICKET['model'])
+                if cancel := ACTIVE_TICKET.get('cancel'):
+                    cancel()
+                if transport := ACTIVE_TICKET.get('transport'):
+                    transport.abort()
+            # Successors stay queued until cancellation, native cleanup and
+            # engine exit have all completed. Unknown completion still refuses.
+            while ACTIVE_REQUESTS:
+                check_inference_certainty()
+                await REQUEST_CONDITION.wait()
+        return await shutdown_engines(request, maintenance=False)
+    finally:
+        async with REQUEST_CONDITION:
+            UNLOAD_PENDING = False
+            REQUEST_CONDITION.notify_all()
 
 
 async def handle_resume(request):
@@ -1236,6 +1274,7 @@ async def main():
         "routes": MODEL_BACKENDS,
         "ds4_loaded_model": DS4_LOADED_MODEL_ID,
         "active_requests": ACTIVE_REQUESTS,
+        "unloading": UNLOAD_PENDING,
         "resident_model": INDEPENDENT_SWITCH.model if INDEPENDENT_SWITCH else None,
         "ds4_active_requests": DS4_ACTIVE_REQUESTS,
         "ds4_idle_timeout": DS4_IDLE_TIMEOUT,
@@ -1244,7 +1283,8 @@ async def main():
         "ds4_models": sorted(BACKENDS["ds4"]["models"]),
     }))
 
-    # Keep draining admitted work after client disconnect; never cancel its owner.
+    # Client disconnect must not cancel native cleanup. Operator unload uses
+    # the admitted request's explicit cancellation hook instead.
     runner = web.AppRunner(app, handler_cancellation=False)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", LISTEN_PORT)

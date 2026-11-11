@@ -184,12 +184,13 @@ async def handle_main(request, body, backend_name, model_id,
        payload.get('temperature', 0) != 0 or not request_id or len(request_id) > 128 or \
        not all(c.isascii() and (c.isalnum() or c in '-_') for c in request_id):
         unavailable(request, 'unsupported_native_reservation_path')
-    engine = await begin_request(backend_name, model_id, request, managed=True)
     queue = asyncio.Queue(maxsize=128)
     disconnected = forwarding = False
 
     def disconnect():
         nonlocal disconnected
+        if disconnected:
+            return
         disconnected = True
         if forwarding:
             forward_task.cancel()  # Close upstream now, not the native cleanup task below.
@@ -248,6 +249,7 @@ async def handle_main(request, body, backend_name, model_id,
         finally:
             await queue.put(None)
 
+    engine = await begin_request(backend_name, model_id, request, managed=True, cancel=disconnect)
     forward_task = MAIN_TASK = asyncio.create_task(forward())
     response = web.StreamResponse(headers={'Content-Type': 'text/event-stream',
                            'Cache-Control': 'no-cache', 'Connection': 'keep-alive',
